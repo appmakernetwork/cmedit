@@ -1,0 +1,8 @@
+-- Build against the packages that ship with GHC and never consult a remote
+-- Hackage index (every dependency is a GHC boot library).
+--
+-- NOTE: on a machine whose Hackage index cache has not been built, plain
+-- `cabal build` may fail with "Could not read index". In that case use the
+-- Makefile (`make`) which drives `ghc --make` directly and needs no index.
+packages: .
+active-repositories: none

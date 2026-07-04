@@ -1,0 +1,97 @@
+cabal-version:      2.4
+name:               cmedit
+version:            0.3.0
+synopsis:           Cmedit - a from-scratch terminal text editor in Haskell
+description:        A terminal text editor inspired by Microsoft Edit (msedit) and
+                    nano, implemented from first principles: raw terminal control,
+                    a hand-written input parser, diff-based rendering, a top menu
+                    bar, text selection with system-clipboard integration, and
+                    resize handling. No TUI framework is used.
+license:            GPL-3.0-only
+license-file:       LICENSE
+copyright:          (c) 2026 Benjamin Marsh
+author:             Benjamin Marsh
+maintainer:         benmarshnz@gmail.com
+category:           Editor
+build-type:         Simple
+extra-source-files: README.md
+                    LICENSE
+
+common warnings
+    ghc-options: -Wall -Wno-unused-imports -Wno-name-shadowing
+                 -Wno-unused-do-bind -Wno-type-defaults
+
+library
+    import:           warnings
+    hs-source-dirs:   src
+    exposed-modules:  Cmedit.Types
+                      Cmedit.ConfigFile
+                      Cmedit.About
+                      Cmedit.HelpCard
+                      Cmedit.Manual
+                      Cmedit.Term
+                      Cmedit.Ansi
+                      Cmedit.Caps
+                      Cmedit.Gfx
+                      Cmedit.Width
+                      Cmedit.Input
+                      Cmedit.Clipboard
+                      Cmedit.TextBuffer
+                      Cmedit.EditorState
+                      Cmedit.EditorEdit
+                      Cmedit.EditorDoc
+                      Cmedit.EditorFind
+                      Cmedit.Editor
+                      Cmedit.Menu
+                      Cmedit.Dialog
+                      Cmedit.Browser
+                      Cmedit.Search
+                      Cmedit.Definition
+                      Cmedit.QuickOpen
+                      Cmedit.Regex
+                      Cmedit.Syntax
+                      Cmedit.Csv
+                      Cmedit.Image
+                      Cmedit.Render
+                      Cmedit.App
+                      Cmedit.Help
+    c-sources:        cbits/cmedit_term.c
+    build-depends:    base        >=4.14 && <5
+                    , bytestring
+                    , text
+                    , containers
+                    , array
+                    , unix
+                    , process
+                    , stm
+                    , directory
+                    , filepath
+                    , mtl
+    default-language: Haskell2010
+    default-extensions: LambdaCase
+                        OverloadedStrings
+                        BangPatterns
+                        TupleSections
+                        ScopedTypeVariables
+                        MultiWayIf
+                        RecordWildCards
+                        NamedFieldPuns
+    ghc-options:      -O2
+
+executable cmedit
+    import:           warnings
+    hs-source-dirs:   app
+    main-is:          Main.hs
+    build-depends:    base, cmedit, text
+    default-language: Haskell2010
+    ghc-options:      -O2 -threaded -rtsopts "-with-rtsopts=-N2"
+
+test-suite cmedit-test
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   test
+    main-is:          Spec.hs
+    build-depends:    base, cmedit, text, containers
+    default-language: Haskell2010
+    default-extensions: OverloadedStrings
+    ghc-options:      -threaded

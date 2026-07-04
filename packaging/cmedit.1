@@ -1,0 +1,60 @@
+.\" Manpage for cmedit.
+.TH CMEDIT 1 "2026-07-01" "cmedit 0.1.1" "User Commands"
+.SH NAME
+cmedit \- a from-scratch terminal text editor
+.SH SYNOPSIS
+.B cmedit
+.RI [ FILE .\|.\|.]
+.SH DESCRIPTION
+.B cmedit
+is a modeless terminal text editor written from first principles in Haskell.
+It is a cross between Microsoft's Edit (msedit) and GNU nano: a drop-down menu
+bar, real mouse support, system-clipboard integration and nano-style on-screen
+shortcut hints. No TUI framework is used \(em raw-mode terminal control, the
+input parser, the diff renderer and the menus are built directly on VT/ANSI
+escape sequences and the POSIX termios API.
+.PP
+If one or more
+.I FILE
+arguments are given they are opened on startup; otherwise an empty buffer is
+created.
+.SH KEY BINDINGS
+.TP
+.B ^S
+Save the current file.
+.TP
+.B ^O
+Open a file.
+.TP
+.B ^F
+Find.
+.TP
+.B ^G
+Go to line.
+.TP
+.B ^Z
+Undo.
+.TP
+.B ^X
+Cut.
+.TP
+.B ^V
+Paste.
+.TP
+.B ^Q
+Quit.
+.TP
+.B F10
+Open the menu bar (also Alt+letter).
+.SH FILES
+.TP
+.I FILE
+One or more text files to open. Files with a
+.I .csv
+or
+.I .tsv
+extension can be opened in a spreadsheet-style table view.
+.SH AUTHOR
+Cmedit contributors <benmarshnz@gmail.com>.
+.SH BUGS
+Report bugs to <benmarshnz@gmail.com>.

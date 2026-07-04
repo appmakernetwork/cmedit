@@ -1,0 +1,10 @@
+# Build outputs (everything `make clean` removes, plus cabal's dist dir)
+dist-*/
+/cmedit
+/cmedit-test
+*.deb
+*.o
+*.hi
+
+# Local session/build logs
+cmedit_build_history.txt
