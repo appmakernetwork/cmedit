@@ -9,3 +9,8 @@ dist-*/
 
 # Local session/build logs
 cmedit_build_history.txt
+
+# Kept local: the website is deployed to https://arrrg.org/cmedit/ and the
+# JPEG is a manual test image for the image viewer
+website/
+Van_Gogh_-_Starry_Night_-_Google_Art_Project.jpg
