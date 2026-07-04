@@ -16,7 +16,6 @@ import Data.Char (toLower)
 import Data.Text (Text)
 import qualified Data.Text as T
 import System.FilePath (takeDirectory, takeExtension, takeFileName)
-import System.Posix.Types (EpochTime)
 
 import Data.Array (Array)
 
@@ -107,7 +106,7 @@ data Document = Document
   , docLeft         :: !Int
   , docPath         :: !(Maybe FilePath)
   , docModified     :: !Bool
-  , docDiskMtime    :: !(Maybe EpochTime)  -- ^ On-disk mtime when last loaded/saved.
+  , docDiskMtime    :: !(Maybe DiskTime)  -- ^ On-disk mtime when last loaded/saved.
   , docDiskChanged  :: !Bool               -- ^ File on disk is newer than 'docDiskMtime'.
   , docLineEnding   :: !LineEnding
   , docSavedEol     :: !LineEnding         -- ^ Line ending as last loaded/saved (the modified flag tracks divergence).
@@ -151,7 +150,7 @@ data Editor = Editor
   , edLeft          :: !Int
   , edPath          :: !(Maybe FilePath)
   , edModified      :: !Bool
-  , edDiskMtime     :: !(Maybe EpochTime)  -- ^ On-disk mtime when the active file was last loaded/saved.
+  , edDiskMtime     :: !(Maybe DiskTime)  -- ^ On-disk mtime when the active file was last loaded/saved.
   , edDiskChanged   :: !Bool               -- ^ Active file on disk is newer than 'edDiskMtime' (refreshed when a menu opens).
   , edLineEnding    :: !LineEnding
   , edSavedEol      :: !LineEnding         -- ^ Line ending as last loaded/saved; a switched EOL keeps the file "modified" even if the text matches.

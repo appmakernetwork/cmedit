@@ -1,6 +1,8 @@
--- | Low-level terminal control: raw mode (via the POSIX @termios@ API exposed
--- by the @unix@ package), window-size queries (via a tiny @ioctl@ C helper)
--- and signal wiring. This is the only module that talks to the real tty.
+-- | The POSIX platform layer: raw mode (via the @termios@ API exposed by the
+-- @unix@ package), window-size queries (via a tiny @ioctl@ C helper), signal
+-- wiring, and the one hot-path filesystem stat the portable libraries can't
+-- express in a single call. This module has a Windows twin under
+-- @platform/windows@ with the identical export list; the build picks one.
 module Cmedit.Term
   ( -- * Raw mode
     setRawMode
@@ -16,10 +18,13 @@ module Cmedit.Term
   , installInterruptHandlers
     -- * Handle setup
   , configureHandles
+    -- * Directory-walk stat
+  , EntryStat(..)
+  , statEntry
   ) where
 
 import Control.Concurrent (ThreadId)
-import Control.Exception (bracket, throwTo, AsyncException(UserInterrupt))
+import Control.Exception (SomeException, bracket, throwTo, try, AsyncException(UserInterrupt))
 import Control.Monad (void, when)
 import Foreign.C.Types (CInt(..))
 import Foreign.Marshal.Alloc (alloca)
@@ -27,6 +32,8 @@ import Foreign.Ptr (Ptr)
 import Foreign.Storable (peek)
 import System.Environment (lookupEnv)
 import System.IO
+import System.Posix.Files
+  (FileStatus, getSymbolicLinkStatus, isSymbolicLink, isDirectory, isRegularFile, fileSize)
 import System.Posix.IO (stdInput, stdOutput)
 import System.Posix.Signals
 import System.Posix.Signals.Exts (windowChange)
@@ -168,3 +175,22 @@ configureHandles = do
   hSetBuffering stdin NoBuffering
   hSetBuffering stdout (BlockBuffering Nothing)
   hSetEcho stdin False
+
+-- | What a directory-walk entry is — and, for files, its size. Symbolic
+-- links are never followed ('EntryOther'), so tree walks cannot loop.
+data EntryStat = EntryDir | EntryFile !Integer | EntryOther
+
+-- | Classify one directory entry. The walkers (workspace search, quick open,
+-- go-to-definition) call this once per entry over thousands of files, so it
+-- must stay a single @lstat@ on POSIX; 'Nothing' means the entry vanished or
+-- can't be stat'd.
+statEntry :: FilePath -> IO (Maybe EntryStat)
+statEntry path = do
+  r <- try (getSymbolicLinkStatus path) :: IO (Either SomeException FileStatus)
+  pure $ case r of
+    Left _ -> Nothing
+    Right st
+      | isSymbolicLink st -> Just EntryOther
+      | isDirectory st    -> Just EntryDir
+      | isRegularFile st  -> Just (EntryFile (toInteger (fileSize st)))
+      | otherwise         -> Just EntryOther

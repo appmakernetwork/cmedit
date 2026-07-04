@@ -53,6 +53,11 @@ import qualified Data.Map.Strict as M
 import Data.Char (isAlphaNum, isDigit, isSpace, toLower)
 import Cmedit.Syntax (Lang(..), Tok(..), HlState(..), langForPath, initialState, lexLine,
                       refreshHlCache, hlStateBefore, hlCoverage)
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
+
+-- Build an ordered 'DiskTime' from a small integer, for the stale-file tests.
+mt :: Int -> DiskTime
+mt = posixSecondsToUTCTime . fromIntegral
 
 main :: IO ()
 main = do
@@ -352,17 +357,17 @@ main = do
   check "revert hidden on an untitled buffer" (not (hasRevert ed0))
   check "revert shown after an edit" (hasRevert (fst (update (KChar 'x') edA)))
   -- A file that changed on disk offers Revert even with no local edits.
-  let edDisk = noteDiskMtime (Just 100) edA { edDiskMtime = Just 50 }
+  let edDisk = noteDiskMtime (Just (mt 100)) edA { edDiskMtime = Just (mt 50) }
   check "noteDiskMtime flags a newer file" (edDiskChanged edDisk)
   check "revert shown when the file changed on disk" (hasRevert edDisk)
   check "noteDiskMtime: same mtime is unchanged"
-        (not (edDiskChanged (noteDiskMtime (Just 50) edA { edDiskMtime = Just 50 })))
+        (not (edDiskChanged (noteDiskMtime (Just (mt 50)) edA { edDiskMtime = Just (mt 50) })))
   check "noteDiskMtime: missing file is treated as unchanged"
-        (not (edDiskChanged (noteDiskMtime Nothing edA { edDiskMtime = Just 50 })))
+        (not (edDiskChanged (noteDiskMtime Nothing edA { edDiskMtime = Just (mt 50) })))
   -- Saving re-baselines the on-disk time and clears the changed flag.
-  let (edSaved, _) = onSaved 3 (Just 200) edDisk
+  let (edSaved, _) = onSaved 3 (Just (mt 200)) edDisk
   check "onSaved clears disk-changed" (not (edDiskChanged edSaved))
-  checkEq "onSaved updates disk mtime" (edDiskMtime edSaved) (Just 200)
+  checkEq "onSaved updates disk mtime" (edDiskMtime edSaved) (Just (mt 200))
   -- Opening the menu requests a stat so the flag is fresh; untitled files don't.
   check "opening the menu requests a disk stat"
         (any (\e -> case e of EffStatFile "a.txt" -> True; _ -> False)
@@ -484,8 +489,8 @@ main = do
   checkEq "panel divider drawn" (cellChar (cellRC scrExp 1 (cl - 1))) '\x2502'
   checkEq "directory marker drawn" (cellChar (cellRC scrExp 2 1)) '\x25b8'
   -- A file that changed on disk since loading is marked with a diamond (◆).
-  let edDisk = noteDiskMtime (Just 100)
-                 ((setLoaded "/w/a.txt" (mkLR "aaa") edExp) { edDiskMtime = Just 50 })
+  let edDisk = noteDiskMtime (Just (mt 100))
+                 ((setLoaded "/w/a.txt" (mkLR "aaa") edExp) { edDiskMtime = Just (mt 50) })
       scrDisk = renderEditor edDisk
   checkEq "disk-changed file shows a diamond"
           (cellChar (cellRC scrDisk 3 (sidebarWidth edDisk - 2))) '\x25c6'
@@ -538,12 +543,12 @@ main = do
          in null effs && edFocus e' == edFocus edExp
             && fmap brSelected (edExplorer e') == fmap brSelected (edExplorer edExp))
   -- noteDiskMtimes: stale-on-disk flags for open docs, active or backgrounded.
-  let edA100 = (setLoaded "/w/a.txt" (mkLR "aaa") ed0) { edDiskMtime = Just 100 }
+  let edA100 = (setLoaded "/w/a.txt" (mkLR "aaa") ed0) { edDiskMtime = Just (mt 100) }
       edAB   = setLoadedNew "/w/b.txt" (mkLR "bbb") edA100   -- a.txt joins edBefore
-      edPolled = noteDiskMtimes [("/w/a.txt", Just 200), ("/w/b.txt", Nothing)] edAB
+      edPolled = noteDiskMtimes [("/w/a.txt", Just (mt 200)), ("/w/b.txt", Nothing)] edAB
   check "background doc flagged when newer on disk" (any docDiskChanged (edBefore edPolled))
   check "doc without a baseline stays unflagged" (not (edDiskChanged edPolled))
-  let edStale = noteDiskMtimes [("/w/a.txt", Just 200)] (edA100 { edStatus = T.empty })
+  let edStale = noteDiskMtimes [("/w/a.txt", Just (mt 200))] (edA100 { edStatus = T.empty })
   check "active doc flagged when newer on disk" (edDiskChanged edStale)
   check "stale active doc shows a notice"
         (T.pack "changed on disk" `T.isInfixOf` edStatus edStale)
@@ -1589,7 +1594,7 @@ main = do
   checkEq "staged doc has the replacement"
           (map (getLine' 0 . docBuffer) (filter ((== Just "/proj/new.txt") . docPath) (edAfter edStg)))
           [T.pack "BAR and BAR"]
-  let edSavedAll = savedAll [("/proj/new.txt", Just 100)] edStg
+  let edSavedAll = savedAll [("/proj/new.txt", Just (mt 100))] edStg
   check "Save All clears the staged doc's modified flag" (not (any docModified (edAfter edSavedAll)))
   checkEq "modifiedDocsToSave lists dirty titled docs"
           (map (\(p,_,_,_,_) -> p) (modifiedDocsToSave edStg)) ["/proj/new.txt"]

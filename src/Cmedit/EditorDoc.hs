@@ -16,7 +16,6 @@ import Data.Char (toLower)
 import Data.Text (Text)
 import qualified Data.Text as T
 import System.FilePath (takeDirectory, takeExtension, takeFileName)
-import System.Posix.Types (EpochTime)
 
 import Data.Array (Array)
 
@@ -234,7 +233,7 @@ revertLoaded path lr ed =
 -- | The driver's reply to 'EffStatFile': record whether the file on disk is now
 -- newer than the baseline captured at load/save, so the File menu can offer
 -- Revert. A missing/unreadable file (Nothing) is treated as unchanged.
-noteDiskMtime :: Maybe EpochTime -> Editor -> Editor
+noteDiskMtime :: Maybe DiskTime -> Editor -> Editor
 noteDiskMtime mt ed = ed { edDiskChanged = changed }
   where
     changed = case (mt, edDiskMtime ed) of
@@ -246,7 +245,7 @@ noteDiskMtime mt ed = ed { edDiskChanged = changed }
 -- active or not — same newer-than-baseline rule as 'noteDiskMtime'. The
 -- explorer's ◆ markers follow the flags. A newly-stale active file also gets
 -- a status-line notice (once), since its buffer is what the user is looking at.
-noteDiskMtimes :: [(FilePath, Maybe EpochTime)] -> Editor -> Editor
+noteDiskMtimes :: [(FilePath, Maybe DiskTime)] -> Editor -> Editor
 noteDiskMtimes stats ed =
   edActive { edBefore = map upDoc (edBefore ed), edAfter = map upDoc (edAfter ed) }
   where
@@ -460,7 +459,7 @@ switchToFile k ed
 
 -- | The driver calls this after a successful save, passing the file's new
 -- on-disk modification time.
-onSaved :: Int -> Maybe EpochTime -> Editor -> (Editor, [Effect])
+onSaved :: Int -> Maybe DiskTime -> Editor -> (Editor, [Effect])
 onSaved bytes mtime ed0 =
   let ed   = case edPath ed0 of    -- freshly saved = recently used (covers Save As)
                Just p  -> recordRecent p (activeCursorPos ed0) ed0
@@ -794,7 +793,7 @@ modifiedDocsToSave ed0 =
 
 -- | Driver callback: mark the given (path, new-mtime) documents saved after a
 -- Save All, and report how many were written.
-savedAll :: [(FilePath, Maybe EpochTime)] -> Editor -> Editor
+savedAll :: [(FilePath, Maybe DiskTime)] -> Editor -> Editor
 savedAll saved ed =
   let saveMap = saved
       applyDoc d = case docPath d of

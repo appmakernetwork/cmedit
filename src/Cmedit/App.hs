@@ -17,16 +17,15 @@ import Data.IORef
 import Data.List (isPrefixOf, sort)
 import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe, isJust, isNothing)
-import Data.Time.Clock.POSIX (POSIXTime)
+import Data.Time.Clock (UTCTime)
 import Data.Word (Word8)
 import qualified Data.Text as T
 import GHC.Clock (getMonotonicTime)
 import System.Directory
   ( canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, doesFileExist
-  , getCurrentDirectory, getFileSize, listDirectory, removeDirectoryRecursive
-  , removeFile, renamePath )
+  , getCurrentDirectory, getFileSize, getModificationTime, listDirectory
+  , removeDirectoryRecursive, removeFile, renamePath )
 import System.FilePath ((</>), makeRelative, splitDirectories, takeDirectory, takeFileName)
-import qualified System.Posix.Files as PF
 import System.IO
 
 import Cmedit.About (aboutTickUs)
@@ -254,7 +253,7 @@ data Drv = Drv
   , drvSearchQ   :: !(TQueue SearchMsg)
   , drvSearchGen :: !(TVar Int)       -- ^ id of the newest search; the walker bails when it changes.
   , drvDefGen    :: !(TVar Int)       -- ^ id of the newest definition scan (independent of searches).
-  , drvDirMtimes :: !(IORef (M.Map FilePath POSIXTime))  -- ^ Each listed dir's mtime at listing time (for the freshness poll).
+  , drvDirMtimes :: !(IORef (M.Map FilePath UTCTime))  -- ^ Each listed dir's mtime at listing time (for the freshness poll).
   , drvFocused   :: !(IORef Bool)     -- ^ Terminal focus, if the terminal reports it (defaults True).
   , drvRecents   :: !(IORef [FilePath])  -- ^ Paths of the recents list as last persisted (order matters).
   , drvQuickGen  :: !(TVar Int)       -- ^ id of the newest quick-open walk (independent of searches).
@@ -562,10 +561,11 @@ fsOpError = show
 
 -- Hi-res mtime for the directory poll: seconds-only granularity would miss a
 -- change landing within the same second the directory was listed.
-dirMtimeHiRes :: FilePath -> IO (Maybe POSIXTime)
+-- getModificationTime keeps sub-second precision where the OS provides it.
+dirMtimeHiRes :: FilePath -> IO (Maybe UTCTime)
 dirMtimeHiRes path = do
-  r <- try (PF.getFileStatus path) :: IO (Either SomeException PF.FileStatus)
-  pure (either (const Nothing) (Just . PF.modificationTimeHiRes) r)
+  r <- try (getModificationTime path) :: IO (Either SomeException UTCTime)
+  pure (either (const Nothing) Just r)
 
 -- Remember a directory's mtime at the moment it is (re-)listed, so the poll
 -- has a baseline. Recorded *before* the listing is taken: a change racing the
@@ -954,14 +954,12 @@ runQuickWalker q genRef gen root = do
             c <- readIORef countRef
             when (keep && c < Q.maxQuickFiles) $ do
               let path = dir </> name
-              mst <- try (PF.getSymbolicLinkStatus path) :: IO (Either SomeException PF.FileStatus)
+              mst <- statEntry path
               case mst of
-                Left _ -> pure ()
-                Right st
-                  | PF.isSymbolicLink st -> pure ()
-                  | PF.isDirectory st    -> unless (S.dirPruned [] name) (walk path)
-                  | PF.isRegularFile st  -> push (makeRelative root path)
-                  | otherwise            -> pure ()
+                Nothing              -> pure ()
+                Just EntryOther      -> pure ()   -- symlinks and specials: skip
+                Just EntryDir        -> unless (S.dirPruned [] name) (walk path)
+                Just (EntryFile _)   -> push (makeRelative root path)
   walk root
   flush
   ok <- alive
@@ -1071,21 +1069,18 @@ runScan spec = do
             stillOK   <- not <$> readIORef truncRef
             when (keepGoing && stillOK) $ do
               let path = dir </> name
-              mst <- try (PF.getSymbolicLinkStatus path) :: IO (Either SomeException PF.FileStatus)
+              mst <- statEntry path
               case mst of
-                Left _ -> pure ()
-                Right st
-                  | PF.isSymbolicLink st -> pure ()                    -- skip symlinks (avoid loops)
-                  | PF.isDirectory st    -> unless (S.dirPruned (scExclude spec) name) (walk path)
-                  | PF.isRegularFile st  -> do
+                Nothing         -> pure ()
+                Just EntryOther -> pure ()                             -- skip symlinks (avoid loops)
+                Just EntryDir   -> unless (S.dirPruned (scExclude spec) name) (walk path)
+                Just (EntryFile sz) -> do
                       let rel = makeRelative (scRoot spec) path
-                          sz  = toInteger (PF.fileSize st)
                       when (sz <= S.maxFileBytesToSearch
                             && not (S.binaryExtension name)
                             && S.pathIncluded (scInclude spec) (scExclude spec) rel
                             && path `notElem` scSkip spec) $
                         atomically (writeTBQueue pathQ (Just path))
-                  | otherwise -> pure ()
 
   forM_ [1 .. nWorkers] $ \_ -> forkIO worker
   walk (scRoot spec)

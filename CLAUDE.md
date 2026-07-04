@@ -16,16 +16,30 @@ escape sequences. Preserve this constraint when adding features.
 make          # build the optimized ./cmedit binary (ghc --make -O2)
 make test     # build and run the test suite (./cmedit-test)
 make run      # build and launch
+make windows-check  # typecheck the Windows port's configuration (-fno-code, works on Linux)
+make windows  # native Windows build (cmedit.exe) — only runs on Windows itself
 make clean
 ```
+
+- **The platform layer is `Cmedit.Term`, in two implementations**:
+  `platform/posix/Cmedit/Term.hs` (termios/signals/ioctl + the one-lstat
+  `statEntry`) and `platform/windows/Cmedit/Term.hs` (hand-rolled kernel32
+  FFI: `SetConsoleMode` VT modes, polling resize, ctrl-handler, UTF-8 code
+  pages) — identical export lists; each build picks one with `-i` (Makefile)
+  or `if os(windows)` (cabal). **Everything outside `platform/posix` must
+  stay portable**: no `unix`-package imports in `src/` — use `DiskTime`
+  (TextBuffer's `UTCTime` alias) for mtimes and `Term.statEntry` for walker
+  stats. Run `make windows-check` after touching driver-level code; it
+  typechecks every module against the Windows platform layer.
 
 - **Use `make`, not `cabal`, here.** This environment is offline with no Hackage
   index, so `cabal build` fails with "Could not read index". The Makefile drives
   `ghc --make` directly. `cabal build` / `cabal run` only work where a Hackage
   index cache exists. GHC is 9.0.2.
 - **Dependencies are limited to GHC boot libraries** (base, bytestring, text,
-  containers, array, unix, process, stm, directory, filepath, mtl). Do not add a
-  dependency unless it ships with GHC — there is no way to fetch packages.
+  containers, array, process, stm, directory, filepath, mtl, time; plus unix
+  on the POSIX side only). Do not add a dependency unless it ships with GHC —
+  there is no way to fetch packages.
 - The test suite (`test/Spec.hs`) is a single hand-rolled program (no external
   test framework offline). There is no per-test selector; it prints
   `Passed N, failed M` and exits non-zero on failure. To run a subset, edit

@@ -1,7 +1,8 @@
 -- | System clipboard integration. Copy/paste go through whichever external
 -- helper is available (@wl-copy@/@wl-paste@ on Wayland, @xclip@ or @xsel@ on
--- X11, @pbcopy@/@pbpaste@ on macOS). When no helper works we fall back to an
--- OSC 52 escape sequence, which many terminals honour even over SSH.
+-- X11, @pbcopy@/@pbpaste@ on macOS, @clip.exe@/PowerShell's @Get-Clipboard@
+-- on Windows). When no helper works we fall back to an OSC 52 escape
+-- sequence, which many terminals honour even over SSH.
 module Cmedit.Clipboard
   ( CopyOutcome(..)
   , copyToClipboard
@@ -15,6 +16,7 @@ import Data.Word (Word8)
 import System.Directory (findExecutable)
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode(..))
+import System.Info (os)
 import System.IO
 import System.Process
 import qualified Data.ByteString as BS
@@ -64,7 +66,8 @@ detectCopyBackends = do
   wayland <- isSet "WAYLAND_DISPLAY"
   x11     <- isSet "DISPLAY"
   candidates $
-       [ ("wl-copy", []) | wayland ]
+       [ ("clip", []) | windows ]        -- clip.exe reads stdin (UTF-8 via our 65001 code page)
+    ++ [ ("wl-copy", []) | wayland ]
     ++ [ ("xclip", ["-selection", "clipboard"]) | x11 ]
     ++ [ ("xsel", ["--clipboard", "--input"])   | x11 ]
     ++ [ ("pbcopy", []) ]
@@ -75,7 +78,8 @@ detectPasteBackends = do
   wayland <- isSet "WAYLAND_DISPLAY"
   x11     <- isSet "DISPLAY"
   candidates $
-       [ ("wl-paste", ["--no-newline"]) | wayland ]
+       [ ("powershell", ["-NoProfile", "-Command", "Get-Clipboard -Raw"]) | windows ]
+    ++ [ ("wl-paste", ["--no-newline"]) | wayland ]
     ++ [ ("xclip", ["-selection", "clipboard", "-o"]) | x11 ]
     ++ [ ("xsel", ["--clipboard", "--output"])        | x11 ]
     ++ [ ("pbpaste", []) ]
@@ -95,6 +99,9 @@ candidates = go
 
 isSet :: String -> IO Bool
 isSet name = maybe False (not . null) <$> lookupEnv name
+
+windows :: Bool
+windows = os == "mingw32"
 
 ------------------------------------------------------------------------------
 -- Process plumbing

@@ -16,7 +16,6 @@ import Data.Char (toLower)
 import Data.Text (Text)
 import qualified Data.Text as T
 import System.FilePath (takeDirectory, takeExtension, takeFileName)
-import System.Posix.Types (EpochTime)
 
 import Data.Array (Array)
 

@@ -1,6 +1,7 @@
 # Build outputs (everything `make clean` removes, plus cabal's dist dir)
 dist-*/
 /cmedit
+/cmedit.exe
 /cmedit-test
 *.deb
 *.o

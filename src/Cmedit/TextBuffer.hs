@@ -53,6 +53,7 @@ module Cmedit.TextBuffer
   , canWrite
   , saveFile
   , replaceInFile
+  , DiskTime
   , fileMtime
   ) where
 
@@ -70,10 +71,9 @@ import qualified Data.Text as T
 import qualified Data.ByteString as BS
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Encoding.Error as TEE
-import System.Directory (Permissions, doesFileExist, removeFile, renameFile, getPermissions, writable)
+import Data.Time.Clock (UTCTime)
+import System.Directory (Permissions, doesFileExist, removeFile, renameFile, getPermissions, writable, getModificationTime)
 import System.IO (withBinaryFile, IOMode(WriteMode), hFlush)
-import System.Posix.Files (FileStatus, getFileStatus, modificationTime)
-import System.Posix.Types (EpochTime)
 
 import Cmedit.Types (Pos(..), origin)
 
@@ -525,15 +525,19 @@ data LoadResult = LoadResult
   , lrEncoding    :: !Encoding
   , lrFinalNewline :: !Bool
   , lrReadOnly    :: !Bool
-  , lrMtime       :: !(Maybe EpochTime)  -- ^ On-disk modification time at load (for stale-file detection).
+  , lrMtime       :: !(Maybe DiskTime)  -- ^ On-disk modification time at load (for stale-file detection).
   } deriving (Show)
+
+-- | An on-disk modification timestamp. A portable alias (sub-second where the
+-- OS provides it) so nothing outside the platform layer touches POSIX types.
+type DiskTime = UTCTime
 
 -- | The file's last-modification time, or @Nothing@ if it can't be stat'd
 -- (missing/unreadable). Used to detect a file changing underneath us.
-fileMtime :: FilePath -> IO (Maybe EpochTime)
+fileMtime :: FilePath -> IO (Maybe DiskTime)
 fileMtime path = do
-  r <- try (getFileStatus path) :: IO (Either SomeException FileStatus)
-  pure (either (const Nothing) (Just . modificationTime) r)
+  r <- try (getModificationTime path) :: IO (Either SomeException DiskTime)
+  pure (either (const Nothing) Just r)
 
 -- | Load a file. A non-existent path yields an empty buffer (new file). IO
 -- errors are reported as @Left@.
@@ -558,7 +562,7 @@ emptyLoadResult = LoadResult emptyBuffer LF Utf8 True False Nothing
 -- | Decode already-read file bytes into a 'LoadResult'. Split out from
 -- 'loadFile' so a caller that has the bytes in hand (e.g. an async loader that
 -- also needs to sniff for images/binary) doesn't have to re-read the file.
-loadFromBytes :: Bool -> Maybe EpochTime -> BS.ByteString -> LoadResult
+loadFromBytes :: Bool -> Maybe DiskTime -> BS.ByteString -> LoadResult
 loadFromBytes ro mt bs =
   let (enc, bs') = stripBom bs
       txt        = TE.decodeUtf8With TEE.lenientDecode bs'
@@ -594,7 +598,7 @@ canWrite path = do
 -- | Save a buffer atomically (write to a temp file then rename). Returns the
 -- number of bytes written and the file's new modification time on success.
 saveFile :: FilePath -> Encoding -> LineEnding -> Bool -> Buffer
-         -> IO (Either String (Int, Maybe EpochTime))
+         -> IO (Either String (Int, Maybe DiskTime))
 saveFile path enc le final b = do
   let txt   = bufferToText le final b
       body  = TE.encodeUtf8 txt

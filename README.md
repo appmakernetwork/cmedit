@@ -210,6 +210,25 @@ make test     # builds and runs the test suite
 make run      # build and launch
 ```
 
+### Windows
+
+CMeDit has a native Windows port: the same codebase with a Windows
+implementation of the platform layer (`platform/windows/Cmedit/Term.hs`,
+hand-rolled kernel32 FFI — no extra packages). On Windows, with GHC (via
+[ghcup](https://www.haskell.org/ghcup/)) and `make` (via MSYS2):
+
+```sh
+make windows        # builds cmedit.exe
+```
+
+It needs a console that speaks VT — Windows 10 1809 or later; **Windows
+Terminal is recommended** (and is the Windows 11 default). Legacy conhost
+gets the portable fallback path like any other minimal terminal. On any
+other OS, `make windows-check` typechecks the whole program against the
+Windows platform layer without linking, which is how the port is kept
+honest from Linux. (WSL and `ssh` from Windows Terminal run the POSIX
+build unchanged, and are still great ways to use CMeDit from Windows.)
+
 `cabal build` / `cabal run cmedit` also work in environments whose Hackage index
 cache has been built. On a fully offline machine prefer `make`, which drives
 `ghc --make` directly and needs no index.
@@ -279,7 +298,7 @@ logic unit-testable without a terminal.
 | --- | --- |
 | `Cmedit.Types` | Shared types: keys, mouse, colours, styles, cells |
 | `Cmedit.ConfigFile` | The `~/.config/cmedit` config file + persisted recent-files list |
-| `Cmedit.Term` | Raw mode (`termios`), window size (`ioctl`), signals |
+| `Cmedit.Term` | The platform layer (`platform/{posix,windows}`, one module two implementations): raw mode, window size, resize/terminate wiring, walker stat |
 | `Cmedit.Ansi` | ANSI/VT escape-sequence builders (incl. queries, sync output, scroll regions) |
 | `Cmedit.Caps` | Terminal capability model: probe-reply folding, fingerprints, colour parsing |
 | `Cmedit.Gfx` | Kitty-graphics and sixel encoders (base64, quantiser, RLE) for the pixel image view |
