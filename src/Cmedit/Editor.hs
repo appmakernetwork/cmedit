@@ -36,6 +36,7 @@ module Cmedit.Editor
   , setCellPx
   , cellAspect
   , cellPxKey
+  , imageFitCap
   , pointerShapeFor
     -- * Layout (shared with the renderer)
   , Layout(..)
@@ -1479,7 +1480,10 @@ explorerCollapseSel br ed = case Br.selectedNode br of
              []      -> noEff ed
   Nothing -> noEff ed
 
--- Enter / activate: toggle a directory, or open a file (and focus the editor).
+-- Enter / activate: toggle a directory, or open a file. Focus follows the
+-- loaded document (text/CSV hands focus to the editor via 'setLoaded'); an
+-- image keeps the focus here in the panel ('imageLoaded'), so we don't force
+-- FEdit at activation time — the load callback decides once the type is known.
 explorerActivate :: Browser -> Editor -> (Editor, [Effect])
 explorerActivate br ed = case Br.selectedNode br of
   Just n
@@ -1488,7 +1492,7 @@ explorerActivate br ed = case Br.selectedNode br of
     | fnIsDir n ->   -- expand: always re-list so the listing is never stale
         ( ed { edExplorer = Just (Br.scrollInto (explorerTreeHeight ed) (Br.expandSelected br)) }
         , [EffExplorerList (fnPath n)] )
-    | otherwise -> ( pushNavIfFar (Just (fnPath n)) origin ed { edFocus = FEdit }
+    | otherwise -> ( pushNavIfFar (Just (fnPath n)) origin ed
                    , [EffOpen (fnPath n)] )
   Nothing -> noEff ed
 

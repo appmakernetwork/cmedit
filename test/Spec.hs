@@ -460,7 +460,12 @@ main = do
   let (edOpenF, openEffs) = update KEnter edDown
   check "explorer Enter opens the file"
         (any (\e -> case e of EffOpen "/w/a.txt" -> True; _ -> False) openEffs)
-  check "opening a file blurs the panel" (edFocus edOpenF == FEdit)
+  -- Focus follows the loaded document, not the keypress: the panel keeps focus
+  -- until the file loads, then a text/CSV file hands focus to the editor (an
+  -- image keeps it in the panel — checked with the image fixtures below).
+  check "opening a file keeps panel focus until it loads" (edFocus edOpenF == FExplorer)
+  check "loading text from the panel blurs it"
+        (edFocus (setLoadedNew "/w/a.txt" (mkLR "aaa") edOpenF) == FEdit)
   -- Right arrow on a directory requests its listing (lazy load).
   let (_, expandEffs) = update (KArrow DRight noMods) edExp
   check "explorer expand lists the directory"
@@ -638,8 +643,16 @@ main = do
   check "corrupt PNG -> error" (isLeft (decodeImage badPng))
   -- Rendering produces a grid of exactly the requested size.
   case decodeImage bmp of
-    Right im -> checkEq "render grid bounds"
-                  (bounds (renderImage 1.0 Ascii 10 4 (0,0,imgW im,imgH im) im)) ((0,0),(3,9))
+    Right im -> do
+      checkEq "render grid bounds"
+        (bounds (renderImage 1.0 Nothing Ascii 10 4 (0,0,imgW im,imgH im) im)) ((0,0),(3,9))
+      -- Opening an image from the file-explorer panel keeps the selection focus
+      -- in the panel (no keystroke editing in the read-only image view);
+      -- opened any other way it takes the editor focus like a normal document.
+      check "image opened from the panel keeps panel focus"
+            (edFocus (imageLoadedNew "/w/pic.bmp" im edExp) == FExplorer)
+      check "image opened elsewhere focuses the view"
+            (edFocus (imageLoadedNew "/w/pic.bmp" im ed0) == FEdit)
     Left _   -> check "render decode" False
   -- The image view is read-only and cursor-less: the terminal cursor must be
   -- hidden over a focused image (a text document still shows one).
@@ -957,8 +970,14 @@ main = do
           ThemeDark
 
   -- Cell-aspect-aware image fit ----------------------------------------------
-  checkEq "viewFit: classic 2:1 cells" (viewFit 1.0 20 10 100 100) (20, 20, 0, 0)
-  checkEq "viewFit: taller cells shorten the fitted height" (viewFit 1.25 20 10 100 100) (20, 16, 0, 2)
+  checkEq "viewFit: classic 2:1 cells" (viewFit 1.0 Nothing 20 10 100 100) (20, 20, 0, 0)
+  checkEq "viewFit: taller cells shorten the fitted height" (viewFit 1.25 Nothing 20 10 100 100) (20, 16, 0, 2)
+  -- With a native-size cap a small image is pinned at 1:1 and centred rather
+  -- than enlarged to fill the canvas.
+  checkEq "viewFit: cap pins a small image at native, centred"
+          (viewFit 1.0 (Just 0.125) 80 22 32 32) (4, 4, 38, 20)
+  checkEq "viewFit: cap does not shrink an image that already fits"
+          (viewFit 1.0 (Just 10.0) 20 10 100 100) (20, 20, 0, 0)
   checkEq "cellAspect: unknown geometry = 1.0" (cellAspect ed0) 1.0
   check "cellAspect: reported geometry is clamped sane"
         (let a = cellAspect (setCellPx (9, 22) ed0) in a > 1.0 && a <= 1.6)
@@ -977,8 +996,12 @@ main = do
   check "sixel: DCS..ST framing with raster attributes"
         ("\ESCP0;1;0q" `isPrefixOf` sixRed && "\ESC\\" `isSuffixOf` sixRed
            && "\"1;1;2;2" `isInfixOf` sixRed && "#" `isInfixOf` sixRed)
-  checkEq "gfxFit: aspect-true centred box"
-          (gfxFit (10, 20) (1, 0, 80, 22) (100, 100)) (1, 18, 44, 22, 100, 100)
+  checkEq "gfxFit: aspect-true centred box (upscale to fill)"
+          (gfxFit (10, 20) (1, 0, 80, 22) (100, 100) True) (1, 18, 44, 22, 100, 100)
+  -- Without upscaling a small image is placed at native size, centred, and the
+  -- pixel payload is 1:1 with the source (matches the cell view's imageFitCap).
+  checkEq "gfxFit: no-upscale pins a small image at native, centred"
+          (gfxFit (8, 16) (0, 0, 80, 24) (32, 32) False) (11, 38, 4, 2, 32, 32)
   case decodeImage bmp of
     Right im -> checkEq "scaleRGBA: exact payload size"
                         (BS.length (scaleRGBA im (0, 0, imgW im, imgH im) 5 3)) 60

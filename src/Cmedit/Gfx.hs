@@ -66,17 +66,23 @@ maxGfxPixels = 1200 * 1000
 -- @top,left,tw,th@) given the cell pixel size, preserving aspect: returns
 -- @(row, col, cols, rows, pxW, pxH)@ — the placement cell box (centred) and
 -- the pixel resolution to encode at ('maxGfxPixels'-capped, and never more
--- than the source has).
-gfxFit :: (Int, Int) -> (Int, Int, Int, Int) -> (Int, Int)
+-- than the source has). When @allowUpscale@ is 'False' the crop is never
+-- enlarged past native (1 device pixel per source pixel), so a small image is
+-- shown at 1:1 and centred rather than blown up to fill; a user zoom crop
+-- passes 'True' so a selected region still fills the view. Kept in step with
+-- the cell-renderer cap in 'Cmedit.EditorState.imageFitCap'.
+gfxFit :: (Int, Int) -> (Int, Int, Int, Int) -> (Int, Int) -> Bool
        -> (Int, Int, Int, Int, Int, Int)
-gfxFit (pw0, ph0) (top, left, tw, th) (cw0, ch0) =
+gfxFit (pw0, ph0) (top, left, tw, th) (cw0, ch0) allowUpscale =
   let pw = max 1 pw0; ph = max 1 ph0
       cw = max 1 cw0; ch = max 1 ch0
-      -- Uniform physical scale bounded by the box in both directions.
-      sc = min (fromIntegral (tw * pw) / fromIntegral cw)
-               (fromIntegral (th * ph) / fromIntegral ch) :: Double
-      cols = max 1 (min tw (floor (fromIntegral cw * sc / fromIntegral pw)))
-      rows = max 1 (min th (floor (fromIntegral ch * sc / fromIntegral ph)))
+      -- Uniform physical scale bounded by the box in both directions, capped
+      -- at native resolution unless upscaling is allowed.
+      scFit = min (fromIntegral (tw * pw) / fromIntegral cw)
+                  (fromIntegral (th * ph) / fromIntegral ch) :: Double
+      sc = if allowUpscale then scFit else min scFit 1.0
+      cols = max 1 (min tw (round (fromIntegral cw * sc / fromIntegral pw)))
+      rows = max 1 (min th (round (fromIntegral ch * sc / fromIntegral ph)))
       row = top + (th - rows) `div` 2
       col = left + (tw - cols) `div` 2
       -- Encode at the displayed resolution, capped, and never upscaled past

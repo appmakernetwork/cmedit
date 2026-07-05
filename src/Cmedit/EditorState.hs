@@ -329,6 +329,20 @@ cellAspect ed = case edCellPx ed of
 cellPxKey :: Editor -> (Int, Int)
 cellPxKey ed = fromMaybe (0, 0) (edCellPx ed)
 
+-- | The fit-scale cap for the given image doc (the @maxScale@ argument to
+-- 'Cmedit.Image.viewFit'/'renderImage'). When the terminal's real cell pixel
+-- size is known and the whole image is shown, cap the scale at native
+-- resolution (@1 / cellWidthPx@ in viewFit's cell-widths-per-source-pixel
+-- units) so a small picture sits centred at 1:1 rather than being blown up to
+-- fill the view; a zoom crop ('idCrop') lifts the cap so a selected region
+-- fills the view. Returns 'Nothing' (fill, as before) when the pixel geometry
+-- is unknown or a zoom is active. Kept in step with the pixel-overlay cap in
+-- 'Cmedit.Gfx.gfxFit'.
+imageFitCap :: Editor -> ImageDoc -> Maybe Double
+imageFitCap ed idoc = case edCellPx ed of
+  Just (pw, _) | isNothing (idCrop idoc), pw > 0 -> Just (1 / fromIntegral pw)
+  _                                              -> Nothing
+
 -- | The mouse-pointer shape to suggest for a screen cell (the OSC 22 hint the
 -- driver emits on hover): an I-beam over editable text, a hand over the
 -- clickable chrome (menu bar, status zones, explorer rows, search results),

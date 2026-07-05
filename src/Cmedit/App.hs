@@ -1179,10 +1179,13 @@ wantGfx caps ed = do
   kind <- if tcKittyGfx caps then Just GfxKitty
           else if tcSixel caps then Just GfxSixel
           else Nothing
-  -- Only when the image view is the unobstructed content: any modal, menu,
-  -- panel focus or search view falls back to the cell picture beneath.
+  -- Only when the image view is the unobstructed content: any modal, menu or
+  -- search view falls back to the cell picture beneath. Explorer-panel focus
+  -- is allowed — the panel sits left of the image (loContentLeft), so the
+  -- placement never covers it, and viewing an image with the tree focused is
+  -- an intended flow (opening one from the panel keeps focus there).
   let lo = computeLayout ed
-      unobstructed = edFocus ed == FEdit
+      unobstructed = (edFocus ed == FEdit || edFocus ed == FExplorer)
                        && not (edSearchMode ed)
                        && isNothing (edDialog ed)
                        && isNothing (edLoading ed)
@@ -1205,7 +1208,11 @@ placeGfx ed key = fromMaybe mempty $ do
       (cx, cy, cw, ch) = gkCrop key
       cellPx = case gkPx key of (0, 0) -> (8, 16); p -> p  -- unknown: assume 2:1
       (top, left, tw, th) = gkGeom key
-      (row, col, cols, rows, pxW, pxH) = gfxFit cellPx (top, left, tw, th) (cw, ch)
+      -- Fill (upscale) only when zoomed into a crop, or when the real cell
+      -- pixel size is unknown so "native" is meaningless; otherwise a small
+      -- image stays at 1:1 and centred. Matches 'imageFitCap' for the cell view.
+      allowUpscale = isJust (idCrop idoc) || gkPx key == (0, 0)
+      (row, col, cols, rows, pxW, pxH) = gfxFit cellPx (top, left, tw, th) (cw, ch) allowUpscale
       rgba = scaleRGBA img (cx, cy, cw, ch) pxW pxH
   pure $ case gkKind key of
     GfxKitty -> kittyPlace (row, col) (cols, rows) (pxW, pxH) rgba

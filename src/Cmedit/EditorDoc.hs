@@ -308,7 +308,11 @@ imageLoaded path img ed = touchRecent path $ refreshImage $ ensureVisible ed
   , edStatus = T.pack ("Viewing image  " ++ imgFmt img ++ " "
                 ++ show (imgW img) ++ "x" ++ show (imgH img)
                 ++ "  —  press 'a' for ASCII/colour")
-  , edFocus = FEdit, edDialog = Nothing, edSearchMode = False
+    -- Opened from the file-explorer panel: keep the selection focus there
+    -- (an image view has no keystroke editing to hand the focus to); every
+    -- other open route arrives here with FEdit or a modal focus.
+  , edFocus = if edFocus ed == FExplorer then FExplorer else FEdit
+  , edDialog = Nothing, edSearchMode = False
   , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
   , edCsv = Nothing, edCsvStash = Nothing
   , edImage = Just (ImageDoc img HalfBlock Nothing Nothing Nothing)
@@ -318,7 +322,9 @@ imageLoaded path img ed = touchRecent path $ refreshImage $ ensureVisible ed
 -- present), mirroring 'setLoadedNew' for text.
 imageLoadedNew :: FilePath -> Image -> Editor -> Editor
 imageLoadedNew path img ed = case switchToOpen path ed of
-  Just ed' -> ed'
+  Just ed'
+    | edFocus ed == FExplorer -> ed' { edFocus = FExplorer }  -- see 'imageLoaded'
+    | otherwise               -> ed'
   Nothing
     | isPristine ed -> imageLoaded path img ed
     | otherwise     -> imageLoaded path img ed { edBefore = edBefore ed ++ [captureDoc ed] }
@@ -361,7 +367,7 @@ refreshImage ed = case edImage ed of
     in if stale && cols > 0 && rows > 0
          then ed { edImage = Just idoc
                      { idCache = Just (cols, rows, idMode idoc, crop, pxk
-                                      , renderImage (cellAspect ed) (idMode idoc) cols rows crop (idImage idoc)) } }
+                                      , renderImage (cellAspect ed) (imageFitCap ed idoc) (idMode idoc) cols rows crop (idImage idoc)) } }
          else ed
 
 -- | Record the terminal's cell pixel geometry (driver callback: the winsize
@@ -394,7 +400,7 @@ cellRectToCrop ed idoc (r0,c0,r1,c1) =
       cols = loTextWidth lo; rows = loTextHeight lo
       img = idImage idoc
       (cx,cy,cw,ch) = imageCrop idoc
-      (outW,outH,offX,offY) = viewFit (cellAspect ed) cols rows cw ch
+      (outW,outH,offX,offY) = viewFit (cellAspect ed) (imageFitCap ed idoc) cols rows cw ch
       fx k = fromIntegral cx + fromIntegral (k - offX) * fromIntegral cw / fromIntegral outW
       fy k = fromIntegral cy + fromIntegral (k - offY) * fromIntegral ch / fromIntegral outH
       clampD lo' hi v = max lo' (min hi v) :: Double

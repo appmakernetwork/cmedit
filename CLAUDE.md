@@ -146,11 +146,18 @@ in `README.md`; the cross-cutting structure that matters when editing:
   crop to the fitted resolution (`gfxFit`, aspect-true via the real cell
   pixel size, capped at `maxGfxPixels`), then `kittyPlace` (base64 RGBA
   chunks, delete-all first) or `sixelPlace` (hand-rolled encoder: 6×7×6
-  palette, transparency via P2=1, RLE) positions it over the text area. The
-  half-block cell picture is always painted underneath — it *is* the
-  fallback — and any overlay (menu, dialog, zoom drag, panel focus)
-  suppresses the placement so cell-drawn UI is never hidden under an image.
-  Cursor position is re-asserted after graphics emission.
+  palette, transparency via P2=1, RLE) positions it over the text area.
+  `gfxFit` centres the placement and, unless a zoom crop is active (or the
+  cell-pixel size is unknown), refuses to enlarge past native (1 device
+  pixel per source pixel) — this cap tracks `EditorState.imageFitCap`, which
+  applies the identical rule to the cell fallback, so overlay and fallback
+  agree on the box. The half-block cell picture is always painted
+  underneath — it *is* the fallback — and any overlay (menu, dialog, zoom
+  drag) suppresses the placement so cell-drawn UI is never hidden under an
+  image; **explorer-panel focus does not** (the panel sits left of the
+  placement, and viewing an image with the tree focused is intended — opening
+  one from the panel keeps focus there). Cursor position is re-asserted after
+  graphics emission.
 
 - **No import cycles by design.** `Cmedit.Menu` and `Cmedit.Dialog` are
   Editor-independent *data* (a `MenuAction` / `DialogKind` enum plus pure field
@@ -364,10 +371,20 @@ in `README.md`; the cross-cutting structure that matters when editing:
   comparison. `viewFit`/`renderImage` take the sub-pixel aspect ratio
   (`cellAspect ed`, derived from `edCellPx` — the winsize ioctl's
   ws_xpixel/ws_ypixel or the XTWINOPS replies; 1.0 = the classic 2:1 cell
-  assumption when unknown) so pictures keep true proportions in any font;
-  the mouse crop mapping (`cellRectToCrop`) shares it. `computeLayout` forces gutter 0
+  assumption when unknown) so pictures keep true proportions in any font,
+  plus a `maxScale` cap (`imageFitCap ed idoc`): when the cell-pixel size is
+  known and the whole image is shown, the fit is capped at native resolution
+  so a small picture sits centred at 1:1 rather than being blown up to fill —
+  a large one still shrinks to fit, and a zoom crop lifts the cap. The mouse
+  crop mapping (`cellRectToCrop`) shares the same geometry (cap included).
+  `computeLayout` forces gutter 0
   for image docs so the picture uses the full width. `'a'` toggles
   `HalfBlock`↔`Ascii`. Per-document state lives in `docImage` in the zipper.
+  **Opening focus:** `explorerActivate` no longer forces `FEdit` on open —
+  focus follows the loaded document, so `setLoaded` (text/CSV) hands focus to
+  the editor while `imageLoaded`/`imageLoadedNew` keep it in the panel when the
+  open originated there (`edFocus == FExplorer`), since a read-only image has no
+  keystroke editing to receive it.
   **Zoom:** `idCrop` is the displayed source-pixel rectangle (`Nothing` = whole
   image) and is part of the render-cache key. A left-drag records `idDrag` (a
   cell rectangle, drawn as a reverse-video border overlay each frame, *not*

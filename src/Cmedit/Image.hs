@@ -2490,36 +2490,45 @@ vpYuvRgb y u v =
 -- ('Cmedit.EditorState.cellAspect'): 1.0 assumes the classic 2:1 cell; when
 -- the terminal reports its real cell pixel size the fit compensates, so
 -- pictures keep their true proportions in any font.
-viewFit :: Double -> Int -> Int -> Int -> Int -> (Int, Int, Int, Int)
-viewFit aspect cols rows cropW cropH =
+--
+-- @maxScale@ optionally caps the fit scale (in the same cell-widths-per-source-
+-- pixel units): @Nothing@ scales the crop to fill the canvas as before, while
+-- @Just m@ refuses to enlarge past @m@ — used to pin an image at native size
+-- (centred, not blown up) when the terminal's real pixel geometry is known.
+viewFit :: Double -> Maybe Double -> Int -> Int -> Int -> Int -> (Int, Int, Int, Int)
+viewFit aspect maxScale cols rows cropW cropH =
   let cols' = max 1 cols
       subH  = max 1 rows * 2
       cw = max 1 cropW; ch = max 1 cropH
       a  = if aspect > 0 then aspect else 1
       -- Uniform physical scale (cell-widths per source pixel), bounded by the
       -- canvas in both directions; a sub-pixel is 1 wide and @a@ tall.
-      sc = min (fromIntegral cols' / fromIntegral cw)
-               (fromIntegral subH * a / fromIntegral ch) :: Double
+      scFit = min (fromIntegral cols' / fromIntegral cw)
+                  (fromIntegral subH * a / fromIntegral ch) :: Double
+      sc = case maxScale of Nothing -> scFit; Just m -> min m scFit
       outW = max 1 (min cols' (round (fromIntegral cw * sc)))
       outH = max 1 (min subH  (round (fromIntegral ch * sc / a)))
   in (outW, outH, (cols' - outW) `div` 2, (subH - outH) `div` 2)
 
 -- | Render a sub-rectangle @(cropX, cropY, cropW, cropH)@ (in source pixels) of
 -- an image into a @rows x cols@ grid of styled cells, scaled to fit while
--- preserving aspect ratio and centred. Pass the whole image rectangle for the
--- default (unzoomed) view. In 'HalfBlock' mode each cell is a @▀@ glyph whose
+-- preserving aspect ratio and centred (@maxScale@ as in 'viewFit' — pass
+-- @Just@ to keep a small image at native size instead of enlarging it). Pass
+-- the whole image rectangle for the default (unzoomed) view. In 'HalfBlock'
+-- mode each cell is a @▀@ glyph whose
 -- foreground is the top sub-pixel and background the bottom, doubling vertical
 -- resolution; in 'Ascii' mode each cell is a luminance-ramp character tinted
 -- with the average colour. The grid is indexed @(row, col)@.
-renderImage :: Double -> ImgMode -> Int -> Int -> (Int, Int, Int, Int) -> Image
+renderImage :: Double -> Maybe Double -> ImgMode -> Int -> Int
+            -> (Int, Int, Int, Int) -> Image
             -> Array (Int, Int) Cell
-renderImage aspect mode cols rows (cropX, cropY, cropW, cropH) img =
+renderImage aspect maxScale mode cols rows (cropX, cropY, cropW, cropH) img =
   listArray ((0,0),(rows-1,cols-1))
     [ cellAt r c | r <- [0 .. rows-1], c <- [0 .. cols-1] ]
   where
     iw = imgW img
     cw = max 1 cropW; ch = max 1 cropH
-    (outW, outH, offX, offY) = viewFit aspect cols rows cw ch
+    (outW, outH, offX, offY) = viewFit aspect maxScale cols rows cw ch
     pix  = imgPix img
 
     -- Average source RGBA over the box that output sub-pixel (sx,sy) maps from
