@@ -37,6 +37,8 @@ module Cmedit.Editor
   , cellAspect
   , cellPxKey
   , imageFitCap
+  , setGfxCaps
+  , imageOverlayActive
   , pointerShapeFor
     -- * Layout (shared with the renderer)
   , Layout(..)

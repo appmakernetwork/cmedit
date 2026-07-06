@@ -151,10 +151,17 @@ in `README.md`; the cross-cutting structure that matters when editing:
   cell-pixel size is unknown), refuses to enlarge past native (1 device
   pixel per source pixel) — this cap tracks `EditorState.imageFitCap`, which
   applies the identical rule to the cell fallback, so overlay and fallback
-  agree on the box. The half-block cell picture is always painted
-  underneath — it *is* the fallback — and any overlay (menu, dialog, zoom
-  drag) suppresses the placement so cell-drawn UI is never hidden under an
-  image; **explorer-panel focus does not** (the panel sits left of the
+  agree on the box. The half-block cell picture is the fallback, drawn
+  **only when no placement will cover it**: the shared predicate
+  `EditorState.imageOverlayActive` (mirroring `wantGfx`) gates both the
+  driver's placement *and* the renderer — when it holds, `Render.drawImage`
+  paints blank (terminal-background) cells instead of the half-block grid, so
+  the blocky fallback and its transparency checkerboard can't bleed through the
+  overlay's transparent pixels. It holds when the terminal advertises pixels
+  (`edGfxCaps`, mirrored from `TermCaps` in `applyReplyIO`) and the image is
+  the unobstructed content; any overlay (menu, dialog, zoom drag) drops it, so
+  the cell picture reappears as the true fallback under that UI.
+  **Explorer-panel focus does not** drop it (the panel sits left of the
   placement, and viewing an image with the tree focused is intended — opening
   one from the panel keeps focus there). Cursor position is re-asserted after
   graphics emission.

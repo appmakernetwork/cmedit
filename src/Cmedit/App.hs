@@ -472,6 +472,10 @@ applyTerminalPixels ed = do
 applyReplyIO :: Drv -> IORef Editor -> TermReply -> IO ()
 applyReplyIO drv editorRef rep = do
   modifyIORef' (drvCaps drv) (applyReply rep)
+  -- Mirror pixel-graphics support into the editor so the renderer can drop the
+  -- half-block fallback under a real placement (kept in step with 'wantGfx').
+  caps' <- readIORef (drvCaps drv)
+  modifyIORef' editorRef (setGfxCaps (tcKittyGfx caps' || tcSixel caps'))
   case rep of
     -- theme=auto: dark or light follows the reported background.
     TrBgColor r g b -> modifyIORef' editorRef (setDetectedDark (isDarkRgb r g b))
@@ -1179,26 +1183,21 @@ wantGfx caps ed = do
   kind <- if tcKittyGfx caps then Just GfxKitty
           else if tcSixel caps then Just GfxSixel
           else Nothing
-  -- Only when the image view is the unobstructed content: any modal, menu or
-  -- search view falls back to the cell picture beneath. Explorer-panel focus
-  -- is allowed — the panel sits left of the image (loContentLeft), so the
-  -- placement never covers it, and viewing an image with the tree focused is
-  -- an intended flow (opening one from the panel keeps focus there).
-  let lo = computeLayout ed
-      unobstructed = (edFocus ed == FEdit || edFocus ed == FExplorer)
-                       && not (edSearchMode ed)
-                       && isNothing (edDialog ed)
-                       && isNothing (edLoading ed)
-                       && isNothing (idDrag idoc)   -- the drag border is cell-drawn
-  if not unobstructed || loTextWidth lo <= 0 || loTextHeight lo <= 0
+  -- 'imageOverlayActive' decides *whether* a placement is wanted (image is the
+  -- unobstructed content; any modal, menu or search view falls back to the cell
+  -- picture beneath — explorer-panel focus is allowed since the panel sits left
+  -- of the image). The renderer shares that predicate and blanks the cell area
+  -- when it holds, so the two never disagree. Caps only pick the *kind* here.
+  if not (imageOverlayActive ed)
     then Nothing
-    else Just GfxKey
-      { gkPath = edPath ed
-      , gkCrop = imageCrop idoc
-      , gkGeom = (loTextTop lo, loTextLeft lo, loTextWidth lo, loTextHeight lo)
-      , gkPx   = cellPxKey ed
-      , gkKind = kind
-      }
+    else let lo = computeLayout ed
+         in Just GfxKey
+              { gkPath = edPath ed
+              , gkCrop = imageCrop idoc
+              , gkGeom = (loTextTop lo, loTextLeft lo, loTextWidth lo, loTextHeight lo)
+              , gkPx   = cellPxKey ed
+              , gkKind = kind
+              }
 
 -- Scale the cropped source to the fitted pixel size and emit the placement.
 placeGfx :: Editor -> GfxKey -> Builder

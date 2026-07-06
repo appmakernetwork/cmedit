@@ -1228,12 +1228,22 @@ drawImage ed idoc lo arr = do
       th   = loTextHeight lo; tw = loTextWidth lo
       crop = imageCrop idoc
       pxk  = cellPxKey ed
-      grid = case idCache idoc of
-               Just (c, r, m, cr, px, g)
-                 | c == tw && r == th && m == idMode idoc && cr == crop && px == pxk -> g
-               _ -> renderImage (cellAspect ed) (imageFitCap ed idoc) (idMode idoc) tw th crop (idImage idoc)
-  forM_ [0 .. th-1] $ \r -> forM_ [0 .. tw-1] $ \c ->
-    putCell arr cols rows (top+r) (left+c) (grid ! (r, c))
+  if imageOverlayActive ed
+    then
+      -- A real pixel placement will cover this area, so leave the cells blank:
+      -- painting the half-block picture underneath lets its blocky edges and
+      -- transparency checkerboard bleed through the overlay's transparent
+      -- pixels (see 'imageOverlayActive'). Blank = terminal background, which
+      -- is exactly what the overlay composites its own transparency over.
+      forM_ [0 .. th-1] $ \r -> forM_ [0 .. tw-1] $ \c ->
+        putCell arr cols rows (top+r) (left+c) blankCell
+    else do
+      let grid = case idCache idoc of
+                   Just (c, r, m, cr, px, g)
+                     | c == tw && r == th && m == idMode idoc && cr == crop && px == pxk -> g
+                   _ -> renderImage (cellAspect ed) (imageFitCap ed idoc) (idMode idoc) tw th crop (idImage idoc)
+      forM_ [0 .. th-1] $ \r -> forM_ [0 .. tw-1] $ \c ->
+        putCell arr cols rows (top+r) (left+c) (grid ! (r, c))
   -- While dragging, highlight the border of the selection rectangle.
   case idDrag idoc of
     Nothing -> pure ()

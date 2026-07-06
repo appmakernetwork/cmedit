@@ -653,6 +653,18 @@ main = do
             (edFocus (imageLoadedNew "/w/pic.bmp" im edExp) == FExplorer)
       check "image opened elsewhere focuses the view"
             (edFocus (imageLoadedNew "/w/pic.bmp" im ed0) == FEdit)
+      -- The half-block cell picture is drawn only when no pixel placement will
+      -- cover it; with graphics caps present the renderer blanks the area so the
+      -- blocky fallback / checkerboard can't bleed through the overlay.
+      let edImgE = setGfxCaps True (imageLoaded "/w/pic.bmp" im ed0)   -- caps + editor
+      check "gfx overlay off without caps"
+            (not (imageOverlayActive (imageLoaded "/w/pic.bmp" im ed0)))
+      check "gfx overlay on with caps (image focused)"
+            (imageOverlayActive edImgE)
+      check "gfx overlay on with caps (panel focused)"
+            (imageOverlayActive (setGfxCaps True (imageLoaded "/w/pic.bmp" im edExp)))
+      check "gfx overlay off when the search view obscures the image"
+            (not (imageOverlayActive (edImgE { edSearchMode = True })))
     Left _   -> check "render decode" False
   -- The image view is read-only and cursor-less: the terminal cursor must be
   -- hidden over a focused image (a text document still shows one).

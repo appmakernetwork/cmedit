@@ -217,6 +217,7 @@ data Editor = Editor
   , edRecent        :: ![RecentEntry]   -- ^ Recently-opened files, most recent first (global; persisted by the driver).
   , edDetectedDark  :: !(Maybe Bool)    -- ^ OSC 11 verdict: the terminal background is dark (drives @theme = auto@; Nothing until the terminal answers).
   , edCellPx        :: !(Maybe (Int, Int)) -- ^ One character cell's (width, height) in pixels, when the terminal reported it (image aspect ratio).
+  , edGfxCaps       :: !Bool             -- ^ The terminal supports a pixel-graphics protocol (kitty or sixel); the driver mirrors 'Cmedit.Caps.TermCaps' here so the renderer can suppress the half-block picture under a real placement.
   } deriving (Show)
 
 -- | A fresh editor for the given terminal size and config.
@@ -298,6 +299,7 @@ newEditor size cfg = Editor
   , edRecent        = []
   , edDetectedDark  = Nothing
   , edCellPx        = Nothing
+  , edGfxCaps       = False
   }
 
 -- | The theme to draw with this frame: an explicit config choice wins; with
@@ -342,6 +344,33 @@ imageFitCap :: Editor -> ImageDoc -> Maybe Double
 imageFitCap ed idoc = case edCellPx ed of
   Just (pw, _) | isNothing (idCrop idoc), pw > 0 -> Just (1 / fromIntegral pw)
   _                                              -> Nothing
+
+-- | Record whether the terminal supports a pixel-graphics protocol (the driver
+-- mirrors 'Cmedit.Caps.TermCaps' after each capability reply). Feeds
+-- 'imageOverlayActive'.
+setGfxCaps :: Bool -> Editor -> Editor
+setGfxCaps b ed = ed { edGfxCaps = b }
+
+-- | Will a real pixel-graphics placement cover the image view this frame? True
+-- exactly when the terminal can draw pixels ('edGfxCaps') and the active image
+-- is the unobstructed content — the same conditions the driver's @wantGfx@
+-- uses to emit the placement. The renderer consults this to paint blank cells
+-- instead of the half-block picture, so the blocky fallback (and its
+-- transparency checkerboard) never bleeds through the overlay's transparent
+-- pixels; keep it in step with @wantGfx@ so the two never disagree (blanking a
+-- cell the driver won't cover would leave a hole, and vice versa).
+imageOverlayActive :: Editor -> Bool
+imageOverlayActive ed = case edImage ed of
+  Nothing   -> False
+  Just idoc ->
+    let lo = computeLayout ed
+    in edGfxCaps ed
+         && (edFocus ed == FEdit || edFocus ed == FExplorer)
+         && not (edSearchMode ed)
+         && isNothing (edDialog ed)
+         && isNothing (edLoading ed)
+         && isNothing (idDrag idoc)
+         && loTextWidth lo > 0 && loTextHeight lo > 0
 
 -- | The mouse-pointer shape to suggest for a screen cell (the OSC 22 hint the
 -- driver emits on hover): an I-beam over editable text, a hand over the
