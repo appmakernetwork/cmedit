@@ -272,9 +272,10 @@ data GfxKey = GfxKey
   , gkPx   :: !(Int, Int)               -- ^ Cell pixel size in effect.
   , gkKind :: !GfxKind
   , gkFrame :: !Int                     -- ^ Displayed animation frame. Static under
-                                        --   kitty (the terminal loops natively); the
-                                        --   editor's sixel tick steps it, re-placing
-                                        --   the picture each animation frame.
+                                        --   real kitty (the terminal loops natively);
+                                        --   the editor's tick steps it elsewhere —
+                                        --   a cheap placement swap on static-kitty
+                                        --   terminals, a full re-place on sixel.
   } deriving (Eq, Show)
 
 -- | Persist the recent-files list when its path set/order changed (opens,
@@ -497,7 +498,10 @@ applyReplyIO drv editorRef rep = do
   -- Mirror pixel-graphics support into the editor so the renderer can drop the
   -- half-block fallback under a real placement (kept in step with 'wantGfx').
   caps' <- readIORef (drvCaps drv)
-  modifyIORef' editorRef (setGfxCaps (tcKittyGfx caps') (tcSixel caps'))
+  modifyIORef' editorRef
+    (setGfxCaps (tcKittyGfx caps')
+                (maybe False supportsKittyAnim (tcVersion caps'))
+                (tcSixel caps'))
   case rep of
     -- theme=auto: dark or light follows the reported background.
     TrBgColor r g b -> modifyIORef' editorRef (setDetectedDark (isDarkRgb r g b))
@@ -1195,8 +1199,17 @@ gfxOverlay drv caps ed fullRedraw = do
     (mprev, Just key)
       | mprev == Just key && not fullRedraw -> pure Nothing
       | otherwise -> do
+          -- When only the animation frame moved on a kitty placement whose
+          -- frames are pre-uploaded (client-driven animation), swap the
+          -- placement instead of re-transmitting; anything else re-places.
+          let prevFrame = case mprev of
+                Just prev | not fullRedraw
+                          , prev { gkFrame = gkFrame key } == key
+                          , gkKind key == GfxKitty
+                          -> Just (gkFrame prev)
+                _         -> Nothing
           writeIORef (drvGfx drv) (Just key)
-          pure (Just (placeGfx ed key))
+          pure (Just (placeGfx ed key prevFrame))
 
 -- Is a pixel placement wanted right now, and under what identity?
 wantGfx :: TermCaps -> Editor -> Maybe GfxKey
@@ -1223,13 +1236,18 @@ wantGfx caps ed = do
               }
 
 -- Scale the cropped source to the fitted pixel size and emit the placement.
--- A multi-frame image on kitty uploads the whole animation (each frame scaled
--- to the same fitted resolution, bounded by 'maxAnimGfxPixels' in total) and
--- lets the terminal loop it; on sixel the placement shows the current frame
--- and the editor's animation tick re-places it per frame ('gkFrame' is in the
--- key). A zoom crop on kitty deliberately shows a still (see 'imageKittyAnim').
-placeGfx :: Editor -> GfxKey -> Builder
-placeGfx ed key = fromMaybe mempty $ do
+-- A multi-frame image on real kitty ('edGfxKittyAnim') uploads the whole
+-- animation (each frame scaled to the same fitted resolution, bounded by
+-- 'maxAnimGfxPixels' in total) and lets the terminal loop it; a terminal
+-- that speaks only the static kitty protocol (Ghostty, WezTerm) gets the
+-- frames pre-uploaded as separate image ids and the editor's tick swaps the
+-- visible placement per frame — @prevFrame@ is 'Just' when the previous
+-- placement was the same animation, so only the swap needs emitting. On
+-- sixel the placement shows the current frame and the tick re-places it per
+-- frame ('gkFrame' is in the key). A zoom crop on any kitty-protocol
+-- terminal deliberately shows a still (see 'imageKittyAnim').
+placeGfx :: Editor -> GfxKey -> Maybe Int -> Builder
+placeGfx ed key prevFrame = fromMaybe mempty $ do
   idoc <- edImage ed
   let img = idImage idoc
       (cx, cy, cw, ch) = gkCrop key
@@ -1242,7 +1260,10 @@ placeGfx ed key = fromMaybe mempty $ do
       (row, col, cols, rows, pxW, pxH) = gfxFit cellPx (top, left, tw, th) (cw, ch) allowUpscale
       rgba = scaleRGBA img (cx, cy, cw, ch) pxW pxH
       frames = idFrames idoc
-      kittyAnim = gkKind key == GfxKitty && length frames > 1 && isNothing (idCrop idoc)
+      nFrames = length frames
+      kittyAnim = gkKind key == GfxKitty && nFrames > 1 && isNothing (idCrop idoc)
+      -- 1-based image id of an animation frame in the client-driven scheme.
+      frameId f = (f `mod` nFrames) + 1
       -- Shrink the common frame resolution so the whole upload fits the
       -- animation budget; kitty stretches the payload back into the cell box.
       animScale = min 1.0 (sqrt (fromIntegral maxAnimGfxPixels
@@ -1253,6 +1274,14 @@ placeGfx ed key = fromMaybe mempty $ do
                     | (f, delay) <- frames ]
   pure $ case gkKind key of
     GfxKitty
-      | kittyAnim -> kittyPlaceAnim (row, col) (cols, rows) (apxW, apxH) animPayload
+      | kittyAnim, edGfxKittyAnim ed ->
+          kittyPlaceAnim (row, col) (cols, rows) (apxW, apxH) animPayload
+      | kittyAnim, Just pf <- prevFrame, pf /= gkFrame key ->
+          -- Same client-driven animation, next frame: the data is resident.
+          kittySwapFrame (row, col) (cols, rows)
+                         (Just (frameId pf)) (frameId (gkFrame key))
+      | kittyAnim ->
+          kittyClientAnim (row, col) (cols, rows) (apxW, apxH)
+                          (gkFrame key `mod` nFrames) (map fst animPayload)
       | otherwise -> kittyPlace (row, col) (cols, rows) (pxW, pxH) rgba
     GfxSixel -> sixelPlace (row, col) (pxW, pxH) rgba

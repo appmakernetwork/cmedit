@@ -17,6 +17,7 @@ module Cmedit.Caps
     -- * Policy helpers
   , isDarkRgb
   , supportsUndercurl
+  , supportsKittyAnim
   , repProbeResult
   ) where
 
@@ -112,6 +113,16 @@ supportsUndercurl v =
   let lv = map toLower v
   in any (`isInfixOf` lv)
        ["kitty", "wezterm", "ghostty", "foot", "iterm2", "contour", "vte", "alacritty"]
+
+-- | Does this XTVERSION string belong to a terminal known to implement the
+-- kitty graphics *animation* actions (@a=f@ frame upload, @a=a@ run/loop)?
+-- Several terminals answer the static kitty-graphics probe (Ghostty, WezTerm,
+-- Konsole) but silently drop the animation actions — trusting them to loop
+-- an animation freezes it on the root frame. Deliberately a whitelist, like
+-- 'supportsUndercurl': anything unrecognised gets the client-driven
+-- placement-swap animation instead, which needs only the static protocol.
+supportsKittyAnim :: String -> Bool
+supportsKittyAnim v = "kitty" `isPrefixOf` map toLower v
 
 -- | Interpret a DECXCPR reply as the outcome of 'Cmedit.Ansi.repProbe': the
 -- probe homes the cursor, prints two spaces and asks for two repeats, so on a

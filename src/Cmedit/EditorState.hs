@@ -230,7 +230,8 @@ data Editor = Editor
   , edDetectedDark  :: !(Maybe Bool)    -- ^ OSC 11 verdict: the terminal background is dark (drives @theme = auto@; Nothing until the terminal answers).
   , edCellPx        :: !(Maybe (Int, Int)) -- ^ One character cell's (width, height) in pixels, when the terminal reported it (image aspect ratio).
   , edGfxCaps       :: !Bool             -- ^ The terminal supports a pixel-graphics protocol (kitty or sixel); the driver mirrors 'Cmedit.Caps.TermCaps' here so the renderer can suppress the half-block picture under a real placement.
-  , edGfxKitty      :: !Bool             -- ^ Specifically the kitty graphics protocol (whose native animation loop the terminal drives itself; sixel and the cell fallback are stepped by the editor's tick instead).
+  , edGfxKitty      :: !Bool             -- ^ Specifically the kitty graphics protocol (placements; animation may still be client-driven — see 'edGfxKittyAnim').
+  , edGfxKittyAnim  :: !Bool             -- ^ The terminal also implements kitty's animation actions (whitelisted real kitty), so it loops an uploaded animation itself. Without this, kitty-protocol animations are stepped by the editor's tick as cheap placement swaps.
   } deriving (Show)
 
 -- | A fresh editor for the given terminal size and config.
@@ -314,6 +315,7 @@ newEditor size cfg = Editor
   , edCellPx        = Nothing
   , edGfxCaps       = False
   , edGfxKitty      = False
+  , edGfxKittyAnim  = False
   }
 
 -- | The theme to draw with this frame: an explicit config choice wins; with
@@ -360,11 +362,16 @@ imageFitCap ed idoc = case edCellPx ed of
   _                                              -> Nothing
 
 -- | Record whether the terminal supports a pixel-graphics protocol (the driver
--- mirrors 'Cmedit.Caps.TermCaps' after each capability reply): @kitty@ then
--- @sixel@. Feeds 'imageOverlayActive' and the animation scheduling
--- ('imageTickUs' — a kitty terminal loops the animation itself).
-setGfxCaps :: Bool -> Bool -> Editor -> Editor
-setGfxCaps kitty sixel ed = ed { edGfxCaps = kitty || sixel, edGfxKitty = kitty }
+-- mirrors 'Cmedit.Caps.TermCaps' after each capability reply): @kitty@, then
+-- whether it truly implements kitty's *animation* actions (whitelisted real
+-- kitty only — Ghostty/WezTerm/Konsole speak the static protocol but drop the
+-- animation actions), then @sixel@. Feeds 'imageOverlayActive' and the
+-- animation scheduling ('imageTickUs').
+setGfxCaps :: Bool -> Bool -> Bool -> Editor -> Editor
+setGfxCaps kitty kittyAnim sixel ed =
+  ed { edGfxCaps = kitty || sixel
+     , edGfxKitty = kitty
+     , edGfxKittyAnim = kitty && kittyAnim }
 
 -- | Will a real pixel-graphics placement cover the image view this frame? True
 -- exactly when the terminal can draw pixels ('edGfxCaps') and the active image
@@ -393,41 +400,50 @@ imageAnim ed = case edImage ed of
   Just idoc | length (idFrames idoc) > 1 -> Just idoc
   _                                      -> Nothing
 
--- | The kitty terminal drives the animation loop itself: the driver uploads
--- every frame with its gap alongside the placement and issues the run-loop
--- control, so the editor must not also step frames. Holds whenever a kitty
--- placement covers the view; under a zoom crop the placement is a still of
--- the current frame (re-uploading a cropped frame per tick would be a
--- client-driven animation at full transmission cost), so the animation
--- deliberately freezes while zoomed on kitty.
+-- | A real-kitty terminal drives the animation loop itself: the driver
+-- uploads every frame with its gap alongside the placement and issues the
+-- run-loop control, so the editor must not also step frames. Holds only when
+-- the terminal is whitelisted as implementing the animation actions
+-- ('edGfxKittyAnim' — a terminal that merely speaks the static protocol gets
+-- editor-stepped placement swaps instead) and a placement covers the view;
+-- under a zoom crop the placement is a still of the current frame
+-- (re-uploading a cropped frame per tick would cost a full transmission), so
+-- the animation deliberately freezes while zoomed on any kitty-protocol
+-- terminal.
 imageKittyAnim :: Editor -> Bool
 imageKittyAnim ed =
-  isJust (imageAnim ed) && edGfxKitty ed && imageOverlayActive ed
+  isJust (imageAnim ed) && edGfxKittyAnim ed && imageOverlayActive ed
     && maybe True (isNothing . idCrop) (edImage ed)
 
 -- | Microseconds until the next animation frame is due, when the *editor*
--- must step the animation itself — the half-block cell picture, or a sixel
--- placement re-emitted per frame. 'Nothing' when there is nothing to animate,
--- a load is in progress, or a kitty placement covers the view (the terminal
--- loops natively / a crop freezes it — see 'imageKittyAnim'). Cell steps are
--- held to >= 50ms; sixel steps additionally scale with the placement's pixel
+-- must step the animation itself — the half-block cell picture, a sixel
+-- placement re-emitted per frame, or (on kitty-protocol terminals without
+-- the animation extension) a cheap placement swap between pre-uploaded
+-- frames. 'Nothing' when there is nothing to animate, a load is in progress,
+-- a whitelisted-kitty placement covers the view (the terminal loops
+-- natively), or a zoom crop shows a still on any kitty-protocol terminal
+-- (see 'imageKittyAnim'). Cell repaints and kitty placement swaps are held
+-- to >= 50ms; sixel steps additionally scale with the placement's pixel
 -- area, since each one re-encodes and re-transmits the whole picture (a huge
 -- placement animates slower rather than flooding the terminal).
 imageTickUs :: Editor -> Maybe Int
 imageTickUs ed = case imageAnim ed of
   Nothing -> Nothing
   Just idoc
-    | isJust (edLoading ed)                    -> Nothing
-    | edGfxKitty ed && imageOverlayActive ed   -> Nothing
+    | isJust (edLoading ed)                       -> Nothing
+    | edGfxKittyAnim ed && imageOverlayActive ed  -> Nothing
+    | edGfxKitty ed && imageOverlayActive ed
+        && isJust (idCrop idoc)                   -> Nothing
     | loTextWidth lo <= 0 || loTextHeight lo <= 0 -> Nothing
     | otherwise ->
         let delay = snd (idFrames idoc !! (idFrame idoc `mod` max 1 (length (idFrames idoc))))
             floorMs
-              | imageOverlayActive ed =        -- sixel re-upload per step
+              | imageOverlayActive ed && not (edGfxKitty ed) =
+                  -- sixel: a whole re-encoded upload per step
                   let (cw, ch) = case cellPxKey ed of (0, 0) -> (8, 16); p -> p
                       pxArea = loTextWidth lo * cw * loTextHeight lo * ch
                   in max 100 (pxArea `div` 5000)
-              | otherwise = 50                 -- cell repaint per step
+              | otherwise = 50   -- cell repaint / kitty placement swap per step
         in Just (1000 * max floorMs delay)
   where lo = computeLayout ed
 

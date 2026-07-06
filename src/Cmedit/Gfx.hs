@@ -18,6 +18,8 @@ module Cmedit.Gfx
   , maxAnimGfxPixels
   , kittyPlace
   , kittyPlaceAnim
+  , kittyClientAnim
+  , kittySwapFrame
   , sixelPlace
     -- * Encoders (exposed for tests)
   , base64B
@@ -135,8 +137,10 @@ maxAnimGfxPixels = 4 * 1000 * 1000
 -- and hand the loop to the terminal (@s=3,v=1@ = run, loop forever). The
 -- terminal then animates on its own — the editor never ticks. Each frame is
 -- full-canvas RGBA at the same resolution as the root, with @q=2@ keeping the
--- terminal quiet. A kitty-protocol terminal predating animation support
--- simply shows the root frame — the still image, exactly the graceful floor.
+-- terminal quiet. Only emitted for terminals whitelisted as implementing the
+-- animation actions ('Cmedit.Caps.supportsKittyAnim' — real kitty); a
+-- kitty-protocol terminal without them gets 'kittyClientAnim' instead, and
+-- even if one slipped through it would still show the root frame.
 kittyPlaceAnim :: (Int, Int) -> (Int, Int) -> (Int, Int) -> [(BS.ByteString, Int)] -> Builder
 kittyPlaceAnim _ _ _ [] = mempty
 kittyPlaceAnim pos box (pxW, pxH) ((root, rootGap) : rest) =
@@ -157,6 +161,45 @@ kittyPlaceAnim pos box (pxW, pxH) ((root, rootGap) : rest) =
               m = if BS.null restB then 0 else 1
               part = apc (header first m <> char7 ';' <> base64B now)
           in if BS.null restB then part else part <> chunks False restB
+
+-- | Client-driven animation for terminals that speak the kitty graphics
+-- protocol but not its animation extension (Ghostty, WezTerm, Konsole):
+-- delete everything, transmit every frame once as its own image id (@a=t@,
+-- data only, ids are 1-based frame numbers), then show the current frame.
+-- The editor's animation tick thereafter swaps the visible placement with
+-- 'kittySwapFrame' — a few dozen bytes per step against the resident frame
+-- data, instead of a re-upload. Total transmission equals the native
+-- animation upload, so the same 'maxAnimGfxPixels' budget applies.
+kittyClientAnim :: (Int, Int) -> (Int, Int) -> (Int, Int) -> Int -> [BS.ByteString] -> Builder
+kittyClientAnim pos box (pxW, pxH) cur frames =
+  kittyGfxDeleteAll
+    <> mconcat [ transmitB i dat | (i, dat) <- zip [1 ..] frames ]
+    <> kittySwapFrame pos box Nothing (cur + 1)
+  where
+    transmitB :: Int -> BS.ByteString -> Builder
+    transmitB i dat = chunks True dat
+      where
+        header first m
+          | first = string7 "Ga=t,f=32,q=2,i=" <> intDec i
+                      <> string7 ",s=" <> intDec pxW <> string7 ",v=" <> intDec pxH
+                      <> string7 ",m=" <> intDec m
+          | otherwise = string7 "Gm=" <> intDec m
+        chunks first bs =
+          let (now, restB) = BS.splitAt 3072 bs
+              m = if BS.null restB then 0 else 1
+              part = apc (header first m <> char7 ';' <> base64B now)
+          in if BS.null restB then part else part <> chunks False restB
+
+-- | Swap which pre-uploaded frame is on screen: delete the previous frame's
+-- placement (its pixel data stays resident) and place the new frame's image
+-- id into the same cell box. Ids are the 1-based frame numbers from
+-- 'kittyClientAnim'; @Nothing@ for the previous id on the first showing.
+kittySwapFrame :: (Int, Int) -> (Int, Int) -> Maybe Int -> Int -> Builder
+kittySwapFrame (row, col) (cols, rows) mprev cur =
+  maybe mempty (\p -> apc (string7 "Ga=d,d=i,q=2,i=" <> intDec p)) mprev
+    <> moveTo row col
+    <> apc (string7 "Ga=p,q=2,i=" <> intDec cur
+              <> string7 ",c=" <> intDec cols <> string7 ",r=" <> intDec rows)
 
 -- | Place raw RGBA pixels as a sixel graphic at @(row, col)@. The terminal
 -- paints the pixels over that region at its own cell raster; the caller

@@ -698,20 +698,21 @@ main = do
       -- The half-block cell picture is drawn only when no pixel placement will
       -- cover it; with graphics caps present the renderer blanks the area so the
       -- blocky fallback / checkerboard can't bleed through the overlay.
-      let edImgE = setGfxCaps True False (imageLoaded "/w/pic.bmp" [(im, 0)] ed0)   -- caps + editor
+      let edImgE = setGfxCaps True False False (imageLoaded "/w/pic.bmp" [(im, 0)] ed0)   -- caps + editor
       check "gfx overlay off without caps"
             (not (imageOverlayActive (imageLoaded "/w/pic.bmp" [(im, 0)] ed0)))
       check "gfx overlay on with caps (image focused)"
             (imageOverlayActive edImgE)
       check "gfx overlay on with caps (panel focused)"
-            (imageOverlayActive (setGfxCaps True False (imageLoaded "/w/pic.bmp" [(im, 0)] edExp)))
+            (imageOverlayActive (setGfxCaps True False False (imageLoaded "/w/pic.bmp" [(im, 0)] edExp)))
       check "gfx overlay off when the search view obscures the image"
             (not (imageOverlayActive (edImgE { edSearchMode = True })))
       -- Animation scheduling: who steps the frames depends on the terminal.
       let anim2 = [(im, 500), (im, 100)]
           edAnim = imageLoaded "/w/anim.gif" anim2 ed0          -- no gfx caps
-          edAnimK = setGfxCaps True False edAnim                -- kitty
-          edAnimS = setGfxCaps False True edAnim                -- sixel
+          edAnimK = setGfxCaps True True False edAnim           -- real kitty (native animation)
+          edAnimS = setGfxCaps False False True edAnim          -- sixel
+          edAnimG = setGfxCaps True False False edAnim          -- static kitty protocol (Ghostty/WezTerm)
       check "still image never ticks"
             (imageTickUs (imageLoaded "/w/pic.bmp" [(im, 0)] ed0) == Nothing)
       check "cell fallback ticks at the frame delay"
@@ -726,6 +727,23 @@ main = do
              in imageTickUs edCrop == Nothing && not (imageKittyAnim edCrop))
       check "sixel steps with a 100ms floor"
             (maybe False (>= 100000) (imageTickUs edAnimS) && not (imageKittyAnim edAnimS))
+      -- A terminal that answers the kitty-graphics probe but is not real
+      -- kitty (Ghostty, WezTerm, Konsole) must not be trusted to animate:
+      -- the editor steps it via cheap placement swaps at the cell floor.
+      check "static-kitty terminal is stepped by the editor"
+            (imageTickUs edAnimG == Just 500000 && not (imageKittyAnim edAnimG))
+      check "static-kitty steps clamp to 50ms (not the sixel floor)"
+            (imageTickUs (edAnimG { edImage = fmap (\d -> d { idFrames = [(im, 500), (im, 5)], idFrame = 1 }) (edImage edAnimG) }) == Just 50000)
+      check "static-kitty + zoom crop freezes like real kitty"
+            (let edCropG = edAnimG { edImage = fmap (\d -> d { idCrop = Just (0,0,1,1) }) (edImage edAnimG) }
+             in imageTickUs edCropG == Nothing)
+      check "static-kitty tickImage advances (editor owns playback)"
+            (maybe (-1) idFrame (edImage (tickImage edAnimG)) == 1)
+      check "kitty animation whitelist: real kitty only"
+            (supportsKittyAnim "kitty(0.32.2)" && supportsKittyAnim "KiTTY(0.40.0)"
+             && not (supportsKittyAnim "ghostty 1.1.3")
+             && not (supportsKittyAnim "WezTerm 20240203-110809-5046fc22")
+             && not (supportsKittyAnim "Konsole 24.08.0"))
       check "tickImage advances and wraps"
             (let f = maybe (-1) idFrame . edImage
              in f edAnim == 0 && f (tickImage edAnim) == 1

@@ -423,24 +423,33 @@ in `README.md`; the cross-cutting structure that matters when editing:
   budget truncates over-long animations and `decodeGIF`/`decodeImage` stay
   the cheap first-frame path). Frames live in `idFrames`/`idFrame` in the
   `ImageDoc` (so the zipper carries them) and the current frame index is part
-  of the `idCache` key. **Who steps the frames is capability-dependent**:
-  on kitty the driver uploads the whole animation once with the placement
+  of the `idCache` key. **Who steps the frames is capability-dependent**,
+  and answering the kitty-graphics probe is NOT enough to be trusted with
+  playback: Ghostty/WezTerm/Konsole speak the static protocol but silently
+  drop the animation actions, so native animation is gated on the XTVERSION
+  whitelist `Caps.supportsKittyAnim` (real kitty only, mirrored into
+  `edGfxKittyAnim` by `setGfxCaps kitty anim sixel`). On whitelisted kitty
+  the driver uploads the whole animation once with the placement
   (`Gfx.kittyPlaceAnim`: `a=f` frames + root-gap + `a=a s=3,v=1` run-loop,
   total pixels bounded by `maxAnimGfxPixels`) and the *terminal* loops it —
-  the editor never ticks; everywhere else the event loop arms a separate
-  `ImgTick` timer from the pure `imageTickUs` (current frame's delay,
-  floored at 50ms for the half-block cells and at a pixel-area-scaled
-  ≥100ms for sixel, whose placement is re-emitted per frame — `gkFrame` is
-  in `GfxKey` for exactly this) and `tickImage` advances the frame,
-  re-checking `imageTickUs` so ownership changes between arm and fire are
-  safe. A still image or a backgrounded animation costs nothing (the timer
-  is simply not armed, like the settled About box). Zooming (`idCrop`) on
-  kitty deliberately shows a frozen still of the current frame (re-uploading
-  a cropped frame per tick would be a full-cost client-driven animation);
-  the cell/sixel paths keep animating the crop. A kitty-protocol terminal
-  that predates animation support just shows the root frame — the graceful
-  floor is always the still image, and dumb terminals get the animated
-  half-block picture, which needs no capability at all.
+  the editor never ticks. On a static-kitty terminal the driver instead
+  pre-uploads every fitted frame as its own image id (`Gfx.kittyClientAnim`,
+  same pixel budget) and the editor's tick swaps the visible placement
+  (`Gfx.kittySwapFrame`, a few dozen bytes: `gfxOverlay` detects a
+  same-key-but-`gkFrame` change and `placeGfx` gets the previous frame to
+  swap from). Everywhere else the event loop arms a separate `ImgTick`
+  timer from the pure `imageTickUs` (current frame's delay, floored at 50ms
+  for half-block cells and kitty placement swaps, and at a
+  pixel-area-scaled ≥100ms for sixel, whose placement is re-emitted whole
+  per frame) and `tickImage` advances the frame, re-checking `imageTickUs`
+  so ownership changes between arm and fire are safe. A still image or a
+  backgrounded animation costs nothing (the timer is simply not armed, like
+  the settled About box). Zooming (`idCrop`) on any kitty-protocol terminal
+  deliberately shows a frozen still of the current frame (re-uploading a
+  cropped frame per tick would be a full-cost transmission); the cell/sixel
+  paths keep animating the crop. The graceful floor is always the still
+  image, and dumb terminals get the animated half-block picture, which
+  needs no capability at all.
 - **Editing QoL cluster (all pure `Editor` logic).** Line ops (duplicate /
   Alt+↑↓ move — `EKMoveLine` coalesces held moves into one undo — delete /
   Alt+J join) work on `selLineSpan` (a selection ending at col 0 excludes that
