@@ -972,7 +972,7 @@ fileKindStyle th k = case k of
 
 -- | The leading glyph for a file kind (only images get one for now), or a space.
 fileKindIcon :: FileKind -> Char
-fileKindIcon FKImage = '\x25a6'   -- ▦ : a displayable image
+fileKindIcon FKImage = '\x274f'   -- ❏ : a displayable image
 fileKindIcon _       = ' '
 
 -- The expanded panel: a header (folder name + collapse/close buttons), the
@@ -1056,13 +1056,14 @@ drawExplorerPanel th ed lo arr = do
             avail    = max 0 (sizeCol - nameCol)
         fillRect arr cols rows r 0 1 pcw rowSty
         putCell arr cols rows r startCol (Cell markCh rowSty)
-        -- Type glyph just before the name (currently only displayable images).
+        -- Type glyph in the leading indicator column (where a directory's
+        -- arrow goes), so image rows read like "❏ name" beside "▸ folder".
+        -- Currently only displayable images get one.
         let iconCh  = fileKindIcon kind
-            iconCol = nameCol - 1
             iconSty | selected  = selSty
                     | otherwise = fileKindStyle th kind
-        when (iconCh /= ' ' && iconCol >= startCol && iconCol < sizeCol) $
-          putCell arr cols rows r iconCol (Cell iconCh iconSty)
+        when (iconCh /= ' ' && startCol < sizeCol) $
+          putCell arr cols rows r startCol (Cell iconCh iconSty)
         drawStr arr cols rows r nameCol nameSty (take avail nameStr)
         drawStr arr cols rows r sizeCol sizeSty sizeStr
         putCell arr cols rows r statusCol (Cell statusCh statusSty)
