@@ -1038,6 +1038,38 @@ main = do
   check "link: id is stable and hex"
         (linkIdOf "https://a.b/1" == linkIdOf "https://a.b/1"
          && all (`elem` ("0123456789abcdef" :: String)) (linkIdOf "https://a.b/1"))
+  -- Interactive links: terminals with mouse reporting on rarely forward
+  -- link clicks to their own OSC 8 handling, so the editor opens its links
+  -- itself — Ctrl+Click or right-click, with a hand pointer and a status
+  -- hint on hover.
+  let edUrl = setLoaded "u.txt" (mkLR "see https://a.b/c end") ed0
+      loU = computeLayout edUrl
+      urlEvt btn mods press drag =
+        MouseEvent btn (loTextLeft loU + 6) (loTextTop loU) press drag mods 1
+      ctrlM = Mods False False True
+      hasOpen effs = [ u | EffOpenUrl u <- effs ] == ["https://a.b/c"]
+  check "link: ctrl+click on a url opens it"
+        (hasOpen (snd (update (KMouse (urlEvt MBLeft ctrlM True False)) edUrl)))
+  check "link: ctrl+click beside the url goes to definition instead"
+        (null [ u | EffOpenUrl u <- snd (update
+                 (KMouse (MouseEvent MBLeft (loTextLeft loU + 1) (loTextTop loU)
+                            True False ctrlM 1)) edUrl) ])
+  check "link: right-click on a url opens it"
+        (hasOpen (snd (update (KMouse (urlEvt MBRight noMods True False)) edUrl)))
+  check "link: hover sets the status hint and the hand pointer"
+        (let hov = urlEvt MBNone noMods False True
+             edH = fst (update (KMouse hov) edUrl)
+         in edHoverUrl edH == Just "https://a.b/c"
+            && pointerShapeAt hov edUrl == "pointer")
+  check "link: a keystroke clears the hover hint"
+        (let edH = fst (update (KMouse (urlEvt MBNone noMods False True)) edUrl)
+         in edHoverUrl (fst (update (KChar 'x') edH)) == Nothing)
+  check "link: hover hint is rendered on the status bar"
+        (let edH = fst (update (KMouse (urlEvt MBNone noMods False True)) edUrl)
+             scr = renderEditor edH
+             row = [ cellChar (scrCells scr A.! (loStatusRow loU * scrW scr + c))
+                   | c <- [0 .. scrW scr - 1] ]
+         in "Ctrl+Click to open" `isInfixOf` row)
   -- A document line containing a URL emits an OSC 8 open around it and a
   -- close after — and the replay (which skips OSC strings) is still exact.
   let edUrl  = setLoaded "u.txt" (mkLR "docs at https://example.com/guide today\nplain") ed0

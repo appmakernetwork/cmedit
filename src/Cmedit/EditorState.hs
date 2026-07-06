@@ -232,6 +232,7 @@ data Editor = Editor
   , edGfxCaps       :: !Bool             -- ^ The terminal supports a pixel-graphics protocol (kitty or sixel); the driver mirrors 'Cmedit.Caps.TermCaps' here so the renderer can suppress the half-block picture under a real placement.
   , edGfxKitty      :: !Bool             -- ^ Specifically the kitty graphics protocol (placements; animation may still be client-driven — see 'edGfxKittyAnim').
   , edGfxKittyAnim  :: !Bool             -- ^ The terminal also implements kitty's animation actions (whitelisted real kitty), so it loops an uploaded animation itself. Without this, kitty-protocol animations are stepped by the editor's tick as cheap placement swaps.
+  , edHoverUrl      :: !(Maybe Text)     -- ^ The http(s) URL the mouse is hovering in the text area, for the status-bar hint ("Ctrl+Click to open"). Set/cleared by mouse motion, cleared by any keystroke.
   } deriving (Show)
 
 -- | A fresh editor for the given terminal size and config.
@@ -316,6 +317,7 @@ newEditor size cfg = Editor
   , edGfxCaps       = False
   , edGfxKitty      = False
   , edGfxKittyAnim  = False
+  , edHoverUrl      = Nothing
   }
 
 -- | The theme to draw with this frame: an explicit config choice wins; with
@@ -737,6 +739,7 @@ data Effect
   | EffReplaceOnDisk !ReplaceReq -- ^ Rewrite closed files on disk for a large Replace All (driver replies via 'replaceDone').
   | EffStageReplace !ReplaceReq -- ^ Open the closed files, apply the replacement in-buffer (unsaved), reveal them (driver replies via 'stageReplaceDone').
   | EffSaveAll               -- ^ Save every open document that has unsaved changes (driver replies via 'savedAll').
+  | EffOpenUrl !String       -- ^ Open a URL in the system browser (fire-and-forget; driver reports a missing opener via 'setError').
   deriving (Show)
 
 -- | The closed-file part of a workspace Replace All: which files to rewrite on

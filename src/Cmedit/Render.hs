@@ -613,7 +613,12 @@ drawStatus th ed lo arr = do
       -- The right side (and its clickable zones) comes from the shared
       -- builder in Cmedit.Editor so mouse hit-testing can never disagree.
       right = fst (statusRightInfo ed)
-      status = T.unpack (edStatus ed)
+      -- The link-hover hint temporarily overlays the message slot while the
+      -- pointer is on a URL (hovering is the *current* action; any status
+      -- message is older news and comes back when the pointer moves off).
+      status = case edHoverUrl ed of
+        Just u  -> "Ctrl+Click to open " ++ T.unpack u
+        Nothing -> T.unpack (edStatus ed)
   drawStr arr cols rows r 0 (thStatus th) prefix
   drawStrL arr cols rows r (length prefix) (thStatus th) nameLink name
   drawStr arr cols rows r (length prefix + length name) (thStatus th) ro

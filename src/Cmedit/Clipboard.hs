@@ -8,9 +8,13 @@ module Cmedit.Clipboard
   , copyToClipboard
   , pasteFromClipboard
   , osc52Copy
+  , openUrl
   ) where
 
+import Control.Concurrent (forkIO)
 import Control.Exception (SomeException, handle)
+import Control.Monad (void)
+import Data.Maybe (listToMaybe)
 import Data.ByteString.Builder (Builder, char7, string7)
 import Data.Word (Word8)
 import System.Directory (findExecutable)
@@ -102,6 +106,39 @@ isSet name = maybe False (not . null) <$> lookupEnv name
 
 windows :: Bool
 windows = os == "mingw32"
+
+------------------------------------------------------------------------------
+-- Opening URLs
+
+-- | Open a URL in the system's default handler (browser), fire-and-forget.
+-- The helper's stdio is piped and ignored so it can never scribble on our
+-- raw-mode screen; a detached thread reaps the process so it neither blocks
+-- the event loop nor lingers as a zombie. Returns False when no opener
+-- exists on this system, so the caller can surface that on the status line.
+openUrl :: String -> IO Bool
+openUrl url = handle onErr $ do
+  mcmd <- pickOpener
+  case mcmd of
+    Nothing -> pure False
+    Just (cmd, args) -> do
+      (_, _, _, ph) <- createProcess (proc cmd (args ++ [url]))
+        { std_in = CreatePipe, std_out = CreatePipe, std_err = CreatePipe }
+      _ <- forkIO (void (waitForProcess ph))
+      pure True
+  where
+    onErr :: SomeException -> IO Bool
+    onErr _ = pure False
+
+-- rundll32 (not @cmd /c start@) on Windows: it takes the URL as a plain
+-- argument, so @&@ and friends in query strings survive unquoted.
+pickOpener :: IO (Maybe (String, [String]))
+pickOpener =
+  listToMaybe <$> candidates
+    (  [ ("rundll32", ["url.dll,FileProtocolHandler"]) | windows ]
+    ++ [ ("open", []) | os == "darwin" ]
+    ++ [ ("xdg-open", []) ]
+    ++ [ ("open", []) | os /= "darwin" ]   -- last-ditch: some BSDs alias it
+    )
 
 ------------------------------------------------------------------------------
 -- Process plumbing

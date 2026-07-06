@@ -45,6 +45,8 @@ module Cmedit.Editor
   , setGfxCaps
   , imageOverlayActive
   , pointerShapeFor
+  , pointerShapeAt
+  , urlAtMouse
     -- * Layout (shared with the renderer)
   , Layout(..)
   , computeLayout
@@ -167,7 +169,7 @@ module Cmedit.Editor
 
 import Data.Char (isAlpha, isAlphaNum, isSpace, isDigit)
 import Data.Foldable (toList)
-import Data.List (findIndex, intercalate, isPrefixOf, isSuffixOf, sortBy)
+import Data.List (find, findIndex, intercalate, isPrefixOf, isSuffixOf, sortBy)
 import Data.Ord (comparing)
 import Data.Sequence (Seq, (|>))
 import qualified Data.Sequence as Seq
@@ -204,6 +206,7 @@ import qualified Cmedit.Csv as Csv
 import Cmedit.About (aboutCanvasH, aboutCanvasMinW, aboutTotalFrames)
 import Cmedit.Clipboard (CopyOutcome(..))
 import Cmedit.Image (Image(..), ImgMode(..), renderImage, viewFit)
+import Cmedit.Link (urlSpans)
 import Cmedit.Syntax (HlCache, CommentSyntax(..), langComment, langForPath)
 
 import Cmedit.EditorState
@@ -588,7 +591,16 @@ resize size ed = refreshImage (ensureVisible ed { edSize = size })
 -- Edit-mode key handling
 
 handleEditKey :: Key -> Editor -> (Editor, [Effect])
-handleEditKey key ed = case key of
+handleEditKey key ed0 = editKey key ed
+  where
+    -- Any keystroke dismisses the link-hover status hint; mouse events
+    -- manage it themselves in 'handleMouse'.
+    ed | KMouse _ <- key         = ed0
+       | isJust (edHoverUrl ed0) = ed0 { edHoverUrl = Nothing }
+       | otherwise               = ed0
+
+editKey :: Key -> Editor -> (Editor, [Effect])
+editKey key ed = case key of
   -- Global shortcuts
   KCtrlChar 'q' -> runAction MAExit ed
   KCtrlChar 's' -> runAction MASave ed
@@ -678,10 +690,17 @@ handleEditKey key ed = case key of
   KPaste s    -> noEff (applyPaste s ed)
 
   KEsc        -> noEff (clearSel ed { edStatus = "" })
-  -- Ctrl+Click on an identifier looks up its definition.
+  -- Ctrl+Click on a URL opens it in the system browser; on anything else it
+  -- looks up the identifier's definition. Right-click on a URL opens it too:
+  -- with mouse reporting on, terminals rarely forward link clicks to their
+  -- own OSC 8 handling, so the editor opens its links itself.
   KMouse me
-    | modCtrl (meMods me), mePressed me, not (meDrag me), meButton me == MBLeft
+    | mePressed me, not (meDrag me), meButton me == MBLeft, modCtrl (meMods me)
+    , Just url <- urlAtMouse me ed -> openLink url ed
+    | mePressed me, not (meDrag me), meButton me == MBLeft, modCtrl (meMods me)
     , Just pos <- textClickPos me ed -> goToDefinition pos ed
+    | mePressed me, not (meDrag me), meButton me == MBRight
+    , Just url <- urlAtMouse me ed -> openLink url ed
   KMouse me   -> noEff (handleMouse me ed)
   _           -> noEff ed
 
@@ -1075,10 +1094,14 @@ handleMouse me ed
       let lo = computeLayout ed
           row = meRow me
           col = meCol me
+          -- Track the hovered URL for the status hint (and the driver's
+          -- hand pointer); only touch the record when it actually changes.
+          hu = urlAtMouse me ed
+          ed' = if hu == edHoverUrl ed then ed else ed { edHoverUrl = hu }
       in if row >= loTextTop lo && row < loTextTop lo + loTextHeight lo
                   && col >= loTextLeft lo
-             then mouseText me lo ed
-             else ed
+             then mouseText me lo ed'
+             else ed'
 
 -- The buffer position (and display column) under a mouse event in the text
 -- area — shared by click/drag handling and Ctrl+Click go-to-definition.
@@ -1095,6 +1118,37 @@ mouseBufPos me lo ed
           d = max 0 (edLeft ed + (meCol me - loTextLeft lo))
           c = displayToCol (tabWidthOf ed) d (getLine' l (edBuffer ed))
       in (Pos l c, d)
+
+-- | The http(s) URL under a mouse position in the text area, if any: the
+-- cell maps to a buffer position exactly where a click would land, then the
+-- recognizer spans of that line decide. Past-end-of-line positions clamp to
+-- the cursor-after-last-char column, which no span contains, so hovering the
+-- void right of a URL does not count. Shared by Ctrl+Click / right-click
+-- opening, the hover pointer shape and the status-bar hint. Table and image
+-- views have no text to scan.
+urlAtMouse :: MouseEvent -> Editor -> Maybe Text
+urlAtMouse me ed
+  | isJust (edCsv ed) || isJust (edImage ed) = Nothing
+  | otherwise = do
+      Pos l c <- textClickPos me ed
+      (_, _, u) <- find (\(s, e, _) -> c >= s && c < e)
+                        (urlSpans (getLine' l (edBuffer ed)))
+      pure u
+
+-- | 'pointerShapeFor' with the link upgrade layered on: a hand over a URL in
+-- the plain edit view (the editor opens it on Ctrl+Click or right-click).
+-- Overlay/panel focus states keep pointerShapeFor's own shapes.
+pointerShapeAt :: MouseEvent -> Editor -> String
+pointerShapeAt me ed
+  | edFocus ed == FEdit, isJust (urlAtMouse me ed) = "pointer"
+  | otherwise = pointerShapeFor ed (meRow me) (meCol me)
+
+-- | Open an http(s) URL via the driver, noting it on the status line (the
+-- hover hint is dropped so the note shows through until the next motion).
+openLink :: Text -> Editor -> (Editor, [Effect])
+openLink url ed =
+  ( ed { edStatus = T.append "Opening " url, edHoverUrl = Nothing }
+  , [EffOpenUrl (T.unpack url)] )
 
 -- The buffer position under a mouse event, when it falls in the text area.
 textClickPos :: MouseEvent -> Editor -> Maybe Pos

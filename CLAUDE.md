@@ -148,7 +148,16 @@ in `README.md`; the cross-cutting structure that matters when editing:
   because they compare whole cells). Every frame ends with the link closed
   so driver-emitted escapes (title, graphics) can never join it. Keep new
   cell emission link-aware: a wide glyph's continuation cells must carry
-  the head cell's link.
+  the head cell's link. **The editor also opens document URLs itself**
+  (Ctrl+Click or right-click on an http(s) URL → `EffOpenUrl` →
+  `Clipboard.openUrl`: xdg-open/open/rundll32, fire-and-forget with stdio
+  swallowed and a reaper thread) because a mouse-reporting app rarely gets
+  its link clicks forwarded to the terminal's own OSC 8 handling; hovering
+  a URL sets `edHoverUrl` (a hand pointer via `pointerShapeAt`, and a
+  status-bar hint that overlays `edStatus` while hovering — hovering is the
+  current action, the message returns on move-off). `urlAtMouse` is the
+  shared hit-test (click-position semantics; CSV/image views never match);
+  any keystroke clears the hover state in the `handleEditKey` wrapper.
 
 - **Pixel image upgrade (`Cmedit.Gfx`).** When `TermCaps` shows kitty
   graphics (probe reply) or sixel (DA1 attr 4), `App.renderNow` overlays the

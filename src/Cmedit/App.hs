@@ -462,7 +462,7 @@ eventLoop editorRef prevRef titleRef q drv _src = registerDelay fsPollDelayUs >>
         case k of
           KMouse me -> do
             ed <- readIORef editorRef
-            let shape = pointerShapeFor ed (meRow me) (meCol me)
+            let shape = pointerShapeAt me ed
             old <- readIORef (drvPointer drv)
             when (shape /= old) $ do
               writeIORef (drvPointer drv) shape
@@ -625,6 +625,11 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
     mt <- pasteFromClipboard
     let txt = fromMaybe (edClipboard ed) mt
     pure (applyPaste txt ed)
+
+  EffOpenUrl url -> do
+    ok <- openUrl url
+    pure (if ok then ed
+          else setError "Cannot open link: no opener found (xdg-open)" ed)
 
   EffSaveTo path -> do
     -- If the active document is in CSV table mode, flush the table to the
