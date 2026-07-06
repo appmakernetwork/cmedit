@@ -15,7 +15,9 @@ module Cmedit.Gfx
   , GfxKind(..)
   , gfxFit
   , maxGfxPixels
+  , maxAnimGfxPixels
   , kittyPlace
+  , kittyPlaceAnim
   , sixelPlace
     -- * Encoders (exposed for tests)
   , base64B
@@ -117,6 +119,44 @@ kittyPlace (row, col) (cols, rows) (pxW, pxH) rgba =
           m = if BS.null rest then 0 else 1
           part = apc (header first m <> char7 ';' <> base64B now)
       in if BS.null rest then part else part <> chunks False rest
+
+-- | Total pixels we are willing to transmit for one animation upload (all
+-- frames together). Kitty stores every frame, so this bounds both the
+-- encode/transmit cost and the terminal's storage; 'placeGfx' scales the
+-- frames' common resolution down to fit (the terminal stretches the payload
+-- into the same cell box, so a long animation just gets a little softer).
+maxAnimGfxPixels :: Int
+maxAnimGfxPixels = 4 * 1000 * 1000
+
+-- | Place an animation via the kitty protocol: transmit the root frame
+-- exactly like 'kittyPlace' (so it displays immediately), then send every
+-- further frame with the animation-frame action (@a=f@) carrying its
+-- per-frame gap, set the root frame's gap (it cannot be given at creation),
+-- and hand the loop to the terminal (@s=3,v=1@ = run, loop forever). The
+-- terminal then animates on its own — the editor never ticks. Each frame is
+-- full-canvas RGBA at the same resolution as the root, with @q=2@ keeping the
+-- terminal quiet. A kitty-protocol terminal predating animation support
+-- simply shows the root frame — the still image, exactly the graceful floor.
+kittyPlaceAnim :: (Int, Int) -> (Int, Int) -> (Int, Int) -> [(BS.ByteString, Int)] -> Builder
+kittyPlaceAnim _ _ _ [] = mempty
+kittyPlaceAnim pos box (pxW, pxH) ((root, rootGap) : rest) =
+  kittyPlace pos box (pxW, pxH) root
+    <> mconcat [ frameB gap dat | (dat, gap) <- rest ]
+    <> apc (string7 "Ga=a,i=1,q=2,r=1,z=" <> intDec (max 1 rootGap))
+    <> apc (string7 "Ga=a,i=1,q=2,s=3,v=1")
+  where
+    frameB gap dat = chunks True dat
+      where
+        header first m
+          | first = string7 "Ga=f,i=1,f=32,q=2,s=" <> intDec pxW <> string7 ",v=" <> intDec pxH
+                      <> string7 ",z=" <> intDec (max 1 gap) <> string7 ",m=" <> intDec m
+          -- Continuation chunks of frame data carry only a=f, q and m.
+          | otherwise = string7 "Ga=f,q=2,m=" <> intDec m
+        chunks first bs =
+          let (now, restB) = BS.splitAt 3072 bs
+              m = if BS.null restB then 0 else 1
+              part = apc (header first m <> char7 ';' <> base64B now)
+          in if BS.null restB then part else part <> chunks False restB
 
 -- | Place raw RGBA pixels as a sixel graphic at @(row, col)@. The terminal
 -- paints the pixels over that region at its own cell raster; the caller

@@ -1335,8 +1335,9 @@ drawImage ed idoc lo arr = do
         putCell arr cols rows (top+r) (left+c) blankCell
     else do
       let grid = case idCache idoc of
-                   Just (c, r, m, cr, px, g)
-                     | c == tw && r == th && m == idMode idoc && cr == crop && px == pxk -> g
+                   Just (c, r, m, cr, px, fr, g)
+                     | c == tw && r == th && m == idMode idoc && cr == crop && px == pxk
+                         && fr == idFrame idoc -> g
                    _ -> renderImage (cellAspect ed) (imageFitCap ed idoc) (idMode idoc) tw th crop (idImage idoc)
       forM_ [0 .. th-1] $ \r -> forM_ [0 .. tw-1] $ \c ->
         putCell arr cols rows (top+r) (left+c) (grid ! (r, c))

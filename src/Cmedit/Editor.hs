@@ -25,11 +25,16 @@ module Cmedit.Editor
   , recentMenuPaths
     -- * Image view mode
   , ImageDoc(..)
+  , mkImageDoc
   , imageLoaded
   , imageLoadedNew
   , addImageDocument
   , refreshImage
   , imageCrop
+  , imageAnim
+  , imageKittyAnim
+  , imageTickUs
+  , tickImage
     -- * Terminal-reported appearance (driver callbacks)
   , resolvedTheme
   , setDetectedDark

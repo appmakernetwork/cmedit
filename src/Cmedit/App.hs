@@ -41,7 +41,7 @@ import Cmedit.Definition (DefReq(..))
 import qualified Cmedit.Definition as D
 import Cmedit.Editor
 import Cmedit.Gfx
-import Cmedit.Image (Image, imgW, imgH, sniffImage, decodeImage, scaleRGBA)
+import Cmedit.Image (Image, imgW, imgH, sniffImage, decodeFrames, scaleRGBA)
 import Cmedit.Input
 import Cmedit.Render
 import Cmedit.Search (SearchReq(..), FileResult(..))
@@ -271,6 +271,10 @@ data GfxKey = GfxKey
   , gkGeom :: !(Int, Int, Int, Int)     -- ^ (top, left, tw, th) of the text area.
   , gkPx   :: !(Int, Int)               -- ^ Cell pixel size in effect.
   , gkKind :: !GfxKind
+  , gkFrame :: !Int                     -- ^ Displayed animation frame. Static under
+                                        --   kitty (the terminal loops natively); the
+                                        --   editor's sixel tick steps it, re-placing
+                                        --   the picture each animation frame.
   } deriving (Eq, Show)
 
 -- | Persist the recent-files list when its path set/order changed (opens,
@@ -300,7 +304,8 @@ data SearchMsg
 -- Main loop
 
 -- One thing the loop woke up for.
-data LoopAction = GotKey !Key | GotLoad !LoadOutcome | GotSearch !SearchMsg | Tick | FsTick
+data LoopAction = GotKey !Key | GotLoad !LoadOutcome | GotSearch !SearchMsg
+                | Tick | FsTick | ImgTick
 
 -- Spinner animation interval (µs) while a background file load is in progress.
 spinnerDelayUs :: Int
@@ -330,12 +335,23 @@ eventLoop editorRef prevRef titleRef q drv _src = registerDelay fsPollDelayUs >>
                  else if aboutAnimating ed0
                    then Just <$> registerDelay aboutTickUs
                    else pure Nothing
+      -- A separate timer steps an animated image when the editor drives the
+      -- animation (half-block cells or a sixel placement; a kitty terminal
+      -- loops natively so 'imageTickUs' is Nothing there). Armed with the
+      -- current frame's own delay, and not at all once nothing is animating —
+      -- a still image costs nothing, like the settled About box.
+      mimg <- case imageTickUs ed0 of
+                Just us -> Just <$> registerDelay us
+                Nothing -> pure Nothing
       action <- atomically $
                 (GotLoad   <$> readTQueue loadQ)
         `orElse` (GotSearch <$> readTQueue searchQ)
         `orElse` (GotKey    <$> readTQueue q)
         `orElse` (case mtick of
                     Just tv -> readTVar tv >>= check >> pure Tick
+                    Nothing -> retry)
+        `orElse` (case mimg of
+                    Just tv -> readTVar tv >>= check >> pure ImgTick
                     Nothing -> retry)
         `orElse` (readTVar pollT >>= check >> pure FsTick)
       case action of
@@ -364,6 +380,12 @@ eventLoop editorRef prevRef titleRef q drv _src = registerDelay fsPollDelayUs >>
         -- Advance the spinner(s) / About animation one frame.
         Tick -> do
           modifyIORef' editorRef (tickLoading . searchTick . tickAbout)
+          renderNow drv editorRef prevRef titleRef
+          loop pollT
+        -- Advance the animated image one frame ('tickImage' re-checks that
+        -- the editor still owns playback before stepping).
+        ImgTick -> do
+          modifyIORef' editorRef tickImage
           renderNow drv editorRef prevRef titleRef
           loop pollT
         -- Periodic filesystem freshness pass; repaint only if it changed anything.
@@ -475,7 +497,7 @@ applyReplyIO drv editorRef rep = do
   -- Mirror pixel-graphics support into the editor so the renderer can drop the
   -- half-block fallback under a real placement (kept in step with 'wantGfx').
   caps' <- readIORef (drvCaps drv)
-  modifyIORef' editorRef (setGfxCaps (tcKittyGfx caps' || tcSixel caps'))
+  modifyIORef' editorRef (setGfxCaps (tcKittyGfx caps') (tcSixel caps'))
   case rep of
     -- theme=auto: dark or light follows the reported background.
     TrBgColor r g b -> modifyIORef' editorRef (setDetectedDark (isDarkRgb r g b))
@@ -773,7 +795,7 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
 -- The result of reading and classifying a file, before it touches the editor.
 data LoadOutcome
   = OutText  !FilePath !LoadResult
-  | OutImage !FilePath !Image
+  | OutImage !FilePath ![(Image, Int)]   -- ^ Frames + delays (ms); singleton for a still.
   | OutError !String
 
 -- Read and classify a path without touching the editor. Refuses files that are
@@ -799,7 +821,7 @@ classifyFile path = do
             Left e   -> pure (OutError (show e))
             Right bs -> case sniffImage bs of
               Just _  -> pure (either (\err -> OutError (takeFileName path ++ ": " ++ err))
-                                      (OutImage path) (decodeImage bs))
+                                      (OutImage path) (decodeFrames bs))
               Nothing
                 | looksBinary bs ->
                     pure (OutError (takeFileName path ++ ": binary file ("
@@ -812,7 +834,7 @@ classifyFile path = do
 
 -- Apply a load outcome to the editor via the matching pure installer.
 applyOutcome :: (FilePath -> LoadResult -> Editor -> Editor)
-             -> (FilePath -> Image -> Editor -> Editor)
+             -> (FilePath -> [(Image, Int)] -> Editor -> Editor)
              -> LoadOutcome -> Editor -> Editor
 applyOutcome installText installImage o ed = case o of
   OutText p lr  -> installText p lr ed
@@ -822,7 +844,7 @@ applyOutcome installText installImage o ed = case o of
 -- Open a path synchronously (used at startup and for Revert). The interactive
 -- Open path (EffOpen) loads large files on a background thread instead.
 openPath :: (FilePath -> LoadResult -> Editor -> Editor)
-         -> (FilePath -> Image -> Editor -> Editor)
+         -> (FilePath -> [(Image, Int)] -> Editor -> Editor)
          -> FilePath -> Editor -> IO Editor
 openPath installText installImage path ed =
   flip (applyOutcome installText installImage) ed <$> classifyFile path
@@ -1197,9 +1219,15 @@ wantGfx caps ed = do
               , gkGeom = (loTextTop lo, loTextLeft lo, loTextWidth lo, loTextHeight lo)
               , gkPx   = cellPxKey ed
               , gkKind = kind
+              , gkFrame = idFrame idoc
               }
 
 -- Scale the cropped source to the fitted pixel size and emit the placement.
+-- A multi-frame image on kitty uploads the whole animation (each frame scaled
+-- to the same fitted resolution, bounded by 'maxAnimGfxPixels' in total) and
+-- lets the terminal loop it; on sixel the placement shows the current frame
+-- and the editor's animation tick re-places it per frame ('gkFrame' is in the
+-- key). A zoom crop on kitty deliberately shows a still (see 'imageKittyAnim').
 placeGfx :: Editor -> GfxKey -> Builder
 placeGfx ed key = fromMaybe mempty $ do
   idoc <- edImage ed
@@ -1213,6 +1241,18 @@ placeGfx ed key = fromMaybe mempty $ do
       allowUpscale = isJust (idCrop idoc) || gkPx key == (0, 0)
       (row, col, cols, rows, pxW, pxH) = gfxFit cellPx (top, left, tw, th) (cw, ch) allowUpscale
       rgba = scaleRGBA img (cx, cy, cw, ch) pxW pxH
+      frames = idFrames idoc
+      kittyAnim = gkKind key == GfxKitty && length frames > 1 && isNothing (idCrop idoc)
+      -- Shrink the common frame resolution so the whole upload fits the
+      -- animation budget; kitty stretches the payload back into the cell box.
+      animScale = min 1.0 (sqrt (fromIntegral maxAnimGfxPixels
+                                 / fromIntegral (max 1 (pxW * pxH * length frames)))) :: Double
+      apxW = max 1 (round (fromIntegral pxW * animScale))
+      apxH = max 1 (round (fromIntegral pxH * animScale))
+      animPayload = [ (scaleRGBA f (0, 0, imgW f, imgH f) apxW apxH, delay)
+                    | (f, delay) <- frames ]
   pure $ case gkKind key of
-    GfxKitty -> kittyPlace (row, col) (cols, rows) (pxW, pxH) rgba
+    GfxKitty
+      | kittyAnim -> kittyPlaceAnim (row, col) (cols, rows) (apxW, apxH) animPayload
+      | otherwise -> kittyPlace (row, col) (cols, rows) (pxW, pxH) rgba
     GfxSixel -> sixelPlace (row, col) (pxW, pxH) rgba
