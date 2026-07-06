@@ -253,7 +253,13 @@ in `README.md`; the cross-cutting structure that matters when editing:
   collapsed strip expands and focuses it, from any focus/mode), and the `✕`
   button closes the folder via a `DKConfirmCloseFolder` dialog. Per-file
   decorations (`fileMarkFor`: open/active/`●` modified/`◆` changed-on-disk)
-  are derived from the open documents. Panel state is global (like
+  are derived from the open documents. File names are also tinted by
+  **type** (`Render.fileKind`, by extension): displayable images get a
+  magenta `▦` glyph before the name, source we highlight is green, Markdown/
+  HTML cyan, JSON/YAML/CSV/… yellow, and known binary blobs are dimmed grey
+  so they read as "nothing to open" — but only for *unopened* files; the
+  open/active/modified state colours (and the selection highlight) take
+  precedence. Panel state is global (like
   `edBrowser`/`edMenu`), *not* per-document — don't add it to `Document`.
   **The tree self-refreshes**: expanding a directory always re-lists it (cached
   children show instantly, the fresh listing merges in), and the driver's

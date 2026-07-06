@@ -42,7 +42,7 @@ import qualified Cmedit.Regex as Rx
 import qualified Data.Sequence as Seq
 import Cmedit.Csv
 import Cmedit.Image (Image(..), ImgMode(..), decodeImage, sniffImage, renderImage, viewFit, scaleRGBA)
-import Cmedit.Render (renderEditor, renderFrame, scrollPlan, Screen(..), ScrollHint(..), Theme(..), defaultTheme, lightTheme, themeFor)
+import Cmedit.Render (renderEditor, renderFrame, scrollPlan, Screen(..), ScrollHint(..), Theme(..), defaultTheme, lightTheme, themeFor, FileKind(..), fileKind)
 import Cmedit.ConfigFile (ThemeName(..), defaultConfig)
 import Cmedit.Ansi (styleSgr, styleSgrWith)
 import Cmedit.Caps
@@ -993,6 +993,20 @@ main = do
   checkEq "cellAspect: unknown geometry = 1.0" (cellAspect ed0) 1.0
   check "cellAspect: reported geometry is clamped sane"
         (let a = cellAspect (setCellPx (9, 22) ed0) in a > 1.0 && a <= 1.6)
+
+  -- Explorer file-type classification -----------------------------------------
+  checkEq "fileKind: png is a displayable image" (fileKind "a/b/logo.png") FKImage
+  checkEq "fileKind: JPEG image (case-insensitive)" (fileKind "Photo.JPG") FKImage
+  checkEq "fileKind: source code we highlight" (fileKind "src/Main.hs") FKCode
+  checkEq "fileKind: python source" (fileKind "run.py") FKCode
+  checkEq "fileKind: markdown is markup" (fileKind "README.md") FKMarkup
+  checkEq "fileKind: html is markup" (fileKind "index.html") FKMarkup
+  checkEq "fileKind: json is data" (fileKind "pkg.json") FKData
+  checkEq "fileKind: csv is data" (fileKind "rows.csv") FKData
+  checkEq "fileKind: binary blob we cannot open" (fileKind "app.wasm") FKBinary
+  checkEq "fileKind: svg stays markup, not a displayable image" (fileKind "icon.svg") FKMarkup
+  checkEq "fileKind: unknown extension is plain" (fileKind "notes.txt") FKPlain
+  checkEq "fileKind: no extension is plain" (fileKind "Makefile") FKPlain
 
   -- Pointer-shape hints --------------------------------------------------------
   let edPtr = setLoaded "p.txt" (mkLR "hello world") ed0

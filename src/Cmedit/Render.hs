@@ -13,6 +13,8 @@ module Cmedit.Render
   , defaultTheme
   , lightTheme
   , themeFor
+  , FileKind(..)
+  , fileKind
   ) where
 
 import Control.Monad (forM_, when)
@@ -23,6 +25,7 @@ import Data.Array.MArray (freeze, newArray, readArray, writeArray)
 import Data.Array.ST (STArray)
 import Data.ByteString.Builder (Builder, charUtf8, intDec, string7)
 import qualified Data.Map.Strict as Map
+import Data.Char (toLower)
 import Data.List (find)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
@@ -46,7 +49,7 @@ import Cmedit.QuickOpen (QuickOpen(..))
 import qualified Cmedit.QuickOpen as Q
 import Cmedit.Dialog
 import Cmedit.Editor
-import System.FilePath (makeRelative)
+import System.FilePath (makeRelative, takeExtension)
 import Cmedit.Menu
 import Cmedit.Syntax
 import Cmedit.TextBuffer
@@ -921,6 +924,57 @@ drawExplorerStrip th _ed lo arr = do
   forM_ [ptop .. ptop + ph - 1] $ \r -> putCell arr cols rows r 0 (Cell ' ' sty)
   putCell arr cols rows ptop 0 (Cell '\xbb' sty)   -- » : expand
 
+-- | A coarse file-type classification (by extension) used to tint file names
+-- in the explorer and flag the images we can display. Purely a display hint;
+-- actual openability is still decided by content when a file is opened.
+data FileKind
+  = FKImage    -- ^ a raster image the viewer can display
+  | FKCode     -- ^ a source language we highlight/lint
+  | FKMarkup   -- ^ Markdown / HTML / XML
+  | FKData     -- ^ JSON / YAML / TOML / INI / CSV and friends
+  | FKBinary   -- ^ a known opaque/binary blob we cannot open as text
+  | FKPlain    -- ^ anything else (treated as plain text)
+  deriving (Eq, Show)
+
+-- | Extensions of raster images the viewer can decode ('Cmedit.Image'). Kept in
+-- step with the magic-byte sniffer there — this is only the explorer's hint.
+imageExtensions :: [String]
+imageExtensions =
+  ["png","jpg","jpeg","gif","bmp","webp","ppm","pgm","pbm","pnm"]
+
+fileKind :: FilePath -> FileKind
+fileKind path
+  | ext `elem` imageExtensions            = FKImage
+  | Just lang <- langForPath (Just path)  = case lang of
+      Markdown -> FKMarkup
+      HTML     -> FKMarkup
+      JSON     -> FKData
+      YAML     -> FKData
+      TOML     -> FKData
+      INI      -> FKData
+      CSV      -> FKData
+      _        -> FKCode
+  | S.binaryExtension path                = FKBinary
+  | otherwise                             = FKPlain
+  where ext = map toLower (drop 1 (takeExtension path))
+
+-- | Name colour for a file kind against the panel background (unopened files;
+-- open/active/modified files keep their state colour). Binary blobs are dimmed
+-- so they read as "nothing to open here".
+fileKindStyle :: Theme -> FileKind -> Style
+fileKindStyle th k = case k of
+  FKImage  -> Style Magenta Default attrNone
+  FKCode   -> Style Green   Default attrNone
+  FKMarkup -> Style Cyan    Default attrNone
+  FKData   -> Style Yellow  Default attrNone
+  FKBinary -> Style BrightBlack Default attrNone
+  FKPlain  -> thText th
+
+-- | The leading glyph for a file kind (only images get one for now), or a space.
+fileKindIcon :: FileKind -> Char
+fileKindIcon FKImage = '\x25a6'   -- ▦ : a displayable image
+fileKindIcon _       = ' '
+
 -- The expanded panel: a header (folder name + collapse/close buttons), the
 -- directory tree with open/modified/disk-changed decorations, and a divider.
 drawExplorerPanel :: Theme -> Editor -> Layout -> Surf s -> ST s ()
@@ -958,6 +1012,7 @@ drawExplorerPanel th ed lo arr = do
             isDir = fnIsDir node
             indent = depth * 2
             path = fnPath node
+            kind = if isDir then FKPlain else fileKind path
             fmk  = if isDir then Nothing else fileMarkFor ed path
             open = isJust fmk
             modi = maybe False fmModified fmk
@@ -978,7 +1033,7 @@ drawExplorerPanel th ed lo arr = do
               | active     = Style BrightWhite Default attrBold
               | modi       = Style Yellow Default attrNone
               | open       = Style BrightWhite Default attrNone
-              | otherwise  = thText th
+              | otherwise  = fileKindStyle th kind   -- tint unopened files by type
             statusCh | disk = '\x25c6'   -- ◆ changed on disk since opened
                      | modi = '\x25cf'   -- ● unsaved edits
                      | otherwise = ' '
@@ -1001,6 +1056,13 @@ drawExplorerPanel th ed lo arr = do
             avail    = max 0 (sizeCol - nameCol)
         fillRect arr cols rows r 0 1 pcw rowSty
         putCell arr cols rows r startCol (Cell markCh rowSty)
+        -- Type glyph just before the name (currently only displayable images).
+        let iconCh  = fileKindIcon kind
+            iconCol = nameCol - 1
+            iconSty | selected  = selSty
+                    | otherwise = fileKindStyle th kind
+        when (iconCh /= ' ' && iconCol >= startCol && iconCol < sizeCol) $
+          putCell arr cols rows r iconCol (Cell iconCh iconSty)
         drawStr arr cols rows r nameCol nameSty (take avail nameStr)
         drawStr arr cols rows r sizeCol sizeSty sizeStr
         putCell arr cols rows r statusCol (Cell statusCh statusSty)
