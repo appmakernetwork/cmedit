@@ -558,7 +558,11 @@ statusRightInfo ed = flatten segs
       Just idoc ->
         let img = idImage idoc
             m   = case idMode idoc of HalfBlock -> "colour"; Ascii -> "ASCII"
-        in [ plain (imgFmt img ++ "  " ++ show (imgW img) ++ "\xd7" ++ show (imgH img)
+            nf  = length (idFrames idoc)
+            anim = if nf > 1
+                     then "frame " ++ show (idFrame idoc + 1) ++ "/" ++ show nf ++ "  "
+                     else ""
+        in [ plain (anim ++ imgFmt img ++ "  " ++ show (imgW img) ++ "\xd7" ++ show (imgH img)
                     ++ "   IMAGE/" ++ m ++ " ") ]
       Nothing -> case edCsv ed of
         Just v ->

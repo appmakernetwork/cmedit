@@ -130,15 +130,27 @@ data Document = Document
 -- re-scale on resize or a mode toggle. This is a wholly separate view mode to
 -- both plain-text and CSV — nothing here flows through the line buffer.
 data ImageDoc = ImageDoc
-  { idImage :: !Image
+  { idImage :: !Image                         -- ^ The frame currently displayed ('idFrames' !! 'idFrame').
   , idMode  :: !ImgMode
   , idCrop  :: !(Maybe (Int, Int, Int, Int))  -- ^ Zoomed view rect in source px (x,y,w,h); Nothing = whole image.
   , idDrag  :: !(Maybe (Int, Int, Int, Int))  -- ^ In-progress drag rect in text-area cells (aRow,aCol,curRow,curCol).
+  , idFrames :: ![(Image, Int)]               -- ^ All frames with their delays (ms); a singleton for a static image.
+  , idFrame  :: !Int                          -- ^ Index of the displayed frame in 'idFrames'.
     -- The cache key carries the cell pixel geometry ('cellPxKey') as well as
-    -- size/mode/crop: a font-size change alters the fitted shape even when the
-    -- cell grid dimensions stay the same.
-  , idCache :: !(Maybe (Int, Int, ImgMode, (Int, Int, Int, Int), (Int, Int), Array (Int, Int) Cell))
+    -- size/mode/crop/frame: a font-size change alters the fitted shape even
+    -- when the cell grid dimensions stay the same, and an animation step must
+    -- re-scale the new frame.
+  , idCache :: !(Maybe (Int, Int, ImgMode, (Int, Int, Int, Int), (Int, Int), Int, Array (Int, Int) Cell))
   } deriving (Show)
+
+-- | Build the image-view model for a decoded frame sequence (never empty; the
+-- first frame becomes the displayed one).
+mkImageDoc :: [(Image, Int)] -> ImageDoc
+mkImageDoc frames@((img, _) : _) = ImageDoc
+  { idImage = img, idMode = HalfBlock, idCrop = Nothing, idDrag = Nothing
+  , idFrames = frames, idFrame = 0, idCache = Nothing
+  }
+mkImageDoc [] = error "mkImageDoc: empty frame list"  -- decoders never produce this
 
 data Editor = Editor
   { edBuffer        :: !Buffer
@@ -218,6 +230,7 @@ data Editor = Editor
   , edDetectedDark  :: !(Maybe Bool)    -- ^ OSC 11 verdict: the terminal background is dark (drives @theme = auto@; Nothing until the terminal answers).
   , edCellPx        :: !(Maybe (Int, Int)) -- ^ One character cell's (width, height) in pixels, when the terminal reported it (image aspect ratio).
   , edGfxCaps       :: !Bool             -- ^ The terminal supports a pixel-graphics protocol (kitty or sixel); the driver mirrors 'Cmedit.Caps.TermCaps' here so the renderer can suppress the half-block picture under a real placement.
+  , edGfxKitty      :: !Bool             -- ^ Specifically the kitty graphics protocol (whose native animation loop the terminal drives itself; sixel and the cell fallback are stepped by the editor's tick instead).
   } deriving (Show)
 
 -- | A fresh editor for the given terminal size and config.
@@ -300,6 +313,7 @@ newEditor size cfg = Editor
   , edDetectedDark  = Nothing
   , edCellPx        = Nothing
   , edGfxCaps       = False
+  , edGfxKitty      = False
   }
 
 -- | The theme to draw with this frame: an explicit config choice wins; with
@@ -346,10 +360,11 @@ imageFitCap ed idoc = case edCellPx ed of
   _                                              -> Nothing
 
 -- | Record whether the terminal supports a pixel-graphics protocol (the driver
--- mirrors 'Cmedit.Caps.TermCaps' after each capability reply). Feeds
--- 'imageOverlayActive'.
-setGfxCaps :: Bool -> Editor -> Editor
-setGfxCaps b ed = ed { edGfxCaps = b }
+-- mirrors 'Cmedit.Caps.TermCaps' after each capability reply): @kitty@ then
+-- @sixel@. Feeds 'imageOverlayActive' and the animation scheduling
+-- ('imageTickUs' — a kitty terminal loops the animation itself).
+setGfxCaps :: Bool -> Bool -> Editor -> Editor
+setGfxCaps kitty sixel ed = ed { edGfxCaps = kitty || sixel, edGfxKitty = kitty }
 
 -- | Will a real pixel-graphics placement cover the image view this frame? True
 -- exactly when the terminal can draw pixels ('edGfxCaps') and the active image
@@ -371,6 +386,50 @@ imageOverlayActive ed = case edImage ed of
          && isNothing (edLoading ed)
          && isNothing (idDrag idoc)
          && loTextWidth lo > 0 && loTextHeight lo > 0
+
+-- | The active image doc, when it is a multi-frame animation.
+imageAnim :: Editor -> Maybe ImageDoc
+imageAnim ed = case edImage ed of
+  Just idoc | length (idFrames idoc) > 1 -> Just idoc
+  _                                      -> Nothing
+
+-- | The kitty terminal drives the animation loop itself: the driver uploads
+-- every frame with its gap alongside the placement and issues the run-loop
+-- control, so the editor must not also step frames. Holds whenever a kitty
+-- placement covers the view; under a zoom crop the placement is a still of
+-- the current frame (re-uploading a cropped frame per tick would be a
+-- client-driven animation at full transmission cost), so the animation
+-- deliberately freezes while zoomed on kitty.
+imageKittyAnim :: Editor -> Bool
+imageKittyAnim ed =
+  isJust (imageAnim ed) && edGfxKitty ed && imageOverlayActive ed
+    && maybe True (isNothing . idCrop) (edImage ed)
+
+-- | Microseconds until the next animation frame is due, when the *editor*
+-- must step the animation itself — the half-block cell picture, or a sixel
+-- placement re-emitted per frame. 'Nothing' when there is nothing to animate,
+-- a load is in progress, or a kitty placement covers the view (the terminal
+-- loops natively / a crop freezes it — see 'imageKittyAnim'). Cell steps are
+-- held to >= 50ms; sixel steps additionally scale with the placement's pixel
+-- area, since each one re-encodes and re-transmits the whole picture (a huge
+-- placement animates slower rather than flooding the terminal).
+imageTickUs :: Editor -> Maybe Int
+imageTickUs ed = case imageAnim ed of
+  Nothing -> Nothing
+  Just idoc
+    | isJust (edLoading ed)                    -> Nothing
+    | edGfxKitty ed && imageOverlayActive ed   -> Nothing
+    | loTextWidth lo <= 0 || loTextHeight lo <= 0 -> Nothing
+    | otherwise ->
+        let delay = snd (idFrames idoc !! (idFrame idoc `mod` max 1 (length (idFrames idoc))))
+            floorMs
+              | imageOverlayActive ed =        -- sixel re-upload per step
+                  let (cw, ch) = case cellPxKey ed of (0, 0) -> (8, 16); p -> p
+                      pxArea = loTextWidth lo * cw * loTextHeight lo * ch
+                  in max 100 (pxArea `div` 5000)
+              | otherwise = 50                 -- cell repaint per step
+        in Just (1000 * max floorMs delay)
+  where lo = computeLayout ed
 
 -- | The mouse-pointer shape to suggest for a screen cell (the OSC 22 hint the
 -- driver emits on hover): an I-beam over editable text, a hand over the

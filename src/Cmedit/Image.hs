@@ -19,6 +19,8 @@ module Cmedit.Image
   ( Image(..)
   , ImgMode(..)
   , decodeImage
+  , decodeFrames
+  , decodeGIFFrames
   , sniffImage
   , renderImage
   , viewFit
@@ -30,7 +32,7 @@ import Control.Monad.ST (ST, runST)
 import Data.Array (Array, listArray)
 import qualified Data.Array as A
 import Data.Array.ST (STArray, STUArray, newArray, readArray, writeArray, runSTUArray)
-import Data.Array.MArray (freeze)
+import Data.Array.MArray (freeze, thaw)
 import Data.Array.Unboxed (UArray, (!), bounds)
 import qualified Data.Array.Unboxed as U
 import Data.Bits
@@ -151,6 +153,16 @@ decodeImage bs = case sniffImage bs of
   Just "PNM"  -> decodePNM bs
   Just "WebP" -> decodeWebP bs
   _           -> Left "unrecognised image format"
+
+-- | Decode a recognised image into its full frame sequence: every frame is a
+-- fully-composed canvas-sized RGBA image paired with its display time in
+-- milliseconds. Static formats yield a single frame; an animated GIF yields
+-- them all (up to the 'maxAnimBytes' memory budget). Never returns an empty
+-- list on 'Right'.
+decodeFrames :: BS.ByteString -> Either String [(Image, Int)]
+decodeFrames bs = case sniffImage bs of
+  Just "GIF" -> decodeGIFAnim bs
+  _          -> (\img -> [(img, 0)]) <$> decodeImage bs
 
 ------------------------------------------------------------------------------
 -- BMP (Windows bitmap)
@@ -346,55 +358,110 @@ readAsciiSamples bs pos n = go pos n []
 -- the harder decoders are written).
 
 ------------------------------------------------------------------------------
--- GIF (87a/89a) — LZW-compressed, palette-indexed. We render the first frame.
+-- GIF (87a/89a) — LZW-compressed, palette-indexed. Every frame is decoded and
+-- composed onto the logical-screen canvas (honouring each frame's
+-- sub-rectangle, local palette, transparency and disposal method), so an
+-- animation comes out as a list of full-canvas RGBA frames plus per-frame
+-- delays. 'decodeGIF' keeps the cheap single-image path (it stops after the
+-- first frame).
+
+-- Memory budget for a decoded animation (RGBA bytes across all frames): a
+-- longer GIF is truncated to the frames that fit rather than exhausting
+-- memory. 256 MiB holds e.g. ~340 full-canvas frames of a 640x480 GIF.
+maxAnimBytes :: Int
+maxAnimBytes = 256 * 1024 * 1024
 
 decodeGIF :: BS.ByteString -> Either String Image
-decodeGIF bs = do
+decodeGIF = fmap (fst . head) . decodeGIFFrames 1
+
+-- All frames within the memory budget.
+decodeGIFAnim :: BS.ByteString -> Either String [(Image, Int)]
+decodeGIFAnim bs = do
+  when' (BS.length bs < 13) "truncated GIF header"
+  let w = le16 bs 6; h = le16 bs 8
+  checkDims w h
+  decodeGIFFrames (max 1 (maxAnimBytes `div` max 1 (w * h * 4))) bs
+
+-- The most recent Graphic Control Extension's fields, as they apply to the
+-- frame that follows it.
+data GifGce = GifGce
+  { gceTrans    :: !(Maybe Int)  -- ^ Transparent palette index.
+  , gceDelayMs  :: !Int          -- ^ Display time, clamped ('gifDelayMs').
+  , gceDisposal :: !Int          -- ^ 0/1 leave, 2 clear to transparent, 3 restore previous.
+  }
+
+gceDefault :: GifGce
+gceDefault = GifGce Nothing (gifDelayMs 0) 0
+
+-- Centiseconds -> milliseconds; a zero or tiny delay means 100ms, the
+-- convention browsers settled on for GIFs authored with delay 0.
+gifDelayMs :: Int -> Int
+gifDelayMs cs = let ms = cs * 10 in if ms < 20 then 100 else ms
+
+-- One image descriptor, validated, with the GCE in effect when it appeared.
+data GifFrame = GifFrame
+  { gfLeft, gfTop, gfW, gfH :: !Int
+  , gfInterlace :: !Bool
+  , gfPalOff    :: !Int          -- ^ Colour-table offset in the file (local wins over global).
+  , gfMinCode   :: !Int
+  , gfDataOff   :: !Int          -- ^ Offset of the LZW minimum-code byte's first sub-block.
+  , gfGce       :: !GifGce
+  }
+
+-- | Decode at most @cap@ frames (the animation entry point computes the cap
+-- from the memory budget; 'decodeGIF' passes 1). A malformed *first* frame is
+-- an error; damage after at least one good frame truncates the animation
+-- instead — a partly-downloaded GIF still shows what it has.
+decodeGIFFrames :: Int -> BS.ByteString -> Either String [(Image, Int)]
+decodeGIFFrames cap bs = do
   when' (BS.length bs < 13) "truncated GIF header"
   let w = le16 bs 6
       h = le16 bs 8
       packed = at bs 10
       gctFlag = testBit packed 7
       gctSize = 1 `shiftL` ((packed .&. 7) + 1)
-      gctOff  = 13
       p0 = 13 + (if gctFlag then 3*gctSize else 0)
-      gct = (gctFlag, gctOff)
   checkDims w h
-  parseBlocks bs w h gct p0 Nothing
+  case walkFrames bs gctFlag cap p0 gceDefault of
+    (frames, merr)
+      | null frames -> Left (maybe "GIF has no image data" id merr)
+      | otherwise   -> Right (composeGifFrames bs w h frames)
 
--- Walk top-level GIF blocks until the first image; thread the most recent
--- Graphic Control Extension's transparent-colour index.
-parseBlocks :: BS.ByteString -> Int -> Int -> (Bool, Int) -> Int -> Maybe Int
-            -> Either String Image
-parseBlocks bs w h gct pos mtrans
-  | pos >= BS.length bs = Left "GIF ended before any image"
-  | otherwise = case at bs pos of
-      0x3B -> Left "GIF has no image data"
-      0x21 ->                                   -- extension
-        let label = atSafe bs (pos+1)
-        in if label == 0xF9 && atSafe bs (pos+2) == 4
-             then let p2 = at bs (pos+3)
-                      trans = if testBit p2 0 then Just (at bs (pos+6)) else Nothing
-                  in parseBlocks bs w h gct (skipSubBlocks bs (pos+2)) trans
-             else parseBlocks bs w h gct (skipSubBlocks bs (pos+2)) mtrans
-      0x2C -> decodeGifImage bs w h gct pos mtrans
-      _    -> Left ("unexpected GIF block 0x" ++ show (at bs pos))
+-- Walk the top-level block stream collecting frame descriptors; returns the
+-- frames found and the error that stopped the walk early, if any.
+walkFrames :: BS.ByteString -> Bool -> Int -> Int -> GifGce
+           -> ([GifFrame], Maybe String)
+walkFrames bs gctFlag cap0 pos0 gce0 = go cap0 pos0 gce0
+  where
+    go cap pos gce
+      | cap <= 0            = ([], Nothing)
+      | pos >= BS.length bs = ([], Just "GIF ended before any image")
+      | otherwise = case at bs pos of
+          0x3B -> ([], Just "GIF has no image data")
+          0x21 ->                                   -- extension
+            let label = atSafe bs (pos+1)
+                -- Bounds-guarded: a GIF cut off inside a GCE truncates the
+                -- animation instead of indexing past the end.
+                gce' | label == 0xF9 && atSafe bs (pos+2) == 4
+                       && pos + 7 <= BS.length bs =
+                         let p2 = at bs (pos+3)
+                         in GifGce
+                              { gceTrans = if testBit p2 0 then Just (at bs (pos+6)) else Nothing
+                              , gceDelayMs = gifDelayMs (le16 bs (pos+4))
+                              , gceDisposal = (p2 `shiftR` 2) .&. 7
+                              }
+                     | otherwise = gce
+            in go cap (skipSubBlocks bs (pos+2)) gce'
+          0x2C -> case frameAt bs gctFlag pos gce of
+            Left err        -> ([], Just err)
+            Right (f, pos') -> let (fs, merr) = go (cap-1) pos' gceDefault
+                               in (f : fs, merr)
+          b    -> ([], Just ("unexpected GIF block 0x" ++ show b))
 
-atSafe :: BS.ByteString -> Int -> Int
-atSafe bs i = maybe (-1) id (atM bs i)
-
--- pos points at the first sub-block length byte; returns the index just past
--- the 0x00 terminator.
-skipSubBlocks :: BS.ByteString -> Int -> Int
-skipSubBlocks bs = go
-  where go p = case atM bs p of
-                 Nothing -> BS.length bs
-                 Just 0  -> p+1
-                 Just n  -> go (p + 1 + n)
-
-decodeGifImage :: BS.ByteString -> Int -> Int -> (Bool, Int) -> Int -> Maybe Int
-               -> Either String Image
-decodeGifImage bs sw sh (gctFlag, gctOff) pos mtrans = do
+-- Validate one image descriptor at pos; also returns the position just past
+-- its pixel data.
+frameAt :: BS.ByteString -> Bool -> Int -> GifGce -> Either String (GifFrame, Int)
+frameAt bs gctFlag pos gce = do
   let left = le16 bs (pos+1)
       top  = le16 bs (pos+3)
       iw   = le16 bs (pos+5)
@@ -407,33 +474,85 @@ decodeGifImage bs sw sh (gctFlag, gctOff) pos mtrans = do
       dataOff0 = pos + 10 + (if lctFlag then 3*lctSize else 0)
       palOff
         | lctFlag   = lctOff                 -- local colour table takes priority
-        | gctFlag   = gctOff
+        | gctFlag   = 13
         | otherwise = -1
+  when' (pos + 10 > BS.length bs) "truncated GIF image descriptor"
   when' (iw <= 0 || ih <= 0) "GIF image has zero size"
   when' (not lctFlag && not gctFlag) "GIF has no colour table"
-  let minCode = at bs dataOff0
+  let minCode = atSafe bs dataOff0
   when' (minCode < 1 || minCode > 11) "bad GIF LZW code size"
-  let (lzwData, _) = collectSubBlocksBS bs (dataOff0 + 1)
-      idxRaw = lzwDecode minCode lzwData (iw*ih)
+  pure ( GifFrame { gfLeft = left, gfTop = top, gfW = iw, gfH = ih
+                  , gfInterlace = interlace, gfPalOff = palOff
+                  , gfMinCode = minCode, gfDataOff = dataOff0
+                  , gfGce = gce }
+       , skipSubBlocks bs (dataOff0 + 1) )
+
+-- Compose the frame sequence onto a shared canvas. Each displayed frame is
+-- the canvas after drawing; the working canvas for the next frame follows the
+-- previous frame's disposal method (0/1 leave, 2 clear the frame's rectangle
+-- to transparent, 3 restore the canvas from before the frame was drawn).
+composeGifFrames :: BS.ByteString -> Int -> Int -> [GifFrame] -> [(Image, Int)]
+composeGifFrames bs w h = go emptyCanvas
+  where
+    emptyCanvas :: UArray Int Word8
+    emptyCanvas = runSTUArray (newArray (0, max 0 (w*h*4 - 1)) 0)
+    go _ [] = []
+    go base (f:fs) =
+      let drawn = drawGifFrame bs w h base f
+          next = case gceDisposal (gfGce f) of
+                   2 -> clearGifRect w h drawn f
+                   3 -> base
+                   _ -> drawn
+      in (Image w h "GIF" drawn, gceDelayMs (gfGce f)) : go next fs
+
+-- Draw one frame's (possibly offset, possibly interlaced) pixels over a copy
+-- of the canvas; transparent-index pixels leave the canvas showing through.
+drawGifFrame :: BS.ByteString -> Int -> Int -> UArray Int Word8 -> GifFrame
+             -> UArray Int Word8
+drawGifFrame bs w h base f = runSTUArray $ do
+  a <- thaw base
+  let iw = gfW f; ih = gfH f
+      (lzwData, _) = collectSubBlocksBS bs (gfDataOff f + 1)
+      idxRaw = lzwDecode (gfMinCode f) lzwData (iw*ih)
       -- LZW output rows are in storage order; for an interlaced image that is
       -- the 4-pass sequence, so map each actual raster row to its stored row.
-      rowOrder = if interlace then gifInterlaceOrder ih else [0 .. ih-1]
+      rowOrder = if gfInterlace f then gifInterlaceOrder ih else [0 .. ih-1]
       invRow   = A.array (0, ih-1) (zip rowOrder [0 ..]) :: A.Array Int Int
-      idxAt x y = let d = invRow A.! y
-                  in if x < iw && d < ih then idxRaw ! (d*iw + x) else 0
+      palOff = gfPalOff f
       colAt k = let o = palOff + k*3
                 in if palOff >= 0 && o+2 < BS.length bs
                      then (at bs o, at bs (o+1), at bs (o+2)) else (0,0,0)
-  -- Composite the (possibly offset) frame onto the logical screen.
-  pure $ buildImage "GIF" sw sh $ \a ->
-    forM_ [0 .. sh-1] $ \y -> forM_ [0 .. sw-1] $ \x -> do
-      let ix = x - left; iy = y - top
-      if ix >= 0 && ix < iw && iy >= 0 && iy < ih
-        then do let k = idxAt ix iy
-                    (r,g,b) = colAt k
-                    al = if mtrans == Just k then 0 else 255
-                putRGBA a sw x y r g b al
-        else putRGBA a sw x y 0 0 0 0
+      mtrans = gceTrans (gfGce f)
+  forM_ [0 .. ih-1] $ \iy -> forM_ [0 .. iw-1] $ \ix -> do
+    let x = gfLeft f + ix; y = gfTop f + iy
+    when (x >= 0 && x < w && y >= 0 && y < h) $ do
+      let d = invRow A.! iy
+          k = if d < ih then idxRaw ! (d*iw + ix) else 0
+      unless (mtrans == Just k) $ do
+        let (r,g,b) = colAt k
+        putRGBA a w x y r g b 255
+  pure a
+
+-- Disposal 2: the frame's rectangle reverts to transparent for the next frame.
+clearGifRect :: Int -> Int -> UArray Int Word8 -> GifFrame -> UArray Int Word8
+clearGifRect w h drawn f = runSTUArray $ do
+  a <- thaw drawn
+  forM_ [max 0 (gfTop f) .. min (h-1) (gfTop f + gfH f - 1)] $ \y ->
+    forM_ [max 0 (gfLeft f) .. min (w-1) (gfLeft f + gfW f - 1)] $ \x ->
+      putRGBA a w x y 0 0 0 0
+  pure a
+
+atSafe :: BS.ByteString -> Int -> Int
+atSafe bs i = maybe (-1) id (atM bs i)
+
+-- pos points at the first sub-block length byte; returns the index just past
+-- the 0x00 terminator.
+skipSubBlocks :: BS.ByteString -> Int -> Int
+skipSubBlocks bs = go
+  where go p = case atM bs p of
+                 Nothing -> BS.length bs
+                 Just 0  -> p+1
+                 Just n  -> go (p + 1 + n)
 
 -- The raster rows in GIF interlace storage order (4 passes).
 gifInterlaceOrder :: Int -> [Int]

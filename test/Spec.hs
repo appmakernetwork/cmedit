@@ -41,7 +41,7 @@ import qualified Cmedit.Definition as D
 import qualified Cmedit.Regex as Rx
 import qualified Data.Sequence as Seq
 import Cmedit.Csv
-import Cmedit.Image (Image(..), ImgMode(..), decodeImage, sniffImage, renderImage, viewFit, scaleRGBA)
+import Cmedit.Image (Image(..), ImgMode(..), decodeImage, decodeFrames, decodeGIFFrames, sniffImage, renderImage, viewFit, scaleRGBA)
 import Cmedit.Render (renderEditor, renderFrame, scrollPlan, Screen(..), ScrollHint(..), Theme(..), defaultTheme, lightTheme, themeFor, FileKind(..), fileKind)
 import Cmedit.ConfigFile (ThemeName(..), defaultConfig)
 import Cmedit.Ansi (styleSgr, styleSgrWith)
@@ -641,6 +641,47 @@ main = do
                  ++ [0,0,0,4]  ++ s "IDAT" ++ [0xde,0xad,0xbe,0xef] ++ [0,0,0,0]
                  ++ [0,0,0,0]  ++ s "IEND" ++ [0,0,0,0])
   check "corrupt PNG -> error" (isLeft (decodeImage badPng))
+  -- Animated GIF: the full frame sequence, with sub-rectangle composition,
+  -- transparency, disposal methods and the delay clamp.
+  case decodeFrames mkGIFAnim of
+    Left e -> check ("gif anim decode: " ++ e) False
+    Right frames -> do
+      checkEq "gif anim frame count" (length frames) 3
+      checkEq "gif anim delays (50cs, clamp 0 -> 100ms, 30cs)"
+              (map snd frames) [500, 100, 300]
+      case map fst frames of
+        [f1, f2, f3] -> do
+          checkEq "gif f1 TL red"    (pixelAt f1 0 0) (255,0,0,255)
+          checkEq "gif f1 TR green"  (pixelAt f1 1 0) (0,255,0,255)
+          checkEq "gif f1 BL blue"   (pixelAt f1 0 1) (0,0,255,255)
+          checkEq "gif f1 BR yellow" (pixelAt f1 1 1) (255,255,0,255)
+          -- Frame 2 paints yellow over TL; its transparent TR pixel leaves
+          -- frame 1's green showing through; the bottom row is untouched.
+          checkEq "gif f2 TL painted"     (pixelAt f2 0 0) (255,255,0,255)
+          checkEq "gif f2 TR sees f1"     (pixelAt f2 1 0) (0,255,0,255)
+          checkEq "gif f2 BL untouched"   (pixelAt f2 0 1) (0,0,255,255)
+          -- Frame 2's disposal 2 clears its top-row rectangle before frame 3
+          -- (which draws only a transparent pixel); the bottom row survives.
+          checkEq "gif f3 TL cleared"     (pixelAt f3 0 0) (0,0,0,0)
+          checkEq "gif f3 TR cleared"     (pixelAt f3 1 0) (0,0,0,0)
+          checkEq "gif f3 BL survives"    (pixelAt f3 0 1) (0,0,255,255)
+          checkEq "gif f3 BR survives"    (pixelAt f3 1 1) (255,255,0,255)
+        _ -> check "gif anim: three frames" False
+  -- decodeImage still yields just the first frame (the cheap still path).
+  case decodeImage mkGIFAnim of
+    Left e   -> check ("gif first frame: " ++ e) False
+    Right im -> checkEq "gif decodeImage = frame 1" (pixelAt im 0 0) (255,0,0,255)
+  -- The frame cap truncates a long animation instead of decoding unboundedly.
+  checkEq "gif frame cap truncates"
+          (either (const 0) length (decodeGIFFrames 2 mkGIFAnim)) 2
+  -- A GIF cut off mid-stream keeps the frames already decoded.
+  checkEq "gif truncated keeps whole frames"
+          (either (const 0) length
+             (decodeFrames (BS.pack (gifAnimHeader ++ gifAnimF1 ++ take 4 gifAnimF2)))) 1
+  -- Nonsense dimensions are refused up front, never allocated.
+  check "gif huge header refused"
+        (isLeft (decodeFrames (BS.pack (map (fromIntegral . fromEnum) "GIF89a"
+                                        ++ le16b 30000 ++ le16b 30000 ++ [0x91,0,0]))))
   -- Rendering produces a grid of exactly the requested size.
   case decodeImage bmp of
     Right im -> do
@@ -650,28 +691,53 @@ main = do
       -- in the panel (no keystroke editing in the read-only image view);
       -- opened any other way it takes the editor focus like a normal document.
       check "image opened from the panel keeps panel focus"
-            (edFocus (imageLoadedNew "/w/pic.bmp" im edExp) == FExplorer)
+            (edFocus (imageLoadedNew "/w/pic.bmp" [(im, 0)] edExp) == FExplorer)
       check "image opened elsewhere focuses the view"
-            (edFocus (imageLoadedNew "/w/pic.bmp" im ed0) == FEdit)
+            (edFocus (imageLoadedNew "/w/pic.bmp" [(im, 0)] ed0) == FEdit)
       -- The half-block cell picture is drawn only when no pixel placement will
       -- cover it; with graphics caps present the renderer blanks the area so the
       -- blocky fallback / checkerboard can't bleed through the overlay.
-      let edImgE = setGfxCaps True (imageLoaded "/w/pic.bmp" im ed0)   -- caps + editor
+      let edImgE = setGfxCaps True False (imageLoaded "/w/pic.bmp" [(im, 0)] ed0)   -- caps + editor
       check "gfx overlay off without caps"
-            (not (imageOverlayActive (imageLoaded "/w/pic.bmp" im ed0)))
+            (not (imageOverlayActive (imageLoaded "/w/pic.bmp" [(im, 0)] ed0)))
       check "gfx overlay on with caps (image focused)"
             (imageOverlayActive edImgE)
       check "gfx overlay on with caps (panel focused)"
-            (imageOverlayActive (setGfxCaps True (imageLoaded "/w/pic.bmp" im edExp)))
+            (imageOverlayActive (setGfxCaps True False (imageLoaded "/w/pic.bmp" [(im, 0)] edExp)))
       check "gfx overlay off when the search view obscures the image"
             (not (imageOverlayActive (edImgE { edSearchMode = True })))
+      -- Animation scheduling: who steps the frames depends on the terminal.
+      let anim2 = [(im, 500), (im, 100)]
+          edAnim = imageLoaded "/w/anim.gif" anim2 ed0          -- no gfx caps
+          edAnimK = setGfxCaps True False edAnim                -- kitty
+          edAnimS = setGfxCaps False True edAnim                -- sixel
+      check "still image never ticks"
+            (imageTickUs (imageLoaded "/w/pic.bmp" [(im, 0)] ed0) == Nothing)
+      check "cell fallback ticks at the frame delay"
+            (imageTickUs edAnim == Just 500000)
+      check "cell fallback clamps tiny delays to 50ms"
+            (imageTickUs (tickImage edAnim) == Just 100000
+             && imageTickUs (tickImage edAnim { edImage = fmap (\d -> d { idFrames = [(im, 500), (im, 5)] }) (edImage edAnim) }) == Just 50000)
+      check "kitty animates natively (no editor tick)"
+            (imageTickUs edAnimK == Nothing && imageKittyAnim edAnimK)
+      check "kitty + zoom crop freezes (still no tick)"
+            (let edCrop = edAnimK { edImage = fmap (\d -> d { idCrop = Just (0,0,1,1) }) (edImage edAnimK) }
+             in imageTickUs edCrop == Nothing && not (imageKittyAnim edCrop))
+      check "sixel steps with a 100ms floor"
+            (maybe False (>= 100000) (imageTickUs edAnimS) && not (imageKittyAnim edAnimS))
+      check "tickImage advances and wraps"
+            (let f = maybe (-1) idFrame . edImage
+             in f edAnim == 0 && f (tickImage edAnim) == 1
+                && f (tickImage (tickImage edAnim)) == 0)
+      check "tickImage is a no-op when kitty owns playback"
+            (maybe (-1) idFrame (edImage (tickImage edAnimK)) == 0)
     Left _   -> check "render decode" False
   -- The image view is read-only and cursor-less: the terminal cursor must be
   -- hidden over a focused image (a text document still shows one).
   case decodeImage bmp of
     Right im -> do
       checkEq "image view hides the terminal cursor"
-              (scrCursor (renderEditor (imageLoaded "pic.bmp" im ed0))) Nothing
+              (scrCursor (renderEditor (imageLoaded "pic.bmp" [(im, 0)] ed0))) Nothing
       check "text view still places the cursor"
             (isJust' (scrCursor (renderEditor (setLoaded "t.txt" (mkLR "hi") ed0))))
     Left _ -> check "image cursor decode" False
@@ -1779,7 +1845,7 @@ main = do
   case decodeImage (mkBMP 2 2 [(255,0,0),(0,255,0),(0,0,255),(255,255,0)]) of
     Left _   -> check "image fixture decodes for find-menu test" False
     Right im -> do
-      let edImg = imageLoaded "/pic.png" im ed0
+      let edImg = imageLoaded "/pic.png" [(im, 0)] ed0
           findActs = [ a | MEItem _ _ a <- entriesFor edImg 2 ]   -- Find menu is index 2
       check "image view hides in-file Find/Replace/GoTo"
             (all (`notElem` findActs) [MAFind, MAFindNext, MAFindPrev, MAReplace, MAGoToLine])
@@ -2695,6 +2761,49 @@ le16b, le32b, be32b :: Int -> [Word8]
 le16b n = [fromIntegral (n .&. 255), fromIntegral ((n `shiftR` 8) .&. 255)]
 le32b n = [fromIntegral ((n `shiftR` (8*k)) .&. 255) | k <- [0..3]]
 be32b n = [fromIntegral ((n `shiftR` (8*k)) .&. 255) | k <- [3,2,1,0]]
+
+-- An animated 2x2 GIF89a in three parts (so tests can slice it): frame 1 is a
+-- full red/green/blue/yellow canvas at 50cs, frame 2 paints a 2x1 top-row
+-- sub-rectangle (yellow + a transparent pixel) with delay 0 and disposal 2,
+-- and frame 3 is a transparent 1x1 at 30cs — together exercising
+-- sub-rectangle composition, transparency, disposal 1/2 and the delay clamp.
+gifAnimHeader, gifAnimF1, gifAnimF2, gifAnimF3 :: [Word8]
+gifAnimHeader =
+     map (fromIntegral . fromEnum) "GIF89a" ++ le16b 2 ++ le16b 2 ++ [0x91, 0, 0]
+  ++ concat [[255,0,0],[0,255,0],[0,0,255],[255,255,0]]   -- GCT: red green blue yellow
+gifAnimF1 = [0x21,0xF9,4, 0x04] ++ le16b 50 ++ [0, 0]     -- disposal 1, 500ms
+         ++ [0x2C] ++ le16b 0 ++ le16b 0 ++ le16b 2 ++ le16b 2 ++ [0]
+         ++ gifLzw 2 [0,1,2,3]
+gifAnimF2 = [0x21,0xF9,4, 0x09] ++ le16b 0 ++ [0, 0]      -- disposal 2 + transp 0, 0cs
+         ++ [0x2C] ++ le16b 0 ++ le16b 0 ++ le16b 2 ++ le16b 1 ++ [0]
+         ++ gifLzw 2 [3,0]
+gifAnimF3 = [0x21,0xF9,4, 0x01] ++ le16b 30 ++ [0, 0]     -- transp 0, 300ms
+         ++ [0x2C] ++ le16b 0 ++ le16b 0 ++ le16b 1 ++ le16b 1 ++ [0]
+         ++ gifLzw 2 [0]
+
+mkGIFAnim :: BS.ByteString
+mkGIFAnim = BS.pack (gifAnimHeader ++ gifAnimF1 ++ gifAnimF2 ++ gifAnimF3 ++ [0x3B])
+
+-- Real LZW for tiny GIF fixtures: a clear code before every literal keeps the
+-- code width fixed at minCode+1 bits (the decoder accepts clears anywhere), so
+-- the packer needs no dictionary.
+gifLzw :: Int -> [Int] -> [Word8]
+gifLzw minCode pixels =
+  fromIntegral minCode : fromIntegral (length packed) : packed ++ [0]
+  where
+    clear = 2 ^ minCode
+    codes = concat [ [clear, p] | p <- pixels ] ++ [clear + 1]
+    packed = packBitsLSB (minCode + 1) codes
+
+-- Pack codes LSB-first at a fixed bit width (GIF's LZW bit order).
+packBitsLSB :: Int -> [Int] -> [Word8]
+packBitsLSB width = go 0 0
+  where
+    go acc n cs
+      | n >= 8 = fromIntegral (acc .&. 255) : go (acc `shiftR` 8) (n - 8) cs
+      | otherwise = case cs of
+          []      -> [fromIntegral (acc .&. 255) | n > 0]
+          (c : t) -> go (acc + c * 2 ^ n) (n + width) t
 
 -- A 24-bit uncompressed BMP from row-major (top-to-bottom) RGB pixels.
 mkBMP :: Int -> Int -> [(Word8,Word8,Word8)] -> BS.ByteString

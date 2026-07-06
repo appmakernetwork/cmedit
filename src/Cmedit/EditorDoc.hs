@@ -293,9 +293,10 @@ docFromLoad path lr = Document
 -- Image view mode (read-only). A wholly separate mode to text and CSV: the
 -- decoded image lives in 'edImage' and the line buffer stays empty/unused.
 
--- | Install a decoded image as the active read-only image document.
-imageLoaded :: FilePath -> Image -> Editor -> Editor
-imageLoaded path img ed = touchRecent path $ refreshImage $ ensureVisible ed
+-- | Install a decoded image (its full frame sequence) as the active read-only
+-- image document.
+imageLoaded :: FilePath -> [(Image, Int)] -> Editor -> Editor
+imageLoaded path frames ed = touchRecent path $ refreshImage $ ensureVisible ed
   { edBuffer = emptyBuffer, edSavedBuffer = emptyBuffer
   , edCursor = origin, edSelAnchor = Nothing, edDesiredCol = 0
   , edTop = 0, edLeft = 0
@@ -307,6 +308,7 @@ imageLoaded path img ed = touchRecent path $ refreshImage $ ensureVisible ed
   , edUndo = [], edRedo = [], edLastEdit = EKNone
   , edStatus = T.pack ("Viewing image  " ++ imgFmt img ++ " "
                 ++ show (imgW img) ++ "x" ++ show (imgH img)
+                ++ (if nframes > 1 then ", " ++ show nframes ++ " frames" else "")
                 ++ "  —  press 'a' for ASCII/colour")
     -- Opened from the file-explorer panel: keep the selection focus there
     -- (an image view has no keystroke editing to hand the focus to); every
@@ -315,27 +317,30 @@ imageLoaded path img ed = touchRecent path $ refreshImage $ ensureVisible ed
   , edDialog = Nothing, edSearchMode = False
   , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
   , edCsv = Nothing, edCsvStash = Nothing
-  , edImage = Just (ImageDoc img HalfBlock Nothing Nothing Nothing)
+  , edImage = Just (mkImageDoc frames)
   }
+  where img = case frames of ((i, _) : _) -> i
+                             []           -> error "imageLoaded: empty frame list"
+        nframes = length frames
 
 -- | Open a decoded image as a new document (reusing a pristine empty buffer if
 -- present), mirroring 'setLoadedNew' for text.
-imageLoadedNew :: FilePath -> Image -> Editor -> Editor
-imageLoadedNew path img ed = case switchToOpen path ed of
+imageLoadedNew :: FilePath -> [(Image, Int)] -> Editor -> Editor
+imageLoadedNew path frames ed = case switchToOpen path ed of
   Just ed'
     | edFocus ed == FExplorer -> ed' { edFocus = FExplorer }  -- see 'imageLoaded'
     | otherwise               -> ed'
   Nothing
-    | isPristine ed -> imageLoaded path img ed
-    | otherwise     -> imageLoaded path img ed { edBefore = edBefore ed ++ [captureDoc ed] }
+    | isPristine ed -> imageLoaded path frames ed
+    | otherwise     -> imageLoaded path frames ed { edBefore = edBefore ed ++ [captureDoc ed] }
 
 -- | Append an image document to the open-files list (startup, 2nd+ file).
-addImageDocument :: FilePath -> Image -> Editor -> Editor
-addImageDocument path img ed =
-  touchRecent path ed { edAfter = edAfter ed ++ [imageDocSnapshot path img] }
+addImageDocument :: FilePath -> [(Image, Int)] -> Editor -> Editor
+addImageDocument path frames ed =
+  touchRecent path ed { edAfter = edAfter ed ++ [imageDocSnapshot path frames] }
 
-imageDocSnapshot :: FilePath -> Image -> Document
-imageDocSnapshot path img = Document
+imageDocSnapshot :: FilePath -> [(Image, Int)] -> Document
+imageDocSnapshot path frames = Document
   { docBuffer = emptyBuffer, docSavedBuffer = emptyBuffer, docCursor = origin
   , docSelAnchor = Nothing, docDesiredCol = 0, docTop = 0, docLeft = 0
   , docPath = Just path, docModified = False
@@ -344,7 +349,7 @@ imageDocSnapshot path img = Document
   , docFinalNewline = True, docReadOnly = True
   , docUndo = [], docRedo = [], docLastEdit = EKNone, docOverwrite = False
   , docDiscard = False, docCsv = Nothing, docCsvStash = Nothing
-  , docImage = Just (ImageDoc img HalfBlock Nothing Nothing Nothing)
+  , docImage = Just (mkImageDoc frames)
   , docHlCache = Nothing
   }
 
@@ -361,14 +366,28 @@ refreshImage ed = case edImage ed of
         crop = imageCrop idoc
         pxk  = cellPxKey ed
         stale = case idCache idoc of
-                  Just (c,r,m,cr,px,_) -> c /= cols || r /= rows || m /= idMode idoc
-                                            || cr /= crop || px /= pxk
-                  Nothing              -> True
+                  Just (c,r,m,cr,px,fr,_) -> c /= cols || r /= rows || m /= idMode idoc
+                                               || cr /= crop || px /= pxk || fr /= idFrame idoc
+                  Nothing                 -> True
     in if stale && cols > 0 && rows > 0
          then ed { edImage = Just idoc
-                     { idCache = Just (cols, rows, idMode idoc, crop, pxk
+                     { idCache = Just (cols, rows, idMode idoc, crop, pxk, idFrame idoc
                                       , renderImage (cellAspect ed) (imageFitCap ed idoc) (idMode idoc) cols rows crop (idImage idoc)) } }
          else ed
+
+-- | Advance the animation one frame (driver tick; a no-op unless the editor
+-- is the one stepping the animation right now — see
+-- 'Cmedit.EditorState.imageTickUs', which the driver uses to arm the timer
+-- and this re-checks, since a menu or capability reply may have changed who
+-- owns playback between arming and firing).
+tickImage :: Editor -> Editor
+tickImage ed = case (imageTickUs ed, edImage ed) of
+  (Just _, Just idoc) ->
+    let n = max 1 (length (idFrames idoc))
+        next = (idFrame idoc + 1) `mod` n
+        (img, _) = idFrames idoc !! next
+    in refreshImage ed { edImage = Just idoc { idFrame = next, idImage = img } }
+  _ -> ed
 
 -- | Record the terminal's cell pixel geometry (driver callback: the winsize
 -- ioctl on startup/resize, or the XTWINOPS reply as a fallback) and re-fit
