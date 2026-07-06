@@ -5,6 +5,10 @@ module Cmedit.Ansi
     esc
   , csi
   , osc
+  , oscSt
+    -- * Hyperlinks (OSC 8)
+  , linkOpen
+  , linkClose
     -- * Screen / cursor control
   , clearScreen
   , clearToEol
@@ -63,7 +67,10 @@ module Cmedit.Ansi
   ) where
 
 import Data.ByteString.Builder (Builder, char7, intDec, string7, word8HexFixed)
+import Data.Text (Text)
+import Data.Text.Encoding (encodeUtf8Builder)
 import Data.Word (Word8)
+import Cmedit.Link (linkIdOf)
 import Cmedit.Types
 
 -- | The ESC byte.
@@ -79,6 +86,26 @@ csi b = esc <> char7 '[' <> b
 -- emit unconditionally.
 osc :: Builder -> Builder
 osc b = esc <> char7 ']' <> b <> char7 '\BEL'
+
+-- | Like 'osc' but terminated with ST (@ESC \\@) instead of BEL — the
+-- terminator the OSC 8 hyperlink spec prescribes. Unknown-OSC skipping in
+-- terminals handles either framing, so this is equally safe unconditionally.
+oscSt :: Builder -> Builder
+oscSt b = esc <> char7 ']' <> b <> esc <> char7 '\\'
+
+-- | Open an OSC 8 hyperlink: every printable cell emitted until 'linkClose'
+-- (or the next 'linkOpen') becomes part of the link. The @id=@ parameter is
+-- derived from the URI so a link spanning several runs, rows or frames
+-- hovers as a single unit. The caller is responsible for the URI containing
+-- no control bytes ("Cmedit.Link" produces percent-encoded targets).
+linkOpen :: Text -> Builder
+linkOpen uri =
+  oscSt (string7 "8;id=" <> string7 (linkIdOf uri) <> char7 ';'
+           <> encodeUtf8Builder uri)
+
+-- | Close the open hyperlink (OSC 8 with an empty target).
+linkClose :: Builder
+linkClose = oscSt (string7 "8;;")
 
 -- | Clear the whole screen.
 clearScreen :: Builder

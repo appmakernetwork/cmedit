@@ -8,7 +8,7 @@ import Data.Bits (shiftR, (.&.))
 import Data.IORef
 import Data.Word (Word8)
 import Data.Either (isLeft)
-import Data.List (intercalate, isInfixOf, isPrefixOf, isSuffixOf)
+import Data.List (intercalate, isInfixOf, isPrefixOf, isSuffixOf, tails)
 import System.Exit (exitFailure, exitSuccess)
 import qualified Data.ByteString as BS
 import qualified Data.Text as T
@@ -18,6 +18,7 @@ import qualified Data.Array as A
 import Data.Array.Unboxed ((!))
 
 import Cmedit.Types
+import Cmedit.Link (filePathUri, urlSpans, linkIdOf)
 import Cmedit.About (aboutCanvasH, aboutTotalFrames, aboutFrameCells)
 import Cmedit.HelpCard (helpCanvasH, helpCanvasMinW, helpFrameCells)
 import Cmedit.Manual (manualPath)
@@ -803,6 +804,15 @@ main = do
       vtRun g0 s0 = go g0 (0, 0) "" Nothing ' ' s0
         where
           go g _ _ _ _ [] = g
+          -- OSC/DCS/APC strings (hyperlinks, titles, …) place no cells:
+          -- skip to the BEL or ST terminator like a real terminal.
+          go g pos sgr mg lch ('\ESC' : c0 : rest)
+            | c0 `elem` ("]P_" :: String) = skipStr rest
+            where
+              skipStr ('\BEL' : r') = go g pos sgr mg lch r'
+              skipStr ('\ESC' : '\\' : r') = go g pos sgr mg lch r'
+              skipStr (_ : r') = skipStr r'
+              skipStr [] = g
           go g (r, c) sgr mg lch ('\ESC' : '[' : rest) =
             let (params, rest1) = span (\x -> isDigit x || x `elem` (";?<>=" :: String)) rest
             in case rest1 of
@@ -919,6 +929,66 @@ main = do
         (normEq (scrW scrLb) (scrH scrLb)
                 (vtRun (seedGrid scrLa) (builderStr (renderFrame repCaps (Just scrLa) scrLb)))
                 (seedGrid scrLb))
+
+  -- OSC 8 hyperlinks: URI building, URL recognition, and emission -------------
+  checkEq "link: file uri percent-encodes"
+          (filePathUri "/tmp/a b.txt") (Just "file:///tmp/a%20b.txt")
+  checkEq "link: file uri unicode"
+          (filePathUri "/tmp/caf\233.txt") (Just "file:///tmp/caf%C3%A9.txt")
+  checkEq "link: relative path has no uri" (filePathUri "d.txt") Nothing
+  checkEq "link: pseudo path has no uri" (filePathUri "cmedit://Manual.md") Nothing
+  checkEq "link: windows drive path"
+          (filePathUri "C:\\dir\\f.txt") (Just "file:///C:/dir/f.txt")
+  checkEq "link: url span with trailing dot trimmed"
+          (urlSpans "see https://example.com/x. end")
+          [(4, 25, "https://example.com/x")]
+  checkEq "link: parenthesised url drops the closer"
+          (urlSpans "(https://a.b/c)") [(1, 14, "https://a.b/c")]
+  checkEq "link: balanced wiki parens survive"
+          (urlSpans "https://en.wikipedia.org/wiki/Foo_(bar)")
+          [(0, 39, "https://en.wikipedia.org/wiki/Foo_(bar)")]
+  checkEq "link: bare scheme is not a link" (urlSpans "http:// nope") []
+  checkEq "link: plain text has none" (urlSpans "nothing to see here") []
+  check "link: two urls, both found"
+        (length (urlSpans "https://a.b/1 and http://c.d/2") == 2)
+  check "link: id is stable and hex"
+        (linkIdOf "https://a.b/1" == linkIdOf "https://a.b/1"
+         && all (`elem` ("0123456789abcdef" :: String)) (linkIdOf "https://a.b/1"))
+  -- A document line containing a URL emits an OSC 8 open around it and a
+  -- close after — and the replay (which skips OSC strings) is still exact.
+  let edUrl  = setLoaded "u.txt" (mkLR "docs at https://example.com/guide today\nplain") ed0
+      scrUrl = renderEditor edUrl
+      urlStream = builderStr (renderFrame plainCaps Nothing scrUrl)
+  check "link: url in text emits OSC 8 open with id"
+        ("\ESC]8;id=" `isInfixOf` urlStream)
+  check "link: emission closes the link"
+        ("\ESC]8;;\ESC\\" `isInfixOf` urlStream)
+  check "link: full redraw with links replays exactly"
+        (vtRun M.empty urlStream == seedGrid scrUrl)
+  -- No link, no OSC 8 bytes at all (portable stream unchanged).
+  check "link: linkless frame emits no OSC 8"
+        (not ("\ESC]8" `isInfixOf` builderStr (renderFrame plainCaps Nothing (head scrsD))))
+  -- The status bar links an absolute file path.
+  let edAbs = setLoaded "/tmp/abs.txt" (mkLR "hello") ed0
+      absStream = builderStr (renderFrame plainCaps Nothing (renderEditor edAbs))
+  check "link: status bar links absolute paths"
+        ("file:///tmp/abs.txt" `isInfixOf` absStream)
+  check "link: status bar replay exact"
+        (vtRun M.empty absStream == seedGrid (renderEditor edAbs))
+  -- REP never merges a run across a link boundary: two half-rows of the
+  -- same glyph with different targets must open two separate links.
+  let linkCell u = CellL 'x' defaultStyle (Just u)
+      lrow = [ linkCell (if c < 10 then "https://a.example/" else "https://b.example/")
+             | c <- [0 .. (19 :: Int)] ]
+      lscr = Screen { scrW = 20, scrH = 1
+                    , scrCells = A.listArray (0, 19) lrow
+                    , scrCursor = Nothing, scrHint = Nothing }
+      lstream = builderStr (renderFrame (plainCaps { rcRep = True }) Nothing lscr)
+      countInfix pat s = length [ () | t <- tails s, pat `isPrefixOf` t ]
+  check "link: REP run breaks at a link boundary"
+        (countInfix "\ESC]8;id=" lstream == 2)
+  check "link: REP-linked row replays exactly"
+        (vtRun M.empty lstream == seedGrid lscr)
 
   -- Styled underline emission: colon form only under the capability.
   checkEq "undercurl: colon form when supported"

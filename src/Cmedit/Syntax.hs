@@ -18,6 +18,7 @@ module Cmedit.Syntax
   , langForPath
   , initialState
   , lexLine
+  , maxHlLine
     -- * Comment syntax (Edit ▸ Toggle Comment)
   , CommentSyntax(..)
   , langComment

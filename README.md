@@ -196,6 +196,10 @@ escape sequences and the POSIX `termios` API.
   over, the cursor colour matches the theme, the window **title is
   pushed/popped** instead of clobbered, and finishing a long search or load
   while the terminal is unfocused posts a **desktop notification** (OSC 9).
+  URLs in your text and the file names in the explorer, search results and
+  status bar are **real hyperlinks** (OSC 8) — hover underlines them and
+  Ctrl+Click opens the target — in any terminal that supports links, and
+  invisible everywhere else.
   A terminal that answers none of the probes simply gets the portable
   escape stream cmedit always emitted — every upgrade is opt-in by evidence.
 
@@ -297,6 +301,7 @@ logic unit-testable without a terminal.
 | Module | Responsibility |
 | --- | --- |
 | `Cmedit.Types` | Shared types: keys, mouse, colours, styles, cells |
+| `Cmedit.Link` | OSC 8 hyperlink targets: URL recognition in text, `file://` URIs, link ids |
 | `Cmedit.ConfigFile` | The `~/.config/cmedit` config file + persisted recent-files list |
 | `Cmedit.Term` | The platform layer (`platform/{posix,windows}`, one module two implementations): raw mode, window size, resize/terminate wiring, walker stat |
 | `Cmedit.Ansi` | ANSI/VT escape-sequence builders (incl. queries, sync output, scroll regions) |

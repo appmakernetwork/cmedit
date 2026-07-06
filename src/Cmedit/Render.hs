@@ -42,6 +42,7 @@ import Cmedit.Search
 import qualified Cmedit.Search as S
 import qualified Data.Sequence as Seq
 import Cmedit.Csv (CsvView(..))
+import Cmedit.Link (filePathUri, urlSpans)
 import qualified Cmedit.Csv as Csv
 import Cmedit.ConfigFile (ThemeName(..))
 import Cmedit.Definition (DefPick(..), DefItem(..))
@@ -269,6 +270,12 @@ drawStr :: Surf s -> Int -> Int -> Int -> Int -> Style -> String -> ST s ()
 drawStr arr cols rows r c0 st s =
   forM_ (zip [0 ..] s) $ \(k, ch) -> putCell arr cols rows r (c0 + k) (Cell ch st)
 
+-- | 'drawStr' with an OSC 8 hyperlink target attached to every cell
+-- ('Nothing' is a plain 'drawStr', so callers can pass a computed target).
+drawStrL :: Surf s -> Int -> Int -> Int -> Int -> Style -> Maybe Text -> String -> ST s ()
+drawStrL arr cols rows r c0 st mlnk s =
+  forM_ (zip [0 ..] s) $ \(k, ch) -> putCell arr cols rows r (c0 + k) (CellL ch st mlnk)
+
 -- Like 'drawStr' but underlines the character at index @ui@ (the menu
 -- mnemonic). A negative @ui@ underlines nothing.
 drawStrU :: Surf s -> Int -> Int -> Int -> Int -> Style -> Int -> String -> ST s ()
@@ -336,7 +343,7 @@ drawTextArea th ed lo arr
                          ++ [ (bc, bc + 1, thBracket th) | Pos brl bc <- brs, brl == bl ]
               cells = expandLineCellsFrom tabw (edShowWhitespace ed)
                         baseAt (thSelection th) (thWhitespace th)
-                        selRange selEOL overlays
+                        selRange selEOL overlays (urlLinks line)
                         startCol startDisp (T.drop startCol line)
               visible = takeWhile (\(d, _) -> d < left + tw)
                           (dropWhile (\(d, _) -> d < left) cells)
@@ -369,7 +376,7 @@ drawTextAreaWrapped th ed lo arr = loop (edTop ed) 0
                          ++ [ (bc, bc + 1, thBracket th) | Pos brl bc <- brs, brl == li ]
               cells = expandLineCells tabw (edShowWhitespace ed)
                         baseAt (thSelection th) (thWhitespace th)
-                        selRange False overlays line
+                        selRange False overlays (urlLinks line) line
           vrow' <- drawSegs li line cells eolFlag segs 0 vrow
           loop (li + 1) vrow'
     drawSegs _ _ _ _ [] _ vrow = pure vrow
@@ -406,20 +413,24 @@ lineSelInterval (Just (Pos sl sc, Pos el ec)) bl len
 -- continuation cells.
 expandLineCells
   :: Int -> Bool -> (Int -> Style) -> Style -> Style
-  -> Maybe (Int, Int) -> Bool -> [(Int, Int, Style)] -> Text -> [(Int, Cell)]
-expandLineCells tabw showWS baseAt selSty wsSty msel selEOL overlays line =
-  expandLineCellsFrom tabw showWS baseAt selSty wsSty msel selEOL overlays 0 0 line
+  -> Maybe (Int, Int) -> Bool -> [(Int, Int, Style)] -> [(Int, Int, Text)]
+  -> Text -> [(Int, Cell)]
+expandLineCells tabw showWS baseAt selSty wsSty msel selEOL overlays links line =
+  expandLineCellsFrom tabw showWS baseAt selSty wsSty msel selEOL overlays links 0 0 line
 
 -- | 'expandLineCells' starting from character index @i0@ (whose display
 -- column is @d0@) with the leading characters already dropped from @line@ —
 -- so a view deep into a huge single line only expands the window, not the
 -- whole prefix. @overlays@ are absolute character intervals painted with the
 -- given style (find matches, the bracket pair); the selection wins where they
--- overlap, and the first covering overlay wins among themselves.
+-- overlap, and the first covering overlay wins among themselves. @links@ are
+-- absolute character intervals whose cells carry an OSC 8 hyperlink target
+-- (independent of styling; a wide glyph's continuation cells carry it too).
 expandLineCellsFrom
   :: Int -> Bool -> (Int -> Style) -> Style -> Style
-  -> Maybe (Int, Int) -> Bool -> [(Int, Int, Style)] -> Int -> Int -> Text -> [(Int, Cell)]
-expandLineCellsFrom tabw showWS baseAt selSty wsSty msel selEOL overlays i0 d0 line =
+  -> Maybe (Int, Int) -> Bool -> [(Int, Int, Style)] -> [(Int, Int, Text)]
+  -> Int -> Int -> Text -> [(Int, Cell)]
+expandLineCellsFrom tabw showWS baseAt selSty wsSty msel selEOL overlays links i0 d0 line =
   go d0 i0 (T.unpack line)
   where
     inSel i = case msel of Just (s, e) -> i >= s && i < e; Nothing -> False
@@ -429,27 +440,38 @@ expandLineCellsFrom tabw showWS baseAt selSty wsSty msel selEOL overlays i0 d0 l
     styAt i | inSel i = selSty
             | otherwise = fromMaybe (baseAt i) (overlayAt i)
     wsAt i  = if inSel i then selSty else wsSty
+    lnkAt i = case [ u | (s, e, u) <- links, i >= s, i < e ] of
+                (u : _) -> Just u
+                []      -> Nothing
+    mkC i ch s = CellL ch s (lnkAt i)
     go dcol _ [] = [ (dcol, Cell ' ' selSty) | selEOL ]
     go dcol i (c : cs)
       | c == '\t' =
           let w = tabw - dcol `mod` tabw
               s = styAt i
               cells = if showWS
-                        then (dcol, Cell '\8594' (wsAt i))
-                               : [ (dcol + k, Cell ' ' s) | k <- [1 .. w - 1] ]
-                        else [ (dcol + k, Cell ' ' s) | k <- [0 .. w - 1] ]
+                        then (dcol, mkC i '\8594' (wsAt i))
+                               : [ (dcol + k, mkC i ' ' s) | k <- [1 .. w - 1] ]
+                        else [ (dcol + k, mkC i ' ' s) | k <- [0 .. w - 1] ]
           in cells ++ go (dcol + w) (i + 1) cs
       | isControlChar c =
           let s = styAt i
               cc = take 2 (controlCaret c ++ "  ")
-          in (dcol, Cell (cc !! 0) s) : (dcol + 1, Cell (cc !! 1) s)
+          in (dcol, mkC i (cc !! 0) s) : (dcol + 1, mkC i (cc !! 1) s)
                : go (dcol + 2) (i + 1) cs
       | otherwise =
           let w = max 1 (charWidth c)
               s = styAt i
               c' = if showWS && c == ' ' then '\183' else c
-              cont = [ (dcol + k, Cell contChar s) | k <- [1 .. w - 1] ]
-          in (dcol, Cell c' s) : cont ++ go (dcol + w) (i + 1) cs
+              cont = [ (dcol + k, mkC i contChar s) | k <- [1 .. w - 1] ]
+          in (dcol, mkC i c' s) : cont ++ go (dcol + w) (i + 1) cs
+
+-- | The URL hyperlink spans of a document line, with the same length guard
+-- as highlighting so a megabyte-long minified line can't dominate a frame.
+urlLinks :: Text -> [(Int, Int, Text)]
+urlLinks line
+  | T.length line > maxHlLine = []
+  | otherwise = urlSpans line
 
 -- Map a syntax token to a display style (per-theme palette).
 tokStyle :: Theme -> Tok -> Style
@@ -582,12 +604,19 @@ drawStatus th ed lo arr = do
       tabs = if fileCount ed > 1
                then "[" ++ show (fileIndex ed) ++ "/" ++ show (fileCount ed) ++ "] "
                else ""
-      left = " " ++ modi ++ tabs ++ name ++ ro
+      prefix = " " ++ modi ++ tabs
+      left = prefix ++ name ++ ro
+      -- The file name is an OSC 8 hyperlink to the file itself (absolute
+      -- real paths only — untitled buffers and cmedit:// pseudo-paths give
+      -- 'Nothing' and draw plain).
+      nameLink = filePathUri =<< edPath ed
       -- The right side (and its clickable zones) comes from the shared
       -- builder in Cmedit.Editor so mouse hit-testing can never disagree.
       right = fst (statusRightInfo ed)
       status = T.unpack (edStatus ed)
-  drawStr arr cols rows r 0 (thStatus th) left
+  drawStr arr cols rows r 0 (thStatus th) prefix
+  drawStrL arr cols rows r (length prefix) (thStatus th) nameLink name
+  drawStr arr cols rows r (length prefix + length name) (thStatus th) ro
   -- transient status message just after the filename
   when (not (null status)) $
     drawStr arr cols rows r (length left + 2) (thStatusKey th) status
@@ -1064,7 +1093,9 @@ drawExplorerPanel th ed lo arr = do
                     | otherwise = fileKindStyle th kind
         when (iconCh /= ' ' && startCol < sizeCol) $
           putCell arr cols rows r startCol (Cell iconCh iconSty)
-        drawStr arr cols rows r nameCol nameSty (take avail nameStr)
+        -- The name is an OSC 8 hyperlink to the file/folder, so a
+        -- terminal that supports links lets Ctrl+Click open it in the OS.
+        drawStrL arr cols rows r nameCol nameSty (filePathUri path) (take avail nameStr)
         drawStr arr cols rows r sizeCol sizeSty sizeStr
         putCell arr cols rows r statusCol (Cell statusCh statusSty)
 
@@ -1198,7 +1229,9 @@ drawResultRow th ss arr cols rows r left w srow selected = do
             cntSty = if selected then selSty else Style BrightBlack Default attrNone
             cntCol = left + w - length cntS - 1
         putCell arr cols rows r (left + 1) (Cell chev rowBg)
-        drawStr arr cols rows r (left + 3) nmSty (take (max 0 (cntCol - (left + 3) - 1)) nm)
+        -- The file header is an OSC 8 hyperlink to the matched file.
+        drawStrL arr cols rows r (left + 3) nmSty (filePathUri (frPath fr))
+                 (take (max 0 (cntCol - (left + 3) - 1)) nm)
         let dirCol = left + 3 + length nm + 1
         when (dirCol < cntCol) $
           drawStr arr cols rows r dirCol dirSty (take (max 0 (cntCol - dirCol - 1)) dir)
@@ -1527,22 +1560,32 @@ renderFrame caps mprev cur =
       sameSize = case mprev of
         Just p -> scrW p == scrW cur && scrH p == h
         Nothing -> False
-      body = case mprev of
+      (body, esEnd) = case mprev of
         Just p | sameSize ->
           case scrollPlan p cur of
             Just (top, bot, delta, predScr) ->
               -- Blank rows exposed by SU/SD are erased with the current
               -- background: reset SGR first so they match 'blankCell'.
-              resetSgr <> setScrollRegion top bot
-                <> (if delta > 0 then scrollUp delta else scrollDown (negate delta))
-                <> resetScrollRegion
-                <> diffRows caps predScr cur
+              let (d, es) = diffRows caps predScr cur
+              in ( resetSgr <> setScrollRegion top bot
+                     <> (if delta > 0 then scrollUp delta else scrollDown (negate delta))
+                     <> resetScrollRegion
+                     <> d
+                 , es )
             Nothing -> diffRows caps p cur
-        _ -> clearScreen <> mconcat (map (drawRow caps cur) [0 .. h - 1])
+        _ -> let (d, es) = foldl (\(acc, s) r -> let (b, s') = drawRow caps cur r s
+                                                 in (acc <> b, s'))
+                                 (mempty, emitState0) [0 .. h - 1]
+             in (clearScreen <> d, es)
       curPart = case scrCursor cur of
         Just (r, c) -> moveTo r c <> showCursor
         Nothing -> hideCursor
-  in hideCursor <> body <> resetSgr <> curPart
+      -- A frame never leaves a hyperlink open: whatever goes out next (the
+      -- title, graphics escapes, the next frame) must not join the link.
+      linkPart = case esLink esEnd of
+        Just _  -> linkClose
+        Nothing -> mempty
+  in hideCursor <> body <> linkPart <> resetSgr <> curPart
 
 -- | Decide whether to turn this frame transition into a hardware scroll:
 -- when both frames carry matching hints with a plausible shift, build the
@@ -1602,15 +1645,40 @@ bandDiffCells a b top hgt =
 bridgeGap :: Int
 bridgeGap = 12
 
+-- | The SGR and OSC 8 hyperlink state threaded across a frame's emission
+-- (the terminal keeps both across cursor moves), so a run only emits what
+-- actually changes. 'Nothing' for the style means "unknown, emit before the
+-- next cell"; 'Nothing' for the link means "no link open" — every frame both
+-- starts and ends with no link open ('renderFrame' closes a trailing one).
+data EmitState = EmitState
+  { esStyle :: !(Maybe Style)
+  , esLink  :: !(Maybe Text)
+  }
+
+emitState0 :: EmitState
+emitState0 = EmitState Nothing Nothing
+
+-- The escape prefix needed before painting a cell in the given state, and
+-- the state afterwards. Opening a different link implicitly replaces the
+-- previous one, so only a link→no-link transition emits a close.
+cellPre :: RenderCaps -> Cell -> EmitState -> (Builder, EmitState)
+cellPre caps cell es =
+  let st = cellStyle cell
+      lnk = cellLink cell
+      preS = if esStyle es == Just st then mempty else styleSgrWith caps st
+      preL | esLink es == lnk = mempty
+           | otherwise        = maybe linkClose linkOpen lnk
+  in (preS <> preL, EmitState (Just st) lnk)
+
 -- Emit only the changed cell runs of each row, threading the SGR state across
 -- the whole frame (the terminal keeps it across cursor moves), so a cursor
 -- move or single-character edit costs a handful of bytes instead of full rows.
-diffRows :: RenderCaps -> Screen -> Screen -> Builder
-diffRows caps p cur = fst (foldl step (mempty, Nothing) [0 .. scrH cur - 1])
+diffRows :: RenderCaps -> Screen -> Screen -> (Builder, EmitState)
+diffRows caps p cur = foldl step (mempty, emitState0) [0 .. scrH cur - 1]
   where
-    step (acc, mst) r =
-      let (b, mst') = drawSpans caps cur r (rowSpans p cur r) mst
-      in (acc <> b, mst')
+    step (acc, es) r =
+      let (b, es') = drawSpans caps cur r (rowSpans p cur r) es
+      in (acc <> b, es')
 
 -- The changed column spans of a row, bridging small unchanged gaps and
 -- widening over wide-glyph continuation sentinels so glyphs repaint whole.
@@ -1640,23 +1708,22 @@ rowSpans p cur r = go 0
 -- Emit the changed runs of one row, carrying the frame's SGR state through.
 -- With REP confirmed ('rcRep'), a run of identical ASCII cells collapses to
 -- one character plus CSI n b.
-drawSpans :: RenderCaps -> Screen -> Int -> [(Int, Int)] -> Maybe Style -> (Builder, Maybe Style)
-drawSpans caps cur r spans mst0 = foldl one (mempty, mst0) spans
+drawSpans :: RenderCaps -> Screen -> Int -> [(Int, Int)] -> EmitState -> (Builder, EmitState)
+drawSpans caps cur r spans es0 = foldl one (mempty, es0) spans
   where
     w = scrW cur
-    one (acc, mst) (a, e) = go (acc <> moveTo r a) mst a
+    one (acc, es) (a, e) = go (acc <> moveTo r a) es a
       where
-        go acc' mstyle c
-          | c > e = (acc', mstyle)
+        go acc' es' c
+          | c > e = (acc', es')
           | otherwise =
               let cell = cellAt cur w r c
               in if cellChar cell == contChar
-                   then go acc' mstyle (c + 1)   -- covered by the preceding wide glyph
+                   then go acc' es' (c + 1)   -- covered by the preceding wide glyph
                    else
-                     let st = cellStyle cell
-                         pre = if mstyle == Just st then mempty else styleSgrWith caps st
+                     let (pre, es'') = cellPre caps cell es'
                          n = cellRun caps cur w r c e cell
-                     in go (acc' <> pre <> emitRun cell n) (Just st) (c + n)
+                     in go (acc' <> pre <> emitRun cell n) es'' (c + n)
 
 cellAt :: Screen -> Int -> Int -> Int -> Cell
 cellAt scr w r c = scrCells scr ! (r * w + c)
@@ -1681,19 +1748,19 @@ emitRun cell n
   | otherwise = mconcat (replicate n (charUtf8 (cellChar cell)))
 
 -- Redraw a whole row, skipping wide-glyph continuation sentinels so physical
--- columns stay aligned. Emits SGR only when the style changes.
-drawRow :: RenderCaps -> Screen -> Int -> Builder
-drawRow caps cur r = moveTo r 0 <> go 0 Nothing
+-- columns stay aligned. Emits SGR / link changes only at transitions; the
+-- state threads across rows on the full-redraw path.
+drawRow :: RenderCaps -> Screen -> Int -> EmitState -> (Builder, EmitState)
+drawRow caps cur r es0 = go (moveTo r 0) es0 0
   where
     w = scrW cur
-    go c mstyle
-      | c >= w = mempty
+    go acc es c
+      | c >= w = (acc, es)
       | otherwise =
           let cell = cellAt cur w r c
           in if cellChar cell == contChar
-               then go (c + 1) mstyle    -- covered by the preceding wide glyph
+               then go acc es (c + 1)    -- covered by the preceding wide glyph
                else
-                 let st = cellStyle cell
-                     pre = if mstyle == Just st then mempty else styleSgrWith caps st
+                 let (pre, es') = cellPre caps cell es
                      n = cellRun caps cur w r c (w - 1) cell
-                 in pre <> emitRun cell n <> go (c + n) (Just st)
+                 in go (acc <> pre <> emitRun cell n) es' (c + n)

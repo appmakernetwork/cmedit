@@ -33,6 +33,7 @@ library
         c-sources:      cbits/cmedit_term.c
         build-depends:  unix
     exposed-modules:  Cmedit.Types
+                      Cmedit.Link
                       Cmedit.ConfigFile
                       Cmedit.About
                       Cmedit.HelpCard

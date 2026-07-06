@@ -137,6 +137,18 @@ in `README.md`; the cross-cutting structure that matters when editing:
   longer clobber the shell's; and the theme-matched cursor colour. All of
   these are ignored byte-for-byte by terminals that lack them, which is
   exactly why they need no capability gate.
+  **OSC 8 hyperlinks** are in this family too: `Cell` carries an optional
+  link target (`cellLink`; the `Cell c s` pattern synonym keeps the
+  two-field constructor working, `CellL` is the real one), the pure targets
+  come from `Cmedit.Link` (`urlSpans` for http(s) URLs in visible document
+  lines, `filePathUri` for the explorer / search-result headers / status-bar
+  name — absolute paths only, so untitled and `cmedit://` never link), and
+  the frame diff opens/closes links exactly like it threads SGR
+  (`EmitState` in Render; REP runs and screen diffing already respect links
+  because they compare whole cells). Every frame ends with the link closed
+  so driver-emitted escapes (title, graphics) can never join it. Keep new
+  cell emission link-aware: a wide glyph's continuation cells must carry
+  the head cell's link.
 
 - **Pixel image upgrade (`Cmedit.Gfx`).** When `TermCaps` shows kitty
   graphics (probe reply) or sixel (DA1 attr 4), `App.renderNow` overlays the

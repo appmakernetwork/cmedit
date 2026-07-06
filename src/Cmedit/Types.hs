@@ -1,6 +1,7 @@
 -- | Core shared types: keyboard/mouse events, colours, styles and screen
 -- positions. Kept dependency-free so every other module can import it.
 {-# LANGUAGE MagicHash #-}
+{-# LANGUAGE PatternSynonyms #-}
 module Cmedit.Types
   ( -- * Geometry
     Pos(..)
@@ -33,7 +34,8 @@ module Cmedit.Types
   , hasAttr
   , Style(..)
   , defaultStyle
-  , Cell(..)
+  , Cell(Cell, CellL, cellChar, cellStyle, cellLink)
+  , withLink
   , blankCell
     -- * Negotiated emitter capabilities
   , RenderCaps(..)
@@ -187,11 +189,28 @@ data Style = Style
 defaultStyle :: Style
 defaultStyle = Style Default Default attrNone
 
--- | One character cell in the screen back-buffer.
-data Cell = Cell
+-- | One character cell in the screen back-buffer. 'cellLink' is an OSC 8
+-- hyperlink target: the diff emitter opens/closes the link around runs of
+-- cells that carry it, and terminals without hyperlink support skip the OSC
+-- string bytes entirely, so it needs no capability gate. Wide-glyph
+-- continuation cells must carry the same link as their head cell.
+data Cell = CellL
   { cellChar  :: !Char
   , cellStyle :: !Style
+  , cellLink  :: !(Maybe Text)
   } deriving (Eq, Show)
+
+-- | The common no-link cell, in constructor position: almost every cell has
+-- no link target, so construction and matching stay two-field ('cellLink'
+-- participates in Eq regardless, which is what the frame diff needs).
+pattern Cell :: Char -> Style -> Cell
+pattern Cell c s <- CellL c s _ where
+  Cell c s = CellL c s Nothing
+{-# COMPLETE Cell #-}
+
+-- | Attach (or clear) a hyperlink target.
+withLink :: Maybe Text -> Cell -> Cell
+withLink l c = c { cellLink = l }
 
 blankCell :: Cell
 blankCell = Cell ' ' defaultStyle
