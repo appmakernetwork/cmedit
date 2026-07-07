@@ -96,9 +96,11 @@ escape sequences and the POSIX `termios` API.
   from-scratch `inflate`, WebP — both lossless VP8L and lossy VP8, boolean
   arithmetic decoder, loop filter and all — and Netpbm) is written from first
   principles using only GHC boot libraries.
-- **Dark and light themes**: `theme = light` in the config (or View ▸ Theme to
-  try it live) swaps the syntax palette for one readable on light terminal
-  backgrounds.
+- **Dark, light and cherry-blossom themes**: `theme = light` in the config (or
+  View ▸ Theme to pick one live, with preview) swaps the syntax palette for one readable on
+  light terminal backgrounds; `theme = cherry-blossom` is a light pink 24-bit
+  theme (after GymMaster's) that paints its own background on every cell, so it
+  looks the same whatever the terminal's colours.
 - **Syntax highlighting** for SQL (PostgreSQL), Python, JavaScript/TypeScript
   (`.js/.mjs/.jsx/.ts/.tsx`), CSS/SCSS/LESS, HTML/XML, FreeMarker (`.ftl`),
   Jinja, shell, Markdown, JSON, YAML, TOML, INI/conf and CSV — including
