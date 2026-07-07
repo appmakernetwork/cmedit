@@ -1442,6 +1442,40 @@ main = do
   check "huge csv: typing at the end sets modified" (edModified edHE1)
   check "huge csv: undo clears modified exactly" (not (edModified edHE2))
 
+  -- CSV row rendering with wide (2-cell) glyphs -------------------------------
+  -- Regression for cali_gyms.csv row 17 (Description "\x2728The Portal\x2728…"):
+  -- the CSV row draw path was string-indexed, so a wide-glyph char consumed
+  -- one grid cell instead of two and every column right of that cell shifted
+  -- left by one per glyph. After the fix, the column separator (U+2502) sits
+  -- at the same screen column on every row, regardless of the cell's content.
+  let edEmojiCsv = setLoaded "/tmp/e.csv"
+                     (loadFromBytes False Nothing
+                       (TE.encodeUtf8
+                         (T.pack "hdr,x\n\x2728\&ab,1\ncdxx,2\n")))
+                     (newEditor (24, 80) defaultConfig)
+      scrEC     = renderEditor edEmojiCsv
+      wEC       = scrW scrEC
+      cellAtEC r c = scrCells scrEC A.! (r * wEC + c)
+      sepAtEC r = [ c | c <- [0 .. wEC - 1]
+                      , cellChar (cellAtEC r c) == '\x2502' ]
+      -- First separator column on each row identifies where the first data
+      -- column ends. Rows 3 and 4 hold "✨ab,1" and "cdxx,2" respectively.
+      sep3 = sepAtEC 3
+      sep4 = sepAtEC 4
+  check "csv wide-glyph row has a column separator"
+    (not (null sep3))
+  check "csv separator column matches non-wide row"
+    (not (null sep3) && not (null sep4) && head sep3 == head sep4)
+  -- The wide glyph itself must be followed by a contChar continuation so the
+  -- diff renderer skips one cell and the terminal's own 2-cell emoji lands
+  -- exactly where cmedit's grid expects the next char.
+  let sparkleCol = [ c | c <- [0 .. wEC - 1]
+                       , cellChar (cellAtEC 3 c) == '\x2728' ]
+  check "wide glyph followed by contChar"
+    (case sparkleCol of
+       (c : _) | c + 1 < wEC -> cellChar (cellAtEC 3 (c + 1)) == '\0'
+       _                     -> False)
+
   -- Browser type-ahead ----------------------------------------------------------
   let taNames = ["alpha", "beta", "apple", "cherry", "avocado", "berry"]
       taBr = Br.mkBrowserNoParent "/t" [ ("/t/" ++ nm, False, Just 1) | nm <- taNames ]

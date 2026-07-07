@@ -745,13 +745,36 @@ drawStrU arr cols rows r c0 st ui s =
 
 -- | 'drawStr' but clip characters that would land at a screen column below
 -- @minC@ (used by the CSV table, whose column region is shifted left by
--- 'csvXOff' so the leftmost column is drawn partially). CSV cells emit one cell
--- per character — there are no wide-glyph 'contChar' continuations — so simply
--- dropping the clipped leading characters keeps the cell grid consistent.
+-- 'csvXOff' so the leftmost column is drawn partially). Wide-glyph aware:
+-- a 2-cell character writes the base cell plus a 'contChar' continuation
+-- into the next grid position so the diff renderer's contChar-skip keeps
+-- the grid and the terminal cursor in step; the caller must have already
+-- trimmed the string to the column's display width (see 'takeCellsPad'),
+-- since this function will otherwise happily walk past @c0 + w@.
 drawStrClipL :: Surf s -> Int -> Int -> Int -> Int -> Int -> Style -> String -> ST s ()
-drawStrClipL arr cols rows r c0 minC st s =
-  forM_ (zip [0 ..] s) $ \(k, ch) ->
-    when (c0 + k >= minC) $ putCell arr cols rows r (c0 + k) (Cell ch st)
+drawStrClipL arr cols rows r c0 minC st = go c0
+  where
+    go _ [] = pure ()
+    go !c (ch:cs) = do
+      let cw = max 1 (charWidth ch)
+      when (c >= minC) $ do
+        putCell arr cols rows r c (Cell ch st)
+        when (cw == 2) $ putCell arr cols rows r (c + 1) (Cell contChar st)
+      go (c + cw) cs
+
+-- | Trim @s@ to at most @w@ display cells, then pad with trailing spaces to
+-- exactly @w@ cells. A 2-cell glyph that would straddle the boundary is
+-- dropped (leaving a space in the last cell) so callers can rely on the
+-- returned string's cells-consumed count being exactly @w@.
+takeCellsPad :: Int -> String -> String
+takeCellsPad w s = go w s
+  where
+    go !left [] = replicate (max 0 left) ' '
+    go !left _ | left <= 0 = []
+    go !left (c:cs) =
+      let cw = max 1 (charWidth c)
+      in if cw <= left then c : go (left - cw) cs
+         else replicate left ' '
 
 fillRow :: Surf s -> Int -> Int -> Int -> Style -> ST s ()
 fillRow arr cols rows r st =
@@ -1984,7 +2007,7 @@ drawCsvTable th ed v lo arr = do
     let w = ws !! c
         st = if inSelCol c then hdrSel else hdr
         sx = cl + gut + x - xoff
-    drawStrClipL arr cols rows headerRow sx minC st (take w (padCenter w (Csv.colLabel c) ++ repeat ' '))
+    drawStrClipL arr cols rows headerRow sx minC st (takeCellsPad w (padCenter w (Csv.colLabel c)))
     when (sx + w >= minC) $
       putCell arr cols rows headerRow (sx + w) (Cell '\x2502' hdr)
   -- Data rows (each can span several screen lines when a cell has newlines).
@@ -2007,7 +2030,7 @@ drawCsvTable th ed v lo arr = do
           mCur = if editingHere then Just (maybe 0 fst (csvEdit v)) else Nothing
           dispLines = cellDisplay w visH mCur (Csv.cellAt r c v)
       forM_ (zip [0 ..] dispLines) $ \(li, s) -> do
-        drawStrClipL arr cols rows (sl + li) sx minC st (take w (s ++ repeat ' '))
+        drawStrClipL arr cols rows (sl + li) sx minC st (takeCellsPad w s)
         when (sx + w >= minC) $
           putCell arr cols rows (sl + li) (sx + w) (Cell '\x2502' sepS)
 
@@ -2049,8 +2072,23 @@ cellDisplay w visH mCur cellText =
   in [ lineAt (winTop + li) | li <- [0 .. visH - 1] ]
   where sani ch = if ch == '\t' then ' ' else ch
 
+-- Truncate to display cells (not code points): if @s@ overflows the column
+-- width, trim it to @w-1@ cells and append an ellipsis (which is itself
+-- one cell). A wide glyph that would sit half-in half-out is dropped whole
+-- rather than split.
 clipStr :: Int -> String -> String
-clipStr w s = if length s <= w then s else take (max 0 (w - 1)) s ++ "\x2026"
+clipStr w s
+  | dw <= w  = s
+  | otherwise = takeCells (max 0 (w - 1)) s ++ "\x2026"
+  where
+    dw = sum (map (max 1 . charWidth) s)
+    takeCells !n = go n
+      where
+        go _ [] = []
+        go !left _  | left <= 0 = []
+        go !left (c:cs) =
+          let cw = max 1 (charWidth c)
+          in if cw <= left then c : go (left - cw) cs else []
 
 -- Cursor for the cell being edited in CSV mode (on the right line + column of a
 -- multi-line cell). Mirrors the windowing done by 'cellDisplay'.
