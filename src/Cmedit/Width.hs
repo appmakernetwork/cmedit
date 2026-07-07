@@ -51,13 +51,17 @@ controlCaret c =
 -- | Display column at which character index @col@ begins, given a tab width.
 -- Equivalent to the rendered width of @take col line@. A strict fold over the
 -- text (no intermediate list) — this runs on every cursor move and repaint,
--- including on multi-megabyte single-line files.
+-- including on multi-megabyte single-line files. Uses @max 1@ per glyph to
+-- agree with the renderer's own cell emission (@Render.expandLineCells@),
+-- which forces at least one grid cell per code point; this keeps zero-width
+-- code points — notably the emoji variation selector U+FE0F — accounted for
+-- as one column, matching how terminals then fold them into a wide glyph.
 colToDisplay :: Int -> Int -> Text -> Int
 colToDisplay tabw col line = T.foldl' step 0 (T.take col line)
   where
     step !disp c
       | c == '\t' = disp + (tabw - disp `mod` tabw)
-      | otherwise = disp + max 0 (renderWidth c)
+      | otherwise = disp + max 1 (renderWidth c)
 
 -- | Character index whose start lies at or just past display column @target@.
 -- Used to translate mouse clicks and to preserve a desired column during

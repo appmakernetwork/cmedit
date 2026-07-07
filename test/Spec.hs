@@ -141,6 +141,21 @@ main = do
   checkEq "wide width" (charWidth '\x4e00') 2     -- CJK
   checkEq "combining width" (charWidth '\x0301') 0
   checkEq "displayToCol tab" (displayToCol 4 4 (T.pack "\tx")) 1
+  -- Emoji + variation selector: the terminal folds ℹ️ into a 2-cell glyph,
+  -- and our sizing must agree with the renderer's own cell emission
+  -- (which forces at least one grid cell per code point). If either side
+  -- undercounts, CSV columns to the right of an emoji cell drift left by
+  -- one cell per occurrence — the row-1236 bug.
+  checkEq "colToDisplay info+VS16"
+    (colToDisplay 4 2 (T.pack "\x2139\xFE0Fx")) 2
+  checkEq "colToDisplay past info+VS16"
+    (colToDisplay 4 3 (T.pack "\x2139\xFE0Fx")) 3
+  checkEq "cellWidth info+VS16"
+    (cellWidth (T.pack "\x2139\xFE0F")) 2
+  checkEq "cellWidth mixed emoji row"
+    (cellWidth
+      (T.pack "\x1F44D Reviews \x1F4CC Map \x2139\xFE0F Information"))
+    (2 + 1 + 7 + 1 + 2 + 1 + 3 + 1 + 2 + 1 + 11)
 
   -- Input parser -------------------------------------------------------------
   kUp <- parseBytes [0x1b, 0x5b, 0x41]

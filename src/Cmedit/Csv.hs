@@ -13,6 +13,7 @@ module Cmedit.Csv
   , cellAt
   , colLabel
   , columnWidths
+  , cellWidth
   , setColWidth
   , resetColWidth
   , maxCellLines
@@ -317,9 +318,15 @@ syncWidths old ws new
       in foldl (\w c -> Seq.update c (colWidth new c) w) w1 (nub redoCols)
 
 -- Display width of a cell: its widest line (cells may contain newlines).
+-- Uses @max 1@ per glyph to agree with the renderer, which emits at least
+-- one grid cell per code point; this matters for emoji whose presentation is
+-- selected by a following variation selector U+FE0F (e.g. ℹ️, ⚠️, ❤️): the
+-- selector is zero-width but the terminal folds it into a two-cell emoji,
+-- so a column that ignored it would come up one cell short and the whole
+-- row's right-hand columns would shift.
 cellWidth :: Text -> Int
 cellWidth = maximum . (0 :) . map lineW . T.splitOn (T.pack "\n")
-  where lineW = sum . map (max 0 . charWidth) . T.unpack
+  where lineW = sum . map (max 1 . charWidth) . T.unpack
 
 -- | A cell's display rows grow with embedded newlines, but a row is capped at
 -- this many lines on screen (taller cells scroll while being edited).
