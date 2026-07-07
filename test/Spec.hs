@@ -27,8 +27,8 @@ import Cmedit.Width
 import Cmedit.Input
 import Cmedit.Editor
 import Cmedit.ConfigFile
-  ( parseConfigText, RecentEntry(..), parseRecentText, renderRecentText
-  , parseHistoryText, renderHistoryText )
+  ( parseConfigText, updateConfigText, RecentEntry(..), parseRecentText
+  , renderRecentText, parseHistoryText, renderHistoryText )
 import Cmedit.QuickOpen (QuickOpen(..))
 import qualified Cmedit.QuickOpen as Q
 import Cmedit.Menu (MenuAction(..), MenuEntry(..), MenuState(..))
@@ -2088,6 +2088,51 @@ main = do
     let edC = newEditor (24, 80) c1
     check "config drives editor toggles"
       (edWordWrap edC && edShowLineNumbers edC && tabWidthOf edC == 8)
+
+  -- Writing the config back --------------------------------------------------
+  do
+    let roundtrips desired src =
+          fst (parseConfigText (updateConfigText desired (T.pack src)) defaultConfig)
+            == desired
+        want = defaultConfig { cfgTabWidth = 8, cfgWordWrap = True
+                             , cfgTabsToSpaces = True, cfgTheme = ThemeLight
+                             , cfgTrimTrailingWs = True }
+    -- Round-trip: update then parse gives the desired config, for several inputs.
+    check "config write roundtrip on empty" (roundtrips want "")
+    check "config write roundtrip on pristine defaults"
+      (roundtrips want "# my settings\ntab-width = 4\n")
+    check "config write roundtrip all defaults keeps empty"
+      (roundtrips defaultConfig "")
+    -- A pristine (all-default) target must not spam a pristine file with keys.
+    checkEq "config write appends nothing for defaults"
+      (updateConfigText defaultConfig (T.pack "# header\n")) (T.pack "# header\n")
+    -- Comment preservation: header, an inline comment, an unknown key and a
+    -- malformed line all survive; only the value of a present key changes.
+    let src = "# header comment\nword-wrap = off # keep wrapped\nbogus = 1\nnonsense\ntheme = dark\n"
+        out = T.unpack (updateConfigText want (T.pack src))
+    check "config write preserves header" ("# header comment" `isInfixOf` out)
+    check "config write preserves inline comment" ("# keep wrapped" `isInfixOf` out)
+    check "config write rewrites value in place" ("word-wrap = on # keep wrapped" `isInfixOf` out)
+    check "config write preserves unknown key" ("bogus = 1" `isInfixOf` out)
+    check "config write preserves malformed line" ("nonsense" `isInfixOf` out)
+    check "config write rewrites present theme" ("theme = light" `isInfixOf` out)
+    check "config write roundtrips through comments" (roundtrips want src)
+    -- Duplicate keys: a later line wins in the parser, so every occurrence must
+    -- be updated (otherwise the stale last line would override).
+    let dup = "word-wrap = off\nword-wrap = off\n"
+        dupOut = updateConfigText (defaultConfig { cfgWordWrap = True }) (T.pack dup)
+    checkEq "config write updates duplicate keys"
+      (cfgWordWrap (fst (parseConfigText dupOut defaultConfig))) True
+    check "config write updated both duplicates"
+      (length (filter (isInfixOf "word-wrap = on") (lines (T.unpack dupOut))) == 2)
+    -- Append only non-default missing keys; separated by a blank line.
+    let appended = T.unpack (updateConfigText
+                     (defaultConfig { cfgWordWrap = True }) (T.pack "# a config\n"))
+    check "config write appends the changed key" ("word-wrap = on" `isInfixOf` appended)
+    check "config write does not append unchanged keys"
+      (not ("tab-width" `isInfixOf` appended))
+    check "config write keeps original content when appending"
+      ("# a config" `isInfixOf` appended)
 
   -- Recent files ---------------------------------------------------------------
   do

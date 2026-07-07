@@ -758,6 +758,7 @@ data Effect
   | EffStageReplace !ReplaceReq -- ^ Open the closed files, apply the replacement in-buffer (unsaved), reveal them (driver replies via 'stageReplaceDone').
   | EffSaveAll               -- ^ Save every open document that has unsaved changes (driver replies via 'savedAll').
   | EffOpenUrl !String       -- ^ Open a URL in the system browser (fire-and-forget; driver reports a missing opener via 'setError').
+  | EffSaveConfig !Config    -- ^ Write the user config file (comment-preserving) and report via the status line.
   deriving (Show)
 
 -- | The closed-file part of a workspace Replace All: which files to rewrite on

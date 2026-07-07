@@ -20,6 +20,7 @@ import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Time.Clock (UTCTime)
 import Data.Word (Word8)
 import qualified Data.Text as T
+import qualified Data.Text.IO as TIO
 import GHC.Clock (getMonotonicTime)
 import System.Directory
   ( canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, doesFileExist
@@ -36,7 +37,7 @@ import Cmedit.Caps
 import Cmedit.Clipboard
 import Cmedit.ConfigFile
   ( RecentEntry(..), ThemeName(..), loadRecentFile, saveRecentFile
-  , loadHistoryFile, saveHistoryFile )
+  , loadHistoryFile, saveHistoryFile, configFilePath, updateConfigText )
 import Cmedit.Definition (DefReq(..))
 import qualified Cmedit.Definition as D
 import Cmedit.Editor
@@ -800,6 +801,22 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
       r <- saveFile p enc le fin buf
       pure (p, either (const Nothing) snd r)   -- (path, Just mtime) on success, Nothing on error
     pure (savedAll [ (p, mt) | (p, mt) <- results, isJust mt ] edFixed)
+
+  -- Write the user config file (from the Settings dialog), preserving the
+  -- user's comments/layout. Any IO failure (e.g. a read-only config dir) turns
+  -- into a status-line error rather than a crash.
+  EffSaveConfig cfg -> do
+    r <- try $ do
+      path <- configFilePath
+      current <- do
+        exists <- doesFileExist path
+        if exists then TIO.readFile path else pure T.empty
+      createDirectoryIfMissing True (takeDirectory path)
+      TIO.writeFile path (updateConfigText cfg current)
+      pure path
+    case r :: Either SomeException FilePath of
+      Left e     -> pure (setError (fsOpError e) ed)
+      Right path -> pure (setStatus (T.pack ("Settings saved to " ++ path)) ed)
 
 -- The result of reading and classifying a file, before it touches the editor.
 data LoadOutcome

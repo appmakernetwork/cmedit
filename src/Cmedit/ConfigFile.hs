@@ -14,6 +14,7 @@ module Cmedit.ConfigFile
   , ThemeName(..)
   , defaultConfig
   , parseConfigText
+  , updateConfigText
   , configKeysHelp
   , configFilePath
   , loadConfigFile
@@ -158,6 +159,84 @@ configKeysHelp =
   , "                     background (default dark). 'cherry-blossom' is a"
   , "                     light pink theme with its own background colours."
   ]
+
+------------------------------------------------------------------------------
+-- Writing the config back
+
+-- | The supported keys and how to render each one's value from a 'Config'. The
+-- rendering must round-trip through 'applyKey' (bools as @on@\/@off@, @indent@
+-- as @tabs@\/@spaces@, @theme@ as its canonical word), so the writer and parser
+-- can't drift apart.
+configFields :: [(Text, Config -> Text)]
+configFields =
+  [ ("tab-width",                \c -> T.pack (show (cfgTabWidth c)))
+  , ("indent",                   \c -> if cfgTabsToSpaces c then "spaces" else "tabs")
+  , ("auto-indent",              renderBool . cfgAutoIndent)
+  , ("word-wrap",                renderBool . cfgWordWrap)
+  , ("line-numbers",             renderBool . cfgLineNumbers)
+  , ("whitespace",               renderBool . cfgShowWhitespace)
+  , ("trim-trailing-whitespace", renderBool . cfgTrimTrailingWs)
+  , ("final-newline",            renderBool . cfgEnsureFinalNl)
+  , ("freeze-header",            renderBool . cfgFreezeHeader)
+  , ("theme",                    renderTheme . cfgTheme)
+  ]
+
+renderBool :: Bool -> Text
+renderBool b = if b then "on" else "off"
+
+renderTheme :: ThemeName -> Text
+renderTheme t = case t of
+  ThemeAuto          -> "auto"
+  ThemeDark          -> "dark"
+  ThemeLight         -> "light"
+  ThemeCherryBlossom -> "cherry-blossom"
+
+-- | Produce config-file text setting every key to @desired@, editing the given
+-- current text as little as possible: a supported key already present has only
+-- its value rewritten (leading indentation, the @=@ spacing and any trailing
+-- @# comment@ are preserved, and every occurrence is updated since the parser
+-- lets a later line win); comments, blank lines, unknown keys and malformed
+-- lines pass through untouched. Keys absent from the file are appended at the
+-- end only when their desired value differs from 'defaultConfig' (so a pristine
+-- file isn't spammed with defaults), separated from existing content by one
+-- blank line. It satisfies @fst (parseConfigText (updateConfigText c t)
+-- defaultConfig) == c@.
+updateConfigText :: Config -> Text -> Text
+updateConfigText desired txt =
+  let results = map (rewriteLine desired) (T.lines txt)
+      body    = map fst results
+      present = [ k | (_, Just k) <- results ]
+      missing = [ k <> " = " <> render desired
+                | (k, render) <- configFields
+                , k `notElem` present
+                , render desired /= render defaultConfig ]
+  in if null missing
+       then T.unlines body
+       else let sep = [ "" | not (null body), not (isBlank (last body)) ]
+            in T.unlines (body ++ sep ++ missing)
+  where
+    isBlank = T.null . T.strip
+
+-- | Rewrite one line if it sets a supported key, returning the new line and the
+-- key it set (so the caller knows which keys were present). Anything that isn't
+-- a @supported-key = value@ line is returned verbatim.
+rewriteLine :: Config -> Text -> (Text, Maybe Text)
+rewriteLine cfg raw =
+  let (code, comment) = T.break (== '#') raw
+  in if T.null (T.strip code)
+       then (raw, Nothing)
+       else case T.breakOn "=" code of
+         (_, rest) | T.null rest -> (raw, Nothing)          -- no '=', malformed
+         (lhs, rest) ->
+           case lookup (T.strip lhs) configFields of
+             Nothing     -> (raw, Nothing)                  -- unknown key
+             Just render ->
+               let afterEq   = T.drop 1 rest                -- text after '='
+                   (ws1, r1) = T.span isSpace afterEq       -- leading value spacing
+                   trimmed   = T.stripEnd r1
+                   ws2       = T.drop (T.length trimmed) r1 -- trailing spacing before comment
+                   newCode   = lhs <> "=" <> ws1 <> render cfg <> ws2
+               in (newCode <> comment, Just (T.strip lhs))
 
 ------------------------------------------------------------------------------
 -- Recent files
