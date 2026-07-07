@@ -37,6 +37,8 @@ module Cmedit.Editor
   , tickImage
     -- * Terminal-reported appearance (driver callbacks)
   , resolvedTheme
+  , themeChoices
+  , themeIndex
   , setDetectedDark
   , setCellPx
   , cellAspect
@@ -352,7 +354,7 @@ relabelEntry ed e = case e of
   MEItem _ acc MAToggleBom ->
     MEItem (T.pack ("&UTF-8 BOM: " ++ (if edEncoding ed == Utf8Bom then "on" else "off"))) acc MAToggleBom
   MEItem _ acc MAToggleTheme ->
-    MEItem (T.pack ("The&me: " ++ themeLabel (cfgTheme (edConfig ed)))) acc MAToggleTheme
+    MEItem (T.pack ("The&me: " ++ themeLabel (cfgTheme (edConfig ed)) ++ "\x2026")) acc MAToggleTheme
   _ -> e
 
 -- The Edit menu's line-operation group (hidden outside the plain-text view).
@@ -456,7 +458,8 @@ runAction a ed0 =
        MASortColumn -> noEff (sortCsvColumn ed)
        MACycleLineEnding -> noEff (cycleLineEnding ed)
        MAToggleBom       -> noEff (toggleBom ed)
-       MAToggleTheme     -> noEff (toggleTheme ed)
+       MAToggleTheme     -> noEff (openDialog
+                              (mkTheme (themeIndex (cfgTheme (edConfig ed)))) ed)
        MAToggleExplorer -> toggleExplorer ed
        MASwitchFile k ->
          let target = case drop k (allOpenDocs ed) of
@@ -999,6 +1002,10 @@ dispatchDialog kind btn d ed = case kind of
   DKAbout   -> noEff (closeDialog ed)
   DKHelp
     | btn == 0  -> noEff (openManual (closeDialog ed))
+    | otherwise -> noEff (cancelDialog ed)
+  DKTheme
+    | btn < length themeChoices
+                -> noEff (applyTheme (themeChoices !! btn) (closeDialog ed))
     | otherwise -> noEff (cancelDialog ed)
   DKMessage -> noEff (closeDialog ed)
 

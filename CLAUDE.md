@@ -511,9 +511,16 @@ in `README.md`; the cross-cutting structure that matters when editing:
   through `edDetectedDark` — the driver's OSC 11 background query, re-run on
   every focus-in so a system light/dark switch follows — and falls back to
   dark when the terminal never answers. Paint with `resolvedTheme`, never
-  `cfgTheme`, or `auto` breaks. View ▸ Theme toggles per-session only (from
-  auto it flips away from whatever detection resolved). The driver also
-  matches the cursor colour to the theme (OSC 12, reset on exit).
+  `cfgTheme`, or `auto` breaks. View ▸ Theme… opens a picker dialog
+  (`DKTheme`/`mkTheme`, one button per `themeChoices` entry, focus starting
+  on the current mode): moving the focus **live-previews** the theme —
+  `resolvedTheme` consults the open picker's focused button, so Esc/Cancel
+  restores simply because nothing was written — and Enter commits via
+  `applyTheme` (per-session; the config key persists it). Note dark and
+  light keep the terminal's default background, so a preview restyles
+  chrome/tokens only, while cherry-blossom repaints every cell. The driver
+  also matches the cursor colour to the theme (OSC 12, reset on exit) —
+  previews included, since it reads `resolvedTheme` per frame.
 - **About-box animation (`Cmedit.About`, `edAboutTick`).** The About dialog's
   wordmark animation ("CMD" and "edit" snake in from opposite sides; the big D
   vaults over the e and clobbers the little d to spell "CMeDit") is pure frame

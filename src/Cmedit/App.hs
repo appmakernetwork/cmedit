@@ -1180,10 +1180,12 @@ renderNow drv editorRef prevRef titleRef = do
   hFlush stdout
   writeIORef prevRef (Just scr)
 
--- A visible cursor for a dark theme, a dark one for light.
+-- A visible cursor for a dark theme, a dark one for light backgrounds
+-- (cherry blossom gets its raspberry accent).
 themeCursorColor :: ThemeName -> (Word8, Word8, Word8)
-themeCursorColor ThemeLight = (0x20, 0x20, 0x20)
-themeCursorColor _          = (0xE8, 0xE8, 0xE8)
+themeCursorColor ThemeLight         = (0x20, 0x20, 0x20)
+themeCursorColor ThemeCherryBlossom = (0xA3, 0x12, 0x5F)
+themeCursorColor _                  = (0xE8, 0xE8, 0xE8)
 
 -- | The pixel-graphics overlay for this frame, if any output is needed:
 -- 'Just' a builder that places (or deletes) the image, 'Nothing' when the

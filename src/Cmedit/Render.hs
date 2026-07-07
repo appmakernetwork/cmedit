@@ -12,6 +12,7 @@ module Cmedit.Render
   , Theme(..)
   , defaultTheme
   , lightTheme
+  , cherryBlossomTheme
   , themeFor
   , FileKind(..)
   , fileKind
@@ -115,6 +116,12 @@ data Theme = Theme
   , thBracket      :: !Style   -- ^ The bracket pair enclosing/under the cursor.
   , thScrollbar    :: !Style   -- ^ The right-edge scrollbar track and thumb.
   , thTokens       :: !(Tok -> Style) -- ^ Syntax-token palette (differs between dark and light).
+  , thRemap        :: !(Maybe (Style -> Style))
+    -- ^ Applied to every finished cell before the frame is frozen. Themes
+    -- that paint their own background (Cherry Blossom) use this to remap the
+    -- 16 ANSI colours — including the hardcoded styles in views like the
+    -- explorer, search and quick-open — onto their palette, so no cell ever
+    -- falls through to the terminal's own colours. 'Nothing' skips the pass.
   }
 
 defaultTheme :: Theme
@@ -145,6 +152,7 @@ defaultTheme = Theme
   , thBracket     = Style BrightCyan Default (attrBold .|. attrUndercurl)
   , thScrollbar   = Style BrightBlack Default attrNone
   , thTokens      = darkTokens
+  , thRemap       = Nothing
   }
 
 -- | The light variant: chrome (menus, dialogs, status) is already explicit
@@ -159,10 +167,132 @@ lightTheme = defaultTheme
   , thTokens    = lightTokens
   }
 
+-- | Cherry Blossom: a light 24-bit theme with (soft pinks with lilac/purple accents)
+-- toned down for day-long work:
+-- a near-white pink page, dark plum-grey text, and muted accents that keep
+-- readable contrast on the tinted ground. The chrome fields below are set in
+-- explicit RGB, and 'cherryRemap' catches everything else, so every cell
+-- carries its own colours and the terminal palette never shows through.
+cherryBlossomTheme :: Theme
+cherryBlossomTheme = Theme
+  { thText        = txt
+  , thGutter      = Style (rgb 184 143 174) cbBase attrNone
+  , thGutterCur   = Style cbRaspberry cbBase attrBold
+  , thMenuBar     = Style cbInk cbBarPink attrNone
+  , thMenuActive  = Style cbInkDeep cbLilac attrNone
+  , thMenuItem    = Style cbInk cbDropPink attrNone
+  , thMenuSel     = Style cbInkDeep cbLilac attrNone
+  , thMenuAccel   = Style (rgb 147 100 139) cbDropPink attrNone
+  , thStatus      = Style cbInk cbBarPink attrNone
+  , thStatusKey   = Style (rgb 122 21 96) cbBarPink attrBold
+  , thHint        = Style (rgb 92 67 86) cbBase attrNone
+  , thHintKey     = Style cbInkDeep (rgb 242 153 231) attrNone
+  , thSelection   = Style cbInkDeep cbSelLav attrNone
+  , thDialog      = Style cbInk cbDlgPink attrNone
+  , thDialogTitle = Style cbInkDeep cbLilac attrBold
+  , thField       = Style cbInk (rgb 255 255 255) attrNone
+  , thFieldFocus  = Style cbInkDeep cbSelLav attrNone
+  , thButton      = Style cbInk cbDropPink attrNone
+  , thButtonFocus = Style (rgb 255 255 255) cbPurple attrBold
+  , thWhitespace  = Style (rgb 224 179 212) cbBase attrNone
+  , thFindMatch   = Style cbInkDeep (rgb 247 208 112) attrNone
+  , thBracket     = Style cbRaspberry cbBase (attrBold .|. attrUndercurl)
+  , thScrollbar   = Style (rgb 216 168 207) cbBase attrNone
+  , thTokens      = cherryTokens
+  , thRemap       = Just cherryRemap
+  }
+  where
+    rgb = ColorRGB
+    txt = Style cbText cbBase attrNone
+
+-- The Cherry Blossom palette. The pinks are: navbar #ffb6f6,
+-- dropdown #ffdcfc, modal #ffe9fc, active-gradient lilac #d29cf1, primary
+-- purple #6d67c5; page and inks are toned for contrast on the pink ground.
+cbBase, cbText, cbInk, cbInkDeep, cbBarPink, cbDropPink, cbDlgPink,
+  cbLilac, cbSelLav, cbPurple, cbRaspberry :: Color
+cbBase      = ColorRGB 255 240 250   -- page: barely-pink white
+cbText      = ColorRGB 45 37 48      -- body text: dark warm grey
+cbInk       = ColorRGB 58 36 55      -- chrome text: dark plum-grey
+cbInkDeep   = ColorRGB 42 22 51
+cbBarPink   = ColorRGB 255 182 246   -- menu/status bars
+cbDropPink  = ColorRGB 255 220 252   -- dropdowns, buttons
+cbDlgPink   = ColorRGB 255 233 252   -- dialogs
+cbLilac     = ColorRGB 210 156 241   -- highlighted menu items, titles
+cbSelLav    = ColorRGB 220 194 245   -- text selection
+cbPurple    = ColorRGB 109 103 197   -- strong accent (focused button)
+cbRaspberry = ColorRGB 163 18 95
+
+-- Remap one finished cell style onto the Cherry Blossom palette. Cells the
+-- theme fields already coloured are pure RGB and pass through unchanged; what
+-- this really handles are the ANSI-named styles hardcoded in the explorer,
+-- search view, quick-open, CSV table, browser and About wordmark. Named
+-- colours never reach the terminal, so the forced background stays intact.
+cherryRemap :: Style -> Style
+cherryRemap (Style fg bg at) = Style fg' (mapBg bg) at
+  where
+    -- Blue and Black backgrounds are the dark chrome (selections, table
+    -- headers); they keep light foregrounds. Everything else sits on a light
+    -- pink ground and gets the dark on-base palette.
+    fg' = if bg == Blue || bg == Black then lightFg fg else darkFg fg
+    mapBg c = case c of
+      Default     -> cbBase
+      Black       -> cbInk
+      Blue        -> cbPurple
+      Cyan        -> cbLilac
+      White       -> cbDropPink
+      BrightWhite -> ColorRGB 255 255 255
+      BrightBlack -> ColorRGB 185 162 180      -- unfocused selection
+      Yellow      -> ColorRGB 247 208 112      -- find-match amber
+      Green       -> ColorRGB 182 236 205      -- mint
+      Red         -> ColorRGB 232 160 164
+      Magenta     -> ColorRGB 242 153 231
+      other       -> other                     -- RGB / 256 pass through
+    -- Light tints for dark (purple) chrome.
+    lightFg c = case c of
+      BrightWhite   -> ColorRGB 255 255 255
+      White         -> ColorRGB 243 227 240
+      Yellow        -> ColorRGB 255 227 179
+      BrightYellow  -> ColorRGB 255 227 179
+      BrightBlack   -> ColorRGB 217 198 230
+      Green         -> ColorRGB 196 240 216
+      BrightGreen   -> ColorRGB 196 240 216
+      Red           -> ColorRGB 255 196 200
+      BrightRed     -> ColorRGB 255 196 200
+      Cyan          -> ColorRGB 201 232 242
+      BrightCyan    -> ColorRGB 201 232 242
+      Magenta       -> ColorRGB 247 201 239
+      BrightMagenta -> ColorRGB 247 201 239
+      Blue          -> ColorRGB 212 208 245
+      BrightBlue    -> ColorRGB 212 208 245
+      ColorRGB{}    -> c
+      Color256{}    -> c
+      _             -> ColorRGB 255 255 255    -- Default / Black
+    -- Dark hues readable on the pink page and light chrome.
+    darkFg c = case c of
+      Default       -> cbText
+      Black         -> cbInkDeep
+      White         -> ColorRGB 125 107 119
+      BrightWhite   -> cbInkDeep               -- "emphasized" on dark terminals
+      BrightBlack   -> ColorRGB 150 112 139
+      Red           -> ColorRGB 181 72 77
+      BrightRed     -> ColorRGB 196 64 74
+      Green         -> ColorRGB 46 125 84
+      BrightGreen   -> ColorRGB 46 143 94
+      Yellow        -> ColorRGB 178 101 0
+      BrightYellow  -> ColorRGB 178 101 0
+      Blue          -> ColorRGB 94 85 184
+      BrightBlue    -> cbPurple
+      Magenta       -> cbRaspberry
+      BrightMagenta -> ColorRGB 192 57 154
+      Cyan          -> ColorRGB 14 116 144
+      BrightCyan    -> ColorRGB 14 116 144
+      _             -> c                       -- RGB / 256 pass through
+
 -- | Pick the palette the editor's config asks for.
 themeFor :: ThemeName -> Theme
 themeFor ThemeDark  = defaultTheme
 themeFor ThemeLight = lightTheme
+themeFor ThemeCherryBlossom = cherryBlossomTheme
 themeFor ThemeAuto  = defaultTheme   -- resolved before we get here ('resolvedTheme'); dark is the fallback
 
 darkTokens :: Tok -> Style
@@ -208,6 +338,32 @@ lightTokens t = case t of
   TkLink      -> Style Blue Default attrUnderline
   TkProperty  -> Style Blue Default attrNone
 
+-- Hand-tuned hues for the Cherry Blossom page (the Default backgrounds are
+-- turned into the pink base by 'cherryRemap'): raspberry keywords, plum
+-- functions, deep green strings, mauve comments — all picked for contrast on
+-- the tinted near-white ground.
+cherryTokens :: Tok -> Style
+cherryTokens t = case t of
+  TkText      -> Style Default Default attrNone
+  TkPunct     -> Style Default Default attrNone
+  TkKeyword   -> on cbRaspberry attrBold
+  TkType      -> on (ColorRGB 94 85 184) attrNone
+  TkString    -> on (ColorRGB 46 125 84) attrNone
+  TkComment   -> on (ColorRGB 151 107 139) attrItalic
+  TkNumber    -> on (ColorRGB 181 72 77) attrNone
+  TkFunction  -> on (ColorRGB 156 61 146) attrNone
+  TkBuiltin   -> on (ColorRGB 124 80 200) attrNone
+  TkDecorator -> on (ColorRGB 178 101 0) attrNone
+  TkTag       -> on (ColorRGB 94 85 184) attrNone
+  TkAttr      -> on (ColorRGB 140 86 200) attrNone
+  TkHeading   -> on cbRaspberry attrBold
+  TkEmph      -> Style Default Default attrItalic
+  TkStrong    -> Style Default Default attrBold
+  TkCode      -> on (ColorRGB 46 125 84) attrNone
+  TkLink      -> on (ColorRGB 124 80 200) attrUnderline
+  TkProperty  -> on (ColorRGB 94 85 184) attrNone
+  where on fg = Style fg Default
+
 ------------------------------------------------------------------------------
 -- Pure render to a cell grid
 
@@ -240,6 +396,13 @@ renderEditor ed = runST $ do
   when (edFocus ed == FQuickOpen) $ maybe (pure ()) (\qo -> drawQuickOpen th ed qo arr) (edQuickOpen ed)
   when (edFocus ed == FEdit) $ maybe (pure ()) (\cp -> drawComplete th ed cp arr) (edComplete ed)
   maybe (pure ()) (\ld -> drawLoading th ed lo ld arr) (edLoading ed)
+  -- Forced-background themes remap every cell onto their palette (see
+  -- 'thRemap'); dark/light skip this entirely.
+  case thRemap th of
+    Nothing -> pure ()
+    Just f  -> forM_ [0 .. rows * cols - 1] $ \i -> do
+      cell <- readArray arr i
+      writeArray arr i cell { cellStyle = f (cellStyle cell) }
   frozen <- freeze arr
   pure (Screen cols rows frozen (computeCursor ed lo) (scrollHintFor ed lo))
 

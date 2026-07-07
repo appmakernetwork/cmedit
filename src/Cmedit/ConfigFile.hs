@@ -51,7 +51,9 @@ import Text.Read (readMaybe)
 -- | The colour theme (interpreted by "Cmedit.Render"). 'ThemeAuto' follows
 -- the terminal's background colour when the terminal reports it (the driver's
 -- OSC 11 query), and falls back to dark where it doesn't.
-data ThemeName = ThemeDark | ThemeLight | ThemeAuto
+-- 'ThemeCherryBlossom' is a light 24-bit pink theme that paints its own
+-- background on every cell, so it never depends on the terminal's palette.
+data ThemeName = ThemeDark | ThemeLight | ThemeAuto | ThemeCherryBlossom
   deriving (Eq, Show)
 
 data Config = Config
@@ -116,10 +118,13 @@ applyKey key val cfg = case key of
   "trim-trailing-whitespace" -> boolKey (\b -> cfg { cfgTrimTrailingWs = b })
   "final-newline"            -> boolKey (\b -> cfg { cfgEnsureFinalNl = b })
   "theme" -> case map toLower val of
-    "dark"  -> Right cfg { cfgTheme = ThemeDark }
-    "light" -> Right cfg { cfgTheme = ThemeLight }
-    "auto"  -> Right cfg { cfgTheme = ThemeAuto }
-    _       -> Left "theme expects 'dark', 'light' or 'auto'"
+    "dark"           -> Right cfg { cfgTheme = ThemeDark }
+    "light"          -> Right cfg { cfgTheme = ThemeLight }
+    "auto"           -> Right cfg { cfgTheme = ThemeAuto }
+    "cherry-blossom" -> Right cfg { cfgTheme = ThemeCherryBlossom }
+    "cherryblossom"  -> Right cfg { cfgTheme = ThemeCherryBlossom }
+    "cherry"         -> Right cfg { cfgTheme = ThemeCherryBlossom }
+    _ -> Left "theme expects 'dark', 'light', 'auto' or 'cherry-blossom'"
   _ -> Left ("unknown key '" ++ key ++ "'")
   where
     boolKey set = case parseBool val of
@@ -145,8 +150,10 @@ configKeysHelp =
   , "                     Strip trailing spaces/tabs on save (default false)."
   , "final-newline = BOOL Ensure the file ends with a newline on save"
   , "                     (default false)."
-  , "theme = auto|dark|light  Colour theme; 'auto' follows the terminal"
-  , "                     backgrounds (default dark)."
+  , "theme = auto|dark|light|cherry-blossom"
+  , "                     Colour theme; 'auto' follows the terminal"
+  , "                     background (default dark). 'cherry-blossom' is a"
+  , "                     light pink theme with its own background colours."
   ]
 
 ------------------------------------------------------------------------------

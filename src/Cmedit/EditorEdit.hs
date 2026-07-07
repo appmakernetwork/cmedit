@@ -519,20 +519,20 @@ toggleBom ed
       in ed1 { edStatus = if new == Utf8Bom then "UTF-8 BOM will be written on save"
                                             else "UTF-8 BOM will be removed on save" }
 
--- | View ▸ Theme: switch the colour palette for this session (the config
--- file's @theme =@ key sets the startup default). From @auto@ the toggle
--- flips away from whatever the detection resolved to; explicit dark/light
--- then toggle between each other (only the config returns you to auto).
-toggleTheme :: Editor -> Editor
-toggleTheme ed =
-  let cfg = edConfig ed
-      new = case resolvedTheme ed of ThemeDark -> ThemeLight; _ -> ThemeDark
-  in ed { edConfig = cfg { cfgTheme = new }
-        , edStatus = T.pack ("Theme: " ++ themeLabel new
-                             ++ " (set theme = " ++ themeLabel new ++ " in the config to keep it)") }
+-- | View ▸ Theme confirmed a pick: switch the colour palette for this
+-- session (the config file's @theme =@ key sets the startup default;
+-- choosing @auto@ returns to following the terminal's background).
+applyTheme :: ThemeName -> Editor -> Editor
+applyTheme new ed =
+  ed { edConfig = (edConfig ed) { cfgTheme = new }
+     , edStatus = T.pack $ case new of
+         ThemeAuto -> "Theme: auto (following the terminal's background)"
+         _ -> "Theme: " ++ themeLabel new
+              ++ " (set theme = " ++ themeLabel new ++ " in the config to keep it)" }
 
 themeLabel :: ThemeName -> String
-themeLabel ThemeDark = "dark"; themeLabel ThemeLight = "light"; themeLabel ThemeAuto = "auto"
+themeLabel ThemeDark = "dark"; themeLabel ThemeLight = "light"
+themeLabel ThemeAuto = "auto"; themeLabel ThemeCherryBlossom = "cherry-blossom"
 
 -- | The clickable regions of the status bar's right side.
 data StatusZone = SZGoTo | SZOverwrite | SZEncoding | SZLineEnding

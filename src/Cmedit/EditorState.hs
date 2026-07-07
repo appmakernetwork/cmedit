@@ -320,15 +320,33 @@ newEditor size cfg = Editor
   , edHoverUrl      = Nothing
   }
 
+-- | The theme buttons of the 'DKTheme' picker, in button order
+-- ('Cmedit.Dialog.mkTheme' lists them as Auto, Dark, Light, Cherry Blossom;
+-- anything past this list is its Cancel button).
+themeChoices :: [ThemeName]
+themeChoices = [ThemeAuto, ThemeDark, ThemeLight, ThemeCherryBlossom]
+
+-- | The 'themeChoices' index of a theme (the initial focus for 'mkTheme').
+themeIndex :: ThemeName -> Int
+themeIndex t = length (takeWhile (/= t) themeChoices)
+
 -- | The theme to draw with this frame: an explicit config choice wins; with
 -- @theme = auto@ the detected terminal background decides, defaulting to dark
--- until (unless) the terminal answers the driver's OSC 11 query.
+-- until (unless) the terminal answers the driver's OSC 11 query. While the
+-- View ▸ Theme picker is open, the focused theme button wins instead — that
+-- is the live preview; Esc restores simply because nothing was written.
 resolvedTheme :: Editor -> ThemeName
-resolvedTheme ed = case cfgTheme (edConfig ed) of
+resolvedTheme ed = case base of
   ThemeAuto -> case edDetectedDark ed of
                  Just False -> ThemeLight
                  _          -> ThemeDark
   t         -> t
+  where
+    base = case edDialog ed of
+      Just d | dlgKind d == DKTheme
+             , Just b <- focusedButton d
+             , b < length themeChoices -> themeChoices !! b
+      _ -> cfgTheme (edConfig ed)
 
 -- | Record the OSC 11 verdict (driver callback).
 setDetectedDark :: Bool -> Editor -> Editor

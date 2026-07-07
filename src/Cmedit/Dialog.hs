@@ -18,6 +18,7 @@ module Cmedit.Dialog
   , mkAbout
   , mkMessage
   , mkHelp
+  , mkTheme
     -- * Focus
   , focusCount
   , focusedField
@@ -68,6 +69,7 @@ data DialogKind
   | DKConfirmReplaceAll
   | DKAbout
   | DKHelp           -- ^ The F1 keyboard card (Manual button + styled overlay).
+  | DKTheme          -- ^ View ▸ Theme: one button per colour theme, live-previewed.
   | DKMessage
   deriving (Eq, Show)
 
@@ -148,6 +150,17 @@ mkMessage title msg = Dialog DKMessage title [] [] ["OK"] 0 msg False
 -- ("Cmedit.HelpCard"), overlaid with styled cells by the renderer.
 mkHelp :: Text -> Dialog
 mkHelp msg = Dialog DKHelp "Keyboard Shortcuts" [] [] ["Manual", "Close"] 1 msg False
+
+-- | View ▸ Theme: pick the colour theme directly — one button per mode,
+-- focus starting on the current one (@cur@ indexes the theme buttons in the
+-- same order as @Cmedit.EditorState.themeChoices@). Moving the focus
+-- live-previews the theme ('resolvedTheme' consults this dialog's focused
+-- button); Esc or Cancel restores what you came in with.
+mkTheme :: Int -> Dialog
+mkTheme cur = Dialog DKTheme "Theme"
+  [] [] ["Auto", "Dark", "Light", "Cherry Blossom", "Cancel"] cur
+  "Applies for this session; set theme = ... in the config to keep it."
+  False
 
 ------------------------------------------------------------------------------
 -- Focus

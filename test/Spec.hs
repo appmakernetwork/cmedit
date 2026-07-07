@@ -2665,15 +2665,54 @@ main = do
         scrL = renderEditor edT { edConfig = (edConfig edT) { cfgTheme = ThemeLight } }
         styleAtCol c scr = cellStyle (scrCells scr A.! (1 * scrW scr + c))
     check "render follows the theme" (styleAtCol 4 scrD /= styleAtCol 4 scrL)
-    -- View ▸ Theme toggles per-session, with a live label.
-    let edTog = fst (update KEnter edT { edFocus = FMenu
+    -- View ▸ Theme opens a picker dialog: buttons for every theme, focus
+    -- starting on the current one, live preview while the focus moves, and
+    -- nothing committed until Enter.
+    let edDlg = fst (update KEnter edT { edFocus = FMenu
                                        , edMenu = menuStateFor edT viewIx MAToggleTheme })
-    checkEq "menu toggles theme" (cfgTheme (edConfig edTog)) ThemeLight
+    check "menu opens the theme picker"
+      (maybe False ((== DKTheme) . dlgKind) (edDialog edDlg))
+    checkEq "picker focus starts on the current theme (auto)"
+            (fmap dlgFocus (edDialog edDlg)) (Just (themeIndex ThemeAuto))
+    let edPrev = key (KArrow DRight noMods)
+                     (key (KArrow DRight noMods) edDlg)   -- Auto -> Dark -> Light
+    check "moving focus previews without committing"
+      (resolvedTheme edPrev == ThemeLight
+       && cfgTheme (edConfig edPrev) == ThemeAuto)
+    let edPick = key KEnter edPrev
+    checkEq "Enter applies the focused theme" (cfgTheme (edConfig edPick)) ThemeLight
+    check "picker closes after choosing" (edDialog edPick == Nothing)
     check "menu label shows the value"
       (any (\case MEItem lbl _ MAToggleTheme -> T.pack "light" `T.isInfixOf` lbl; _ -> False)
-           (entriesFor edTog viewIx))
-    checkEq "toggle back" (cfgTheme (edConfig (key KEnter edTog { edFocus = FMenu
-                             , edMenu = menuStateFor edTog viewIx MAToggleTheme }))) ThemeDark
+           (entriesFor edPick viewIx))
+    let edEsc = key KEsc edPrev
+    check "Esc drops the preview and keeps the old theme"
+      (cfgTheme (edConfig edEsc) == ThemeAuto && resolvedTheme edEsc == ThemeDark
+       && edDialog edEsc == Nothing)
+    checkEq "the Cancel button keeps the old theme too"
+            (cfgTheme (edConfig (key KEnter
+              (edDlg { edDialog = fmap (\d -> d { dlgFocus = length themeChoices })
+                                       (edDialog edDlg) }))))
+            ThemeAuto
+    checkEq "picking Cherry Blossom applies it"
+            (cfgTheme (edConfig (key KEnter
+              (edDlg { edDialog = fmap (\d -> d { dlgFocus = 3 }) (edDialog edDlg) }))))
+            ThemeCherryBlossom
+    -- Cherry blossom: config spellings parse, and the rendered frame carries
+    -- an explicit RGB background on every cell (nothing falls through to the
+    -- terminal's own colours).
+    checkEq "config theme=cherry-blossom"
+            (cfgTheme (fst (parseConfigText (T.pack "theme = cherry-blossom") defaultConfig)))
+            ThemeCherryBlossom
+    checkEq "config theme=cherry shorthand"
+            (cfgTheme (fst (parseConfigText (T.pack "theme = cherry") defaultConfig)))
+            ThemeCherryBlossom
+    let scrC = renderEditor edT { edConfig = (edConfig edT) { cfgTheme = ThemeCherryBlossom } }
+        isRGB c = case c of ColorRGB{} -> True; _ -> False
+    check "cherry blossom forces an RGB background on every cell"
+      (all (isRGB . styleBg . cellStyle) (A.elems (scrCells scrC)))
+    check "cherry blossom keyword colour differs from light theme"
+      (thTokens (themeFor ThemeCherryBlossom) TkKeyword /= thTokens lightTheme TkKeyword)
 
   -- Horizontal mouse scrolling --------------------------------------------------------
   do

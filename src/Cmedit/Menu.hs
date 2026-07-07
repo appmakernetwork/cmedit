@@ -49,7 +49,7 @@ data MenuAction
   | MASortColumn               -- ^ Sort the table by the current column (toggles asc/desc).
   | MACycleLineEnding          -- ^ Switch the saved line ending (LF ⇄ CRLF).
   | MAToggleBom                -- ^ Toggle the UTF-8 BOM written on save.
-  | MAToggleTheme              -- ^ Switch the colour theme (dark ⇄ light).
+  | MAToggleTheme              -- ^ Open the theme picker dialog (auto / dark / light / cherry-blossom, live-previewed).
   | MASwitchFile !Int          -- ^ Switch to the open file at this index.
   | MARecentFile !Int          -- ^ Open the k-th entry of the File menu's recent-files list.
   | MANextFile | MAPrevFile
@@ -137,7 +137,7 @@ menuBar =
       -- (Cmedit.Editor.relabelEntries).
       , MEItem "Line E&ndings: LF" "" MACycleLineEnding
       , MEItem "&UTF-8 BOM: off"   "" MAToggleBom
-      , MEItem "The&me: dark"      "" MAToggleTheme
+      , MEItem "The&me: dark\x2026" "" MAToggleTheme
       ]
   , Menu "&Window"
       [ MEItem "&Next File"       "Alt+." MANextFile
