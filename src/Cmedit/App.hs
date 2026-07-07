@@ -9,25 +9,31 @@ module Cmedit.App
 import Control.Concurrent (forkIO, getNumCapabilities, myThreadId)
 import Control.Concurrent.STM
 import GHC.Conc (getNumProcessors, setNumCapabilities)
-import Control.Exception (SomeException, bracket, bracket_, finally, try)
+import Control.Exception (SomeException, bracket, bracket_, finally, handle, try)
 import Control.Monad (foldM, forM, forM_, unless, void, when)
 import qualified Data.ByteString as BS
 import Data.ByteString.Builder (Builder, char7, hPutBuilder)
 import Data.IORef
-import Data.List (isPrefixOf, sort)
+import Data.List (isPrefixOf, sort, sortOn)
 import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Time.Clock (UTCTime)
 import Data.Word (Word8)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
+import qualified Data.Text.Encoding.Error as TEE
 import qualified Data.Text.IO as TIO
 import GHC.Clock (getMonotonicTime)
 import System.Directory
   ( canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, doesFileExist
-  , getCurrentDirectory, getFileSize, getModificationTime, listDirectory
+  , findExecutable, getCurrentDirectory, getFileSize, getModificationTime, listDirectory
   , removeDirectoryRecursive, removeFile, renamePath )
 import System.FilePath ((</>), makeRelative, splitDirectories, takeDirectory, takeFileName)
 import System.IO
+import System.Process
+  ( CreateProcess(..), StdStream(CreatePipe), proc
+  , terminateProcess, waitForProcess, withCreateProcess )
+import System.Timeout (timeout)
 
 import Cmedit.About (aboutTickUs)
 import Cmedit.Ansi
@@ -44,6 +50,9 @@ import Cmedit.Editor
 import Cmedit.Gfx
 import Cmedit.Image (Image, imgW, imgH, sniffImage, decodeFrames, scaleRGBA)
 import Cmedit.Input
+import Cmedit.Lint
+  ( LinterId, Linter(..), Diag(..), LintAvail
+  , linters, linterById, parseLintOutput, maxDiagsPerFile )
 import Cmedit.Render
 import Cmedit.Search (SearchReq(..), FileResult(..))
 import qualified Cmedit.Search as S
@@ -114,8 +123,11 @@ runTui cfg cfgWarns files readOnly = do
     pointerRef <- newIORef "default"
     themeRef  <- newIORef (Nothing :: Maybe ThemeName)
     gfxRef    <- newIORef (Nothing :: Maybe GfxKey)
+    lintGen   <- newTVarIO 0
+    lintFpRef <- newIORef (lintFingerprint ed0Px)
+    lintAvRef <- newIORef (edLintAvail ed0Px)
     let drv = Drv loadQ searchQ searchGen defGen dirMtimes focused recentsRef quickGen
-                  capsRef pointerRef themeRef gfxRef
+                  capsRef pointerRef themeRef gfxRef lintGen lintFpRef lintAvRef
     src       <- mkHandleSource stdin
     clickRef  <- newIORef (ClickState 0 (-1) (-1) 0)
     mainTid   <- myThreadId
@@ -126,6 +138,10 @@ runTui cfg cfgWarns files readOnly = do
 
     -- Background reader: parse keys and enqueue them.
     void $ forkIO $ readerLoop src q clickRef
+    -- Probe which external linters are installed (off the main thread; the
+    -- result arrives as an SMLintAvail message). The root, when a workspace
+    -- folder was opened, lets node-local tools in node_modules/.bin be found.
+    forkDetectLinters drv (explorerRootOf ed0Px)
 
     bracket_
       (enterScreen ed0)
@@ -262,7 +278,26 @@ data Drv = Drv
   , drvPointer   :: !(IORef String)   -- ^ The last OSC 22 pointer shape emitted (hover hint).
   , drvTheme     :: !(IORef (Maybe ThemeName)) -- ^ The theme whose cursor colour (OSC 12) is current.
   , drvGfx       :: !(IORef (Maybe GfxKey))    -- ^ The pixel-image placement currently on screen, if any.
+  , drvLintGen   :: !(TVar Int)       -- ^ id of the newest lint pass; a stale runner's result is dropped.
+  , drvLintFp    :: !(IORef LintFp)   -- ^ Last-seen lint fingerprint; the debounce arms when it changes.
+  , drvLintAvail :: !(IORef LintAvail) -- ^ Driver copy of detected linters (the runner reads it; the editor's copy drives the pure side).
   }
+
+-- | What the driver watches to decide a fresh lint pass is due: the active
+-- document path, its edit counter, and the linting configuration/availability.
+-- Any change re-arms the debounce (see 'lintFingerprint').
+type LintFp = (Maybe FilePath, Int, Bool, Bool, [(LinterId, Bool)], LintAvail)
+
+-- | Fingerprint the lint-relevant state. Changes here (an edit, switching
+-- files, toggling a linter, or detection completing) re-arm the debounce.
+lintFingerprint :: Editor -> LintFp
+lintFingerprint ed =
+  -- The CSV flag matters: toggling table view -> text view changes neither
+  -- path nor edit counter, but the buffer re-syncs from the table and the
+  -- diags need a fresh pass (lintRequest is Nothing while in table mode).
+  ( edPath ed, edEditSeq ed, isJust (edCsv ed)
+  , cfgLint cfg, cfgLintOn cfg, edLintAvail ed )
+  where cfg = edConfig ed
 
 -- | Identity of an on-screen kitty/sixel placement: re-emitted only when any
 -- part of this changes (or after a full redraw invalidated the terminal).
@@ -301,13 +336,15 @@ data SearchMsg
   | SMDefDone  !Int               -- ^ def-gen, the definition scan finished.
   | SMQuickFiles !Int ![FilePath] -- ^ quick-gen, a batch of workspace-relative file paths.
   | SMQuickDone  !Int             -- ^ quick-gen, the quick-open walk finished.
+  | SMLint       !Int !FilePath ![Diag]  -- ^ lint-gen, one file's diagnostics (empty list clears old squiggles).
+  | SMLintAvail  !LintAvail       -- ^ detected linter availability (from the startup / on-demand probe).
 
 ------------------------------------------------------------------------------
 -- Main loop
 
 -- One thing the loop woke up for.
 data LoopAction = GotKey !Key | GotLoad !LoadOutcome | GotSearch !SearchMsg
-                | Tick | FsTick | ImgTick
+                | Tick | FsTick | ImgTick | LintTick
 
 -- Spinner animation interval (µs) while a background file load is in progress.
 spinnerDelayUs :: Int
@@ -319,13 +356,26 @@ spinnerDelayUs = 100000
 fsPollDelayUs :: Int
 fsPollDelayUs = 2000000
 
+-- Debounce (µs) between the last edit and running the linters, so a burst of
+-- keystrokes triggers a single lint pass once typing settles.
+lintDebounceUs :: Int
+lintDebounceUs = 500000
+
+-- Hard cap (µs) on any one linter invocation; a tool that hangs is terminated
+-- and yields no diagnostics rather than wedging the runner thread.
+lintTimeoutUs :: Int
+lintTimeoutUs = 10000000
+
 eventLoop :: IORef Editor -> IORef (Maybe Screen) -> IORef String
           -> TQueue Key -> Drv -> ByteSource -> IO ()
-eventLoop editorRef prevRef titleRef q drv _src = registerDelay fsPollDelayUs >>= loop
+eventLoop editorRef prevRef titleRef q drv _src =
+  registerDelay fsPollDelayUs >>= \pollT -> loop pollT Nothing
   where
     loadQ   = drvLoadQ drv
     searchQ = drvSearchQ drv
-    loop pollT = do
+    -- The loop carries two software timers: 'pollT' (filesystem freshness) and
+    -- 'mlint' (the lint debounce, armed only when the lint fingerprint changes).
+    loop pollT mlint = do
       -- While a file is loading or a search is running, arm a timer so the
       -- spinner animates; otherwise block purely on input / load / search results.
       ed0 <- readIORef editorRef
@@ -355,6 +405,9 @@ eventLoop editorRef prevRef titleRef q drv _src = registerDelay fsPollDelayUs >>
         `orElse` (case mimg of
                     Just tv -> readTVar tv >>= check >> pure ImgTick
                     Nothing -> retry)
+        `orElse` (case mlint of
+                    Just tv -> readTVar tv >>= check >> pure LintTick
+                    Nothing -> retry)
         `orElse` (readTVar pollT >>= check >> pure FsTick)
       case action of
         -- A background load finished: install it, apply any pending result-jump,
@@ -367,43 +420,62 @@ eventLoop editorRef prevRef titleRef q drv _src = registerDelay fsPollDelayUs >>
             OutImage p _ -> notifyUnfocused drv ("Finished loading " ++ takeFileName p)
             OutError _   -> pure ()
           renderNow drv editorRef prevRef titleRef
-          loop pollT
+          -- A load installed a fresh buffer (fingerprint changed): (re-)arm lint.
+          mlint' <- maybeArmLint mlint
+          loop pollT mlint'
         -- A streamed search/replace result: drain the whole backlog and fold it
         -- in before a *single* repaint — a broad search (a common word over a huge
         -- tree) floods thousands of results, and repainting per result would peg
         -- the terminal and freeze the UI. Only repaint when the panel is on screen.
         GotSearch msg -> do
           rest <- atomically (flushTQueue searchQ)
-          mapM_ handleSearchMsg (msg : rest)
+          let msgs = msg : rest
+          mapM_ handleSearchMsg msgs
           ed <- readIORef editorRef
-          when (searchViewActive ed || edFocus ed == FDefPick || edFocus ed == FQuickOpen) $
+          -- A lint result for the active file, or fresh availability while the
+          -- settings dialog is open, must repaint even when no panel is shown.
+          let lintRepaint = any (lintAffectsView ed) msgs
+          when (searchViewActive ed || edFocus ed == FDefPick || edFocus ed == FQuickOpen
+                  || lintRepaint) $
             renderNow drv editorRef prevRef titleRef
-          loop pollT
+          -- Detection completing (SMLintAvail) changes the fingerprint, which
+          -- arms the initial lint for a file opened before any keystroke.
+          mlint' <- maybeArmLint mlint
+          loop pollT mlint'
         -- Advance the spinner(s) / About animation one frame.
         Tick -> do
           modifyIORef' editorRef (tickLoading . searchTick . tickAbout)
           renderNow drv editorRef prevRef titleRef
-          loop pollT
+          loop pollT mlint
         -- Advance the animated image one frame ('tickImage' re-checks that
         -- the editor still owns playback before stepping).
         ImgTick -> do
           modifyIORef' editorRef tickImage
           renderNow drv editorRef prevRef titleRef
-          loop pollT
+          loop pollT mlint
+        -- The debounce fired: run the linters for the active document (if any
+        -- still apply) and disarm the timer.
+        LintTick -> do
+          fireLint
+          loop pollT Nothing
         -- Periodic filesystem freshness pass; repaint only if it changed anything.
         FsTick -> do
           changed <- pollFs drv editorRef
           when changed $ renderNow drv editorRef prevRef titleRef
-          registerDelay fsPollDelayUs >>= loop
+          registerDelay fsPollDelayUs >>= \pt -> loop pt mlint
         -- A key: drain everything else already queued and apply the whole batch
         -- before a single repaint (so held keys / fast typing never lag).
         GotKey k -> do
           rest <- atomically (flushTQueue q)
           keep <- applyBatch (k : rest)
-          when keep $ do
-            maybePersistRecents drv editorRef
-            renderNow drv editorRef prevRef titleRef
-            loop pollT
+          if keep
+            then do
+              maybePersistRecents drv editorRef
+              renderNow drv editorRef prevRef titleRef
+              -- Edits/undo/redo/file-switch changed the fingerprint → debounce.
+              mlint' <- maybeArmLint mlint
+              loop pollT mlint'
+            else pure ()   -- quit or EOF: stop the loop
 
     handleSearchMsg msg = case msg of
       SMFile gen fr     -> modifyIORef' editorRef (searchFileFound gen fr)
@@ -427,6 +499,50 @@ eventLoop editorRef prevRef titleRef q drv _src = registerDelay fsPollDelayUs >>
         writeIORef editorRef ed2
         notifyUnfocused drv ("Replace All finished: " ++ show tot
                              ++ " occurrence" ++ (if tot == 1 then "" else "s"))
+      -- A finished lint pass: install its diagnostics on the matching document,
+      -- but only if this runner is still the current one (a newer edit may have
+      -- superseded it).
+      SMLint gen path ds -> do
+        cur <- readTVarIO (drvLintGen drv)
+        when (gen == cur) (modifyIORef' editorRef (lintResults path ds))
+      -- The linter-availability probe finished: keep a driver copy for the
+      -- runner and fold it into the editor (refreshes the Settings notes too).
+      SMLintAvail av -> do
+        writeIORef (drvLintAvail drv) av
+        modifyIORef' editorRef (lintersDetected av)
+
+    -- Does a search-queue message need a repaint even when no search panel is
+    -- shown? Only a lint result for the active file, or fresh availability while
+    -- the Settings dialog is open.
+    lintAffectsView ed m = case m of
+      SMLint _ path _ -> edPath ed == Just path
+      SMLintAvail _   -> isJust (edDialog ed)
+      _               -> False
+
+    -- Re-arm the lint debounce when the fingerprint changed since last time
+    -- (an edit, a file switch, a config toggle, or detection completing).
+    -- Skipped while a background load is pending — the fingerprint will change
+    -- again once the load installs, which arms it then. Re-arming simply drops
+    -- the previous timer and starts a fresh one — that IS the debounce.
+    maybeArmLint mlint = do
+      ed <- readIORef editorRef
+      if isJust (edLoading ed)
+        then pure mlint
+        else do
+          let fp = lintFingerprint ed
+          old <- readIORef (drvLintFp drv)
+          if fp == old
+            then pure mlint
+            else do
+              writeIORef (drvLintFp drv) fp
+              Just <$> registerDelay lintDebounceUs
+
+    -- Run the debounced lint pass for the active document (edit-time tools).
+    fireLint = do
+      ed <- readIORef editorRef
+      case lintRequest False ed of
+        Nothing  -> pure ()
+        Just req -> startLintRun drv req
 
     -- Apply each key in order (side effects still run per key). Returns False to
     -- stop the loop (quit or EOF) without a trailing render.
@@ -639,7 +755,9 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
     let ed' = applySaveFixups (syncCsvToBuffer ed)
     res <- saveFile path (edEncoding ed') (edLineEnding ed') (edFinalNewline ed') (edBuffer ed')
     case res of
-      Right (n, mt) -> let (ed1, effs) = onSaved n mt ed' in performEffects drv effs ed1
+      Right (n, mt) -> do
+        let (ed1, effs) = onSaved n mt ed'   -- effs includes EffLintNow
+        performEffects drv effs ed1
       Left err      -> pure (setError err ed')
 
   EffOpen path -> do
@@ -680,6 +798,9 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
     cpath   <- canonicalizeSafe path
     recordDirMtime drv cpath
     entries <- listEntries cpath
+    -- A new workspace root may bring node-local linters into scope (or take
+    -- some out): re-probe availability against it.
+    forkDetectLinters drv (Just cpath)
     pure (explorerStart cpath entries ed)
 
   EffExplorerList path -> do
@@ -800,7 +921,8 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
     results <- forM (modifiedDocsToSave edFixed) $ \(p, enc, le, fin, buf) -> do
       r <- saveFile p enc le fin buf
       pure (p, either (const Nothing) snd r)   -- (path, Just mtime) on success, Nothing on error
-    pure (savedAll [ (p, mt) | (p, mt) <- results, isJust mt ] edFixed)
+    let (edSaved, effs) = savedAll [ (p, mt) | (p, mt) <- results, isJust mt ] edFixed
+    performEffects drv effs edSaved   -- effs includes EffLintNow
 
   -- Write the user config file (from the Settings dialog), preserving the
   -- user's comments/layout. Any IO failure (e.g. a read-only config dir) turns
@@ -817,6 +939,159 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
     case r :: Either SomeException FilePath of
       Left e     -> pure (setError (fsOpError e) ed)
       Right path -> pure (setStatus (T.pack ("Settings saved to " ++ path)) ed)
+
+  -- Re-probe which linters are installed (e.g. after opening the Settings
+  -- dialog); the result arrives as an SMLintAvail message.
+  EffDetectLinters -> do
+    forkDetectLinters drv (explorerRootOf ed)
+    pure ed
+
+  -- Run an immediate lint pass of the active document (save-time tools too),
+  -- bypassing the debounce. Emitted by pure sites that want fresh diagnostics.
+  EffLintNow -> do
+    forkLintNow drv ed
+    pure ed
+
+------------------------------------------------------------------------------
+-- Linting (external-linter integration)
+
+-- | The workspace/explorer root, when a folder is open. Used to find
+-- node-local tools (@node_modules/.bin@) and as a fallback CWD hint.
+explorerRootOf :: Editor -> Maybe FilePath
+explorerRootOf ed = fnPath . brRoot <$> edExplorer ed
+
+-- | Probe linter availability off the main thread and post the result back as
+-- an 'SMLintAvail' message.
+forkDetectLinters :: Drv -> Maybe FilePath -> IO ()
+forkDetectLinters drv mroot =
+  void $ forkIO $ do
+    av <- detectLinters mroot
+    atomically (writeTQueue (drvSearchQ drv) (SMLintAvail av))
+
+-- | Detect which linters are installed. For each catalogue entry: look the
+-- executable up on @PATH@; on a miss, and if the tool ships as a node package,
+-- try @\<root\>/node_modules/.bin/\<cmd\>@. A found executable is probed with
+-- @--version@ (its first output line is the version label; @""@ if the probe
+-- fails — the tool still counts as installed).
+detectLinters :: Maybe FilePath -> IO LintAvail
+detectLinters mroot = forM linters $ \l -> do
+  mexe <- findExecutable (linCmd l)
+  resolved <- case mexe of
+    Just exe -> pure (Just exe)
+    Nothing
+      | linNodeTool l, Just root <- mroot -> do
+          let cand = root </> "node_modules" </> ".bin" </> linCmd l
+          there <- doesFileExist cand
+          pure (if there then Just cand else Nothing)
+      | otherwise -> pure Nothing
+  case resolved of
+    Nothing  -> pure (linId l, Nothing)
+    Just exe -> do
+      mver <- runToolCapture exe ["--version"] "." Nothing
+      let ver = case mver of
+                  Just t | (v : _) <- T.lines t -> T.unpack v
+                  _                             -> ""
+      pure (linId l, Just (exe, ver))
+
+-- | Run an immediate lint pass of the active document, save-time tools
+-- included (used on save completion and 'EffLintNow'). No debounce.
+forkLintNow :: Drv -> Editor -> IO ()
+forkLintNow drv ed = case lintRequest True ed of
+  Nothing  -> pure ()
+  Just req -> startLintRun drv req
+
+-- | Bump the lint generation and fork a runner for this request. The new
+-- generation supersedes any in-flight pass (its result is dropped).
+startLintRun :: Drv -> LintReq -> IO ()
+startLintRun drv req = do
+  gen <- atomically $ do
+           modifyTVar' (drvLintGen drv) (+ 1)
+           readTVar (drvLintGen drv)
+  void $ forkIO (runLinters (drvSearchQ drv) (drvLintGen drv) gen req)
+
+-- | Run each tool of a request in turn, parse its output, and post the merged
+-- diagnostics as one 'SMLint'. Bails between tools if a newer pass superseded
+-- this one; posts even an empty list (so stale squiggles clear).
+runLinters :: TQueue SearchMsg -> TVar Int -> Int -> LintReq -> IO ()
+runLinters outQ genVar gen req = do
+    perTool <- goRuns (lrRuns req) []
+    cur <- readTVarIO genVar
+    when (gen == cur) $ do
+      let merged = take maxDiagsPerFile
+                     $ sortOn (\d -> (dgLine d, dgCol d)) (concat perTool)
+      atomically (writeTQueue outQ (SMLint gen (lrPath req) merged))
+  where
+    goRuns [] acc = pure (reverse acc)
+    goRuns ((lid, exe, args, feed) : rest) acc = do
+      cur <- readTVarIO genVar
+      if gen /= cur
+        then pure (reverse acc)   -- superseded: stop early (result is dropped anyway)
+        else do
+          -- Node tools run from the file's own directory, not the workspace
+          -- root: ESLint 9's flat-config lookup (and stylelint's) searches
+          -- UPWARD from the cwd, and real projects keep those configs in
+          -- subtrees (e.g. ui/eslint.config.mjs) — from the file's dir the
+          -- upward search finds nested and root configs alike. Python tools
+          -- keep the root cwd (.flake8 lives there; ruff resolves from the
+          -- --stdin-filename path and doesn't care).
+          let dir = if linNodeTool (linterById lid)
+                      then takeDirectory (lrPath req) else lrCwd req
+          mout <- runToolCapture exe args dir
+                    (if feed then Just (lrText req) else Nothing)
+          let ds = maybe [] (parseLintOutput lid (lrPath req)) mout
+          goRuns rest (ds : acc)
+
+-- | Run an external tool capturing its stdout. The CWD is set; stdin is a pipe
+-- we feed (when 'Just') then close, or close immediately (never inherited — the
+-- terminal is in raw mode and some tools would hang on an open inherited
+-- stdin). Stdout is read strictly and lenient-decoded; stderr is piped but not
+-- read; exit codes are ignored. The whole run is bounded by 'lintTimeoutUs' —
+-- on timeout the process is terminated and 'Nothing' returned — and any
+-- exception collapses to 'Nothing'.
+runToolCapture :: FilePath -> [String] -> FilePath -> Maybe T.Text -> IO (Maybe T.Text)
+runToolCapture exe args dir mstdin = handle onErr $
+  -- 'withCreateProcess' guarantees the pipe handles are closed and the child
+  -- reaped even on the timeout / exception paths — important because linting
+  -- runs often and leaked fds would accumulate over a session.
+  withCreateProcess
+    (proc exe args) { cwd = Just dir, std_in = CreatePipe
+                     , std_out = CreatePipe, std_err = CreatePipe }
+    $ \mIn mOut mErr ph -> do
+        -- Feed stdin from its own thread and drain stderr concurrently: the
+        -- child interleaves reads/writes across all three pipes, so doing
+        -- either sequentially deadlocks once a ~64K pipe buffer fills (a big
+        -- buffer in, or a chatty tool's stderr) — and a block before the
+        -- timeout wrapper would wedge this thread forever. Both helpers
+        -- swallow their own exceptions (EPIPE when the child exits early,
+        -- handles closed by withCreateProcess after a timeout).
+        case mIn of
+          Just hin -> void $ forkIO $ handle ignoreErr $ do
+            case mstdin of
+              Just t  -> hSetBinaryMode hin True >> BS.hPutStr hin (TE.encodeUtf8 t)
+              Nothing -> pure ()
+            hClose hin
+          Nothing -> pure ()
+        case mErr of
+          Just herr -> void $ forkIO $ handle ignoreErr $
+            hSetBinaryMode herr True >> void (BS.hGetContents herr)
+          Nothing -> pure ()
+        res <- timeout lintTimeoutUs $ do
+          out <- case mOut of
+            Just hout -> do
+              hSetBinaryMode hout True
+              bs <- BS.hGetContents hout          -- strict: drains stdout fully
+              pure (TE.decodeUtf8With TEE.lenientDecode bs)
+            Nothing -> pure T.empty
+          _ <- waitForProcess ph
+          pure out
+        case res of
+          Just out -> pure (Just out)
+          Nothing  -> terminateProcess ph >> pure Nothing
+  where
+    onErr :: SomeException -> IO (Maybe T.Text)
+    onErr _ = pure Nothing
+    ignoreErr :: SomeException -> IO ()
+    ignoreErr _ = pure ()
 
 -- The result of reading and classifying a file, before it touches the editor.
 data LoadOutcome
@@ -1198,10 +1473,12 @@ renderNow drv editorRef prevRef titleRef = do
   writeIORef prevRef (Just scr)
 
 -- A visible cursor for a dark theme, a dark one for light backgrounds
--- (cherry blossom gets its raspberry accent).
+-- (cherry blossom gets its raspberry accent, midnight its periwinkle).
 themeCursorColor :: ThemeName -> (Word8, Word8, Word8)
 themeCursorColor ThemeLight         = (0x20, 0x20, 0x20)
+themeCursorColor ThemeFlashbang     = (0x1A, 0x1A, 0x1A)
 themeCursorColor ThemeCherryBlossom = (0xA3, 0x12, 0x5F)
+themeCursorColor ThemeMidnight      = (0x7A, 0xA2, 0xF7)
 themeCursorColor _                  = (0xE8, 0xE8, 0xE8)
 
 -- | The pixel-graphics overlay for this frame, if any output is needed:

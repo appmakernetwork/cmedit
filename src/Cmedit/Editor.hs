@@ -39,6 +39,7 @@ module Cmedit.Editor
   , resolvedTheme
   , themeChoices
   , themeIndex
+  , themeLabel
   , settingsSpec
   , openSettings
   , applySettingRow
@@ -57,7 +58,9 @@ module Cmedit.Editor
   , computeLayout
   , DRow(..)
   , dialogRows
+  , buttonRows
   , dialogGeom
+  , dialogScroll
   , fieldRowIndex
   , fieldLineWidth
   , fieldVisH
@@ -163,6 +166,14 @@ module Cmedit.Editor
   , scrollThumb
   , StatusZone(..)
   , statusRightInfo
+    -- * Linting (diagnostics spine)
+  , LintReq(..)
+  , lintRequest
+  , lintersDetected
+  , lintResults
+  , diagCounts
+  , diagUnderCursor
+  , jumpNextDiag
   , applySaveFixups
   , applySaveFixupsAll
   , tabWidthOf
@@ -173,6 +184,8 @@ module Cmedit.Editor
   , dropdownGeom
   , syncCsvToBuffer
   , csvGutterWidthFor
+  , csvBorderColAt
+  , csvColStartX
     -- * Pure helpers exposed for testing
   , replaceAllText
   , replaceAllStatus
@@ -219,6 +232,7 @@ import Cmedit.Clipboard (CopyOutcome(..))
 import Cmedit.Image (Image(..), ImgMode(..), renderImage, viewFit)
 import Cmedit.Link (urlSpans)
 import Cmedit.Syntax (HlCache, CommentSyntax(..), langComment, langForPath)
+import Cmedit.Lint (Linter(..), Diag(..), linters)
 
 import Cmedit.EditorState
 import Cmedit.EditorEdit
@@ -353,7 +367,7 @@ dropTextToggles es = dropTrailingSep (filter (not . isTextToggle) es)
 -- The in-file find actions that don't apply to a read-only image (there's no
 -- text to search or line to jump to). Workspace Find/Replace in Files still do.
 imageDisabledFind :: [MenuAction]
-imageDisabledFind = [MAFind, MAFindNext, MAFindPrev, MAReplace, MAGoToLine, MAGoToDef, MAGoToBracket]
+imageDisabledFind = [MAFind, MAFindNext, MAFindPrev, MAReplace, MAGoToLine, MAGoToDef, MAGoToBracket, MANextProblem]
 
 -- Rewrite value-carrying menu labels to show the document's current setting.
 relabelEntry :: Editor -> MenuEntry -> MenuEntry
@@ -469,7 +483,8 @@ runAction a ed0 =
        MAToggleBom       -> noEff (toggleBom ed)
        MAToggleTheme     -> noEff (openDialog
                               (mkTheme (themeIndex (cfgTheme (edConfig ed)))) ed)
-       MASettings        -> noEff (openSettings ed)
+       MASettings        -> (openSettings ed, [EffDetectLinters])
+       MANextProblem     -> noEff (jumpNextDiag ed)
        MAToggleExplorer -> toggleExplorer ed
        MASwitchFile k ->
          let target = case drop k (allOpenDocs ed) of
@@ -504,7 +519,7 @@ openSettings ed =
                           , cfgLineNumbers    = edShowLineNumbers ed
                           , cfgShowWhitespace = edShowWhitespace ed
                           , cfgFreezeHeader   = edFreezeHeader ed }
-  in openDialog (mkSettings cfg) ed { edConfig = cfg, edSettingsStash = Just cfg }
+  in openDialog (mkSettings (edLintAvail ed) cfg) ed { edConfig = cfg, edSettingsStash = Just cfg }
 
 -- | Interpret row @k@ of 'settingsSpec' set to value index @v@: update the
 -- config AND the live session state, so every change is visible behind the
@@ -523,10 +538,26 @@ applySettingRow k v ed = case k of
   8 -> upd (\c -> c { cfgEnsureFinalNl = on }) ed
   9 -> let ed1 = (upd (\c -> c { cfgFreezeHeader = on }) ed) { edFreezeHeader = on }
        in maybe ed1 (\vw -> csvPut vw ed1) (edCsv ed1)   -- re-scroll under the new freeze
+  10 ->                                                  -- master linting switch
+    let ed1 = upd (\c -> c { cfgLint = on }) ed
+    -- Off means no future pass will ever clear diagnostics, so drop them
+    -- everywhere now (active doc and zipper) — squiggles must not outlive
+    -- the feature being disabled.
+    in if on then ed1
+       else ed1 { edDiags = []
+                , edBefore = map (\d -> d { docDiags = [] }) (edBefore ed1)
+                , edAfter  = map (\d -> d { docDiags = [] }) (edAfter ed1) }
+  _ | k >= 11, k - 11 < length linters ->                -- one row per linter
+        let lid = linId (linters !! (k - 11))
+            ed1 = upd (\c -> c { cfgLintOn = setLintOn lid on (cfgLintOn c) }) ed
+        -- Turning a linter off immediately drops its squiggles on the active
+        -- doc; zipper docs refresh on their next lint pass.
+        in if on then ed1 else ed1 { edDiags = filter ((/= lid) . dgTool) (edDiags ed1) }
   _ -> ed
   where
     on = v == 1
     upd f e = e { edConfig = f (edConfig e) }
+    setLintOn lid b = map (\(i, x) -> if i == lid then (i, b) else (i, x))
 
 -- | Esc or the Cancel button: re-apply the stashed config row by row (the
 -- one code path settings changes ever travel), then close.
@@ -596,6 +627,9 @@ dispatchKey key ed
 -- A scrollbar-thumb drag swallows mouse events until release, likewise.
 dispatchKey key ed
   | KMouse me <- key, edScrollDrag ed = noEff (scrollDragMove me ed)
+-- A CSV column-width drag (grabbed on a header border) swallows the mouse too.
+dispatchKey key ed
+  | KMouse me <- key, Just c <- edCsvColDrag ed = noEff (csvColDragMove me c ed)
 dispatchKey key ed = case edFocus ed of
   -- The Find/Replace dialogs keep a live match count in their message line;
   -- any key other than Up/Down ends a history-browsing run.
@@ -704,6 +738,7 @@ editKey key ed = case key of
           | otherwise  -> runAction MAFindNext ed
   KFn 4 _ -> runAction MAFindInFiles ed     -- workspace-wide find
   KFn 6 _ -> runAction MAReplaceInFiles ed  -- workspace-wide replace
+  KFn 8 _ -> runAction MANextProblem ed     -- jump to the next linter diagnostic
   KFn 10 _ -> noEff (enterMenu ed)
   KFn 12 _ -> goToDefinition (edCursor ed) ed   -- Sublime's Goto Definition key
 
@@ -964,18 +999,28 @@ handleDialogMouse me ed = case edDialog ed of
             dismissable = length (dlgButtons d) <= 1 || dlgKind d == DKHelp
             rs = dialogRows d
             innerX = x + 2; innerW = w - 4
-            rowIx = meRow me - (y + 1)
+            -- The body scrolls when it overflows (the settings list on a short
+            -- terminal): offset the clicked row by the same derived scroll the
+            -- renderer draws with.
+            scroll = dialogScroll (h - 2) d
+            rowIx = meRow me - (y + 1) + scroll
         in if not inside
              then if dismissable then noEff (cancelDialog ed) else noEff ed
              else if rowIx < 0 || rowIx >= length rs
              then noEff ed
              else case rs !! rowIx of
-               DRButtons   -> case hitDialogButton d innerX innerW (meCol me) of
-                                Just b  -> dispatchDialog (dlgKind d) b d ed
-                                Nothing -> noEff ed
+               DRButtons bs -> case hitDialogButton bs innerX innerW (meCol me) of
+                                 Just b  -> dispatchDialog (dlgKind d) b d ed
+                                 Nothing -> noEff ed
                DRField fi li visH -> noEff ed { edDialog = Just (clickField fi li visH innerX innerW (meCol me) d) }
                DROption oi -> noEff ed { edDialog = Just (toggleOption (setFocus (length (dlgFields d) + oi) d)) }
                DRChoice ci -> noEff (clickChoice ci innerX (meCol me) d ed)
+               -- A note line belongs to the choice above it: clicking it just
+               -- focuses that choice (find the nearest preceding DRChoice).
+               DRNote _    -> case [ ci | DRChoice ci <- reverse (take rowIx rs) ] of
+                                (ci : _) -> noEff ed { edDialog = Just
+                                              (setFocus (length (dlgFields d) + length (dlgOptions d) + ci) d) }
+                                []       -> noEff ed
                _           -> noEff ed
 
 -- A click on a choice row: focus it, and — deriving the guillemet columns from
@@ -1013,16 +1058,16 @@ clickField fi li visH innerX innerW clickCol d =
       textCol    = off + max 0 (clickCol - valStart)
   in fieldSetCursorLineCol textLine textCol (setFocus fi d)
 
--- Index of the button under display column @c@ on the button row, mirroring the
--- renderer's layout ("  label  " padding, one space between buttons, centred).
-hitDialogButton :: Dialog -> Int -> Int -> Int -> Maybe Int
-hitDialogButton d innerX innerW c =
-  let btns = dlgButtons d
-      total = sum [ T.length b + 4 | b <- btns ] + (length btns - 1)
+-- Index of the button under display column @c@ on one button row (a
+-- 'buttonRows' slice), mirroring the renderer's layout ("  label  " padding,
+-- one space between buttons, centred).
+hitDialogButton :: [(Int, Text)] -> Int -> Int -> Int -> Maybe Int
+hitDialogButton btns innerX innerW c =
+  let total = sum [ T.length b + 4 | (_, b) <- btns ] + (length btns - 1)
       start = innerX + max 0 ((innerW - total) `div` 2)
       go _ [] = []
       go col ((i, b) : rest) = let lab = T.length b + 4 in (i, col, col + lab) : go (col + lab + 1) rest
-  in case [ i | (i, lo', hi') <- go start (zip [0 ..] btns), c >= lo', c < hi' ] of
+  in case [ i | (i, lo', hi') <- go start btns, c >= lo', c < hi' ] of
        (i : _) -> Just i
        []      -> Nothing
 
@@ -2293,6 +2338,16 @@ csvMouse me v ed
   | meButton me == MBWheelRight = csvPut (Csv.clearSel (Csv.moveCursor DRight v)) ed
   | meButton me == MBWheelUp   = csvPut (Csv.pageMove (-3) v) ed
   | meButton me == MBWheelDown = csvPut (Csv.pageMove 3 v) ed
+  -- A press on a column border in the header row grabs it for a width drag
+  -- (like the explorer divider); a double-click there re-fits the column.
+  | mePressed me && meButton me == MBLeft && not (meDrag me)
+  , let lo0 = computeLayout ed
+  , meRow me == loTextTop lo0
+  , Just c <- csvBorderColAt v (meCol me - loContentLeft lo0) =
+      if meClicks me >= 2
+        then (csvPut (Csv.resetColWidth c v) ed)
+               { edStatus = T.pack ("Column " ++ Csv.colLabel c ++ " width: auto") }
+        else ed { edCsvColDrag = Just c }
   | mePressed me && meButton me == MBLeft =
       let lo = computeLayout ed
           cl = loContentLeft lo
@@ -2312,6 +2367,24 @@ csvMouse me v ed
            else let v' = Csv.clearSel (Csv.setCursor row col (Csv.commitEdit v))
                 in csvPut (if meClicks me >= 2 then Csv.beginEdit v' else v') ed  -- double-click edits
   | otherwise = ed
+
+-- Resize the grabbed column from a header-border drag. The width follows the
+-- pointer directly (border x − column start x); 'csvPut' is deliberately not
+-- called per move so the horizontal scroll can't shift under the pointer —
+-- the release re-clamps the scroll around the final geometry.
+csvColDragMove :: MouseEvent -> Int -> Editor -> Editor
+csvColDragMove me c ed = case edCsv ed of
+  Nothing -> ed { edCsvColDrag = Nothing }
+  Just v
+    | not (mePressed me) -> (csvPut v ed) { edCsvColDrag = Nothing }
+    | otherwise -> case csvColStartX v c of
+        Nothing -> ed { edCsvColDrag = Nothing }        -- column scrolled away
+        Just x0 ->
+          let lo = computeLayout ed
+              v' = Csv.setColWidth c (meCol me - (loContentLeft lo + x0)) v
+              w' = Csv.columnWidths v' !! c
+          in ed { edCsv = Just v'
+                , edStatus = T.pack ("Column " ++ Csv.colLabel c ++ " width: " ++ show w') }
 
 -- Which column index a screen x falls in, given the gutter width.
 csvColAtX :: CsvView -> Int -> Int -> Int

@@ -6,7 +6,7 @@ module Cmedit.EditorState where
 
 import Data.Char (isAlpha, isAlphaNum, isSpace, isDigit)
 import Data.Foldable (toList)
-import Data.List (findIndex, intercalate, isPrefixOf, isSuffixOf, sortBy)
+import Data.List (findIndex, intercalate, intersperse, isPrefixOf, isSuffixOf, partition, sortBy)
 import Data.Ord (comparing)
 import Data.Sequence (Seq, (|>))
 import qualified Data.Sequence as Seq
@@ -45,6 +45,10 @@ import Cmedit.HelpCard (helpCanvasMinW, helpDialogText)
 import Cmedit.Clipboard (CopyOutcome(..))
 import Cmedit.Image (Image(..), ImgMode(..), renderImage, viewFit)
 import Cmedit.Syntax (HlCache, CommentSyntax(..), langComment, langForPath)
+import Cmedit.Lint
+  ( Diag(..), Severity(..), LintAvail, LinterId, Linter(..), linters, linterById
+  , lintersForPath, diagAt )
+import qualified Cmedit.Lint as Lint
 
 
 ------------------------------------------------------------------------------
@@ -123,6 +127,7 @@ data Document = Document
   , docCsvStash      :: !(Maybe CsvView)  -- ^ Table model kept while in plain-text view (preserves CSV undo).
   , docImage         :: !(Maybe ImageDoc) -- ^ Image-view model when this doc is an image.
   , docHlCache       :: !(Maybe HlCache)  -- ^ Cached syntax-highlight lexer states (perf only; self-validating).
+  , docDiags         :: ![Diag]           -- ^ Latest linter diagnostics for this doc (sorted by line,col; @[]@ until a lint pass posts).
   } deriving (Show)
 
 -- | A read-only image-view document: the decoded image, the current paint mode,
@@ -206,6 +211,7 @@ data Editor = Editor
   , edExpCollapsed  :: !Bool            -- ^ The panel is collapsed to a single-column strip.
   , edSidebarDrag   :: !Bool            -- ^ A panel-width drag (on the divider) is in progress.
   , edScrollDrag    :: !Bool            -- ^ A scrollbar-thumb drag is in progress (swallows mouse until release).
+  , edCsvColDrag    :: !(Maybe Int)     -- ^ A CSV column-width drag (on a header border) is in progress: the column being resized.
   , edLoading       :: !(Maybe (String, Int)) -- ^ A file is loading in the background: (display name, spinner frame).
   , edAboutTick     :: !Int             -- ^ Frame counter of the About-box animation (reset when the dialog opens).
   , edSearch        :: !(Maybe SearchState) -- ^ Workspace-wide find/replace panel state (global, not per-document).
@@ -234,6 +240,9 @@ data Editor = Editor
   , edGfxKittyAnim  :: !Bool             -- ^ The terminal also implements kitty's animation actions (whitelisted real kitty), so it loops an uploaded animation itself. Without this, kitty-protocol animations are stepped by the editor's tick as cheap placement swaps.
   , edHoverUrl      :: !(Maybe Text)     -- ^ The http(s) URL the mouse is hovering in the text area, for the status-bar hint ("Ctrl+Click to open"). Set/cleared by mouse motion, cleared by any keystroke.
   , edSettingsStash :: !(Maybe Config)   -- ^ The session-effective config captured when the Settings dialog opened; Cancel/Esc re-applies it (changes apply live, so cancel is an explicit undo).
+  , edDiags         :: ![Diag]           -- ^ Linter diagnostics for the active document (sorted by line,col; the renderer draws squiggles/counts from these; per-doc twin 'docDiags').
+  , edLintAvail     :: !LintAvail         -- ^ Which linters the driver has detected as installed (drives the run list and the Settings availability notes); global, refreshed by 'EffDetectLinters'.
+  , edEditSeq       :: !Int              -- ^ Monotonic edit counter bumped at every buffer edit/undo/redo/load; the driver fingerprints it to debounce lint passes.
   } deriving (Show)
 
 -- | A fresh editor for the given terminal size and config.
@@ -292,6 +301,7 @@ newEditor size cfg = Editor
   , edExpCollapsed  = False
   , edSidebarDrag   = False
   , edScrollDrag    = False
+  , edCsvColDrag    = Nothing
   , edLoading       = Nothing
   , edAboutTick     = 0
   , edSearch        = Nothing
@@ -320,13 +330,18 @@ newEditor size cfg = Editor
   , edGfxKittyAnim  = False
   , edHoverUrl      = Nothing
   , edSettingsStash = Nothing
+  , edDiags         = []
+  , edLintAvail     = [ (linId l, Nothing) | l <- linters ]
+  , edEditSeq       = 0
   }
 
 -- | The theme buttons of the 'DKTheme' picker, in button order
--- ('Cmedit.Dialog.mkTheme' lists them as Auto, Dark, Light, Cherry Blossom;
--- anything past this list is its Cancel button).
+-- ('Cmedit.Dialog.mkTheme' lists them as Auto, Dark Terminal, Light Terminal,
+-- Cherry Blossom, Flashbang, Midnight; anything past this list is its Cancel
+-- button).
 themeChoices :: [ThemeName]
-themeChoices = [ThemeAuto, ThemeDark, ThemeLight, ThemeCherryBlossom]
+themeChoices = [ ThemeAuto, ThemeDark, ThemeLight
+               , ThemeCherryBlossom, ThemeFlashbang, ThemeMidnight ]
 
 -- | The 'themeChoices' index of a theme (the initial focus for 'mkTheme').
 themeIndex :: ThemeName -> Int
@@ -469,6 +484,33 @@ imageTickUs ed = case imageAnim ed of
         in Just (1000 * max floorMs delay)
   where lo = computeLayout ed
 
+-- Width of the row-number gutter for a given table.
+csvGutterWidthFor :: CsvView -> Int
+csvGutterWidthFor v = max 3 (length (show (Csv.nRows v)) + 1)
+
+-- | The column whose separator border (the @│@ after its cells) sits at
+-- screen column @x@, measured relative to 'loContentLeft'. Shared by the
+-- pointer-shape hint and the hub's column-resize hit test / drag geometry.
+csvBorderColAt :: CsvView -> Int -> Maybe Int
+csvBorderColAt v x = go (csvLeft v) (csvGutterWidthFor v)
+  where
+    ws = Csv.columnWidths v
+    n = length ws
+    go c bx
+      | c >= n            = Nothing
+      | x == bx + ws !! c = Just c
+      | x <  bx + ws !! c = Nothing
+      | otherwise         = go (c + 1) (bx + ws !! c + 1)
+
+-- | Screen column (relative to 'loContentLeft') where column @c@'s cells
+-- begin, honouring the horizontal scroll; 'Nothing' if it is scrolled off.
+csvColStartX :: CsvView -> Int -> Maybe Int
+csvColStartX v c
+  | c < csvLeft v = Nothing
+  | otherwise = Just (csvGutterWidthFor v
+                        + sum [ w + 1 | w <- take (c - csvLeft v)
+                                               (drop (csvLeft v) (Csv.columnWidths v)) ])
+
 -- | The mouse-pointer shape to suggest for a screen cell (the OSC 22 hint the
 -- driver emits on hover): an I-beam over editable text, a hand over the
 -- clickable chrome (menu bar, status zones, explorer rows, search results),
@@ -477,6 +519,7 @@ imageTickUs ed = case imageAnim ed of
 pointerShapeFor :: Editor -> Int -> Int -> String
 pointerShapeFor ed row col
   | isJust (edLoading ed)   = "wait"
+  | isJust (edCsvColDrag ed) = "col-resize"                -- mid column-width drag
   | edFocus ed `elem` [FDialog, FBrowser, FDefPick, FQuickOpen, FMenu] = "default"
   | edShowMenu ed   && row == loMenuRow lo   = "pointer"
   | edShowStatus ed && row == loStatusRow lo = "pointer"
@@ -485,6 +528,9 @@ pointerShapeFor ed row col
   | inSidebar                                = "pointer"
   | edSearchMode ed && inContent             = "pointer"   -- result rows / fields
   | isJust (edImage ed) && inContent         = "crosshair" -- drag-zoom
+  | Just v <- edCsv ed, row == loTextTop lo, inContent
+  , isJust (csvBorderColAt v (col - loContentLeft lo))
+                                             = "col-resize" -- header column border
   | isJust (edCsv ed) && inContent           = "default"
   | inText                                   = "text"
   | otherwise                                = "default"
@@ -761,6 +807,8 @@ data Effect
   | EffSaveAll               -- ^ Save every open document that has unsaved changes (driver replies via 'savedAll').
   | EffOpenUrl !String       -- ^ Open a URL in the system browser (fire-and-forget; driver reports a missing opener via 'setError').
   | EffSaveConfig !Config    -- ^ Write the user config file (comment-preserving) and report via the status line.
+  | EffDetectLinters         -- ^ Re-probe which linters are installed (driver replies via 'lintersDetected').
+  | EffLintNow               -- ^ Run an immediate lint pass of the active document, save-time tools included (driver runs 'lintRequest' True and replies via 'lintResults'); emitted on save completion / settings change.
   deriving (Show)
 
 -- | The closed-file part of a workspace Replace All: which files to rewrite on
@@ -837,7 +885,9 @@ closeDialog ed = ed { edDialog = Nothing, edFocus = if edSearchMode ed then FSea
 data DRow
   = DRMsg Text | DRField !Int !Int !Int | DROption Int
   | DRHeader !Text | DRChoice !Int
-  | DRBlank | DRButtons
+  | DRNote !Text                  -- ^ A dimmed note line drawn under the preceding 'DRChoice' (a choice's 'chNote').
+  | DRBlank
+  | DRButtons ![(Int, Text)]      -- ^ One row of buttons: (button index, label) pairs (see 'buttonRows').
 
 -- On-screen height of a field: its line count capped at the table view's cap, so
 -- a multi-line value shows up to 'Csv.maxCellLines' rows (taller ones scroll).
@@ -846,7 +896,9 @@ fieldVisH f = max 1 (min Csv.maxCellLines (Csv.cellLineCount (fText f)))
 
 dialogRows :: Dialog -> [DRow]
 dialogRows d =
-  msgRows ++ fieldRows ++ optionRows ++ choiceRows ++ hintRows ++ [DRBlank, DRButtons]
+  msgRows ++ fieldRows ++ optionRows ++ choiceRows ++ hintRows
+    -- A blank line above the buttons, and between wrapped button rows.
+    ++ DRBlank : intersperse DRBlank (map DRButtons (buttonRows d))
   where
     msgLines = if T.null (T.strip (dlgMessage d)) then [] else T.splitOn "\n" (dlgMessage d)
     msgRows  = map DRMsg msgLines
@@ -859,7 +911,8 @@ dialogRows d =
     -- separator above it — except when that header is the very first body row).
     precedes  = not (null msgRows && null fieldRows && null optionRows)
     choiceRows = concat
-      [ headerRows i c ++ [DRChoice i] | (i, c) <- zip [0 ..] (dlgChoices d) ]
+      [ headerRows i c ++ [DRChoice i] ++ noteRows c | (i, c) <- zip [0 ..] (dlgChoices d) ]
+    noteRows c = case chNote c of Just n | not (T.null n) -> [DRNote n]; _ -> []
     headerRows i c = case chHeader c of
       Nothing -> []
       Just h  -> [ DRBlank | precedes || i > 0 ] ++ [DRHeader h]
@@ -870,12 +923,84 @@ dialogRows d =
               , not (T.null ht) -> [DRMsg ht]
       _ -> []
 
+-- | The dialog's buttons split into rows: buttons fill a row greedily until
+-- adding another would push the drawn width past 'buttonRowMaxW', then wrap.
+-- Most dialogs fit one row; the theme picker's six themes plus Cancel don't,
+-- and wrapping keeps the box inside an 80-column terminal. Shared by the
+-- renderer, mouse hit-testing and 'dialogGeom' so all three agree.
+buttonRows :: Dialog -> [[(Int, Text)]]
+buttonRows d = go (zip [0 ..] (dlgButtons d))
+  where
+    go [] = [[]]   -- no buttons still draws one (empty) row, like the old layout
+    go bs = case splitRow 0 bs of (row, rest) -> row : if null rest then [] else go rest
+    splitRow _ [] = ([], [])
+    splitRow w ((i, b) : rest)
+      | w > 0 && w + bw > buttonRowMaxW = ([], (i, b) : rest)   -- a lone over-wide button still gets a row
+      | otherwise = case splitRow (w + bw + 1) rest of
+          (row, more) -> ((i, b) : row, more)
+      where bw = T.length b + 4
+
+-- The width cap one button row fills before wrapping ('buttonRows'). Chosen so
+-- a wrapped dialog (cap + borders + padding) still fits 80 columns.
+buttonRowMaxW :: Int
+buttonRowMaxW = 72
+
 -- Row index (within dialogRows) at which field @fi@'s first line is drawn.
 fieldRowIndex :: Dialog -> Int -> Int
 fieldRowIndex d fi =
   let msgLines = if T.null (T.strip (dlgMessage d)) then [] else T.splitOn "\n" (dlgMessage d)
       above    = sum [ fieldVisH f | f <- take fi (dlgFields d) ]
   in length msgLines + 1 + above   -- +1 for the DRBlank preceding the fields
+
+-- | Derived vertical scroll for a dialog whose body overflows the terminal.
+-- Given @visible@ (the number of body rows the box can show — geometry height
+-- minus the two border rows), return the top 'dialogRows' index to draw from so
+-- the row carrying the focused element stays on screen. Deterministic from
+-- @(dlgFocus, rows)@ — the dialog carries no scroll state. Returns 0 when
+-- everything fits; otherwise the minimal scroll clamped to
+-- @[0, totalRows - visible]@ that keeps the focused row (and, for a focused
+-- choice with a note, its note row) visible, and reaches the buttons row when
+-- focus is on the buttons. Shared by 'Cmedit.Editor.handleDialogMouse' and the
+-- renderer so clicks and drawing agree on the same offset.
+dialogScroll :: Int -> Dialog -> Int
+dialogScroll visible d
+  | visible <= 0 || total <= visible = 0
+  | otherwise = max 0 (min maxScroll (min flo desired))
+  where
+    rows      = dialogRows d
+    total     = length rows
+    maxScroll = total - visible
+    (flo, fhi) = focusSpan d rows
+    desired    = max 0 (fhi - visible + 1)
+
+-- The (first, last) 'dialogRows' index that must be visible for the currently
+-- focused element: the field's line span, a single option/choice row (plus its
+-- note row when present), or the buttons row.
+focusSpan :: Dialog -> [DRow] -> (Int, Int)
+focusSpan d rows
+  | Just b <- focusedButton d = single (indexWhere (isButtonRowOf b))
+  | Just ci <- focusedChoice d =
+      let i = indexWhere (isChoice ci)
+          j = if i + 1 < length rows && isNote (rows !! (i + 1)) then i + 1 else i
+      in (i, j)
+  | oi >= 0 && oi < length (dlgOptions d) = single (indexWhere (isOption oi))
+  | Just fi <- focusedField d =
+      let i = indexWhere (isField fi)
+          h = fieldVisH (dlgFields d !! fi)
+      in (i, i + h - 1)
+  | otherwise = (0, 0)
+  where
+    oi = dlgFocus d - length (dlgFields d)
+    single i = (i, i)
+    indexWhere p = case [ k | (k, r) <- zip [0 ..] rows, p r ] of
+                     (k : _) -> k
+                     []      -> max 0 (length rows - 1)
+    isButtonRowOf b (DRButtons bs) = any ((== b) . fst) bs
+    isButtonRowOf _ _              = False
+    isChoice ci (DRChoice j) = j == ci; isChoice _ _ = False
+    isOption oi' (DROption j) = j == oi'; isOption _ _ = False
+    isField fi' (DRField j 0 _) = j == fi'; isField _ _ = False
+    isNote (DRNote _) = True; isNote _ = False
 
 ------------------------------------------------------------------------------
 -- Choice-row geometry (shared by the renderer and mouse hit-testing).
@@ -937,8 +1062,9 @@ dialogGeom _ d lo =
     rowWidth (DROption i) = T.length (fst (dlgOptions d !! i)) + 4
     rowWidth (DRHeader h') = T.length h'
     rowWidth (DRChoice _)  = choiceRowWidth d
+    rowWidth (DRNote n)    = 2 + choiceIndent + T.length n   -- indented under its choice row
     rowWidth DRBlank = 0
-    rowWidth DRButtons = sum [ T.length b + 4 | b <- dlgButtons d ] + 2
+    rowWidth (DRButtons bs) = sum [ T.length b + 4 | (_, b) <- bs ] + 2
 
 -- The field box grows to fit its widest line; longer lines scroll horizontally.
 fieldLineWidth :: Field -> Int
@@ -1076,6 +1202,125 @@ pushNavIfFar tpath tpos ed
     cur = currentStop ed
     isFar = tpath /= edPath ed
               || abs (posLine tpos - posLine (activeCursorPos ed)) >= navFarLines
+
+------------------------------------------------------------------------------
+-- Linting (external-linter diagnostics; the pure spine)
+
+-- | Number of non-lint editing rows in 'Cmedit.EditorEdit.settingsSpec' — the
+-- lint rows are appended after them: row 'nEditingSettings' is the master
+-- "Linting" switch and rows @nEditingSettings+1 ..@ are one per 'linters'
+-- entry, in table order. A Spec test keeps this constant in step with the spec.
+nEditingSettings :: Int
+nEditingSettings = 10
+
+-- | The 'linters' entry a Settings dialog choice row maps to, if it is a
+-- per-linter row (the master switch and the editing rows return 'Nothing').
+linterForSettingsRow :: Int -> Maybe Linter
+linterForSettingsRow i
+  | j >= 0 && j < length linters = Just (linters !! j)
+  | otherwise                    = Nothing
+  where j = i - nEditingSettings - 1
+
+-- | Is a given linter enabled in the config (falling back to its default)?
+lintOnOf :: Config -> LinterId -> Bool
+lintOnOf cfg lid = maybe (linDefaultOn (linterById lid)) id (lookup lid (cfgLintOn cfg))
+
+-- | The contextual hint and always-visible availability note for a per-linter
+-- Settings row, derived from the detected availability. Built by 'mkSettings'
+-- and refreshed in place by 'lintersDetected'.
+lintRowHintNote :: LintAvail -> Linter -> (Text, Maybe Text)
+lintRowHintNote av l = case lookup (linId l) av of
+  Just (Just (_, ver)) ->
+    ( T.pack (linName l ++ " " ++ ver ++ " \x2014 external linter.")
+    , Just (T.pack ("\x2713 " ++ ver)) )
+  _ ->
+    ( "Not installed."
+    , Just (T.pack ("\x2717 not installed \x2014 " ++ linInstall l)) )
+
+-- | A pending lint run: which tools to run against the active document, the
+-- buffer text to feed them, and the working directory to run them in. Built by
+-- 'lintRequest'; carried out by the driver ("Cmedit.App").
+data LintReq = LintReq
+  { lrPath :: !FilePath                                 -- ^ display path (also the tool's --stdin-filename).
+  , lrText :: Text                                      -- ^ full buffer text (LF joins). Deliberately lazy:
+                                                        --   the multi-MB join must be forced on the forked
+                                                        --   runner thread, not the event loop.
+  , lrCwd  :: !FilePath                                 -- ^ workspace root if the file is under it, else the file's directory.
+  , lrRuns :: ![(LinterId, FilePath, [String], Bool)]   -- ^ (id, executable, args, feed-stdin?) per tool to run.
+  } deriving (Eq, Show)
+
+-- | Build the lint request for the active document, or 'Nothing' when nothing
+-- should run. @onSave@ includes the save-time-only tools ('linStdin' False,
+-- e.g. pyright). Gating: master switch on, the active doc is plain text (not
+-- CSV/image), it has a real on-disk path (untitled and the @cmedit://@ manual
+-- pseudo-path are skipped) and is not loading. The run list keeps each matching
+-- linter that is enabled and detected as installed and either feeds stdin or is
+-- a save-time run; a superseded linter (flake8) is dropped when its superseder
+-- (ruff) is in the final list.
+lintRequest :: Bool -> Editor -> Maybe LintReq
+lintRequest onSave ed
+  | not (cfgLint cfg)                        = Nothing
+  | isJust (edCsv ed) || isJust (edImage ed) = Nothing
+  | isJust (edLoading ed)                    = Nothing
+  | Just path <- edPath ed
+  , not ("cmedit://" `isPrefixOf` path)
+  , let runs = buildRuns path
+  , not (null runs)
+  = Just LintReq { lrPath = path
+                 , lrText = bufferToText LF False (edBuffer ed)
+                 , lrCwd  = cwdFor path
+                 , lrRuns = runs }
+  | otherwise = Nothing
+  where
+    cfg = edConfig ed
+    buildRuns path =
+      let cand = [ (l, exe)
+                 | l <- lintersForPath path
+                 , lintOnOf cfg (linId l)
+                 , Just (Just (exe, _)) <- [lookup (linId l) (edLintAvail ed)]
+                 , linStdin l || onSave ]
+          ids  = map (linId . fst) cand
+          keep (l, _) = maybe True (`notElem` ids) (linSupersededBy l)
+      in [ (linId l, exe, linArgs l path, linStdin l) | (l, exe) <- filter keep cand ]
+    cwdFor path = case edExplorer ed of
+      Just br -> let root = fnPath (brRoot br)
+                 in if isJust (relativeTo root path) then root else takeDirectory path
+      Nothing -> takeDirectory path
+
+-- | (errors, warnings+info) among the active document's diagnostics.
+diagCounts :: Editor -> (Int, Int)
+diagCounts ed = (length errs, length rest)
+  where (errs, rest) = partition ((== SevError) . dgSev) (edDiags ed)
+
+-- | The diagnostic whose squiggle covers the cursor, if any (for the status
+-- bar's cursor-on-problem message).
+diagUnderCursor :: Editor -> Maybe Diag
+diagUnderCursor ed =
+  let Pos l c = edCursor ed
+  in diagAt l c (getLine' l (edBuffer ed)) (edDiags ed)
+
+-- | Driver callback for 'EffDetectLinters': record the detected availability.
+-- If a Settings dialog is open, refresh its per-linter rows' hint\/note in place
+-- (preserving 'dlgFocus' and every 'chIx').
+lintersDetected :: LintAvail -> Editor -> Editor
+lintersDetected av ed = ed { edLintAvail = av, edDialog = fmap patch (edDialog ed) }
+  where
+    patch dlg
+      | dlgKind dlg == DKSettings =
+          dlg { dlgChoices = [ patchRow i c | (i, c) <- zip [0 ..] (dlgChoices dlg) ] }
+      | otherwise = dlg
+    patchRow i c = case linterForSettingsRow i of
+      Just l  -> let (h, note) = lintRowHintNote av l in c { chHint = h, chNote = note }
+      Nothing -> c
+
+-- | Driver callback for a completed lint pass: install the diagnostics on the
+-- document with matching path (the active one, else a zipper doc). Generation
+-- staleness is checked driver-side before this is called.
+lintResults :: FilePath -> [Diag] -> Editor -> Editor
+lintResults path ds ed
+  | edPath ed == Just path = ed { edDiags = ds }
+  | otherwise = ed { edBefore = map upd (edBefore ed), edAfter = map upd (edAfter ed) }
+  where upd doc = if docPath doc == Just path then doc { docDiags = ds } else doc
 
 ------------------------------------------------------------------------------
 -- IO-callback used after a system copy attempt

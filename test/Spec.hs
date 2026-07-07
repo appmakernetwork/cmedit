@@ -15,7 +15,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Array (bounds)
 import qualified Data.Array as A
-import Data.Array.Unboxed ((!))
+import Data.Array.Unboxed ((!), listArray)
 
 import Cmedit.Types
 import Cmedit.Link (filePathUri, urlSpans, linkIdOf)
@@ -32,7 +32,7 @@ import Cmedit.ConfigFile
 import Cmedit.QuickOpen (QuickOpen(..))
 import qualified Cmedit.QuickOpen as Q
 import Cmedit.Menu (MenuAction(..), MenuEntry(..), MenuState(..))
-import Cmedit.Dialog (fieldValue, Field(..), Choice(..), Dialog(..), DialogKind(..), mkFind, fieldSetCursorLineCol, focusedButton, focusedChoice, focusedField, focusIsButton, focusNext, focusPrev, cycleChoice, setChoiceIx, focusCount)
+import Cmedit.Dialog (fieldValue, Field(..), Choice(..), Dialog(..), DialogKind(..), mkFind, mkTheme, fieldSetCursorLineCol, focusedButton, focusedChoice, focusedField, focusIsButton, focusNext, focusPrev, cycleChoice, setChoiceIx, focusCount)
 import Cmedit.Browser (Browser(..), FileNode(..))
 import qualified Cmedit.Browser as Br
 import Cmedit.Search (SearchState(..), SField(..), SearchField(..), FileResult(..), Match(..), SRow(..))
@@ -43,7 +43,7 @@ import qualified Cmedit.Regex as Rx
 import qualified Data.Sequence as Seq
 import Cmedit.Csv
 import Cmedit.Image (Image(..), ImgMode(..), decodeImage, decodeFrames, decodeGIFFrames, sniffImage, renderImage, viewFit, scaleRGBA)
-import Cmedit.Render (renderEditor, renderFrame, scrollPlan, Screen(..), ScrollHint(..), Theme(..), defaultTheme, lightTheme, themeFor, FileKind(..), fileKind)
+import Cmedit.Render (renderEditor, renderFrame, scrollPlan, Screen(..), ScrollHint(..), Theme(..), defaultTheme, lightTheme, themeFor, FileKind(..), fileKind, expandLineCells)
 import Cmedit.ConfigFile (ThemeName(..), defaultConfig)
 import Cmedit.Ansi (styleSgr, styleSgrWith)
 import Cmedit.Caps
@@ -54,6 +54,10 @@ import qualified Data.Map.Strict as M
 import Data.Char (isAlphaNum, isDigit, isSpace, toLower)
 import Cmedit.Syntax (Lang(..), Tok(..), HlState(..), langForPath, initialState, lexLine,
                       refreshHlCache, hlStateBefore, hlCoverage)
+import Cmedit.Lint
+  ( LinterId(..), Linter(..), Severity(..), Diag(..)
+  , linters, linterById, lintersForPath
+  , parseLintOutput, diagSpans, diagAt, maxDiagsPerFile )
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 
 -- Build an ordered 'DiskTime' from a small integer, for the stale-file tests.
@@ -335,9 +339,9 @@ main = do
   -- rendered choice shows its label, current value and the guillemets, plus the
   -- focused row's hint line.
   let chTheme = Choice (T.pack "Theme") [T.pack "auto", T.pack "dark", T.pack "light"] 0
-                       (Just (T.pack "Appearance")) (T.pack "Editor colour theme")
+                       (Just (T.pack "Appearance")) (T.pack "Editor colour theme") Nothing
       chTabs  = Choice (T.pack "Tab width") [T.pack "2", T.pack "4", T.pack "8"] 1
-                       Nothing (T.pack "Spaces per tab")
+                       Nothing (T.pack "Spaces per tab") Nothing
       -- A dialog with a field, an option, a choice and buttons (all four kinds).
       dAll = Dialog DKMessage (T.pack "Settings")
                [Field (T.pack "Name:") (T.pack "") 0]
@@ -1348,6 +1352,36 @@ main = do
             width = 10 + (s1 `div` 11) `mod` 70
         in csvLeft (Cmedit.Csv.ensureVisible 5 0 width v1) == scrollLeftRef width v1
   check "csv scrollLeft matches the reference" (all slCase [1 .. 120])
+  -- User column widths (header-border drag) --------------------------------
+  -- An override replaces the content-fitted width, sticks across cell edits,
+  -- clamps to a sane range, follows its column across inserts/deletes, and
+  -- resets back to the content width.
+  let vcw0 = mkCsvView ',' (T.pack "a,bb,ccc\ndddd,e,f")   -- widths [4,3,3]
+      vcw1 = setColWidth 1 20 vcw0
+  checkEq "csv setColWidth overrides one column" (columnWidths vcw1) [4, 20, 3]
+  checkEq "csv setColWidth survives a content edit"
+          (columnWidths (setCurrentCell (T.replicate 30 (T.pack "z")) (setCursor 0 1 vcw1)))
+          [4, 20, 3]
+  checkEq "csv setColWidth clamps narrow and wide"
+          (columnWidths (setColWidth 0 1 (setColWidth 2 999 vcw0))) [2, 3, 200]
+  checkEq "csv setColWidth ignores an out-of-range column"
+          (columnWidths (setColWidth 7 20 vcw0)) [4, 3, 3]
+  checkEq "csv resetColWidth restores the content width"
+          (columnWidths (resetColWidth 1 vcw1)) [4, 3, 3]
+  checkEq "csv width override follows the column past an insert"
+          (columnWidths (insertColLeft vcw1)) [3, 4, 20, 3]   -- cursor col 0: insert before
+  checkEq "csv width override follows the column past a delete"
+          (columnWidths (deleteCol vcw1)) [20, 3]             -- delete col 0
+  checkEq "csv deleting the sized column drops its override"
+          (columnWidths (deleteCol (setCursor 0 1 vcw1))) [4, 3]
+  -- Border hit-test / geometry shared by pointer hint and resize drag: with
+  -- widths [4,20,3] and a 3-cell gutter, borders sit at 3+4=7, 7+1+20=28, 32.
+  checkEq "csv csvBorderColAt finds each header border"
+          (map (csvBorderColAt vcw1) [7, 28, 32]) [Just 0, Just 1, Just 2]
+  checkEq "csv csvBorderColAt misses cell interiors"
+          (map (csvBorderColAt vcw1) [2, 6, 8, 33]) [Nothing, Nothing, Nothing, Nothing]
+  checkEq "csv csvColStartX honours the horizontal scroll"
+          (map (csvColStartX vcw1 { csvLeft = 1 }) [0, 1, 2]) [Nothing, Just 3, Just 24]
   -- Perf tripwire: navigating a 200k-row table must not rescan every cell per
   -- keystroke (this regresses to many seconds if the width cache is bypassed).
   let vHuge = mkCsvView ',' (T.intercalate (T.pack "\n")
@@ -1908,7 +1942,7 @@ main = do
   checkEq "staged doc has the replacement"
           (map (getLine' 0 . docBuffer) (filter ((== Just "/proj/new.txt") . docPath) (edAfter edStg)))
           [T.pack "BAR and BAR"]
-  let edSavedAll = savedAll [("/proj/new.txt", Just (mt 100))] edStg
+  let (edSavedAll, _) = savedAll [("/proj/new.txt", Just (mt 100))] edStg
   check "Save All clears the staged doc's modified flag" (not (any docModified (edAfter edSavedAll)))
   checkEq "modifiedDocsToSave lists dirty titled docs"
           (map (\(p,_,_,_,_) -> p) (modifiedDocsToSave edStg)) ["/proj/new.txt"]
@@ -2847,6 +2881,57 @@ main = do
     check "cherry blossom keyword colour differs from light theme"
       (thTokens (themeFor ThemeCherryBlossom) TkKeyword /= thTokens lightTheme TkKeyword)
 
+    -- Flashbang & Midnight: the other two forced-background themes. Config
+    -- words parse (including the renamed terminal themes and their legacy
+    -- spellings), every theme's label round-trips through the parser, and
+    -- both palettes carry an explicit RGB background on every cell.
+    checkEq "config theme=flashbang"
+            (cfgTheme (fst (parseConfigText (T.pack "theme = flashbang") defaultConfig)))
+            ThemeFlashbang
+    checkEq "config theme=midnight"
+            (cfgTheme (fst (parseConfigText (T.pack "theme = midnight") defaultConfig)))
+            ThemeMidnight
+    checkEq "config theme=dark-terminal"
+            (cfgTheme (fst (parseConfigText (T.pack "theme = dark-terminal") defaultConfig)))
+            ThemeDark
+    checkEq "legacy theme=dark still parses"
+            (cfgTheme (fst (parseConfigText (T.pack "theme = dark") defaultConfig)))
+            ThemeDark
+    check "every theme label parses back to its theme"
+      (and [ cfgTheme (fst (parseConfigText (T.pack ("theme = " ++ themeLabel t)) defaultConfig)) == t
+           | t <- themeChoices ])
+    let scrF = renderEditor edT { edConfig = (edConfig edT) { cfgTheme = ThemeFlashbang } }
+        scrM = renderEditor edT { edConfig = (edConfig edT) { cfgTheme = ThemeMidnight } }
+    check "flashbang forces an RGB background on every cell"
+      (all (isRGB . styleBg . cellStyle) (A.elems (scrCells scrF)))
+    check "midnight forces an RGB background on every cell"
+      (all (isRGB . styleBg . cellStyle) (A.elems (scrCells scrM)))
+    check "flashbang and midnight keyword colours differ"
+      (thTokens (themeFor ThemeFlashbang) TkKeyword /= thTokens (themeFor ThemeMidnight) TkKeyword)
+    checkEq "picking Flashbang applies it"
+            (cfgTheme (edConfig (key KEnter
+              (edDlg { edDialog = fmap (\d -> d { dlgFocus = 4 }) (edDialog edDlg) }))))
+            ThemeFlashbang
+    checkEq "picking Midnight applies it"
+            (cfgTheme (edConfig (key KEnter
+              (edDlg { edDialog = fmap (\d -> d { dlgFocus = 5 }) (edDialog edDlg) }))))
+            ThemeMidnight
+    -- The seven-button picker no longer fits one 80-column row: its buttons
+    -- wrap ('buttonRows'), every button lands on exactly one row, and the
+    -- box still fits the terminal.
+    checkEq "theme picker buttons wrap to two rows"
+            (length [ () | DRButtons _ <- dialogRows (mkTheme 0) ]) 2
+    check "a blank line separates the wrapped button rows"
+      (case [ i | (i, DRButtons _) <- zip [0 :: Int ..] (dialogRows (mkTheme 0)) ] of
+         [a, b] -> b == a + 2
+                   && (case dialogRows (mkTheme 0) !! (a + 1) of DRBlank -> True; _ -> False)
+         _      -> False)
+    checkEq "every picker button lands on exactly one row"
+            (concatMap (map fst) (buttonRows (mkTheme 0)))
+            [0 .. length (dlgButtons (mkTheme 0)) - 1]
+    let (_, _, _, wTheme) = dialogGeom edT (mkTheme 0) (computeLayout edT)
+    check "theme picker fits an 80-column terminal" (wTheme <= 78)
+
   -- Settings dialog (File ▸ Settings…) ---------------------------------------
   do
     let key k e = fst (update k e)
@@ -3041,6 +3126,304 @@ main = do
     let edBack = key KBackspace edCmd
     check "deleting '>' returns to files"
       (maybe True (not . Q.qoCommandMode) (edQuickOpen edBack))
+
+  -- Lint ---------------------------------------------------------------------
+  do
+    -- ruff (concise): code + [*] fixable marker skipped, E999 → error, noise
+    -- lines (summary / blank) skipped, 1-based → 0-based.
+    let ruffOut = T.pack $ unlines
+          [ "Found 2 errors."
+          , ""
+          , "foo.py:3:8: F401 [*] 'os' imported but unused"
+          , "foo.py:10:1: E999 SyntaxError: invalid syntax" ]
+        ruffD = parseLintOutput LRuff "foo.py" ruffOut
+    checkEq "ruff count" (length ruffD) 2
+    case ruffD of
+      (d : _) -> do
+        checkEq "ruff line 0-based" (dgLine d) 2
+        checkEq "ruff col 0-based" (dgCol d) 7
+        checkEq "ruff code" (dgCode d) (T.pack "F401")
+        checkEq "ruff sev" (dgSev d) SevWarning
+        checkEq "ruff [*] stripped" (dgMsg d) (T.pack "'os' imported but unused")
+      _ -> check "ruff parsed" False
+    checkEq "ruff E999 error" (map dgSev ruffD) [SevWarning, SevError]
+
+    -- flake8: E9xx → error, others warning, F401 stays a warning.
+    let flakeOut = T.pack $ unlines
+          [ "foo.py:1:1: E999 IndentationError: unexpected indent"
+          , "foo.py:2:5: F401 'os' imported but unused" ]
+        flakeD = parseLintOutput LFlake8 "foo.py" flakeOut
+    checkEq "flake8 sev list" (map dgSev flakeD) [SevError, SevWarning]
+    checkEq "flake8 codes" (map dgCode flakeD) (map T.pack ["E999", "F401"])
+
+    -- eslint (unix): rule id after '/', severity word, "N problems" summary skipped.
+    let eslintOut = T.pack "foo.js:1:10: Unexpected var. [Error/no-var]\n\n1 problem\n"
+        eslintD = parseLintOutput LEslint "foo.js" eslintOut
+    checkEq "eslint count" (length eslintD) 1
+    case eslintD of
+      [d] -> do
+        checkEq "eslint pos" (dgLine d, dgCol d) (0, 9)
+        checkEq "eslint code" (dgCode d) (T.pack "no-var")
+        checkEq "eslint sev" (dgSev d) SevError
+        checkEq "eslint msg" (dgMsg d) (T.pack "Unexpected var.")
+      _ -> check "eslint parsed" False
+
+    -- stylelint (unix): severity in [ ], optional trailing (rule) → code.
+    let styOut = T.pack $ unlines
+          [ "a.scss:2:3: Unexpected unit [error]"
+          , "a.scss:4:5: Unexpected thing (unit-no-unknown) [error]" ]
+        styD = parseLintOutput LStylelint "a.scss" styOut
+    checkEq "stylelint sev" (map dgSev styD) [SevError, SevError]
+    checkEq "stylelint codes" (map dgCode styD) (map T.pack ["", "unit-no-unknown"])
+    checkEq "stylelint msg no paren" (map dgMsg styD)
+      (map T.pack ["Unexpected unit", "Unexpected thing"])
+
+    -- shellcheck (gcc): note → info; path field is "-"; code from [SCnnnn].
+    let scOut = T.pack $ unlines
+          [ "-:2:1: warning: foo unused [SC2034]"
+          , "-:5:3: note: minor thing [SC2086]"
+          , "-:7:1: error: bad [SC1009]" ]
+        scD = parseLintOutput LShellcheck "-" scOut
+    checkEq "shellcheck sev" (map dgSev scD) [SevWarning, SevInfo, SevError]
+    checkEq "shellcheck codes" (map dgCode scD) (map T.pack ["SC2034", "SC2086", "SC1009"])
+
+    -- pyright: own parser, leading spaces, " - " sep, (reportXxx) → code.
+    let pyOut = T.pack $ unlines
+          [ "  /path/foo.py:12:5 - error: Something wrong (reportGeneralTypeIssues)"
+          , "  /path/foo.py:3:1 - warning: mild (reportUnusedImport)"
+          , "1 error, 1 warning, 0 informations " ]
+        pyD = parseLintOutput LPyright "/path/foo.py" pyOut
+    checkEq "pyright count" (length pyD) 2
+    case [ d | d <- pyD, dgSev d == SevError ] of
+      (d : _) -> do
+        checkEq "pyright pos" (dgLine d, dgCol d) (11, 4)
+        checkEq "pyright code" (dgCode d) (T.pack "reportGeneralTypeIssues")
+        checkEq "pyright msg" (dgMsg d) (T.pack "Something wrong")
+      _ -> check "pyright error diag" False
+
+    -- Windows-ish path with a drive-letter colon: the numeric-colon scan wins.
+    let winD = parseLintOutput LFlake8 "C:\\x\\foo.py"
+                 (T.pack "C:\\x\\foo.py:1:2: E501 line too long\n")
+    checkEq "windows path parses" (map (\d -> (dgLine d, dgCol d, dgCode d)) winD)
+      [(0, 1, T.pack "E501")]
+
+    -- Cap: 600 lines → 500 diags.
+    let capOut = T.pack (concat (replicate 600 "foo.py:1:1: E501 x\n"))
+    checkEq "lint cap" (length (parseLintOutput LFlake8 "foo.py" capOut)) maxDiagsPerFile
+
+    -- diagSpans: identifier run, non-ident width 1, past-EOL, empty, overlap order.
+    let dg c sv = Diag 0 c sv (T.pack "") (T.pack "") LRuff
+    checkEq "span identifier run" (diagSpans (T.pack "foo bar") [dg 0 SevWarning])
+      [(0, 3, SevWarning)]
+    checkEq "span non-ident width 1" (diagSpans (T.pack "a+b") [dg 1 SevWarning])
+      [(1, 2, SevWarning)]
+    checkEq "span past EOL" (diagSpans (T.pack "abc") [dg 10 SevWarning])
+      [(2, 3, SevWarning)]
+    checkEq "span empty line" (diagSpans (T.pack "") [dg 0 SevWarning])
+      [(0, 0, SevWarning)]
+    checkEq "span overlap severity order"
+      (map (\(_, _, s) -> s) (diagSpans (T.pack "foobar") [dg 0 SevWarning, dg 0 SevError]))
+      [SevError, SevWarning]
+
+    -- diagAt: prefer the more severe diag covering the position.
+    case diagAt 0 2 (T.pack "foobar") [dg 0 SevWarning, dg 0 SevError] of
+      Just d -> checkEq "diagAt severity" (dgSev d) SevError
+      Nothing -> check "diagAt hit" False
+    check "diagAt miss on other line" (diagAt 1 2 (T.pack "foobar") [dg 0 SevError] == Nothing)
+
+    -- lintersForPath: case-insensitive extension routing.
+    checkEq "lintersForPath .PY" (map linId (lintersForPath "a.PY"))
+      [LRuff, LFlake8, LPyright]
+    checkEq "lintersForPath .tsx" (map linId (lintersForPath "a.tsx")) [LEslint]
+    checkEq "lintersForPath none" (map linId (lintersForPath "Makefile")) []
+    checkEq "linterById total" (linId (linterById LShellcheck)) LShellcheck
+    checkEq "linters count" (length linters) 6
+
+  -- Lint settings/config -----------------------------------------------------
+  do
+    let mkLR t = LoadResult (fromText (T.pack t)) LF Utf8 True False Nothing
+        ed0 = newEditor (24, 80) defaultConfig
+        availAll = [ (linId l, Just ("/bin/" ++ linName l, linName l ++ " 9.9")) | l <- linters ]
+        setOff lid = map (\(i, b) -> if i == lid then (i, False) else (i, b))
+        runsIds req = map (\(i, _, _, _) -> i) (lrRuns req)
+        -- a plain .py document with every linter detected as installed
+        edPy = (setLoaded "/w/a.py" (mkLR "import os\n") ed0) { edLintAvail = availAll }
+
+    -- settingsSpec / applySettingRow position sync (extends the settings tests).
+    checkEq "settingsSpec has editing + master + per-linter rows"
+      (length settingsSpec) (11 + length linters)
+    check "applySettingRow round-trips every spec row to its default"
+      (and [ edConfig (applySettingRow k (ixOf defaultConfig) ed0) == defaultConfig
+           | (k, (_, _, _, ixOf, _)) <- zip [0 ..] settingsSpec ])
+
+    -- Config: parsing, per-linter keys, unknown-key warning, round-trip.
+    let (cl, wl) = parseConfigText (T.pack "lint-pyright = on\nlint = off\n") defaultConfig
+    checkEq "lint master parses off" (cfgLint cl) False
+    checkEq "lint-pyright = on parses" (lookup LPyright (cfgLintOn cl)) (Just True)
+    checkEq "lint config no warnings" wl []
+    let (_, wb) = parseConfigText (T.pack "lint-foo = on\n") defaultConfig
+    checkEq "unknown lint- key warns" (length wb) 1
+    let wantLint = defaultConfig { cfgLint = False
+                                 , cfgLintOn = [ (linId l, linId l == LPyright) | l <- linters ] }
+        writtenLint = updateConfigText wantLint (T.pack "")
+    check "lint config round-trips through the writer"
+      (fst (parseConfigText writtenLint defaultConfig) == wantLint)
+    check "writer renders lint keys"
+      ("lint = off" `isInfixOf` T.unpack writtenLint
+       && "lint-ruff = off" `isInfixOf` T.unpack writtenLint
+       && "lint-pyright = on" `isInfixOf` T.unpack writtenLint)
+
+    -- lintRequest gating.
+    check "master off -> no lint" (lintRequest False edPy { edConfig = (edConfig edPy) { cfgLint = False } } == Nothing)
+    checkEq "edit-time runs ruff, drops superseded flake8"
+      (fmap runsIds (lintRequest False edPy)) (Just [LRuff])
+    -- pyright is default-off; enable it to check the save-time path includes it.
+    let edPyAll = edPy { edConfig = (edConfig edPy) { cfgLintOn = [ (linId l, True) | l <- linters ] } }
+    checkEq "edit-time excludes save-time-only pyright"
+      (fmap runsIds (lintRequest False edPyAll)) (Just [LRuff])
+    checkEq "save-time also runs pyright"
+      (fmap runsIds (lintRequest True edPyAll)) (Just [LRuff, LPyright])
+    let edNoRuff = edPy { edConfig = (edConfig edPy) { cfgLintOn = setOff LRuff (cfgLintOn (edConfig edPy)) } }
+    checkEq "disabling ruff keeps flake8"
+      (fmap runsIds (lintRequest False edNoRuff)) (Just [LFlake8])
+    let edCsvDoc = (setLoaded "/w/t.csv" (mkLR "a,b\n1,2") ed0) { edLintAvail = availAll }
+    check "csv doc -> no lint" (lintRequest False edCsvDoc == Nothing)
+    let img1 = Image 1 1 "test" (listArray (0, 3) [0, 0, 0, 255])
+        edImg = edPy { edImage = Just (mkImageDoc [(img1, 0)]) }
+    check "image doc -> no lint" (lintRequest False edImg == Nothing)
+    check "untitled -> no lint"
+      (lintRequest False (ed0 { edLintAvail = availAll, edBuffer = fromText (T.pack "x=1\n") }) == Nothing)
+    check "cmedit:// pseudo-path -> no lint"
+      (lintRequest False (edPy { edPath = Just "cmedit://x.py" }) == Nothing)
+
+    -- edEditSeq bumps on edits/undo/redo, not on plain navigation.
+    let edPlain = setLoaded "/w/n.txt" (mkLR "hello\nworld") ed0
+        seqOf = edEditSeq
+        edType = fst (update (KChar 'z') edPlain)
+        edUndo1 = fst (update (KCtrlChar 'z') edType)
+        edRedo1 = fst (update (KCtrlChar 'y') edUndo1)
+        edNav  = fst (update (KArrow DDown noMods) edType)
+    check "edEditSeq bumps on insert" (seqOf edType > seqOf edPlain)
+    check "edEditSeq bumps on undo"   (seqOf edUndo1 > seqOf edType)
+    check "edEditSeq bumps on redo"   (seqOf edRedo1 > seqOf edUndo1)
+    checkEq "edEditSeq unchanged by navigation" (seqOf edNav) (seqOf edType)
+
+    -- diagCounts / diagUnderCursor / jumpNextDiag.
+    let d0 = Diag 0 0 SevError (T.pack "E1") (T.pack "bad") LRuff
+        d2 = Diag 2 0 SevWarning (T.pack "W1") (T.pack "meh") LRuff
+        d2b = Diag 2 4 SevInfo (T.pack "") (T.pack "note") LRuff
+        edD = edPlain { edBuffer = fromText (T.pack "aaa\nbbb\nccccc")
+                      , edDiags = [d0, d2, d2b], edCursor = Pos 0 0 }
+    checkEq "diagCounts (errors, warns+info)" (diagCounts edD) (1, 2)
+    check "diagUnderCursor at (0,0)" (fmap dgSev (diagUnderCursor edD) == Just SevError)
+    let edJ1 = jumpNextDiag edD                       -- from (0,0) -> next after it = line 2
+    checkEq "jumpNextDiag advances" (posLine (edCursor edJ1)) 2
+    let edJ2 = jumpNextDiag (edD { edCursor = Pos 2 4 }) -- past the last -> wraps to line 0
+    checkEq "jumpNextDiag wraps to first" (posLine (edCursor edJ2)) 0
+    check "jumpNextDiag on empty is a no-op with a note"
+      (edCursor (jumpNextDiag (edD { edDiags = [] })) == Pos 0 0)
+
+    -- lintResults targets a zipper doc by path.
+    let edA  = setLoaded "/w/a.py" (mkLR "aaa") ed0
+        edTwo = setLoadedNew "/w/b.py" (mkLR "bbb") edA   -- b active, a backgrounded
+        edLR = lintResults "/w/a.py" [d0] edTwo
+    check "lintResults sets a zipper doc's docDiags"
+      (any (\dd -> docPath dd == Just "/w/a.py" && docDiags dd == [d0])
+           (edBefore edLR ++ edAfter edLR))
+    check "lintResults leaves the active doc alone" (null (edDiags edLR))
+
+    -- Master toggle off clears diagnostics everywhere (no future pass will).
+    let edDirty = edLR { edDiags = [d0] }                 -- active + zipper both carry diags
+        edMOff  = applySettingRow 10 0 edDirty            -- row 10 = Linting master, 0 = off
+    check "master lint off clears active diags" (null (edDiags edMOff))
+    check "master lint off clears zipper diags"
+      (all (null . docDiags) (edBefore edMOff ++ edAfter edMOff))
+    check "master lint on keeps diags" (edDiags (applySettingRow 10 1 edDirty) == [d0])
+
+    -- lintersDetected refreshes an open Settings dialog's per-linter notes.
+    let edSettingsNone = openSettings ed0                 -- edLintAvail all Nothing
+        edSettingsAv = lintersDetected availAll edSettingsNone
+        ruffRow d = dlgChoices d !! 11                     -- master at 10, ruff (linters!!0) at 11
+    check "settings shows not-installed note before detection"
+      (maybe False (\d -> maybe False (T.isInfixOf (T.pack "\x2717")) (chNote (ruffRow d)))
+             (edDialog edSettingsNone))
+    check "lintersDetected refreshes the note in place"
+      (maybe False (\d -> maybe False (T.isInfixOf (T.pack "\x2713")) (chNote (ruffRow d)))
+             (edDialog edSettingsAv))
+    check "lintersDetected preserves dialog focus and choice indices"
+      (maybe False (\d -> dlgFocus d == 0 && chIx (ruffRow d) == chIx (ruffRow (maybe d id (edDialog edSettingsNone))))
+             (edDialog edSettingsAv))
+
+    -- ✓ / ✗ notes use single-width glyphs (else fall back per the spec).
+    checkEq "check glyph width" (charWidth '\x2713') 1
+    checkEq "cross glyph width" (charWidth '\x2717') 1
+
+    -- dialogScroll: fits -> 0; overflow with focus on buttons -> clamped positive
+    -- and keeps the buttons row reachable.
+    let Just sdlg = edDialog (openSettings edPy)
+        dbtn = sdlg { dlgFocus = focusCount sdlg - 1 }    -- focus on the last button
+        totalFit = length (dialogRows sdlg)
+        totalBtn = length (dialogRows dbtn)
+    checkEq "dialogScroll fits -> 0" (dialogScroll (totalFit + 5) sdlg) 0
+    check "dialogScroll overflow scrolls to reach the buttons"
+      (let s = dialogScroll 8 dbtn in s == totalBtn - 8 && s > 0)
+
+  -- Lint render ----------------------------------------------------------------
+  do
+    -- Style/StyleU pattern synonym: the three-field synonym equals the
+    -- four-field constructor with a default underline colour, and record
+    -- updates on a synonym-built value preserve the underline-colour field.
+    check "Style synonym == StyleU with default ul"
+      (Style Red Blue attrBold == StyleU Red Blue attrBold Default)
+    checkEq "synonym-built styleUl defaults to Default"
+      (styleUl (Style Red Blue attrBold)) Default
+    checkEq "record update preserves styleUl (default)"
+      (styleUl ((Style Red Blue attrBold) { styleFg = Green })) Default
+    checkEq "record update preserves styleUl (set)"
+      (styleUl (((Style Red Blue attrBold) { styleUl = Green }) { styleFg = Yellow })) Green
+
+    -- SGR emission of undercurl + underline colour, gated on rcUndercurl.
+    let sgrStr caps st = map (toEnum . fromIntegral)
+                           (BSL.unpack (BB.toLazyByteString (styleSgrWith caps st))) :: String
+        ulStyle = StyleU Default Default attrUndercurl (ColorRGB 200 40 40)
+        onCaps  = plainCaps { rcUndercurl = True }
+        sOn  = sgrStr onCaps ulStyle
+        sOff = sgrStr plainCaps ulStyle
+    check "undercurl caps on: emits 4:3"  ("4:3" `isInfixOf` sOn)
+    check "undercurl caps on: emits 58:"  ("58:" `isInfixOf` sOn)
+    check "undercurl caps off: plain ;4"  (";4" `isInfixOf` sOff)
+    check "undercurl caps off: no 4:3"    (not ("4:3" `isInfixOf` sOff))
+    check "undercurl caps off: no 58"     (not ("58" `isInfixOf` sOff))
+    -- A named/indexed underline colour uses the 58:5:n form.
+    check "named underline colour -> 58:5:1"
+      ("58:5:1" `isInfixOf` sgrStr onCaps (StyleU Default Default attrUndercurl Red))
+
+    -- expandLineCells with a diagOver span: covered cells gain attrUndercurl and
+    -- keep the base fg + a set styleUl; uncovered cells are untouched.
+    let baseSty = Style Red Default attrNone
+        cells1  = expandLineCells 4 False (const baseSty) (Style White Blue attrNone)
+                    defaultStyle Nothing False [] [(1, 3, Green)] [] (T.pack "abcd")
+        cellAt d cs = head [ c | (dd, c) <- cs, dd == d ]
+        styD d = cellStyle (cellAt d cells1)
+    check "diag: covered cell gains attrUndercurl" (hasAttr attrUndercurl (styleAttr (styD 1)))
+    checkEq "diag: covered cell underline colour"  (styleUl (styD 1)) Green
+    checkEq "diag: covered cell keeps base fg"      (styleFg (styD 1)) Red
+    check "diag: uncovered cell has no undercurl"   (not (hasAttr attrUndercurl (styleAttr (styD 0))))
+    checkEq "diag: uncovered cell keeps default ul" (styleUl (styD 0)) Default
+
+    -- Wide-glyph continuation cells keep alignment and carry the head's squiggle.
+    let cells2 = expandLineCells 4 False (const baseSty) (Style White Blue attrNone)
+                   defaultStyle Nothing False [] [(0, 1, Green)] [] (T.pack "\x4E2Dx")
+        headC = cellAt 0 cells2
+        contC = cellAt 1 cells2
+        tailC = cellAt 2 cells2
+    checkEq "wide glyph head char"              (cellChar headC) '\x4E2D'
+    checkEq "wide glyph continuation sentinel"  (cellChar contC) '\NUL'
+    checkEq "wide glyph tail char"              (cellChar tailC) 'x'
+    check "wide glyph head has undercurl"          (hasAttr attrUndercurl (styleAttr (cellStyle headC)))
+    check "wide glyph continuation has undercurl"  (hasAttr attrUndercurl (styleAttr (cellStyle contC)))
+    checkEq "wide glyph continuation shares underline colour"
+      (styleUl (cellStyle contC)) Green
 
   -- Report -------------------------------------------------------------------
   (passed, failed) <- readIORef results

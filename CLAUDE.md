@@ -406,6 +406,14 @@ in `README.md`; the cross-cutting structure that matters when editing:
   size: `sameGrid` compares against `csvSaved` with per-row/per-cell pointer
   shortcuts, so don't reintroduce a plain `==` on grids (or a big-table
   cutoff) — content-comparing shared rows made large tables freeze per key.
+  **User column widths**: dragging a column's border on the header row (like
+  the explorer divider: press starts `edCsvColDrag`, which swallows the mouse
+  until release; double-click re-fits) sets a sparse per-column override
+  (`csvUserW`) that `columnWidths`/`scrollLeft` fold over the cached widths —
+  overrides shift with `insertColAt`/`deleteCol` and are per-document via
+  `docCsv`. `csvBorderColAt`/`csvColStartX` (EditorState, where
+  `csvGutterWidthFor` also lives) are the shared border geometry for the hub's
+  hit-test/drag and the `col-resize` pointer hint.
 
 - **Image view mode (`Cmedit.Image`, `edImage`/`docImage`).** A third,
   read-only view mode, structured exactly like CSV but sharing none of its
@@ -530,21 +538,30 @@ in `README.md`; the cross-cutting structure that matters when editing:
   in-progress draft is stashed). `dlgPristine` makes the first keystroke replace
   a seeded term (cleared after any key by the FDialog wrapper); renames are
   deliberately not pristine.
-- **Themes.** `Render.themeFor (resolvedTheme ed)` picks dark/light per
+- **Themes.** `Render.themeFor (resolvedTheme ed)` picks the palette per
   frame; `Theme` carries `thTokens :: Tok -> Style` so the syntax palette
   differs per theme (light swaps washed-out brights for dark hues). Config key
-  `theme = auto|dark|light` (default `auto`): `resolvedTheme` maps `auto`
+  `theme = auto|dark-terminal|light-terminal|cherry-blossom|flashbang|midnight`
+  (default `auto`; the old `dark`/`light` spellings still parse):
+  `resolvedTheme` maps `auto`
   through `edDetectedDark` — the driver's OSC 11 background query, re-run on
   every focus-in so a system light/dark switch follows — and falls back to
   dark when the terminal never answers. Paint with `resolvedTheme`, never
   `cfgTheme`, or `auto` breaks. View ▸ Theme… opens a picker dialog
   (`DKTheme`/`mkTheme`, one button per `themeChoices` entry, focus starting
-  on the current mode): moving the focus **live-previews** the theme —
+  on the current mode; its seven buttons are why dialog button rows wrap —
+  `EditorState.buttonRows` splits them at `buttonRowMaxW`, shared by the
+  renderer, mouse hit-test and `dialogGeom`): moving the focus
+  **live-previews** the theme —
   `resolvedTheme` consults the open picker's focused button, so Esc/Cancel
   restores simply because nothing was written — and Enter commits via
-  `applyTheme` (per-session; the config key persists it). Note dark and
-  light keep the terminal's default background, so a preview restyles
-  chrome/tokens only, while cherry-blossom repaints every cell. The driver
+  `applyTheme` (per-session; the config key persists it). Note the two
+  terminal themes keep the terminal's default background, so a preview
+  restyles chrome/tokens only, while the forced-background three —
+  cherry-blossom (pink), flashbang (pure white) and midnight (deep navy) —
+  repaint every cell via `thRemap`, so the terminal palette never shows
+  through. `EditorEdit.themeLabel` doubles as the config word and the UI
+  label — keep any new theme's label parseable by `applyKey`. The driver
   also matches the cursor colour to the theme (OSC 12, reset on exit) —
   previews included, since it reads `resolvedTheme` per frame.
 - **About-box animation (`Cmedit.About`, `edAboutTick`).** The About dialog's
@@ -679,6 +696,51 @@ in `README.md`; the cross-cutting structure that matters when editing:
   is shared by `Render.drawQuickOpen` and mouse hit-testing; Enter opens via
   `EffOpen` so already-open files switch and the recents cursor-restore
   applies. Making a document active clears `edQuickOpen` like `edDefPick`.
+- **External linting (`Cmedit.Lint`, `edDiags`/`docDiags`).** Real-time
+  diagnostics from external linters (ruff, flake8, eslint, stylelint, pyright,
+  shellcheck), table-driven off `Lint.linters` — adding a tool is one row
+  (extensions, argv, stdin mode, install hint, supersede link: flake8 yields
+  when ruff runs). `Cmedit.Lint` is a leaf (ConfigFile imports it for the
+  `lint` / `lint-<name>` keys, which round-trip `updateConfigText` like any
+  other key). The driver detects availability on a startup thread
+  (`detectLinters`: `findExecutable`, plus `node_modules/.bin` under the
+  workspace root for node tools), re-probing on `EffDetectLinters` (Settings
+  opening) and folder open; `SMLintAvail` → `lintersDetected`, which also
+  refreshes an open Settings dialog's notes in place. Linting is
+  **driver-initiated like `pollFs`**: after any batch that changes the
+  fingerprint (path, `edEditSeq` — a counter bumped wherever the modified
+  flag is recomputed — lint config, availability) the loop arms a 500 ms
+  `registerDelay` debounce (`LintTick`); firing evaluates the pure
+  `lintRequest` (gates: `cfgLint`, plain-text doc, real non-`cmedit://` path;
+  `lrCwd` = workspace root so each project's own linter configs apply) and
+  forks `runLinters`: buffer over stdin, tolerant `path:line:col:` parse
+  (`parseLintOutput`), one gen-checked `SMLint` per pass — empty results
+  clear old squiggles; `drvLintGen` supersedes exactly like the search
+  walkers. `runToolCapture` feeds stdin and drains stderr on forked threads
+  (sequential pipe handling deadlocks once a ~64K buffer fills) under a 10 s
+  timeout + `terminateProcess`. Saving re-lints immediately including
+  save-time-only tools (pyright is `linStdin = False`, default-off):
+  `onSaved`/`savedAll` emit `EffLintNow`. Diags are per-document
+  (captureDoc/restoreDoc carry them; loads/reverts reset them); positions go
+  stale between passes, so **every consumer clamps** before indexing.
+  Rendering: `diagSpans` widens each hit over the identifier at its column;
+  `expandLineCellsFrom` takes a separate `diagOver` list that ORs
+  `attrUndercurl` and sets `styleUl` onto the already-resolved style (fg/bg
+  preserved, shows through selection, wide-glyph continuations inherit) —
+  `Style` is now a pattern synonym over the 4-field `StyleU` (the
+  Cell/`CellL` trick), and `styleUl` emits SGR 58 only under `rcUndercurl`,
+  the same gate that picks `4:3` over plain `4`. Line numbers tint via
+  `gutterStyleFor` (never the gutter *width* — that would oscillate the wrap
+  width); the status bar gains a click-to-jump `SZDiagnostics` count zone,
+  and `diagUnderCursor`'s message slots between the hover-URL override and
+  `edStatus`; F8 / Find ▸ Next Problem cycles via `jumpNextDiag`
+  (`pushNavIfFar` applies). Settings rows 10.. come from the linters table
+  (`nEditingSettings` splits the positional `applySettingRow`; a Spec test
+  pins the row sync); `Choice.chNote` is an always-visible dimmed second
+  line (`DRNote`, `thDialogDim`) carrying "✓ version" / "✗ not installed —
+  <install hint>", and the dialog scrolls when it doesn't fit:
+  `dialogScroll` derives the top row purely from focus + height and is
+  shared by `drawDialog` and mouse hit-testing (▲/▼ markers when clipped).
 - **Syntax highlighting (`Cmedit.Syntax`).** Per-language lexers return one
   `Tok` per character plus a trailing `HlState`, threaded across lines so
   multi-line constructs (block comments, Python docstrings, Markdown fences,

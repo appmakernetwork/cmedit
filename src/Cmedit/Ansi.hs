@@ -297,8 +297,9 @@ styleSgr = styleSgrWith plainCaps
 -- 'attrUndercurl' renders as the curly 4:3 form only when the caps allow it,
 -- and as a plain underline otherwise.
 styleSgrWith :: RenderCaps -> Style -> Builder
-styleSgrWith caps (Style fg bg attr) =
-  csi (string7 "0" <> attrCodes caps attr <> fgCodes fg <> bgCodes bg <> char7 'm')
+styleSgrWith caps (StyleU fg bg attr ul) =
+  csi (string7 "0" <> attrCodes caps attr <> fgCodes fg <> bgCodes bg
+         <> ulCodes caps ul <> char7 'm')
 
 attrCodes :: RenderCaps -> Attr -> Builder
 attrCodes caps a =
@@ -314,6 +315,27 @@ attrCodes caps a =
           string7 (if rcUndercurl caps then ";4:3" else ";4")
       | hasAttr attrUnderline a = string7 ";4"
       | otherwise               = mempty
+
+-- | SGR 58 underline-colour codes (the colon sub-parameter forms). Emitted
+-- ONLY when the terminal advertised curly-underline support ('rcUndercurl') —
+-- a terminal that ignores colon SGR would corrupt on these, per the CLAUDE.md
+-- gating rule — and only for a non-default colour. Named/256 colours map to
+-- the indexed @58:5:n@ form, direct RGB to @58:2::r:g:b@ (the empty
+-- colour-space id keeps the double colon the standard prescribes).
+ulCodes :: RenderCaps -> Color -> Builder
+ulCodes caps col
+  | not (rcUndercurl caps) = mempty
+  | otherwise = case col of
+      Default        -> mempty
+      Black          -> idx 0;  Red     -> idx 1;  Green   -> idx 2;  Yellow -> idx 3
+      Blue           -> idx 4;  Magenta -> idx 5;  Cyan    -> idx 6;  White  -> idx 7
+      BrightBlack    -> idx 8;  BrightRed     -> idx 9;   BrightGreen  -> idx 10
+      BrightYellow   -> idx 11; BrightBlue    -> idx 12;  BrightMagenta -> idx 13
+      BrightCyan     -> idx 14; BrightWhite   -> idx 15
+      Color256 i     -> idx (fromIntegral i)
+      ColorRGB r g b -> string7 ";58:2::" <> intDec (fromIntegral r) <> char7 ':'
+                          <> intDec (fromIntegral g) <> char7 ':' <> intDec (fromIntegral b)
+  where idx k = string7 ";58:5:" <> intDec k
 
 fgCodes :: Color -> Builder
 fgCodes c = case c of

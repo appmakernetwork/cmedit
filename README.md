@@ -98,11 +98,13 @@ escape sequences and the POSIX `termios` API.
   from-scratch `inflate`, WebP — both lossless VP8L and lossy VP8, boolean
   arithmetic decoder, loop filter and all — and Netpbm) is written from first
   principles using only GHC boot libraries.
-- **Dark, light and cherry-blossom themes**: `theme = light` in the config (or
+- **Five themes plus auto**: `theme = light-terminal` in the config (or
   View ▸ Theme to pick one live, with preview) swaps the syntax palette for one readable on
-  light terminal backgrounds; `theme = cherry-blossom` is a light pink 24-bit
-  theme (after GymMaster's) that paints its own background on every cell, so it
-  looks the same whatever the terminal's colours.
+  light terminal backgrounds; dark-terminal and light-terminal keep your
+  terminal's own background, while the other three are 24-bit themes that
+  paint their own background on every cell, so they look the same whatever
+  the terminal's colours: `cherry-blossom` is light pink (after GymMaster's),
+  `flashbang` is a blinding pure white, and `midnight` is a deep navy.
 - **Syntax highlighting** for SQL (PostgreSQL), Python, JavaScript/TypeScript
   (`.js/.mjs/.jsx/.ts/.tsx`), CSS/SCSS/LESS, HTML/XML, FreeMarker (`.ftl`),
   Jinja, shell, Markdown, JSON, YAML, TOML, INI/conf and CSV — including
@@ -146,6 +148,20 @@ escape sequences and the POSIX `termios` API.
   from the words of every open buffer, nearest occurrences first — no language
   servers, works offline. Type to narrow, Tab/Enter accepts, a single
   candidate inserts immediately, and the whole thing is one undo step.
+- **External-linter integration**: cmedit auto-detects `ruff`, `flake8`,
+  `eslint`, `stylelint`, `pyright` and `shellcheck` on your `PATH` (and
+  `eslint`/`stylelint` in the workspace's `node_modules/.bin`), then lints the
+  active file automatically about half a second after you stop typing —
+  buffer content goes to the tool over stdin, so unsaved changes are checked,
+  with the workspace root as the working directory so project configs like
+  `pyproject.toml` or `eslint.config.mjs` apply. Saving re-lints immediately.
+  `pyright` is save-time-only and off by default (it's slow), and `flake8` is
+  skipped when `ruff` is installed and enabled. Problems show as colored
+  squiggly underlines (curly where supported), tinted line numbers, and an
+  "nE mW" count on the status bar (click to jump); resting the cursor on one
+  shows its message. **F8** (or Find ▸ Next Problem) cycles through them.
+  File ▸ Settings has a **Linting** section with a master switch and a row
+  per linter showing install status and, if missing, the install command.
 - **Navigation history (Alt+←/→)**: every long-distance jump — Go to Line,
   find, Go to Definition, a search result, a bracket jump, Ctrl+Home/End,
   opening or switching files — records where you were; Alt+Left walks back
@@ -309,6 +325,7 @@ logic unit-testable without a terminal.
 | `Cmedit.Types` | Shared types: keys, mouse, colours, styles, cells |
 | `Cmedit.Link` | OSC 8 hyperlink targets: URL recognition in text, `file://` URIs, link ids |
 | `Cmedit.ConfigFile` | The `~/.config/cmedit` config file + persisted recent-files list |
+| `Cmedit.Lint` | External-linter catalogue (ruff/flake8/eslint/stylelint/pyright/shellcheck): invocation + output parsing into diagnostics |
 | `Cmedit.Term` | The platform layer (`platform/{posix,windows}`, one module two implementations): raw mode, window size, resize/terminate wiring, walker stat |
 | `Cmedit.Ansi` | ANSI/VT escape-sequence builders (incl. queries, sync output, scroll regions) |
 | `Cmedit.Caps` | Terminal capability model: probe-reply folding, fingerprints, colour parsing |

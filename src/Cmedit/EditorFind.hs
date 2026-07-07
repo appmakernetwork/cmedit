@@ -771,6 +771,7 @@ stagedDoc path lr buf' = Document
   , docOverwrite = False, docDiscard = False
   , docCsv = Nothing, docCsvStash = Nothing, docImage = Nothing
   , docHlCache = Nothing
+  , docDiags = []
   }
 
 -- | The substitution used by a workspace Replace All, shared by the open-buffer
@@ -800,7 +801,10 @@ replaceInOpenDocs subst paths ed =
         | activeHit = let ed1    = beginEdit EKOther ed
                           (b, c) = doBuf (edBuffer ed1)
                       in ( ed1 { edBuffer = b, edCursor = clampPos (edCursor ed1) b
-                               , edSelAnchor = Nothing, edModified = True, edStatus = "" }, c)
+                               , edSelAnchor = Nothing, edModified = True, edStatus = ""
+                               -- bypasses afterEdit, so bump the lint edit
+                               -- counter here or squiggles pin to stale spots
+                               , edEditSeq = edEditSeq ed1 + 1 }, c)
         | otherwise = (ed, 0)
       onDoc d
         | hit d = let snap   = UndoState (docBuffer d) (docCursor d) (docSelAnchor d)

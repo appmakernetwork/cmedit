@@ -39,6 +39,7 @@ data MenuAction
   | MADuplicateLine | MAMoveLineUp | MAMoveLineDown | MADeleteLine | MAJoinLines
   | MAToggleComment
   | MAFind | MAFindNext | MAFindPrev | MAReplace | MAGoToLine
+  | MANextProblem              -- ^ Jump to the next linter diagnostic (F8).
   | MAFindInFiles | MAReplaceInFiles   -- ^ Workspace-wide (multi-file) find / replace.
   | MAGoToDef                  -- ^ Go to the definition of the identifier at the cursor.
   | MAGoToBracket              -- ^ Jump to the bracket matching the one at the cursor.
@@ -50,7 +51,7 @@ data MenuAction
   | MASortColumn               -- ^ Sort the table by the current column (toggles asc/desc).
   | MACycleLineEnding          -- ^ Switch the saved line ending (LF ⇄ CRLF).
   | MAToggleBom                -- ^ Toggle the UTF-8 BOM written on save.
-  | MAToggleTheme              -- ^ Open the theme picker dialog (auto / dark / light / cherry-blossom, live-previewed).
+  | MAToggleTheme              -- ^ Open the theme picker dialog (auto / dark-terminal / light-terminal / cherry-blossom / flashbang / midnight, live-previewed).
   | MASwitchFile !Int          -- ^ Switch to the open file at this index.
   | MARecentFile !Int          -- ^ Open the k-th entry of the File menu's recent-files list.
   | MANextFile | MAPrevFile
@@ -122,6 +123,7 @@ menuBar =
       , MEItem "Go to &Definition" "F12" MAGoToDef
       , MEItem "&Go to Line\x2026" "Ctrl+G" MAGoToLine
       , MEItem "Go to &Bracket"  "Ctrl+]" MAGoToBracket
+      , MEItem "Next Proble&m"   "F8"     MANextProblem
       , MESep
       , MEItem "Go Bac&k"        "Alt+\x2190" MANavBack
       , MEItem "Go For&ward"     "Alt+\x2192" MANavFwd

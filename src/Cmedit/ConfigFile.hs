@@ -37,6 +37,8 @@ module Cmedit.ConfigFile
 
 import Control.Exception (SomeException, try)
 import Data.Char (isSpace, toLower)
+import Data.List (isPrefixOf)
+import Cmedit.Lint (LinterId, Linter(..), linters)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
@@ -51,10 +53,14 @@ import Text.Read (readMaybe)
 
 -- | The colour theme (interpreted by "Cmedit.Render"). 'ThemeAuto' follows
 -- the terminal's background colour when the terminal reports it (the driver's
--- OSC 11 query), and falls back to dark where it doesn't.
--- 'ThemeCherryBlossom' is a light 24-bit pink theme that paints its own
--- background on every cell, so it never depends on the terminal's palette.
+-- OSC 11 query), and falls back to dark where it doesn't. 'ThemeDark' and
+-- 'ThemeLight' keep the terminal's own background (hence \"dark terminal\" /
+-- \"light terminal\" in the UI); 'ThemeCherryBlossom' (light pink),
+-- 'ThemeFlashbang' (blinding white) and 'ThemeMidnight' (deep navy) paint
+-- their own background on every cell, so they never depend on the terminal's
+-- palette.
 data ThemeName = ThemeDark | ThemeLight | ThemeAuto | ThemeCherryBlossom
+               | ThemeFlashbang | ThemeMidnight
   deriving (Eq, Show)
 
 data Config = Config
@@ -68,6 +74,8 @@ data Config = Config
   , cfgEnsureFinalNl  :: !Bool   -- ^ Make sure the file ends with a newline on save.
   , cfgFreezeHeader   :: !Bool   -- ^ CSV table view: pin the first row while scrolling (View ▸ Freeze Header Row toggles it per-session).
   , cfgTheme          :: !ThemeName
+  , cfgLint           :: !Bool                -- ^ Master switch for external-linter diagnostics.
+  , cfgLintOn         :: ![(LinterId, Bool)]  -- ^ Per-linter enable flags, one entry per 'Cmedit.Lint.linters' row.
   } deriving (Eq, Show)
 
 defaultConfig :: Config
@@ -82,6 +90,8 @@ defaultConfig = Config
   , cfgEnsureFinalNl  = False
   , cfgFreezeHeader   = True    -- spreadsheets almost always have a header row
   , cfgTheme          = ThemeAuto   -- follow the terminal background; dark when undetectable
+  , cfgLint           = True
+  , cfgLintOn         = [ (linId l, linDefaultOn l) | l <- linters ]
   }
 
 -- | Apply a config file's text to a base config. Unknown keys and unparsable
@@ -122,18 +132,31 @@ applyKey key val cfg = case key of
   "final-newline"            -> boolKey (\b -> cfg { cfgEnsureFinalNl = b })
   "freeze-header"            -> boolKey (\b -> cfg { cfgFreezeHeader = b })
   "theme" -> case map toLower val of
-    "dark"           -> Right cfg { cfgTheme = ThemeDark }
-    "light"          -> Right cfg { cfgTheme = ThemeLight }
+    "dark-terminal"  -> Right cfg { cfgTheme = ThemeDark }
+    "dark"           -> Right cfg { cfgTheme = ThemeDark }   -- legacy spelling
+    "light-terminal" -> Right cfg { cfgTheme = ThemeLight }
+    "light"          -> Right cfg { cfgTheme = ThemeLight }  -- legacy spelling
     "auto"           -> Right cfg { cfgTheme = ThemeAuto }
     "cherry-blossom" -> Right cfg { cfgTheme = ThemeCherryBlossom }
     "cherryblossom"  -> Right cfg { cfgTheme = ThemeCherryBlossom }
     "cherry"         -> Right cfg { cfgTheme = ThemeCherryBlossom }
-    _ -> Left "theme expects 'dark', 'light', 'auto' or 'cherry-blossom'"
+    "flashbang"      -> Right cfg { cfgTheme = ThemeFlashbang }
+    "midnight"       -> Right cfg { cfgTheme = ThemeMidnight }
+    _ -> Left "theme expects 'auto', 'dark-terminal', 'light-terminal', 'cherry-blossom', 'flashbang' or 'midnight'"
+  "lint" -> boolKey (\b -> cfg { cfgLint = b })
+  _ | Just suffix <- stripPrefix' "lint-" key
+    , Just l <- lookupLinter suffix ->
+        boolKey (\b -> cfg { cfgLintOn = setLintOn (linId l) b (cfgLintOn cfg) })
   _ -> Left ("unknown key '" ++ key ++ "'")
   where
     boolKey set = case parseBool val of
       Just b  -> Right (set b)
       Nothing -> Left (key ++ " expects true or false")
+    stripPrefix' p s = if p `isPrefixOf` s then Just (drop (length p) s) else Nothing
+    lookupLinter nm = case [ l | l <- linters, linName l == nm ] of
+      (l : _) -> Just l
+      []      -> Nothing
+    setLintOn lid b = map (\(i, x) -> if i == lid then (i, b) else (i, x))
 
 parseBool :: String -> Maybe Bool
 parseBool s = case map toLower s of
@@ -156,10 +179,16 @@ configKeysHelp =
   , "                     (default false)."
   , "freeze-header = BOOL Pin a CSV table's first row while scrolling"
   , "                     (default true)."
-  , "theme = auto|dark|light|cherry-blossom"
+  , "theme = auto|dark-terminal|light-terminal|cherry-blossom|flashbang|midnight"
   , "                     Colour theme; 'auto' follows the terminal"
-  , "                     background (default dark). 'cherry-blossom' is a"
-  , "                     light pink theme with its own background colours."
+  , "                     background (default dark). The terminal themes keep"
+  , "                     the terminal's own background; cherry-blossom (light"
+  , "                     pink), flashbang (bright white) and midnight (deep"
+  , "                     navy) paint their own background colours."
+  , "lint = BOOL          Run external linters on the active file (default"
+  , "                     true). Per-linter switches: lint-ruff, lint-flake8,"
+  , "                     lint-eslint, lint-stylelint, lint-pyright,"
+  , "                     lint-shellcheck (each = on|off)."
   ]
 
 ------------------------------------------------------------------------------
@@ -181,7 +210,11 @@ configFields =
   , ("final-newline",            renderBool . cfgEnsureFinalNl)
   , ("freeze-header",            renderBool . cfgFreezeHeader)
   , ("theme",                    renderTheme . cfgTheme)
-  ]
+  , ("lint",                     renderBool . cfgLint)
+  ] ++
+  [ ( T.pack ("lint-" ++ linName l)
+    , \c -> renderBool (maybe (linDefaultOn l) id (lookup (linId l) (cfgLintOn c))) )
+  | l <- linters ]
 
 renderBool :: Bool -> Text
 renderBool b = if b then "on" else "off"
@@ -189,9 +222,11 @@ renderBool b = if b then "on" else "off"
 renderTheme :: ThemeName -> Text
 renderTheme t = case t of
   ThemeAuto          -> "auto"
-  ThemeDark          -> "dark"
-  ThemeLight         -> "light"
+  ThemeDark          -> "dark-terminal"
+  ThemeLight         -> "light-terminal"
   ThemeCherryBlossom -> "cherry-blossom"
+  ThemeFlashbang     -> "flashbang"
+  ThemeMidnight      -> "midnight"
 
 -- | Produce config-file text setting every key to @desired@, editing the given
 -- current text as little as possible: a supported key already present has only

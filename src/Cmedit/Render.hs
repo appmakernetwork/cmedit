@@ -13,9 +13,12 @@ module Cmedit.Render
   , defaultTheme
   , lightTheme
   , cherryBlossomTheme
+  , flashbangTheme
+  , midnightTheme
   , themeFor
   , FileKind(..)
   , fileKind
+  , expandLineCells   -- exposed for the diagnostics-overlay unit test
   ) where
 
 import Control.Monad (forM_, when)
@@ -51,6 +54,7 @@ import Cmedit.QuickOpen (QuickOpen(..))
 import qualified Cmedit.QuickOpen as Q
 import Cmedit.Dialog
 import Cmedit.Editor
+import Cmedit.Lint (Diag(..), Severity(..), diagSpans, linName, linterById)
 import System.FilePath (makeRelative, takeExtension)
 import Cmedit.Menu
 import Cmedit.Syntax
@@ -115,13 +119,19 @@ data Theme = Theme
   , thFindMatch    :: !Style   -- ^ Every-match highlight while the Find dialog is open.
   , thBracket      :: !Style   -- ^ The bracket pair enclosing/under the cursor.
   , thScrollbar    :: !Style   -- ^ The right-edge scrollbar track and thumb.
+  , thDiagErr      :: !Color   -- ^ Underline colour for error diagnostics.
+  , thDiagWarn     :: !Color   -- ^ Underline colour for warning diagnostics.
+  , thDiagInfo     :: !Color   -- ^ Underline colour for info diagnostics.
+  , thGutterDiag   :: !Style   -- ^ Gutter line number on a line carrying diagnostics.
+  , thDialogDim    :: !Style   -- ^ Dimmed dialog text (per-row notes / scroll markers).
   , thTokens       :: !(Tok -> Style) -- ^ Syntax-token palette (differs between dark and light).
   , thRemap        :: !(Maybe (Style -> Style))
     -- ^ Applied to every finished cell before the frame is frozen. Themes
-    -- that paint their own background (Cherry Blossom) use this to remap the
-    -- 16 ANSI colours — including the hardcoded styles in views like the
-    -- explorer, search and quick-open — onto their palette, so no cell ever
-    -- falls through to the terminal's own colours. 'Nothing' skips the pass.
+    -- that paint their own background (Cherry Blossom, Flashbang, Midnight)
+    -- use this to remap the 16 ANSI colours — including the hardcoded styles
+    -- in views like the explorer, search and quick-open — onto their palette,
+    -- so no cell ever falls through to the terminal's own colours. 'Nothing'
+    -- skips the pass.
   }
 
 defaultTheme :: Theme
@@ -151,6 +161,11 @@ defaultTheme = Theme
     -- back to the plain underline this always used elsewhere.
   , thBracket     = Style BrightCyan Default (attrBold .|. attrUndercurl)
   , thScrollbar   = Style BrightBlack Default attrNone
+  , thDiagErr     = Red
+  , thDiagWarn    = Yellow
+  , thDiagInfo    = Blue
+  , thGutterDiag  = Style Red Default attrNone
+  , thDialogDim   = Style Black White attrDim
   , thTokens      = darkTokens
   , thRemap       = Nothing
   }
@@ -164,6 +179,11 @@ lightTheme :: Theme
 lightTheme = defaultTheme
   { thGutterCur = Style Blue Default attrBold
   , thBracket   = Style Blue Default (attrBold .|. attrUndercurl)
+    -- Darker diagnostic hues that stay legible squiggling on a white ground.
+  , thDiagErr    = ColorRGB 197 15 31
+  , thDiagWarn   = ColorRGB 176 120 0
+  , thDiagInfo   = ColorRGB 30 90 190
+  , thGutterDiag = Style (ColorRGB 197 15 31) Default attrNone
   , thTokens    = lightTokens
   }
 
@@ -198,6 +218,12 @@ cherryBlossomTheme = Theme
   , thFindMatch   = Style cbInkDeep (rgb 247 208 112) attrNone
   , thBracket     = Style cbRaspberry cbBase (attrBold .|. attrUndercurl)
   , thScrollbar   = Style (rgb 216 168 207) cbBase attrNone
+    -- Diagnostics in keeping with the plum/rose palette; readable on the pink page.
+  , thDiagErr     = rgb 181 72 77
+  , thDiagWarn    = rgb 178 101 0
+  , thDiagInfo    = rgb 94 85 184
+  , thGutterDiag  = Style (rgb 181 72 77) cbBase attrNone
+  , thDialogDim   = Style cbInk cbDlgPink attrDim
   , thTokens      = cherryTokens
   , thRemap       = Just cherryRemap
   }
@@ -228,7 +254,7 @@ cbRaspberry = ColorRGB 163 18 95
 -- search view, quick-open, CSV table, browser and About wordmark. Named
 -- colours never reach the terminal, so the forced background stays intact.
 cherryRemap :: Style -> Style
-cherryRemap (Style fg bg at) = Style fg' (mapBg bg) at
+cherryRemap st@(Style fg bg _) = st { styleFg = fg', styleBg = mapBg bg }
   where
     -- Blue and Black backgrounds are the dark chrome (selections, table
     -- headers); they keep light foregrounds. Everything else sits on a light
@@ -288,11 +314,230 @@ cherryRemap (Style fg bg at) = Style fg' (mapBg bg) at
       BrightCyan    -> ColorRGB 14 116 144
       _             -> c                       -- RGB / 256 pass through
 
+-- | Flashbang: a light 24-bit theme that paints a pure-white page on every
+-- cell (the name is a promise), with near-black text, neutral grey chrome and
+-- one strong blue accent. Structured exactly like Cherry Blossom: explicit
+-- RGB chrome fields plus 'flashbangRemap' for everything else, so the
+-- terminal palette never shows through — the same blinding page on any
+-- terminal.
+flashbangTheme :: Theme
+flashbangTheme = Theme
+  { thText        = Style fbText fbBase attrNone
+  , thGutter      = Style (rgb 168 168 168) fbBase attrNone
+  , thGutterCur   = Style fbAccent fbBase attrBold
+  , thMenuBar     = Style fbInk fbBar attrNone
+  , thMenuActive  = Style (rgb 255 255 255) fbAccent attrNone
+  , thMenuItem    = Style fbInk fbDrop attrNone
+  , thMenuAccel   = Style (rgb 122 122 122) fbDrop attrNone
+  , thMenuSel     = Style (rgb 255 255 255) fbAccent attrNone
+  , thStatus      = Style fbInk fbBar attrNone
+  , thStatusKey   = Style fbAccent fbBar attrBold
+  , thHint        = Style (rgb 88 88 88) fbBase attrNone
+  , thHintKey     = Style (rgb 255 255 255) fbAccent attrNone
+  , thSelection   = Style fbInk fbSel attrNone
+  , thDialog      = Style fbInk fbDlg attrNone
+  , thDialogTitle = Style (rgb 255 255 255) fbAccent attrBold
+  , thField       = Style fbInk (rgb 235 240 248) attrNone
+  , thFieldFocus  = Style fbInk fbSel attrNone
+  , thButton      = Style fbInk (rgb 229 229 229) attrNone
+  , thButtonFocus = Style (rgb 255 255 255) fbAccent attrBold
+  , thWhitespace  = Style (rgb 208 208 208) fbBase attrNone
+  , thFindMatch   = Style fbInk (rgb 255 232 122) attrNone
+  , thBracket     = Style fbAccent fbBase (attrBold .|. attrUndercurl)
+  , thScrollbar   = Style (rgb 196 196 196) fbBase attrNone
+  , thDiagErr     = rgb 197 15 31
+  , thDiagWarn    = rgb 154 105 0
+  , thDiagInfo    = fbAccent
+  , thGutterDiag  = Style (rgb 197 15 31) fbBase attrNone
+  , thDialogDim   = Style fbInk fbDlg attrDim
+  , thTokens      = flashbangTokens
+  , thRemap       = Just flashbangRemap
+  }
+  where rgb = ColorRGB
+
+-- The Flashbang palette: a pure-white page, greyscale chrome, one blue accent.
+fbBase, fbText, fbInk, fbBar, fbDrop, fbDlg, fbSel, fbAccent :: Color
+fbBase   = ColorRGB 255 255 255   -- page: maximum brightness, as advertised
+fbText   = ColorRGB 26 26 26      -- body text: near black
+fbInk    = ColorRGB 18 18 18      -- chrome text
+fbBar    = ColorRGB 233 233 233   -- menu/status bars
+fbDrop   = ColorRGB 246 246 246   -- dropdowns, buttons
+fbDlg    = ColorRGB 250 250 250   -- dialogs
+fbSel    = ColorRGB 178 211 255   -- text selection: pale blue
+fbAccent = ColorRGB 0 95 184      -- the one strong accent
+
+-- Remap one finished cell style onto the Flashbang palette (the ANSI-named
+-- styles hardcoded in the explorer, search view, quick-open, CSV table,
+-- browser and About wordmark) — the same shape as 'cherryRemap'.
+flashbangRemap :: Style -> Style
+flashbangRemap st@(Style fg bg _) = st { styleFg = fg', styleBg = mapBg bg }
+  where
+    -- Blue and Black backgrounds are the accent/dark chrome (selections,
+    -- table headers); they keep light foregrounds. Everything else sits on
+    -- the white page and gets the dark palette.
+    fg' = if bg == Blue || bg == Black then lightFg fg else darkFg fg
+    mapBg c = case c of
+      Default     -> fbBase
+      Black       -> fbInk
+      Blue        -> fbAccent
+      Cyan        -> ColorRGB 205 226 250
+      White       -> fbDrop
+      BrightWhite -> ColorRGB 255 255 255
+      BrightBlack -> ColorRGB 206 206 206      -- unfocused selection
+      Yellow      -> ColorRGB 255 232 122      -- find-match amber
+      Green       -> ColorRGB 205 238 214
+      Red         -> ColorRGB 250 205 208
+      Magenta     -> ColorRGB 243 214 245
+      other       -> other                     -- RGB / 256 pass through
+    -- Light tints for the blue accent / dark chrome.
+    lightFg c = case c of
+      BrightWhite   -> ColorRGB 255 255 255
+      White         -> ColorRGB 235 240 248
+      Yellow        -> ColorRGB 255 224 130
+      BrightYellow  -> ColorRGB 255 224 130
+      BrightBlack   -> ColorRGB 198 214 235
+      Green         -> ColorRGB 190 235 200
+      BrightGreen   -> ColorRGB 190 235 200
+      Red           -> ColorRGB 255 190 196
+      BrightRed     -> ColorRGB 255 190 196
+      Cyan          -> ColorRGB 190 228 244
+      BrightCyan    -> ColorRGB 190 228 244
+      Magenta       -> ColorRGB 238 200 240
+      BrightMagenta -> ColorRGB 238 200 240
+      Blue          -> ColorRGB 205 220 248
+      BrightBlue    -> ColorRGB 205 220 248
+      ColorRGB{}    -> c
+      Color256{}    -> c
+      _             -> ColorRGB 255 255 255    -- Default / Black
+    -- Dark hues readable on the white page and light chrome.
+    darkFg c = case c of
+      Default       -> fbText
+      Black         -> fbInk
+      White         -> ColorRGB 122 122 122
+      BrightWhite   -> fbInk                   -- "emphasized" on dark terminals
+      BrightBlack   -> ColorRGB 128 128 128
+      Red           -> ColorRGB 197 15 31
+      BrightRed     -> ColorRGB 216 22 40
+      Green         -> ColorRGB 16 124 65
+      BrightGreen   -> ColorRGB 19 145 76
+      Yellow        -> ColorRGB 154 105 0
+      BrightYellow  -> ColorRGB 154 105 0
+      Blue          -> fbAccent
+      BrightBlue    -> ColorRGB 0 78 152
+      Magenta       -> ColorRGB 136 23 152
+      BrightMagenta -> ColorRGB 160 32 178
+      Cyan          -> ColorRGB 0 130 153
+      BrightCyan    -> ColorRGB 0 130 153
+      _             -> c                       -- RGB / 256 pass through
+
+-- | Midnight: a dark 24-bit theme that paints its own deep-navy page on
+-- every cell — the dark counterpart of Flashbang for terminals whose own
+-- background is the wrong shade (or the wrong mode entirely). Moonlit
+-- periwinkle accent, slate-navy chrome, and 'midnightRemap' catching the
+-- hardcoded ANSI styles so nothing falls through to the terminal palette.
+midnightTheme :: Theme
+midnightTheme = Theme
+  { thText        = Style mnText mnBase attrNone
+  , thGutter      = Style (rgb 92 101 145) mnBase attrNone
+  , thGutterCur   = Style mnAccent mnBase attrBold
+  , thMenuBar     = Style mnBright mnBar attrNone
+  , thMenuActive  = Style mnDeep mnAccent attrNone
+  , thMenuItem    = Style mnText mnDrop attrNone
+  , thMenuAccel   = Style (rgb 122 132 178) mnDrop attrNone
+  , thMenuSel     = Style mnDeep mnAccent attrNone
+  , thStatus      = Style mnBright mnBar attrNone
+  , thStatusKey   = Style (rgb 224 175 104) mnBar attrBold
+  , thHint        = Style (rgb 132 142 188) mnBase attrNone
+  , thHintKey     = Style mnDeep (rgb 125 207 255) attrNone
+  , thSelection   = Style mnBright mnSel attrNone
+  , thDialog      = Style mnText mnDlg attrNone
+  , thDialogTitle = Style mnDeep mnAccent attrBold
+  , thField       = Style mnBright (rgb 47 56 96) attrNone
+  , thFieldFocus  = Style mnBright mnSel attrNone
+  , thButton      = Style mnText (rgb 42 50 87) attrNone
+  , thButtonFocus = Style mnDeep mnAccent attrBold
+  , thWhitespace  = Style (rgb 62 70 110) mnBase attrNone
+  , thFindMatch   = Style mnDeep (rgb 224 175 104) attrNone
+  , thBracket     = Style mnAccent mnBase (attrBold .|. attrUndercurl)
+  , thScrollbar   = Style (rgb 62 70 110) mnBase attrNone
+  , thDiagErr     = rgb 247 118 142
+  , thDiagWarn    = rgb 224 175 104
+  , thDiagInfo    = mnAccent
+  , thGutterDiag  = Style (rgb 247 118 142) mnBase attrNone
+  , thDialogDim   = Style mnText mnDlg attrDim
+  , thTokens      = midnightTokens
+  , thRemap       = Just midnightRemap
+  }
+  where rgb = ColorRGB
+
+-- The Midnight palette: a deep-navy page with slate chrome and a moonlit
+-- periwinkle accent.
+mnBase, mnText, mnBright, mnDeep, mnBar, mnDrop, mnDlg, mnSel, mnAccent :: Color
+mnBase   = ColorRGB 13 16 33      -- page: deep midnight navy
+mnText   = ColorRGB 192 202 240   -- body text: moonlit lavender-grey
+mnBright = ColorRGB 222 229 255   -- emphasized text
+mnDeep   = ColorRGB 10 12 26      -- dark ink on the accent
+mnBar    = ColorRGB 30 36 66      -- menu/status bars
+mnDrop   = ColorRGB 24 29 54      -- dropdowns, buttons
+mnDlg    = ColorRGB 21 26 48      -- dialogs
+mnSel    = ColorRGB 45 55 100     -- text selection
+mnAccent = ColorRGB 122 162 247   -- periwinkle accent
+
+-- Remap one finished cell style onto the Midnight palette. The hardcoded
+-- ANSI styles were designed for light chrome panels (Black-on-White headers,
+-- BrightWhite-on-Blue selections); here every panel is a navy, so named
+-- foregrounds map to light hues except on the two backgrounds that stay
+-- light (the find-match amber and pure BrightWhite).
+midnightRemap :: Style -> Style
+midnightRemap st@(Style fg bg _) = st { styleFg = fg', styleBg = mapBg bg }
+  where
+    fg' = if bg == Yellow || bg == BrightWhite then darkFg fg else lightFg fg
+    mapBg c = case c of
+      Default     -> mnBase
+      Black       -> mnDeep
+      Blue        -> ColorRGB 61 78 145        -- selections, table headers
+      Cyan        -> ColorRGB 47 82 126
+      White       -> mnDrop                    -- light chrome panels go navy
+      BrightWhite -> ColorRGB 222 229 255
+      BrightBlack -> ColorRGB 52 60 100        -- unfocused selection
+      Yellow      -> ColorRGB 224 175 104      -- find-match amber
+      Green       -> ColorRGB 34 74 54
+      Red         -> ColorRGB 94 42 52
+      Magenta     -> ColorRGB 78 50 104
+      other       -> other                     -- RGB / 256 pass through
+    -- Light hues for the navy grounds (nearly everything).
+    lightFg c = case c of
+      Default       -> mnText
+      Black         -> mnBright                -- was dark-on-light chrome text
+      White         -> ColorRGB 160 170 214
+      BrightWhite   -> mnBright
+      BrightBlack   -> ColorRGB 108 118 164
+      Red           -> ColorRGB 247 118 142
+      BrightRed     -> ColorRGB 255 138 158
+      Green         -> ColorRGB 158 206 106
+      BrightGreen   -> ColorRGB 178 222 130
+      Yellow        -> ColorRGB 224 175 104
+      BrightYellow  -> ColorRGB 238 195 128
+      Blue          -> mnAccent
+      BrightBlue    -> ColorRGB 146 180 255
+      Magenta       -> ColorRGB 187 154 247
+      BrightMagenta -> ColorRGB 204 176 255
+      Cyan          -> ColorRGB 125 207 255
+      BrightCyan    -> ColorRGB 148 216 255
+      _             -> c                       -- RGB / 256 pass through
+    -- Dark ink for the few light grounds.
+    darkFg c = case c of
+      ColorRGB{} -> c
+      Color256{} -> c
+      _          -> mnDeep
+
 -- | Pick the palette the editor's config asks for.
 themeFor :: ThemeName -> Theme
 themeFor ThemeDark  = defaultTheme
 themeFor ThemeLight = lightTheme
 themeFor ThemeCherryBlossom = cherryBlossomTheme
+themeFor ThemeFlashbang = flashbangTheme
+themeFor ThemeMidnight  = midnightTheme
 themeFor ThemeAuto  = defaultTheme   -- resolved before we get here ('resolvedTheme'); dark is the fallback
 
 darkTokens :: Tok -> Style
@@ -362,6 +607,56 @@ cherryTokens t = case t of
   TkCode      -> on (ColorRGB 46 125 84) attrNone
   TkLink      -> on (ColorRGB 124 80 200) attrUnderline
   TkProperty  -> on (ColorRGB 94 85 184) attrNone
+  where on fg = Style fg Default
+
+-- The 'lightTokens' hues pinned to explicit RGB for the Flashbang page (the
+-- Default backgrounds become pure white via 'flashbangRemap'): classic
+-- light-IDE colours picked for contrast on #ffffff.
+flashbangTokens :: Tok -> Style
+flashbangTokens t = case t of
+  TkText      -> Style Default Default attrNone
+  TkPunct     -> Style Default Default attrNone
+  TkKeyword   -> on (ColorRGB 136 23 152) attrBold
+  TkType      -> on (ColorRGB 0 95 184) attrNone
+  TkString    -> on (ColorRGB 16 124 65) attrNone
+  TkComment   -> on (ColorRGB 122 122 122) attrItalic
+  TkNumber    -> on (ColorRGB 197 15 31) attrNone
+  TkFunction  -> on (ColorRGB 0 95 184) attrBold
+  TkBuiltin   -> on (ColorRGB 0 130 153) attrNone
+  TkDecorator -> on (ColorRGB 136 23 152) attrNone
+  TkTag       -> on (ColorRGB 0 95 184) attrNone
+  TkAttr      -> on (ColorRGB 0 130 153) attrNone
+  TkHeading   -> on (ColorRGB 136 23 152) attrBold
+  TkEmph      -> Style Default Default attrItalic
+  TkStrong    -> Style Default Default attrBold
+  TkCode      -> on (ColorRGB 16 124 65) attrNone
+  TkLink      -> on (ColorRGB 0 95 184) attrUnderline
+  TkProperty  -> on (ColorRGB 0 78 152) attrNone
+  where on fg = Style fg Default
+
+-- Moonlit hues for the Midnight page (the Default backgrounds become the
+-- deep navy via 'midnightRemap'): periwinkle functions, violet keywords,
+-- sage strings, slate comments — all tuned for the navy ground.
+midnightTokens :: Tok -> Style
+midnightTokens t = case t of
+  TkText      -> Style Default Default attrNone
+  TkPunct     -> Style Default Default attrNone
+  TkKeyword   -> on (ColorRGB 187 154 247) attrBold
+  TkType      -> on (ColorRGB 125 207 255) attrNone
+  TkString    -> on (ColorRGB 158 206 106) attrNone
+  TkComment   -> on (ColorRGB 96 106 152) attrItalic
+  TkNumber    -> on (ColorRGB 255 158 100) attrNone
+  TkFunction  -> on (ColorRGB 122 162 247) attrNone
+  TkBuiltin   -> on (ColorRGB 42 195 222) attrNone
+  TkDecorator -> on (ColorRGB 224 175 104) attrNone
+  TkTag       -> on (ColorRGB 122 162 247) attrNone
+  TkAttr      -> on (ColorRGB 115 218 202) attrNone
+  TkHeading   -> on (ColorRGB 255 158 100) attrBold
+  TkEmph      -> Style Default Default attrItalic
+  TkStrong    -> Style Default Default attrBold
+  TkCode      -> on (ColorRGB 158 206 106) attrNone
+  TkLink      -> on (ColorRGB 122 162 247) attrUnderline
+  TkProperty  -> on (ColorRGB 122 162 247) attrNone
   where on fg = Style fg Default
 
 ------------------------------------------------------------------------------
@@ -482,16 +777,18 @@ drawTextArea th ed lo arr
           tw = loTextWidth lo
           left = edLeft ed
           hlmap = visibleHighlight ed (loTextHeight lo)
+          dmap = visibleDiags ed (loTextHeight lo)
           brs = bracketPair ed
       forM_ [0 .. loTextHeight lo - 1] $ \row -> do
         let bl = edTop ed + row
             sr = loTextTop lo + row
+            diagsOnLine = Map.findWithDefault [] bl dmap
         when (bl < n) $ do
           -- gutter / line number
           when (gut > 0) $ do
             let numStr = show (bl + 1)
                 pad = gut - 1 - length numStr
-                gstyle = if bl == posLine (edCursor ed) then thGutterCur th else thGutter th
+                gstyle = gutterStyleFor th ed diagsOnLine bl
             drawStr arr cols rows sr (cl + max 0 pad) gstyle numStr
           -- line content: expand cells only from just before the horizontal
           -- scroll offset, so a view deep into a huge single line stays cheap.
@@ -504,9 +801,10 @@ drawTextArea th ed lo arr
               (startCol, startDisp) = windowStart tabw left line
               overlays = [ (s, e, thFindMatch th) | (s, e) <- liveMatchSpans ed line ]
                          ++ [ (bc, bc + 1, thBracket th) | Pos brl bc <- brs, brl == bl ]
+              diagOver = diagOverFor th diagsOnLine line
               cells = expandLineCellsFrom tabw (edShowWhitespace ed)
                         baseAt (thSelection th) (thWhitespace th)
-                        selRange selEOL overlays (urlLinks line)
+                        selRange selEOL overlays diagOver (urlLinks line)
                         startCol startDisp (T.drop startCol line)
               visible = takeWhile (\(d, _) -> d < left + tw)
                           (dropWhile (\(d, _) -> d < left) cells)
@@ -524,6 +822,7 @@ drawTextAreaWrapped th ed lo arr = loop (edTop ed) 0
     sel = getSelection ed; tabw = tabWidthOf ed
     gut = loGutter lo; cl = loContentLeft lo; th' = loTextHeight lo
     hlmap = visibleHighlight ed (loTextHeight lo)
+    dmap = visibleDiags ed (loTextHeight lo)
     brs = bracketPair ed
     loop li vrow
       | vrow >= th' || li >= n = pure ()
@@ -537,9 +836,10 @@ drawTextAreaWrapped th ed lo arr = loop (edTop ed) 0
               baseAt = mkBaseAt th (Map.findWithDefault [] li hlmap)
               overlays = [ (s, e, thFindMatch th) | (s, e) <- liveMatchSpans ed line ]
                          ++ [ (bc, bc + 1, thBracket th) | Pos brl bc <- brs, brl == li ]
+              diagOver = diagOverFor th (Map.findWithDefault [] li dmap) line
               cells = expandLineCells tabw (edShowWhitespace ed)
                         baseAt (thSelection th) (thWhitespace th)
-                        selRange False overlays (urlLinks line) line
+                        selRange False overlays diagOver (urlLinks line) line
           vrow' <- drawSegs li line cells eolFlag segs 0 vrow
           loop (li + 1) vrow'
     drawSegs _ _ _ _ [] _ vrow = pure vrow
@@ -553,7 +853,7 @@ drawTextAreaWrapped th ed lo arr = loop (edTop ed) 0
           when (gut > 0 && si == 0) $ do
             let numStr = show (li + 1)
                 pad = gut - 1 - length numStr
-                gstyle = if li == posLine (edCursor ed) then thGutterCur th else thGutter th
+                gstyle = gutterStyleFor th ed (Map.findWithDefault [] li dmap) li
             drawStr arr cols rows sr (cl + max 0 pad) gstyle numStr
           forM_ [ (d - ds, cell) | (d, cell) <- cells, d >= ds, d < de ] $ \(off, cell) ->
             putCell arr cols rows sr (loTextLeft lo + off) cell
@@ -576,33 +876,42 @@ lineSelInterval (Just (Pos sl sc, Pos el ec)) bl len
 -- continuation cells.
 expandLineCells
   :: Int -> Bool -> (Int -> Style) -> Style -> Style
-  -> Maybe (Int, Int) -> Bool -> [(Int, Int, Style)] -> [(Int, Int, Text)]
-  -> Text -> [(Int, Cell)]
-expandLineCells tabw showWS baseAt selSty wsSty msel selEOL overlays links line =
-  expandLineCellsFrom tabw showWS baseAt selSty wsSty msel selEOL overlays links 0 0 line
+  -> Maybe (Int, Int) -> Bool -> [(Int, Int, Style)] -> [(Int, Int, Color)]
+  -> [(Int, Int, Text)] -> Text -> [(Int, Cell)]
+expandLineCells tabw showWS baseAt selSty wsSty msel selEOL overlays diagOver links line =
+  expandLineCellsFrom tabw showWS baseAt selSty wsSty msel selEOL overlays diagOver links 0 0 line
 
 -- | 'expandLineCells' starting from character index @i0@ (whose display
 -- column is @d0@) with the leading characters already dropped from @line@ —
 -- so a view deep into a huge single line only expands the window, not the
 -- whole prefix. @overlays@ are absolute character intervals painted with the
 -- given style (find matches, the bracket pair); the selection wins where they
--- overlap, and the first covering overlay wins among themselves. @links@ are
--- absolute character intervals whose cells carry an OSC 8 hyperlink target
--- (independent of styling; a wide glyph's continuation cells carry it too).
+-- overlap, and the first covering overlay wins among themselves. @diagOver@ are
+-- absolute character intervals carrying a diagnostic underline colour: applied
+-- /after/ the style resolves so the squiggle layers over selection/overlays/
+-- base without clobbering fg/bg (it only ORs in 'attrUndercurl' and sets
+-- 'styleUl'). @links@ are absolute character intervals whose cells carry an OSC
+-- 8 hyperlink target (independent of styling; a wide glyph's continuation cells
+-- carry it too).
 expandLineCellsFrom
   :: Int -> Bool -> (Int -> Style) -> Style -> Style
-  -> Maybe (Int, Int) -> Bool -> [(Int, Int, Style)] -> [(Int, Int, Text)]
+  -> Maybe (Int, Int) -> Bool -> [(Int, Int, Style)] -> [(Int, Int, Color)]
+  -> [(Int, Int, Text)]
   -> Int -> Int -> Text -> [(Int, Cell)]
-expandLineCellsFrom tabw showWS baseAt selSty wsSty msel selEOL overlays links i0 d0 line =
+expandLineCellsFrom tabw showWS baseAt selSty wsSty msel selEOL overlays diagOver links i0 d0 line =
   go d0 i0 (T.unpack line)
   where
     inSel i = case msel of Just (s, e) -> i >= s && i < e; Nothing -> False
     overlayAt i = case [ sty | (s, e, sty) <- overlays, i >= s, i < e ] of
                     (sty : _) -> Just sty
                     []        -> Nothing
-    styAt i | inSel i = selSty
-            | otherwise = fromMaybe (baseAt i) (overlayAt i)
-    wsAt i  = if inSel i then selSty else wsSty
+    diagTint i s = case [ col | (s0, e0, col) <- diagOver, i >= s0, i < e0 ] of
+                     (col : _) -> s { styleAttr = styleAttr s .|. attrUndercurl, styleUl = col }
+                     []        -> s
+    styAt i = diagTint i baseSty
+      where baseSty | inSel i   = selSty
+                    | otherwise = fromMaybe (baseAt i) (overlayAt i)
+    wsAt i  = diagTint i (if inSel i then selSty else wsSty)
     lnkAt i = case [ u | (s, e, u) <- links, i >= s, i < e ] of
                 (u : _) -> Just u
                 []      -> Nothing
@@ -628,6 +937,52 @@ expandLineCellsFrom tabw showWS baseAt selSty wsSty msel selEOL overlays links i
               c' = if showWS && c == ' ' then '\183' else c
               cont = [ (dcol + k, mkC i contChar s) | k <- [1 .. w - 1] ]
           in (dcol, mkC i c' s) : cont ++ go (dcol + w) (i + 1) cs
+
+-- | Group the active document's diagnostics by buffer line for the visible
+-- window, computed **once per frame** and shared by the squiggle overlay and
+-- the gutter tint (scanning all of @edDiags@ per visible row was
+-- O(rows × diags) twice over — this is the 'visibleHighlight' discipline).
+visibleDiags :: Editor -> Int -> Map.Map Int [Diag]
+visibleDiags ed count =
+  Map.fromListWith (flip (++))
+    [ (dgLine d, [d]) | d <- edDiags ed
+    , dgLine d >= top, dgLine d < top + count ]
+  where top = edTop ed
+
+-- | The diagnostic underline spans for one buffer line, given that line's
+-- pre-grouped diags (from 'visibleDiags'): character-column spans coloured by
+-- severity. Only the text-document draw paths build this; CSV/image/search
+-- views never do.
+diagOverFor :: Theme -> [Diag] -> Text -> [(Int, Int, Color)]
+diagOverFor th onLine line =
+  [ (s, e, sevColour th sv) | (s, e, sv) <- diagSpans line onLine ]
+
+-- | Underline colour for a diagnostic severity, from the active theme.
+sevColour :: Theme -> Severity -> Color
+sevColour th SevError   = thDiagErr th
+sevColour th SevWarning = thDiagWarn th
+sevColour th SevInfo    = thDiagInfo th
+
+-- | The status-bar text for a diagnostic under the cursor: @"tool: code: msg"@
+-- with the code (and its separator) dropped when empty.
+diagStatusMsg :: Diag -> String
+diagStatusMsg d =
+  linName (linterById (dgTool d)) ++ ": "
+    ++ (if T.null (dgCode d) then "" else T.unpack (dgCode d) ++ ": ")
+    ++ T.unpack (dgMsg d)
+
+-- | The gutter line-number style for buffer line @bl@: the cursor line keeps
+-- 'thGutterCur' precedence; otherwise a line carrying any error diag tints red
+-- ('thGutterDiag'), any other diag tints the warning colour, and a clean line
+-- uses the plain 'thGutter'. The width is never touched (a diag-dependent
+-- gutter width would oscillate the wrap width).
+gutterStyleFor :: Theme -> Editor -> [Diag] -> Int -> Style
+gutterStyleFor th ed onLine bl
+  | bl == posLine (edCursor ed) = thGutterCur th
+  | otherwise = case map dgSev onLine of
+      [] -> thGutter th
+      ss | minimum ss == SevError -> thGutterDiag th
+         | otherwise              -> (thGutterDiag th) { styleFg = thDiagWarn th }
 
 -- | The URL hyperlink spans of a document line, with the same length guard
 -- as highlighting so a megabyte-long minified line can't dominate a frame.
@@ -779,9 +1134,14 @@ drawStatus th ed lo arr = do
       -- The link-hover hint temporarily overlays the message slot while the
       -- pointer is on a URL (hovering is the *current* action; any status
       -- message is older news and comes back when the pointer moves off).
+      -- Priority: a URL hover (the current action) tops everything, then a
+      -- diagnostic under the cursor ("<tool>: <code>: <msg>", code omitted when
+      -- empty), then the ordinary transient status message.
       status = case edHoverUrl ed of
         Just u  -> "Ctrl+Click to open " ++ T.unpack u
-        Nothing -> T.unpack (edStatus ed)
+        Nothing -> case diagUnderCursor ed of
+          Just d  -> diagStatusMsg d
+          Nothing -> T.unpack (edStatus ed)
   drawStr arr cols rows r 0 (thStatus th) prefix
   drawStrL arr cols rows r (length prefix) (thStatus th) nameLink name
   drawStr arr cols rows r (length prefix + length name) (thStatus th) ro
@@ -854,10 +1214,21 @@ drawDialog th ed lo d arr = do
       let title = " " ++ T.unpack (dlgTitle d) ++ " "
           tx = x + (w - length title) `div` 2
       drawStr arr cols rows y tx (thDialogTitle th) title
+  -- The body scrolls when it overflows a short terminal. The scroll offset is
+  -- derived purely (from focus) by the same 'dialogScroll' the mouse hit-test
+  -- uses, so clicks and drawing never disagree: visible window position @p@
+  -- maps to absolute row @p + scroll@, drawn at @y + 1 + p@.
   let rs = dialogRows d
-  forM_ (zip [0 ..] rs) $ \(j, dr) -> do
-    let r = y + 1 + j
+      visible = h - 2
+      scroll  = dialogScroll visible d
+  forM_ (zip [0 ..] (take visible (drop scroll rs))) $ \(p, dr) -> do
+    let r = y + 1 + p
     drawDRow th ed d arr cols rows r (x + 2) (w - 4) dr
+  -- Dim scroll markers in the border's right corner when rows are clipped.
+  when (scroll > 0) $
+    putCell arr cols rows y (x + w - 2) (Cell '\x25B2' (thDialogDim th))
+  when (scroll + visible < length rs) $
+    putCell arr cols rows (y + h - 1) (x + w - 2) (Cell '\x25BC' (thDialogDim th))
   -- The About box's animated wordmark, overlaid on the blank canvas rows at
   -- the top of its body (frame counter ticked by the event loop).
   when (dlgKind d == DKAbout) $
@@ -919,6 +1290,9 @@ drawDRow th _ed d arr cols rows r x innerW dr = case dr of
     drawStr arr cols rows r x st (box ++ T.unpack lbl)
   -- Section header above a choice group: the dialog's title/emphasis style.
   DRHeader hd -> drawStr arr cols rows r x (thDialogTitle th) (T.unpack hd)
+  -- A dimmed per-row note (e.g. a linter's availability / install hint),
+  -- indented under its owning choice row. No focus highlight on notes.
+  DRNote n -> drawStr arr cols rows r (x + choiceIndent + 2) (thDialogDim th) (T.unpack n)
   -- A settings-style choice row: "  Label            \x2039 value \x203a". The
   -- token is compact and right-aligned to the row's right edge (see
   -- 'choiceCols'), so the guillemets always hug the value. The focused row is
@@ -934,21 +1308,19 @@ drawDRow th _ed d arr cols rows r x innerW dr = case dr of
     fillRect arr cols rows r x 1 innerW st
     drawStr arr cols rows r (x + choiceIndent) st (T.unpack (chLabel ch))
     drawStr arr cols rows r (x + open) st ("\x2039 " ++ val ++ " \x203a")
-  DRButtons -> do
-    let btns = dlgButtons d
-        baseFocus = length (dlgFields d) + length (dlgOptions d)
-        total = sum [ T.length b + 4 | b <- btns ] + (length btns - 1)
+  DRButtons btns -> do
+    let total = sum [ T.length b + 4 | (_, b) <- btns ] + (length btns - 1)
         start = x + max 0 ((innerW - total) `div` 2)
-    drawButtons th d arr cols rows r start baseFocus (zip [0 ..] btns)
+    drawButtons th d arr cols rows r start btns
 
-drawButtons :: Theme -> Dialog -> Surf s -> Int -> Int -> Int -> Int -> Int -> [(Int, Text)] -> ST s ()
-drawButtons _ _ _ _ _ _ _ _ [] = pure ()
-drawButtons th d arr cols rows r col baseFocus ((i, b) : rest) = do
-  let focused = dlgFocus d == baseFocus + i
+drawButtons :: Theme -> Dialog -> Surf s -> Int -> Int -> Int -> Int -> [(Int, Text)] -> ST s ()
+drawButtons _ _ _ _ _ _ _ [] = pure ()
+drawButtons th d arr cols rows r col ((i, b) : rest) = do
+  let focused = focusedButton d == Just i
       st = if focused then thButtonFocus th else thButton th
       label = "  " ++ T.unpack b ++ "  "
   drawStr arr cols rows r col st label
-  drawButtons th d arr cols rows r (col + length label + 1) baseFocus rest
+  drawButtons th d arr cols rows r (col + length label + 1) rest
 
 ------------------------------------------------------------------------------
 -- File browser

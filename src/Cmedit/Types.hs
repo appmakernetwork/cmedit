@@ -32,7 +32,7 @@ module Cmedit.Types
   , attrDim
   , attrUndercurl
   , hasAttr
-  , Style(..)
+  , Style(Style, StyleU, styleFg, styleBg, styleAttr, styleUl)
   , defaultStyle
   , Cell(Cell, CellL, cellChar, cellStyle, cellLink)
   , withLink
@@ -179,12 +179,25 @@ attrUndercurl = 32
 hasAttr :: Attr -> Attr -> Bool
 hasAttr flag a = (a .&. flag) /= 0
 
--- | The visual style of a single cell.
-data Style = Style
+-- | The visual style of a single cell. 'styleUl' is the underline (undercurl)
+-- colour, kept off the common constructor exactly like 'Cell'/'CellL' keeps
+-- 'cellLink' off 'Cell': almost every style leaves the underline colour at the
+-- terminal default, so 'Style' (the pattern synonym) stays three-field for
+-- construction and matching, while the real 'StyleU' constructor carries the
+-- fourth field for diagnostics squiggles. 'styleUl' participates in Eq, so the
+-- frame diff and REP run compression treat it like any other field.
+data Style = StyleU
   { styleFg   :: !Color
   , styleBg   :: !Color
   , styleAttr :: !Attr
+  , styleUl   :: !Color
   } deriving (Eq, Show)
+
+-- | The common no-underline-colour style, in constructor position.
+pattern Style :: Color -> Color -> Attr -> Style
+pattern Style fg bg a <- StyleU fg bg a _ where
+  Style fg bg a = StyleU fg bg a Default
+{-# COMPLETE Style #-}
 
 defaultStyle :: Style
 defaultStyle = Style Default Default attrNone

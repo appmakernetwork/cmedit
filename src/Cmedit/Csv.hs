@@ -13,6 +13,8 @@ module Cmedit.Csv
   , cellAt
   , colLabel
   , columnWidths
+  , setColWidth
+  , resetColWidth
   , maxCellLines
   , cellLineCount
   , rowLineCount
@@ -81,6 +83,8 @@ import Data.Foldable (toList)
 import Data.List (elemIndex, nub, sortBy)
 import Data.Maybe (fromMaybe)
 import Text.Read (readMaybe)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Sequence (Seq, (|>))
 import qualified Data.Sequence as Seq
 import Data.Text (Text)
@@ -108,6 +112,8 @@ data CsvView = CsvView
   , csvWidths :: !(Seq Int)           -- ^ Clamped display width per column, kept in sync with
                                       --   'csvRows' by 'withRows'/undo/redo (scanning the whole
                                       --   grid per keystroke would freeze large tables).
+  , csvUserW  :: !(Map Int Int)       -- ^ User width overrides (header-border drag), by column.
+                                      --   Sparse; wins over the content-fitted 'csvWidths' entry.
   } deriving (Show)
 
 maxUndo :: Int
@@ -125,7 +131,7 @@ mkCsvView delim t =
        { csvRows = rows, csvCurRow = 0, csvCurCol = 0, csvTop = 0, csvLeft = 0
        , csvEdit = Nothing, csvDelim = delim, csvUndo = [], csvRedo = []
        , csvSaved = rows, csvSelAnchor = Nothing
-       , csvWidths = computeWidths rows }
+       , csvWidths = computeWidths rows, csvUserW = Map.empty }
 
 -- | Serialise the grid back to CSV text (records joined by @\\n@; the caller's
 -- buffer applies the file's actual line ending).
@@ -221,12 +227,31 @@ colLabel n0 = go (n0 + 1) ""
 
 -- | Display width of each column (clamped to a sensible range). Reads the
 -- cache maintained alongside every grid change — O(columns), never O(cells) —
--- because this runs on every repaint and every cursor move.
+-- because this runs on every repaint and every cursor move. A user override
+-- (from a header-border drag) replaces the content-fitted width outright.
 columnWidths :: CsvView -> [Int]
-columnWidths = toList . csvWidths
+columnWidths v = zipWith eff [0 ..] (toList (csvWidths v))
+  where eff c w = Map.findWithDefault w c (csvUserW v)
+
+-- | Set a user width override for a column (the header-border drag). Sticks
+-- until 'resetColWidth', whatever the content does.
+setColWidth :: Int -> Int -> CsvView -> CsvView
+setColWidth c w v
+  | c < 0 || c >= nCols v = v
+  | otherwise = v { csvUserW = Map.insert c (clampUserW w) (csvUserW v) }
+
+-- | Drop a column's width override, returning it to the content-fitted width
+-- (double-click on the header border).
+resetColWidth :: Int -> CsvView -> CsvView
+resetColWidth c v = v { csvUserW = Map.delete c (csvUserW v) }
 
 clampW :: Int -> Int
 clampW w = max 3 (min 32 w)
+
+-- A dragged width may be narrower or far wider than the automatic clamp;
+-- horizontal scrolling already handles columns wider than the viewport.
+clampUserW :: Int -> Int
+clampUserW w = max 2 (min 200 w)
 
 -- Full-grid width computation: one pass over every cell. Only used when a
 -- grid appears wholesale (load) or changes shape (row/column insert/delete);
@@ -444,7 +469,10 @@ scrollLeft width v =
   let ws = csvWidths v
       cc = csvCurCol v
       left0 = max 0 (min (csvLeft v) cc)
-      costAt c = maybe 0 (+ 1) (Seq.lookup c ws)
+      -- Effective width: a user override wins, as in 'columnWidths'.
+      costAt c = case Seq.lookup c ws of
+        Nothing -> 0
+        Just w  -> Map.findWithDefault w c (csvUserW v) + 1
       walk l acc
         | l < 0 = 0
         | acc + costAt l > width = l + 1
@@ -731,7 +759,9 @@ insertColAt c v =
       ins row = Seq.insertAt (min c (Seq.length row)) T.empty (padTo cols row)
       padTo n row | Seq.length row >= n = row
                   | otherwise = row <> Seq.replicate (n - Seq.length row) T.empty
-  in withRows (fmap ins) v'
+      -- Width overrides follow their columns rightward past the insertion.
+      userW = Map.mapKeysMonotonic (\k -> if k >= c then k + 1 else k) (csvUserW v)
+  in (withRows (fmap ins) v') { csvUserW = userW }
 
 insertColLeft :: CsvView -> CsvView
 insertColLeft v = insertColAt (csvCurCol v) v
@@ -747,7 +777,10 @@ deleteCol v
       let v' = snapshot v
           c  = csvCurCol v
           del row = if c < Seq.length row then Seq.deleteAt c row else row
-      in clampCursor (withRows (fmap del) v')
+          -- Drop the deleted column's override; the rest follow their columns.
+          userW = Map.mapKeysMonotonic (\k -> if k > c then k - 1 else k)
+                    (Map.delete c (csvUserW v))
+      in clampCursor ((withRows (fmap del) v') { csvUserW = userW })
 
 ------------------------------------------------------------------------------
 -- Sorting

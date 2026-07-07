@@ -59,6 +59,7 @@ rightSections =
   [ ("Find & Go",
       [ ("Ctrl+F",      "Find")
       , ("F3, Shift+F3", "Next / previous")
+      , ("F8",          "Next problem")
       , ("Ctrl+R",      "Replace")
       , ("Ctrl+G",      "Go to line")
       , ("F4",          "Find in files")

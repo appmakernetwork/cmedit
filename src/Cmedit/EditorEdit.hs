@@ -45,6 +45,7 @@ import Cmedit.About (aboutCanvasH, aboutCanvasMinW, aboutTotalFrames)
 import Cmedit.Clipboard (CopyOutcome(..))
 import Cmedit.Image (Image(..), ImgMode(..), renderImage, viewFit)
 import Cmedit.Syntax (HlCache, CommentSyntax(..), langComment, langForPath)
+import Cmedit.Lint (Linter(..), Severity(..), Diag(..), LintAvail, linters, linterById)
 
 import Cmedit.EditorState
 
@@ -250,6 +251,7 @@ undo ed = case edUndo ed of
       , edLastEdit = EKNone
       , edModified = metaModified ed || bufModified ed (usBuffer u)
       , edStatus = ""
+      , edEditSeq = edEditSeq ed + 1
       }
 
 redo :: Editor -> Editor
@@ -265,6 +267,7 @@ redo ed = case edRedo ed of
       , edLastEdit = EKNone
       , edModified = metaModified ed || bufModified ed (usBuffer u)
       , edStatus = ""
+      , edEditSeq = edEditSeq ed + 1
       }
 
 ------------------------------------------------------------------------------
@@ -287,7 +290,8 @@ metaModified ed = edLineEnding ed /= edSavedEol ed || edEncoding ed /= edSavedEn
 
 afterEdit :: Editor -> Editor
 afterEdit ed =
-  ensureVisible ed { edModified = metaModified ed || bufModified ed (edBuffer ed), edStatus = "" }
+  ensureVisible ed { edModified = metaModified ed || bufModified ed (edBuffer ed), edStatus = ""
+                   , edEditSeq = edEditSeq ed + 1 }
 
 typeChar :: Char -> Editor -> Editor
 typeChar ch ed0
@@ -530,9 +534,12 @@ applyTheme new ed =
          _ -> "Theme: " ++ themeLabel new
               ++ " (set theme = " ++ themeLabel new ++ " in the config to keep it)" }
 
+-- | The theme's config-file word, doubling as its UI label (menu, settings) —
+-- keeping them one string means "set theme = <label>" advice always parses.
 themeLabel :: ThemeName -> String
-themeLabel ThemeDark = "dark"; themeLabel ThemeLight = "light"
+themeLabel ThemeDark = "dark-terminal"; themeLabel ThemeLight = "light-terminal"
 themeLabel ThemeAuto = "auto"; themeLabel ThemeCherryBlossom = "cherry-blossom"
+themeLabel ThemeFlashbang = "flashbang"; themeLabel ThemeMidnight = "midnight"
 
 ------------------------------------------------------------------------------
 -- The Settings dialog (File ▸ Settings…)
@@ -574,7 +581,17 @@ settingsSpec =
   , ( Nothing, "Freeze CSV header", offOn
     , boolIx cfgFreezeHeader
     , "Keep a table's first row pinned while scrolling." )
-  ]
+  -- Linting rows (row 'nEditingSettings' onward). The master switch first, then
+  -- one row per 'linters' entry in table order. Per-linter hints and the
+  -- availability notes are filled in by 'mkSettings' from 'edLintAvail'.
+  , ( Just "Linting", "Linting", offOn
+    , boolIx cfgLint
+    , "Run external linters on the active file." )
+  ] ++
+  [ ( Nothing, T.pack (linName l), offOn
+    , \c -> if lintOnOf c (linId l) then 1 else 0
+    , "" )
+  | l <- linters ]
   where
     offOn = ["off", "on"]
     boolIx f c = if f c then 1 else 0
@@ -583,14 +600,17 @@ settingsSpec =
 -- reconciles the session toggles into the config before calling this, so the
 -- rows always show what the editor is actually doing). Focus starts on the
 -- first row; changes apply live and Save/Cancel commit or revert them.
-mkSettings :: Config -> Dialog
-mkSettings cfg = Dialog DKSettings "Settings" [] []
-  [ Choice lbl vals (ixOf cfg) hdr hint
-  | (hdr, lbl, vals, ixOf, hint) <- settingsSpec ]
+mkSettings :: LintAvail -> Config -> Dialog
+mkSettings avail cfg = Dialog DKSettings "Settings" [] []
+  [ let (hint', note') = case linterForSettingsRow i of
+                           Just l  -> lintRowHintNote avail l   -- per-linter row: availability-derived
+                           Nothing -> (hint, Nothing)
+    in Choice lbl vals (ixOf cfg) hdr hint' note'
+  | (i, (hdr, lbl, vals, ixOf, hint)) <- zip [0 ..] settingsSpec ]
   ["Save", "Cancel"] 0 "" False
 
 -- | The clickable regions of the status bar's right side.
-data StatusZone = SZGoTo | SZOverwrite | SZEncoding | SZLineEnding
+data StatusZone = SZGoTo | SZOverwrite | SZEncoding | SZLineEnding | SZDiagnostics
   deriving (Eq, Show)
 
 -- | The status bar's right-hand text and its clickable zones as
@@ -631,6 +651,13 @@ statusRightInfo ed = flatten segs
                       ++ show (Csv.nCols v) ++ " cols   TABLE  ")
              , zone SZLineEnding eol, plain " " ]
         Nothing ->
+          -- A diagnostics count zone (errors/warnings), shown only when the
+          -- active document has any; clicking it jumps to the next problem.
+          -- ASCII only — the zone offsets assume 1 char = 1 cell.
+          let (nE, nW) = diagCounts ed
+              diagSeg = if null (edDiags ed) then []
+                        else [ zone SZDiagnostics (show nE ++ "E " ++ show nW ++ "W"), plain "  " ]
+          in diagSeg ++
           [ zone SZGoTo ("Ln " ++ show (l + 1) ++ ", Col " ++ show (c + 1))
           , plain selInfo, plain "   "
           , zone SZOverwrite ovr, plain "  "
@@ -662,10 +689,38 @@ statusClick col ed =
                                       , edStatus = if edOverwrite ed then "Insert mode" else "Overwrite mode" }
        (SZEncoding : _)   -> noEff (toggleBom ed)
        (SZLineEnding : _) -> noEff (cycleLineEnding ed)
+       (SZDiagnostics : _) -> noEff (jumpNextDiag ed)
        _                  -> noEff ed
 
 openGoTo :: Editor -> Editor
 openGoTo ed = openDialog mkGoToLine ed
+
+-- | Jump to the next diagnostic after the cursor in (line, col) order, wrapping
+-- to the first; a no-op with a "No problems" note when there are none. The
+-- target column is clamped to the (possibly stale) line, the view is scrolled
+-- to show it, and the move is recorded in the navigation history like other
+-- user-initiated jumps.
+jumpNextDiag :: Editor -> Editor
+jumpNextDiag ed = case edDiags ed of
+  [] -> ed { edStatus = "No problems" }
+  ds ->
+    let Pos cl cc = edCursor ed
+        after  = [ d | d <- ds, (dgLine d, dgCol d) > (cl, cc) ]
+        target = case after of (d : _) -> d; [] -> head ds
+        k      = length (takeWhile (/= target) ds) + 1
+        n      = length ds
+        tl     = min (max 0 (dgLine target)) (max 0 (lineCount (edBuffer ed) - 1))
+        line   = getLine' tl (edBuffer ed)
+        tc     = min (max 0 (dgCol target)) (T.length line)
+        pos    = Pos tl tc
+        ed1    = pushNavIfFar (edPath ed) pos ed
+        codeS  = if T.null (dgCode target) then "" else T.unpack (dgCode target) ++ " "
+        msg    = "Problem " ++ show k ++ " of " ++ show n ++ ": "
+                   ++ codeS ++ T.unpack (dgMsg target)
+    in ensureVisible ed1
+         { edCursor = pos, edSelAnchor = Nothing
+         , edDesiredCol = colToDisplay (tabWidthOf ed) tc line
+         , edStatus = T.pack msg }
 
 -- | The bracket pair to highlight this frame: the bracket at/before the cursor
 -- and its partner. Empty outside plain-text view or when nothing matches.

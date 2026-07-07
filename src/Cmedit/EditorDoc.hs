@@ -86,6 +86,8 @@ setLoaded path lr ed =
         , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
         , edCsv = Nothing, edCsvStash = Nothing
         , edImage = Nothing
+        , edDiags = []                        -- a reloaded file's stale diags must not survive
+        , edEditSeq = edEditSeq ed + 1         -- fresh buffer: the driver must re-lint (also covers Revert)
         }
       ed2 = if isCsvPath path then enterCsv ed1 else restoreRecentPos path ed1
   in touchRecent path ed2
@@ -156,6 +158,7 @@ captureDoc ed = Document
   , docCsvStash = edCsvStash ed
   , docImage = edImage ed
   , docHlCache = edHlCache ed
+  , docDiags = edDiags ed
   }
 
 -- Make a saved 'Document' the active one.
@@ -174,6 +177,7 @@ restoreDoc d ed = refreshImage $ ensureVisible ed
   , edCsvStash = docCsvStash d
   , edImage = docImage d
   , edHlCache = docHlCache d
+  , edDiags = docDiags d
   , edFocus = FEdit, edDialog = Nothing, edSearchMode = False
   , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
   }
@@ -283,6 +287,7 @@ docFromLoad path lr = Document
   , docCsvStash = Nothing
   , docImage = Nothing
   , docHlCache = Nothing
+  , docDiags = []
   , docCsv = if isCsvPath path
                then Just (Csv.mkCsvView (csvDelimForPath path)
                             (bufferToText LF False (lrBuffer lr)))
@@ -351,6 +356,7 @@ imageDocSnapshot path frames = Document
   , docDiscard = False, docCsv = Nothing, docCsvStash = Nothing
   , docImage = Just (mkImageDoc frames)
   , docHlCache = Nothing
+  , docDiags = []
   }
 
 -- | Re-scale the active image's cached cell grid if the view size, paint
@@ -505,7 +511,8 @@ onSaved bytes mtime ed0 =
        then noEff (quitStep ed1)                       -- continue the quit sequence
        else if edPendingClose ed1
          then noEff (doClose (ed1 { edPendingClose = False }))
-         else (ed1, [EffSetTitle (windowTitle ed1)])
+         -- Re-lint now that the file is on disk (save-time-only tools too).
+         else (ed1, [EffSetTitle (windowTitle ed1), EffLintNow])
 
 -- | Report an IO error to the user.
 setError :: String -> Editor -> Editor
@@ -824,7 +831,7 @@ modifiedDocsToSave ed0 =
 
 -- | Driver callback: mark the given (path, new-mtime) documents saved after a
 -- Save All, and report how many were written.
-savedAll :: [(FilePath, Maybe DiskTime)] -> Editor -> Editor
+savedAll :: [(FilePath, Maybe DiskTime)] -> Editor -> (Editor, [Effect])
 savedAll saved ed =
   let saveMap = saved
       applyDoc d = case docPath d of
@@ -847,8 +854,9 @@ savedAll saved ed =
         Nothing -> ed1 { edStatus = T.pack ("Saved " ++ show n ++ " file" ++ plural n) }
   -- When Save All was the answer to the quit-all prompt, resume quitting: quit
   -- outright if nothing is left, else fall back to per-file prompts (e.g. for any
-  -- untitled files that Save All couldn't write).
-  in if edQuitting ed2 then quitStep ed2 else ed2
+  -- untitled files that Save All couldn't write). Otherwise re-lint the active
+  -- document now that it is on disk (save-time-only tools too).
+  in if edQuitting ed2 then noEff (quitStep ed2) else (ed2, [EffLintNow])
 
 -- | Alt+Left: go back to the previous location (pushing the current one onto
 -- the forward trail). Stops in untitled buffers are only reachable while that
@@ -939,9 +947,8 @@ quickOpenViewH ed = let (_, _, h, _) = quickOpenGeom ed in max 1 (h - 4)
 ------------------------------------------------------------------------------
 -- CSV table mode
 
--- Width of the row-number gutter for a given table.
-csvGutterWidthFor :: CsvView -> Int
-csvGutterWidthFor v = max 3 (length (show (Csv.nRows v)) + 1)
+-- ('csvGutterWidthFor', the row-number gutter width, lives in EditorState so
+-- the pointer-shape hint can share the border geometry.)
 
 -- (visible data rows, width available for columns).
 -- (scrolling-area height, freeze-row count, scrolling-area width). When the

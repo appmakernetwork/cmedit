@@ -92,6 +92,7 @@ data Choice = Choice
   , chIx     :: !Int           -- ^ current value index
   , chHeader :: !(Maybe Text)  -- ^ section header drawn above this row, if it starts a group
   , chHint   :: !Text          -- ^ one-line contextual help shown while the row is focused
+  , chNote   :: !(Maybe Text)  -- ^ an always-visible dimmed line drawn under the row (e.g. a linter's "✗ not installed — pip install ruff" availability note).
   } deriving (Eq, Show)
 
 -- | A modal dialog. Focus ranges over fields, then options (checkboxes),
@@ -175,7 +176,9 @@ mkHelp msg = Dialog DKHelp "Keyboard Shortcuts" [] [] [] ["Manual", "Close"] 1 m
 -- button); Esc or Cancel restores what you came in with.
 mkTheme :: Int -> Dialog
 mkTheme cur = Dialog DKTheme "Theme"
-  [] [] [] ["Auto", "Dark", "Light", "Cherry Blossom", "Cancel"] cur
+  [] [] []
+  [ "Auto", "Dark Terminal", "Light Terminal"
+  , "Cherry Blossom", "Flashbang", "Midnight", "Cancel" ] cur
   "Applies for this session; set theme = ... in the config to keep it."
   False
 
