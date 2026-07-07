@@ -307,6 +307,30 @@ in `README.md`; the cross-cutting structure that matters when editing:
   those). The driver persists when the list's *path order* changes (cursor moves
   alone don't trigger writes) and once more — with live positions via
   `recentsForPersist` — on the way out (a `finally`, so SIGTERM exits count).
+- **Settings dialog (`DKSettings`, File ▸ Settings…, Ctrl+,).** Built on the
+  dialogs' generic **choice rows** (`Dialog.Choice`: label + value list +
+  index, optional section header, per-row hint; focus order fields →
+  options → choices → buttons; Left/Right/Space/Enter and value clicks cycle
+  — Enter deliberately does *not* confirm while a choice is focused; every
+  change funnels through the hub hook `choiceChanged`; renderer and mouse
+  share the `choiceCols` geometry, where the `‹ value ›` token is compact
+  and right-aligned). `EditorEdit.settingsSpec` is the **single source of
+  truth** for what row k means (labels, values, hints, Config→index);
+  `Editor.applySettingRow` interprets the same indices, updating the config
+  AND the live session mirrors (word wrap, line numbers, whitespace, CSV
+  freeze) so changes show behind the dialog immediately. `openSettings`
+  first reconciles the session toggles *into* `edConfig` (rows always show
+  effective values; Save persists what's on screen) and stashes that config
+  in `edSettingsStash`; Cancel/Esc re-applies the stash through
+  `applySettingRow` — one code path for apply and revert. Save emits
+  `EffSaveConfig` → the driver rewrites the config file via the pure
+  `ConfigFile.updateConfigText` (values updated in place, every duplicate
+  occurrence rewritten since the parser's last-line wins, trailing `#`
+  comments and unknown lines preserved, absent keys appended only when
+  non-default). Adding a config key = extend `Config`/`applyKey`/
+  `configFields`/`configKeysHelp` (ConfigFile), one `settingsSpec` row, and
+  one `applySettingRow` case.
+
 - **Dynamic menus.** Menus are mostly static data in `Cmedit.Menu`, but
   `entriesFor`/`pruneEntries` adjust them per context: the Window menu's entries
   come from the open-files list, the View menu's "Table View" is dropped unless

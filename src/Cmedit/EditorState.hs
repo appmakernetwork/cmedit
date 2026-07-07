@@ -233,6 +233,7 @@ data Editor = Editor
   , edGfxKitty      :: !Bool             -- ^ Specifically the kitty graphics protocol (placements; animation may still be client-driven — see 'edGfxKittyAnim').
   , edGfxKittyAnim  :: !Bool             -- ^ The terminal also implements kitty's animation actions (whitelisted real kitty), so it loops an uploaded animation itself. Without this, kitty-protocol animations are stepped by the editor's tick as cheap placement swaps.
   , edHoverUrl      :: !(Maybe Text)     -- ^ The http(s) URL the mouse is hovering in the text area, for the status-bar hint ("Ctrl+Click to open"). Set/cleared by mouse motion, cleared by any keystroke.
+  , edSettingsStash :: !(Maybe Config)   -- ^ The session-effective config captured when the Settings dialog opened; Cancel/Esc re-applies it (changes apply live, so cancel is an explicit undo).
   } deriving (Show)
 
 -- | A fresh editor for the given terminal size and config.
@@ -318,6 +319,7 @@ newEditor size cfg = Editor
   , edGfxKitty      = False
   , edGfxKittyAnim  = False
   , edHoverUrl      = Nothing
+  , edSettingsStash = Nothing
   }
 
 -- | The theme buttons of the 'DKTheme' picker, in button order
@@ -888,20 +890,27 @@ choiceGap = 3      -- gap between the widest label and the value picker
 choiceLabelColW :: Dialog -> Int
 choiceLabelColW d = maximum (0 : map (T.length . chLabel) (dlgChoices d))
 
--- Width of the value field: the widest value of any choice (so the guillemets
--- never jiggle as the value cycles).
+-- Width of the value field: the widest value of any choice (sizes the box so
+-- no value ever overflows it).
 choiceValueColW :: Dialog -> Int
 choiceValueColW d =
   maximum (0 : [ T.length v | c <- dlgChoices d, v <- chValues c ])
 
--- Column offsets of a choice row, relative to the dialog body's inner-left
--- (the same origin the renderer draws from), shared with mouse hit-testing:
--- (openGuillemet, valueFieldStart, closeGuillemet).
-choiceCols :: Dialog -> (Int, Int, Int)
-choiceCols d = (open, val, close)
-  where open  = choiceIndent + choiceLabelColW d + choiceGap
-        val   = open + 2                       -- past "\x2039 "
-        close = val + choiceValueColW d + 1    -- value field, a space, then "\x203a"
+-- Column offsets of one choice row's value token, relative to the dialog
+-- body's inner-left (the renderer's origin), shared with mouse hit-testing:
+-- (openGuillemet, valueStart, closeGuillemet). The token @\x2039 value \x203a@
+-- is compact and right-aligned to the row's right edge — the \x2039 hugs the
+-- value rather than floating at a fixed column, so short values don't leave
+-- a gulf inside the guillemets; the \x203a and the value's right edge never
+-- move while cycling.
+choiceCols :: Dialog -> Choice -> (Int, Int, Int)
+choiceCols d c = (open, open + 2, close)
+  where
+    close = choiceRowWidth d - 1
+    open  = close - 3 - curLen
+    curLen = case drop (chIx c) (chValues c) of
+               (v : _) | chIx c >= 0 -> T.length v
+               _                     -> 0
 
 -- Full drawn width of a choice row (indent + label + gap + "\x2039 v \x203a").
 choiceRowWidth :: Dialog -> Int

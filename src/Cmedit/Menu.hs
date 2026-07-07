@@ -31,6 +31,7 @@ import qualified Data.Text as T
 -- | Every command reachable from the menus (and from keyboard shortcuts).
 data MenuAction
   = MANew | MAOpen | MAOpenFolder | MACloseFolder | MASave | MASaveAs | MASaveAll | MARevert | MACloseFile | MAExit
+  | MASettings                 -- ^ Open the Settings dialog (every config key as a live choice row).
   | MAQuickOpen                -- ^ The fuzzy go-to-file picker (Ctrl+P).
   | MAPalette                  -- ^ The command palette (quick open in '>' mode).
   | MAUndo | MARedo
@@ -87,6 +88,8 @@ menuBar =
       , MESep
       , MEItem "&Close File"     "Ctrl+W" MACloseFile
       , MEItem "Close Fol&der"   "" MACloseFolder
+      , MESep
+      , MEItem "Se&ttings\x2026" "Ctrl+," MASettings
       , MEItem "E&xit"           "Ctrl+Q" MAExit
       ]
   , Menu "&Edit"

@@ -39,6 +39,9 @@ module Cmedit.Editor
   , resolvedTheme
   , themeChoices
   , themeIndex
+  , settingsSpec
+  , openSettings
+  , applySettingRow
   , setDetectedDark
   , setCellPx
   , cellAspect
@@ -466,6 +469,7 @@ runAction a ed0 =
        MAToggleBom       -> noEff (toggleBom ed)
        MAToggleTheme     -> noEff (openDialog
                               (mkTheme (themeIndex (cfgTheme (edConfig ed)))) ed)
+       MASettings        -> noEff (openSettings ed)
        MAToggleExplorer -> toggleExplorer ed
        MASwitchFile k ->
          let target = case drop k (allOpenDocs ed) of
@@ -485,6 +489,54 @@ runAction a ed0 =
 toggleWrap :: Editor -> Editor
 toggleWrap ed = ed { edWordWrap = not (edWordWrap ed)
                    , edStatus = if edWordWrap ed then "Word wrap off" else "Word wrap on" }
+
+------------------------------------------------------------------------------
+-- Settings dialog (File ▸ Settings…, Ctrl+,)
+
+-- | Open the Settings dialog. The session toggles (word wrap, line numbers,
+-- whitespace, CSV freeze) are reconciled *into* the config first, so the
+-- rows show what the editor is actually doing right now — and Save persists
+-- exactly what is on screen. The reconciled config is stashed so
+-- Cancel\/Esc can put everything back.
+openSettings :: Editor -> Editor
+openSettings ed =
+  let cfg = (edConfig ed) { cfgWordWrap       = edWordWrap ed
+                          , cfgLineNumbers    = edShowLineNumbers ed
+                          , cfgShowWhitespace = edShowWhitespace ed
+                          , cfgFreezeHeader   = edFreezeHeader ed }
+  in openDialog (mkSettings cfg) ed { edConfig = cfg, edSettingsStash = Just cfg }
+
+-- | Interpret row @k@ of 'settingsSpec' set to value index @v@: update the
+-- config AND the live session state, so every change is visible behind the
+-- dialog immediately. Cancel re-applies the stashed config through this same
+-- function, so apply and revert cannot disagree.
+applySettingRow :: Int -> Int -> Editor -> Editor
+applySettingRow k v ed = case k of
+  0 -> ensureVisible (upd (\c -> c { cfgTabWidth = v + 1 }) ed)
+  1 -> upd (\c -> c { cfgTabsToSpaces = on }) ed
+  2 -> upd (\c -> c { cfgAutoIndent = on }) ed
+  3 -> upd (\c -> c { cfgTheme = themeChoices !! min v (length themeChoices - 1) }) ed
+  4 -> ensureVisible ((upd (\c -> c { cfgWordWrap = on }) ed) { edWordWrap = on })
+  5 -> ensureVisible ((upd (\c -> c { cfgLineNumbers = on }) ed) { edShowLineNumbers = on })
+  6 -> (upd (\c -> c { cfgShowWhitespace = on }) ed) { edShowWhitespace = on }
+  7 -> upd (\c -> c { cfgTrimTrailingWs = on }) ed
+  8 -> upd (\c -> c { cfgEnsureFinalNl = on }) ed
+  9 -> let ed1 = (upd (\c -> c { cfgFreezeHeader = on }) ed) { edFreezeHeader = on }
+       in maybe ed1 (\vw -> csvPut vw ed1) (edCsv ed1)   -- re-scroll under the new freeze
+  _ -> ed
+  where
+    on = v == 1
+    upd f e = e { edConfig = f (edConfig e) }
+
+-- | Esc or the Cancel button: re-apply the stashed config row by row (the
+-- one code path settings changes ever travel), then close.
+cancelSettings :: Editor -> Editor
+cancelSettings ed =
+  let restored = case edSettingsStash ed of
+        Nothing  -> ed
+        Just cfg -> foldl (\e (k, (_, _, _, ixOf, _)) -> applySettingRow k (ixOf cfg) e)
+                          ed (zip [0 ..] settingsSpec)
+  in cancelDialog restored { edSettingsStash = Nothing }
 
 -- | Alt+S / View \x25b8 Sort by Column: sort the table rows by the current
 -- column — ascending first, descending when already ascending. Respects the
@@ -612,6 +664,7 @@ editKey :: Key -> Editor -> (Editor, [Effect])
 editKey key ed = case key of
   -- Global shortcuts
   KCtrlChar 'q' -> runAction MAExit ed
+  KCtrlChar ',' -> runAction MASettings ed
   KCtrlChar 's' -> runAction MASave ed
   KCtrlChar 'o' -> runAction MAOpen ed
   KCtrlChar 'n' -> runAction MANew ed
@@ -834,6 +887,9 @@ menuActivate ed =
 -- point for a later @DKSettings@.
 choiceChanged :: Int -> Dialog -> Editor -> Editor
 choiceChanged _ci d ed = case dlgKind d of
+  DKSettings
+    | (c : _) <- drop _ci (dlgChoices d)
+    -> applySettingRow _ci (chIx c) ed { edDialog = Just d }
   _ -> ed { edDialog = Just d }
 
 -- Cycle the focused choice's value by @dir@ and route it through 'choiceChanged'.
@@ -846,7 +902,8 @@ handleDialogKey :: Key -> Editor -> (Editor, [Effect])
 handleDialogKey key ed = case edDialog ed of
   Nothing -> noEff (ed { edFocus = FEdit })
   Just d  -> case key of
-    KEsc        -> noEff (cancelDialog ed)
+    KEsc | dlgKind d == DKSettings -> noEff (cancelSettings ed)
+         | otherwise                 -> noEff (cancelDialog ed)
     KTab        -> noEff ed { edDialog = Just (focusNext d) }
     KBackTab    -> noEff ed { edDialog = Just (focusPrev d) }
     -- Up/Down: move within a multi-line field first; then recall input
@@ -930,7 +987,7 @@ clickChoice :: Int -> Int -> Int -> Dialog -> Editor -> Editor
 clickChoice ci innerX clickCol d ed =
   let base   = length (dlgFields d) + length (dlgOptions d)
       focused = setFocus (base + ci) d
-      (open, valStart, close) = choiceCols d
+      (open, valStart, close) = choiceCols d (dlgChoices d !! ci)
       rel = clickCol - innerX
   in if rel >= open && rel < valStart
        then choiceChanged ci (cycleChoice ci (-1) focused) ed   -- \x2039 / left of value
@@ -1055,6 +1112,10 @@ dispatchDialog kind btn d ed = case kind of
     | btn < length themeChoices
                 -> noEff (applyTheme (themeChoices !! btn) (closeDialog ed))
     | otherwise -> noEff (cancelDialog ed)
+  DKSettings
+    | btn == 0  -> ( closeDialog ed { edSettingsStash = Nothing }
+                   , [EffSaveConfig (edConfig ed)] )   -- Save: persist what's on screen
+    | otherwise -> noEff (cancelSettings ed)           -- Cancel: revert live changes
   DKMessage -> noEff (closeDialog ed)
 
 storeSearch :: Dialog -> Editor -> Editor

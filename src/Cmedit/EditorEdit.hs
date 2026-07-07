@@ -534,6 +534,61 @@ themeLabel :: ThemeName -> String
 themeLabel ThemeDark = "dark"; themeLabel ThemeLight = "light"
 themeLabel ThemeAuto = "auto"; themeLabel ThemeCherryBlossom = "cherry-blossom"
 
+------------------------------------------------------------------------------
+-- The Settings dialog (File ▸ Settings…)
+
+-- | The Settings dialog's rows in display/focus order: section header, label,
+-- values, how to read the current value's index out of a 'Config', and the
+-- one-line hint shown while the row is focused. This list is the single
+-- source of truth for what row k means — the hub's @applySettingRow@
+-- interprets the same indices, and a Spec test keeps the two in step.
+settingsSpec :: [(Maybe Text, Text, [Text], Config -> Int, Text)]
+settingsSpec =
+  [ ( Just "Editing", "Tab width", map (T.pack . show) [1 .. 16 :: Int]
+    , \c -> cfgTabWidth c - 1
+    , "Columns per tab stop (1-16)." )
+  , ( Nothing, "Indent with", ["tabs", "spaces"]
+    , boolIx cfgTabsToSpaces
+    , "What pressing Tab inserts." )
+  , ( Nothing, "Auto-indent", offOn
+    , boolIx cfgAutoIndent
+    , "New lines copy the previous line's indentation." )
+  , ( Just "Display", "Theme", map (T.pack . themeLabel) themeChoices
+    , themeIndex . cfgTheme
+    , "'auto' follows the terminal's light or dark background." )
+  , ( Nothing, "Word wrap", offOn
+    , boolIx cfgWordWrap
+    , "Wrap long lines instead of scrolling sideways (Alt+Z)." )
+  , ( Nothing, "Line numbers", offOn
+    , boolIx cfgLineNumbers
+    , "Show the line-number gutter (Alt+L)." )
+  , ( Nothing, "Whitespace markers", offOn
+    , boolIx cfgShowWhitespace
+    , "Make spaces and tabs visible (Alt+W)." )
+  , ( Just "Files", "Trim trailing whitespace", offOn
+    , boolIx cfgTrimTrailingWs
+    , "Strip line-end whitespace when saving (an undoable edit)." )
+  , ( Nothing, "Final newline", offOn
+    , boolIx cfgEnsureFinalNl
+    , "Make sure saved files end with a newline." )
+  , ( Nothing, "Freeze CSV header", offOn
+    , boolIx cfgFreezeHeader
+    , "Keep a table's first row pinned while scrolling." )
+  ]
+  where
+    offOn = ["off", "on"]
+    boolIx f c = if f c then 1 else 0
+
+-- | Build the Settings dialog from the session-effective config (the hub
+-- reconciles the session toggles into the config before calling this, so the
+-- rows always show what the editor is actually doing). Focus starts on the
+-- first row; changes apply live and Save/Cancel commit or revert them.
+mkSettings :: Config -> Dialog
+mkSettings cfg = Dialog DKSettings "Settings" [] []
+  [ Choice lbl vals (ixOf cfg) hdr hint
+  | (hdr, lbl, vals, ixOf, hint) <- settingsSpec ]
+  ["Save", "Cancel"] 0 "" False
+
 -- | The clickable regions of the status bar's right side.
 data StatusZone = SZGoTo | SZOverwrite | SZEncoding | SZLineEnding
   deriving (Eq, Show)

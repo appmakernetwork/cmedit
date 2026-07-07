@@ -582,16 +582,22 @@ recentMenuEntries ed =
     elide p | length p <= maxW = p
             | otherwise        = "\x2026" ++ drop (length p - maxW + 1) p
 
--- Splice the recent-files section into the File menu, just above Exit.
+-- Splice the recent-files section into the File menu, just above the
+-- Settings…/Exit block at the bottom (dropping a duplicate separator when
+-- the static menu already ends its upper section with one).
 addRecentEntries :: Editor -> [MenuEntry] -> [MenuEntry]
 addRecentEntries ed es = case recentMenuEntries ed of
   [] -> es
-  rs -> case break isExit es of
-    (pre, exit@(_ : _)) -> pre ++ [MESep] ++ rs ++ [MESep] ++ exit
-    (_, [])             -> es ++ [MESep] ++ rs
+  rs -> case break isTail es of
+    (pre, tl@(_ : _)) -> dropTrailingSep pre ++ [MESep] ++ rs ++ [MESep] ++ tl
+    (_, [])           -> es ++ [MESep] ++ rs
   where
-    isExit (MEItem _ _ MAExit) = True
-    isExit _                   = False
+    isTail (MEItem _ _ MAExit)     = True
+    isTail (MEItem _ _ MASettings) = True
+    isTail _                       = False
+    dropTrailingSep xs = case reverse xs of
+      (MESep : r) -> reverse r
+      _           -> xs
 
 save :: Editor -> (Editor, [Effect])
 save ed

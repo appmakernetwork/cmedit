@@ -157,13 +157,15 @@ escape sequences and the POSIX `termios` API.
   is clickable** too: `Ln, Col` opens Go to Line, `INS/OVR` toggles overwrite,
   and the `UTF-8`/`LF` cells switch encoding/line endings directly.
 - **Undo / redo** with sensible coalescing of typing runs.
-- **A config file and remembered recent files**: defaults (tab width,
-  tabs/spaces, auto-indent, word wrap, line numbers, whitespace markers, plus
-  opt-in save-time cleanups: `trim-trailing-whitespace` and `final-newline`,
-  applied as an undoable edit when you save) load
-  from `~/.config/cmedit/config` (`key = value` lines; command-line flags
-  override it, and a bad line is reported on the status bar rather than
-  ignored). The File menu lists recently-opened files, and re-opening one —
+- **A settings page and config file**: File ▸ Settings (`Ctrl+,`) lists every
+  option — tab width, indent style, auto-indent, theme, word wrap, line
+  numbers, whitespace markers, the save-time cleanups and the CSV header
+  freeze — as arrow-key value pickers grouped by topic, with a one-line hint
+  for the highlighted row. Changes apply **live** behind the dialog; Save
+  writes them back to `~/.config/cmedit/config` surgically (your comments and
+  unknown lines survive), and Cancel/Esc reverts everything. The same file can
+  be edited by hand (`key = value` lines; command-line flags override it, and
+  a bad line is reported on the status bar rather than ignored). The File menu lists recently-opened files, and re-opening one —
   same session or the next — puts the cursor back where you left it
   (`~/.config/cmedit/recent`).
 - **Word wrap** (Alt+Z), **line numbers** (Alt+L) and **whitespace markers**

@@ -154,6 +154,8 @@ configKeysHelp =
   , "                     Strip trailing spaces/tabs on save (default false)."
   , "final-newline = BOOL Ensure the file ends with a newline on save"
   , "                     (default false)."
+  , "freeze-header = BOOL Pin a CSV table's first row while scrolling"
+  , "                     (default true)."
   , "theme = auto|dark|light|cherry-blossom"
   , "                     Colour theme; 'auto' follows the terminal"
   , "                     background (default dark). 'cherry-blossom' is a"

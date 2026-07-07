@@ -74,6 +74,7 @@ data DialogKind
   | DKAbout
   | DKHelp           -- ^ The F1 keyboard card (Manual button + styled overlay).
   | DKTheme          -- ^ View ▸ Theme: one button per colour theme, live-previewed.
+  | DKSettings       -- ^ File ▸ Settings: a choice row per config key, applied live.
   | DKMessage
   deriving (Eq, Show)
 

@@ -2830,6 +2830,7 @@ main = do
             (cfgTheme (edConfig (key KEnter
               (edDlg { edDialog = fmap (\d -> d { dlgFocus = 3 }) (edDialog edDlg) }))))
             ThemeCherryBlossom
+
     -- Cherry blossom: config spellings parse, and the rendered frame carries
     -- an explicit RGB background on every cell (nothing falls through to the
     -- terminal's own colours).
@@ -2845,6 +2846,57 @@ main = do
       (all (isRGB . styleBg . cellStyle) (A.elems (scrCells scrC)))
     check "cherry blossom keyword colour differs from light theme"
       (thTokens (themeFor ThemeCherryBlossom) TkKeyword /= thTokens lightTheme TkKeyword)
+
+  -- Settings dialog (File ▸ Settings…) ---------------------------------------
+  do
+    let key k e = fst (update k e)
+        edP = setLoaded "/tmp/s.txt" (mkLR "hello world") (newEditor (24, 80) defaultConfig)
+        focusRow k e = e { edDialog = fmap (\d -> d { dlgFocus = k }) (edDialog e) }
+        edS = fst (update KEnter edP { edFocus = FMenu
+                                     , edMenu = menuStateFor edP 0 MASettings })
+    check "settingsSpec: every default index is in range"
+      (and [ let ix = ixOf defaultConfig in ix >= 0 && ix < length vals
+           | (_, _, vals, ixOf, _) <- settingsSpec ])
+    check "settings opens from the File menu"
+      (maybe False ((== DKSettings) . dlgKind) (edDialog edS))
+    check "Ctrl+, opens settings"
+      (maybe False ((== DKSettings) . dlgKind) (edDialog (key (KCtrlChar ',') edP)))
+    check "settings has a row per spec entry and Save/Cancel"
+      (maybe False (\d -> length (dlgChoices d) == length settingsSpec
+                          && dlgButtons d == ["Save", "Cancel"]) (edDialog edS))
+    -- Row 5 = Line numbers: cycling applies live, behind the dialog.
+    let edLn = key (KArrow DRight noMods) (focusRow 5 edS)
+    check "cycling a row applies live (line numbers)"
+      (edShowLineNumbers edLn && cfgLineNumbers (edConfig edLn)
+       && not (edShowLineNumbers edS))
+    -- Row 3 = Theme: applies live too (no separate preview machinery needed).
+    checkEq "theme row applies live"
+            (cfgTheme (edConfig (key (KArrow DRight noMods) (focusRow 3 edS))))
+            ThemeDark
+    -- Esc reverts every live change to the state captured at open.
+    let edEsc = key KEsc edLn
+    check "Esc reverts live changes and closes"
+      (not (edShowLineNumbers edEsc) && not (cfgLineNumbers (edConfig edEsc))
+       && edDialog edEsc == Nothing && edSettingsStash edEsc == Nothing)
+    -- The Cancel button does the same.
+    let edCanc = key KEnter (focusRow (length settingsSpec + 1) edLn)
+    check "Cancel button reverts too"
+      (not (edShowLineNumbers edCanc) && edDialog edCanc == Nothing)
+    -- Save persists the on-screen values via EffSaveConfig.
+    let (edSaved, effsS) = update KEnter (focusRow (length settingsSpec) edLn)
+    check "Save emits EffSaveConfig carrying the live config"
+      (case effsS of [EffSaveConfig c] -> cfgLineNumbers c; _ -> False)
+    check "Save closes, keeps the setting, drops the stash"
+      (edDialog edSaved == Nothing && edShowLineNumbers edSaved
+       && edSettingsStash edSaved == Nothing)
+    -- Rows show session-effective values: wrap toggled via Alt+Z reads as on.
+    let edW = key (KCtrlChar ',') (key (KAltChar 'z') edP)
+    check "rows show session-effective values (word wrap)"
+      (maybe False (\d -> chIx (dlgChoices d !! 4) == 1) (edDialog edW))
+    -- …and Save from that state persists the session value.
+    let (_, effsW) = update KEnter (focusRow (length settingsSpec) edW)
+    check "Save persists session-effective values"
+      (case effsW of [EffSaveConfig c] -> cfgWordWrap c; _ -> False)
 
   -- Horizontal mouse scrolling --------------------------------------------------------
   do

@@ -32,6 +32,7 @@ leftSections =
       [ ("Ctrl+N",      "New file")
       , ("Ctrl+O",      "Open file\x2026")
       , ("Ctrl+P",      "Go to file\x2026")
+      , ("Ctrl+,",      "Settings\x2026")
       , ("Ctrl+S",      "Save")
       , ("Ctrl+W",      "Close file")
       , ("Ctrl+Q",      "Quit")
