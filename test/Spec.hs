@@ -3323,6 +3323,28 @@ main = do
     check "jumpNextDiag on empty is a no-op with a note"
       (edCursor (jumpNextDiag (edD { edDiags = [] })) == Pos 0 0)
 
+    -- diagToolNames / the status bar's tool prefix.
+    let dPyr = Diag 1 0 SevWarning (T.pack "reportX") (T.pack "hm") LPyright
+    checkEq "diagToolNames in catalogue order"
+      (diagToolNames (edD { edDiags = [dPyr, d0] })) ["ruff", "pyright"]
+    check "status bar names the tool before the counts"
+      ("ruff: 1E 2W" `isInfixOf` fst (statusRightInfo edD))
+    check "status bar joins multiple tools"
+      ("ruff+pyright: " `isInfixOf` fst (statusRightInfo (edD { edDiags = [d0, dPyr] })))
+
+    -- Next Problem is pruned from the Find menu unless linting could produce
+    -- (or has produced) diagnostics for the active document.
+    let findActs e = [ a | MEItem _ _ a <- entriesFor e 2 ]   -- Find menu is index 2
+    check "no linter for file type -> Next Problem hidden"
+      (MANextProblem `notElem` findActs edPlain)
+    check "active linter for file type -> Next Problem shown"
+      (MANextProblem `elem` findActs edPy)
+    check "existing diags keep Next Problem shown"
+      (MANextProblem `elem` findActs edD)
+    check "master lint off without diags hides Next Problem"
+      (MANextProblem `notElem` findActs
+        (edPy { edConfig = (edConfig edPy) { cfgLint = False } }))
+
     -- lintResults targets a zipper doc by path.
     let edA  = setLoaded "/w/a.py" (mkLR "aaa") ed0
         edTwo = setLoadedNew "/w/b.py" (mkLR "bbb") edA   -- b active, a backgrounded

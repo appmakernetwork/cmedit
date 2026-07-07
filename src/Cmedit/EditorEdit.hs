@@ -652,11 +652,13 @@ statusRightInfo ed = flatten segs
              , zone SZLineEnding eol, plain " " ]
         Nothing ->
           -- A diagnostics count zone (errors/warnings), shown only when the
-          -- active document has any; clicking it jumps to the next problem.
+          -- active document has any, prefixed with the tool(s) that produced
+          -- them ("ruff: 2E 1W"); clicking it jumps to the next problem.
           -- ASCII only — the zone offsets assume 1 char = 1 cell.
           let (nE, nW) = diagCounts ed
+              tools = intercalate "+" (diagToolNames ed)
               diagSeg = if null (edDiags ed) then []
-                        else [ zone SZDiagnostics (show nE ++ "E " ++ show nW ++ "W"), plain "  " ]
+                        else [ zone SZDiagnostics (tools ++ ": " ++ show nE ++ "E " ++ show nW ++ "W"), plain "  " ]
           in diagSeg ++
           [ zone SZGoTo ("Ln " ++ show (l + 1) ++ ", Col " ++ show (c + 1))
           , plain selInfo, plain "   "

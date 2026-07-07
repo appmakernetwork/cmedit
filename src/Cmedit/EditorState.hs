@@ -1292,6 +1292,21 @@ diagCounts :: Editor -> (Int, Int)
 diagCounts ed = (length errs, length rest)
   where (errs, rest) = partition ((== SevError) . dgSev) (edDiags ed)
 
+-- | The display names of the tools that produced the active document's
+-- diagnostics, in catalogue order (so "ruff" sorts before "pyright"
+-- consistently). ASCII only — the status bar's zone offsets assume
+-- 1 char = 1 cell.
+diagToolNames :: Editor -> [String]
+diagToolNames ed = [ linName l | l <- linters, linId l `elem` tools ]
+  where tools = map dgTool (edDiags ed)
+
+-- | Would Find ▸ Next Problem (F8) ever have anything to jump to for the
+-- active document? True when diagnostics are already showing, or when linting
+-- is on and some enabled, installed linter covers the file's type
+-- (save-time-only tools count, hence the @True@). Gates the menu entry.
+nextProblemAvailable :: Editor -> Bool
+nextProblemAvailable ed = not (null (edDiags ed)) || isJust (lintRequest True ed)
+
 -- | The diagnostic whose squiggle covers the cursor, if any (for the status
 -- bar's cursor-on-problem message).
 diagUnderCursor :: Editor -> Maybe Diag

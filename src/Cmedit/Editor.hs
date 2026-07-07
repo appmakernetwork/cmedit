@@ -172,6 +172,8 @@ module Cmedit.Editor
   , lintersDetected
   , lintResults
   , diagCounts
+  , diagToolNames
+  , nextProblemAvailable
   , diagUnderCursor
   , jumpNextDiag
   , applySaveFixups
@@ -310,8 +312,14 @@ entriesFor ed mi
 pruneEntries :: Editor -> [MenuEntry] -> [MenuEntry]
 pruneEntries ed = map (relabelEntry ed)
                     . dropRevert . dropCloseFolder . dropSaveAll . dropImageFind . dropDelete
-                    . dropLineOps . dropFileProps . dropToggles . dropTV
+                    . dropNextProblem . dropLineOps . dropFileProps . dropToggles . dropTV
   where
+    -- Next Problem only appears when it could have something to jump to:
+    -- diagnostics are showing, or linting is on with an enabled, installed
+    -- linter covering the active file's type.
+    dropNextProblem es
+      | nextProblemAvailable ed = es
+      | otherwise = filter (\e -> case e of MEItem _ _ MANextProblem -> False; _ -> True) es
     -- Line ending / BOM are meaningless for a read-only image.
     dropFileProps es
       | isJust (edImage ed) = tidySeps (filter keep es)
