@@ -851,15 +851,68 @@ deleteCol v
 
 ------------------------------------------------------------------------------
 -- Sorting
+--
+-- Before sorting we sniff the column's data type from the first non-empty
+-- cell and verify every other non-empty cell matches — timestamps, dates
+-- (ISO / DMY / MDY, disambiguated by which format the whole column agrees
+-- on), times (12h/24h), money, percentages, and thousands-grouped numerics
+-- each sort by their true value rather than alphabetically. Empties always
+-- sink to the bottom in both directions. If any cell breaks the pattern,
+-- we fall back to plain alphanumeric sorting (never error out) so the
+-- user's arrow-key sort is guaranteed to do *something* reasonable.
 
--- The comparison key for one cell: empty cells sort after everything (in both
--- directions), numbers compare numerically and sort before text (which
--- compares case-folded) — the ordering a spreadsheet user expects.
+-- Parsers listed most-specific first: the first one whose interpretation
+-- fits every non-empty cell wins.
+colParsers :: [Text -> Maybe Double]
+colParsers =
+  [ parseTimestampISO
+  , parseISODate
+  , parseDMYDate
+  , parseMDYDate
+  , parseTime
+  , parseMoney
+  , parsePercent
+  , parseNumericTyped
+  ]
+
+-- Pick the parser under which every non-empty cell in @raws@ agrees on a
+-- typed value; 'Nothing' means the column is heterogeneous and should sort
+-- as plain text.
+detectColParser :: [Text] -> Maybe (Text -> Maybe Double)
+detectColParser raws =
+  let nonEmpty = [ r | r <- raws, not (T.null (T.strip r)) ]
+  in case nonEmpty of
+       []    -> Nothing
+       (h:_) ->
+         let ok p = case p h of
+               Just _  -> all (\c -> case p c of Just _ -> True; _ -> False) nonEmpty
+               Nothing -> False
+         in case filter ok colParsers of
+              []      -> Nothing
+              (p : _) -> Just p
+
+-- Plain-text sort key: empty cells last (in both directions), any cell that
+-- happens to look like a plain Haskell-readable number sorts before text
+-- (case-folded) — the ordering a spreadsheet user expects when nothing
+-- fancier is detected.
 sortKeyOf :: Text -> (Bool, Either Double Text)
 sortKeyOf t =
   let s = T.strip t
   in ( T.null s
      , case readMaybe (T.unpack s) :: Maybe Double of
+         Just d  -> Left d
+         Nothing -> Right (T.toCaseFold s) )
+
+-- Typed sort key: empties last, then numeric under the sniffed parser, then
+-- anything that doesn't parse falls through to text. In practice the
+-- fallthrough never fires because detectColParser only picks a parser that
+-- succeeds on every non-empty cell — but keep it defensive so a rogue cell
+-- can't crash the sort.
+sortKeyOfTyped :: (Text -> Maybe Double) -> Text -> (Bool, Either Double Text)
+sortKeyOfTyped p t =
+  let s = T.strip t
+  in ( T.null s
+     , case p t of
          Just d  -> Left d
          Nothing -> Right (T.toCaseFold s) )
 
@@ -875,7 +928,11 @@ sortByColumn c asc keepHeader v0 =
       rows = csvRows v1
       hdrN = if keepHeader && not (Seq.null rows) then 1 else 0
       body = toList (Seq.drop hdrN rows)
-      dec  = [ (sortKeyOf (cellIn c row), i, row) | (i, row) <- zip [0 :: Int ..] body ]
+      cells = [ cellIn c row | row <- body ]
+      keyF = case detectColParser cells of
+        Just p  -> sortKeyOfTyped p
+        Nothing -> sortKeyOf
+      dec  = [ (keyF (cellIn c row), i, row) | (i, row) <- zip [0 :: Int ..] body ]
       cmp ((e1, k1), _, _) ((e2, k2), _, _) =
         compare e1 e2 <> (if asc then compare k1 k2 else compare k2 k1)
       sorted = sortBy cmp dec
@@ -888,11 +945,242 @@ sortByColumn c asc keepHeader v0 =
 
 -- | Are the (non-pinned) rows already in ascending order by column @c@? Used
 -- to make the sort key toggle: ascending first, descending when re-applied.
+-- Uses the same typed sniff as 'sortByColumn' so a date-sorted column doesn't
+-- re-sort ascending under an alpha comparison — Alt+S toggles cleanly.
 sortedAscBy :: Int -> Bool -> CsvView -> Bool
 sortedAscBy c keepHeader v =
   let hdrN = if keepHeader && not (Seq.null (csvRows v)) then 1 else 0
-      keys = [ sortKeyOf (cellIn c row) | row <- toList (Seq.drop hdrN (csvRows v)) ]
+      cells = [ cellIn c row | row <- toList (Seq.drop hdrN (csvRows v)) ]
+      keyF = case detectColParser cells of
+        Just p  -> sortKeyOfTyped p
+        Nothing -> sortKeyOf
+      keys = map keyF cells
   in and (zipWith (<=) keys (drop 1 keys))
+
+------------------------------------------------------------------------------
+-- Typed cell parsers. Each returns 'Just' a comparable 'Double' when the
+-- text parses under its format, and 'Nothing' otherwise. Trailing junk is
+-- always rejected so a partial match can't masquerade as the type.
+
+isDig :: Char -> Bool
+isDig c = c >= '0' && c <= '9'
+
+readDigits :: Text -> Int
+readDigits = T.foldl' (\a c -> a * 10 + (ord c - ord '0')) 0
+
+-- Consume 1..n digits.
+takeIntUpTo :: Int -> Text -> Maybe (Int, Text)
+takeIntUpTo n t =
+  let (ds, rest) = T.span isDig t
+      k = T.length ds
+  in if k >= 1 && k <= n then Just (readDigits ds, rest) else Nothing
+
+-- Consume exactly n digits.
+takeIntN :: Int -> Text -> Maybe (Int, Text)
+takeIntN n t =
+  let (ds, rest) = T.span isDig t
+  in if T.length ds == n then Just (readDigits ds, rest) else Nothing
+
+consumeChar :: Char -> Text -> Maybe Text
+consumeChar c t = case T.uncons t of
+  Just (x, r) | x == c -> Just r
+  _                    -> Nothing
+
+isLeap :: Int -> Bool
+isLeap y = (y `mod` 4 == 0 && y `mod` 100 /= 0) || y `mod` 400 == 0
+
+daysInMonth :: Int -> Int -> Int
+daysInMonth y m = case m of
+  1 -> 31; 3 -> 31; 5 -> 31; 7 -> 31; 8 -> 31; 10 -> 31; 12 -> 31
+  4 -> 30; 6 -> 30; 9 -> 30; 11 -> 30
+  2 -> if isLeap y then 29 else 28
+  _ -> 0
+
+validDate :: Int -> Int -> Int -> Bool
+validDate y m d = y >= 1 && m >= 1 && m <= 12 && d >= 1 && d <= daysInMonth y m
+
+-- 2-digit years: 00..69 → 2000..2069; 70..99 → 1970..1999 (Excel convention).
+takeYear :: Text -> Maybe (Int, Text)
+takeYear t =
+  let (ds, rest) = T.span isDig t
+  in case T.length ds of
+       4 -> Just (readDigits ds, rest)
+       2 -> let n = readDigits ds
+            in Just (if n < 70 then 2000 + n else 1900 + n, rest)
+       _ -> Nothing
+
+-- Compact monotone ordinals — used as comparison keys, not real dates.
+dateOrdinal :: Int -> Int -> Int -> Double
+dateOrdinal y m d = fromIntegral (y * 10000 + m * 100 + d)
+
+dtOrdinal :: Int -> Int -> Int -> Int -> Int -> Int -> Double
+dtOrdinal y mo d h mi s = fromIntegral $
+  ((y * 10000 + mo * 100 + d) * 1000000) + h * 10000 + mi * 100 + s
+
+parseISODate :: Text -> Maybe Double
+parseISODate raw = do
+  let t = T.strip raw
+  (y, t1) <- takeIntN 4 t
+  t2      <- consumeChar '-' t1
+  (m, t3) <- takeIntN 2 t2
+  t4      <- consumeChar '-' t3
+  (d, t5) <- takeIntN 2 t4
+  if T.null t5 && validDate y m d
+    then Just (dateOrdinal y m d)
+    else Nothing
+
+parseDMYDate :: Text -> Maybe Double
+parseDMYDate raw = do
+  let t = T.strip raw
+  (d, t1)    <- takeIntUpTo 2 t
+  (sep, t2)  <- case T.uncons t1 of
+    Just (c, r) | c `elem` ("/-." :: String) -> Just (c, r)
+    _                                        -> Nothing
+  (m, t3)    <- takeIntUpTo 2 t2
+  t4         <- consumeChar sep t3
+  (y, t5)    <- takeYear t4
+  if T.null t5 && validDate y m d
+    then Just (dateOrdinal y m d)
+    else Nothing
+
+parseMDYDate :: Text -> Maybe Double
+parseMDYDate raw = do
+  let t = T.strip raw
+  (m, t1)    <- takeIntUpTo 2 t
+  (sep, t2)  <- case T.uncons t1 of
+    Just (c, r) | c `elem` ("/-." :: String) -> Just (c, r)
+    _                                        -> Nothing
+  (d, t3)    <- takeIntUpTo 2 t2
+  t4         <- consumeChar sep t3
+  (y, t5)    <- takeYear t4
+  if T.null t5 && validDate y m d
+    then Just (dateOrdinal y m d)
+    else Nothing
+
+parseTime :: Text -> Maybe Double
+parseTime raw = do
+  let t0 = T.strip raw
+  (h0, t1) <- takeIntUpTo 2 t0
+  t2       <- consumeChar ':' t1
+  (mi, t3) <- takeIntN 2 t2
+  (s, t4)  <- case T.uncons t3 of
+    Just (':', r) -> takeIntN 2 r
+    _             -> Just (0, t3)
+  let suff = T.toLower (T.strip t4)
+  h <- if T.null suff
+         then if h0 <= 23 then Just h0 else Nothing
+         else if suff == T.pack "am" && h0 >= 1 && h0 <= 12
+                then Just (if h0 == 12 then 0 else h0)
+                else if suff == T.pack "pm" && h0 >= 1 && h0 <= 12
+                        then Just (if h0 == 12 then 12 else h0 + 12)
+                        else Nothing
+  if mi < 60 && s < 60
+    then Just (fromIntegral (h * 3600 + mi * 60 + s))
+    else Nothing
+
+parseTimestampISO :: Text -> Maybe Double
+parseTimestampISO raw = do
+  let t = T.strip raw
+  (y, t1)  <- takeIntN 4 t
+  t2       <- consumeChar '-' t1
+  (mo, t3) <- takeIntN 2 t2
+  t4       <- consumeChar '-' t3
+  (d, t5)  <- takeIntN 2 t4
+  t6       <- case T.uncons t5 of
+    Just ('T', r) -> Just r
+    Just (' ', r) -> Just r
+    _             -> Nothing
+  (h, t7)  <- takeIntUpTo 2 t6
+  t8       <- consumeChar ':' t7
+  (mi, t9) <- takeIntN 2 t8
+  (s, t10) <- case T.uncons t9 of
+    Just (':', r) -> takeIntN 2 r
+    _             -> Just (0, t9)
+  let tE = T.strip (case T.uncons t10 of
+                      Just ('Z', r) -> r
+                      _             -> t10)
+  if T.null tE && validDate y mo d && h <= 23 && mi < 60 && s < 60
+    then Just (dtOrdinal y mo d h mi s)
+    else Nothing
+
+-- Numeric with optional sign, optional decimal, and optional US-style
+-- thousands separators. Strict: '1,23' or '12,3456' are rejected so the
+-- sniffer can distinguish a real thousands-grouped column from noise.
+parseNumericTyped :: Text -> Maybe Double
+parseNumericTyped raw =
+  let t = T.strip raw
+      (sign, t1) = case T.uncons t of
+        Just ('-', r) -> (-1 :: Double, r)
+        Just ('+', r) -> (1, r)
+        _             -> (1, t)
+  in case parseIntPartStrict t1 of
+       Nothing            -> Nothing
+       Just (intTxt, t2)  ->
+         let mDec = case T.uncons t2 of
+               Just ('.', r) ->
+                 let (ds, r') = T.span isDig r
+                 in if T.null ds then Nothing else Just (T.cons '.' ds, r')
+               _             -> Just (T.empty, t2)
+         in case mDec of
+              Nothing            -> Nothing
+              Just (decTxt, t3)
+                | T.null t3 ->
+                    case readMaybe (T.unpack (intTxt <> decTxt)) :: Maybe Double of
+                      Just d  -> Just (sign * d)
+                      Nothing -> Nothing
+                | otherwise -> Nothing
+
+parseIntPartStrict :: Text -> Maybe (Text, Text)
+parseIntPartStrict s =
+  let (g0, r0) = T.span isDig s
+  in if T.null g0 then Nothing
+     else case T.uncons r0 of
+       Just (',', _)
+         | T.length g0 <= 3 -> groupsOnce g0 r0
+         | otherwise        -> Nothing
+       _                    -> Just (g0, r0)
+  where
+    groupsOnce acc r = case T.uncons r of
+      Just (',', rest) ->
+        let (grp, rest') = T.span isDig rest
+        in if T.length grp == 3 then groupsOnce (acc <> grp) rest'
+                                else Nothing
+      _ -> Just (acc, r)
+
+-- Money: requires a currency symbol (prefix or suffix). Accounting parens
+-- for negatives are allowed ("($1,234.50)").
+parseMoney :: Text -> Maybe Double
+parseMoney raw =
+  let t = T.strip raw
+      (negParen, tCore) =
+        case (T.uncons t, T.unsnoc t) of
+          (Just ('(', _), Just (_, ')'))
+            | T.length t >= 2 -> (True, T.dropEnd 1 (T.drop 1 t))
+          _                   -> (False, t)
+      (sign1, tSign) = case T.uncons tCore of
+        Just ('-', r) -> (-1 :: Double, r)
+        Just ('+', r) -> (1, r)
+        _             -> (1, tCore)
+      sign = if negParen then -sign1 else sign1
+      currencyChars = "$£€¥₩₹₽¢" :: String
+      (tNum, hasSym) =
+        case T.uncons tSign of
+          Just (c, r) | c `elem` currencyChars -> (T.stripStart r, True)
+          _ ->
+            case T.unsnoc tSign of
+              Just (r, c) | c `elem` currencyChars -> (T.stripEnd r, True)
+              _                                    -> (tSign, False)
+  in if hasSym
+       then fmap (sign *) (parseNumericTyped tNum)
+       else Nothing
+
+-- Percent: number with a trailing '%'.
+parsePercent :: Text -> Maybe Double
+parsePercent raw =
+  let t = T.strip raw
+  in case T.unsnoc t of
+       Just (r, '%') -> parseNumericTyped (T.stripEnd r)
+       _             -> Nothing
 
 ------------------------------------------------------------------------------
 -- Undo / redo

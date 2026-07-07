@@ -3446,6 +3446,55 @@ main = do
     check "plain text explains sort"
       (T.pack "table view" `T.isInfixOf` edStatus edPlain)
 
+    -- Typed-column sorts: money/percent/thousands-numeric/date/time all sort
+    -- by their true value rather than alphabetically, and blanks sink to the
+    -- bottom. Mixed formats or a stray non-matching cell fall back to alpha.
+    let sortCol0 s = col0 (key (KAltChar 's')
+                              ((mkCsv s) { edFreezeHeader = True }))
+    -- Values that contain the CSV field separator must be quoted so they
+    -- parse as a single cell.
+    checkEq "thousands-grouped numeric sorts numerically"
+      (sortCol0 "h\n\"1,000\"\n500\n\"2,500\"\n50")
+      (map T.pack ["h", "50", "500", "1,000", "2,500"])
+    checkEq "money column sorts by value, blanks last"
+      (sortCol0 "h\n$100\n\"$1,000\"\n\n$50")
+      (map T.pack ["h", "$50", "$100", "$1,000", ""])
+    checkEq "percent column sorts by value"
+      (sortCol0 "h\n50%\n5%\n12.5%")
+      (map T.pack ["h", "5%", "12.5%", "50%"])
+    checkEq "ISO date column sorts chronologically"
+      (sortCol0 "h\n2024-01-15\n2023-12-01\n2024-02-01")
+      (map T.pack ["h", "2023-12-01", "2024-01-15", "2024-02-01"])
+    checkEq "DD/MM/YYYY column sorts chronologically"
+      (sortCol0 "h\n15/01/2024\n01/12/2023\n01/02/2024")
+      (map T.pack ["h", "01/12/2023", "15/01/2024", "01/02/2024"])
+    -- Column disambiguates as MDY (13/xx wouldn't parse as DMY, so DMY fails
+    -- across the column and MDY wins).
+    checkEq "MM/DD/YYYY column sorts chronologically"
+      (sortCol0 "h\n01/13/2024\n12/01/2023\n02/01/2024")
+      (map T.pack ["h", "12/01/2023", "01/13/2024", "02/01/2024"])
+    checkEq "time column sorts by clock, 12h supported"
+      (sortCol0 "h\n2:30 PM\n9:00 AM\n11:59 PM")
+      (map T.pack ["h", "9:00 AM", "2:30 PM", "11:59 PM"])
+    checkEq "ISO timestamp column sorts chronologically"
+      (sortCol0 "h\n2024-01-15T10:00:00\n2024-01-15T09:59:59\n2024-01-14T23:00:00")
+      (map T.pack ["h", "2024-01-14T23:00:00", "2024-01-15T09:59:59"
+                  , "2024-01-15T10:00:00"])
+    -- One rogue cell disqualifies the type and we fall back to alpha, but
+    -- the sort never errors. Start unsorted so Alt+S ascends.
+    checkEq "mixed-format column falls back to alpha"
+      (sortCol0 "h\nnot a date\n2024-02-01\n2024-01-15")
+      (map T.pack ["h", "2024-01-15", "2024-02-01", "not a date"])
+    -- The toggle survives typed detection: sorting a date column twice
+    -- reverses (rather than re-sorting ascending under alpha semantics).
+    let edD1 = key (KAltChar 's')
+                 ((mkCsv "h\n2024-01-15\n2023-12-01\n2024-02-01")
+                    { edFreezeHeader = True })
+        edD2 = key (KAltChar 's') edD1
+    checkEq "second sort on typed date column flips to descending"
+      (col0 edD2)
+      (map T.pack ["h", "2024-02-01", "2024-01-15", "2023-12-01"])
+
   -- Command palette ('>' in quick open) -----------------------------------------------
   do
     let key k e = fst (update k e)
