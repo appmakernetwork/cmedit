@@ -156,6 +156,19 @@ main = do
     (cellWidth
       (T.pack "\x1F44D Reviews \x1F4CC Map \x2139\xFE0F Information"))
     (2 + 1 + 7 + 1 + 2 + 1 + 3 + 1 + 2 + 1 + 11)
+  -- Emoji_Presentation code points in the BMP misc-symbols/dingbats block:
+  -- these render as two-cell emoji by default (no VS16 selector) and used to
+  -- be missing from the 'wide' table, drifting CSV columns by one cell per
+  -- glyph.
+  checkEq "sparkles width"        (charWidth '\x2728') 2   -- ✨
+  checkEq "watch width"           (charWidth '\x231A') 2   -- ⌚
+  checkEq "hourglass sand width"  (charWidth '\x23F3') 2   -- ⏳
+  checkEq "check mark button"     (charWidth '\x2705') 2   -- ✅
+  checkEq "high voltage width"    (charWidth '\x26A1') 2   -- ⚡
+  checkEq "large red square"      (charWidth '\x1F7E5') 2  -- 🟥 (existing range)
+  checkEq "cellWidth sparkles cell"
+    (cellWidth (T.pack "\x2728The Portal\x2728 Mount Shasta"))
+    (2 + 10 + 2 + 1 + 12)
 
   -- Input parser -------------------------------------------------------------
   kUp <- parseBytes [0x1b, 0x5b, 0x41]
