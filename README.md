@@ -75,7 +75,9 @@ escape sequences and the POSIX `termios` API.
   asks once — **Save All**, **Discard All**, or **Cancel**.
 - **CSV table mode**: `.csv`/`.tsv` files open in a navigable spreadsheet grid
   (column letters, row numbers, cell editing, multi-line cells, insert/delete
-  rows & columns, a freezable header row, and undo). Select a rectangle of cells
+  rows & columns, and undo — with the header row frozen while you scroll, since
+  spreadsheets almost always have one; View ▸ Freeze Header Row or
+  `freeze-header = off` in the config turns that off). Select a rectangle of cells
   (Shift+navigation or drag) to copy/cut/delete it; copy yields a mini-CSV, and
   paste fills, spreads, or overwrites a matching block. Saving — or toggling
   back to text with Alt+T or the View menu — writes proper RFC-4180 CSV with

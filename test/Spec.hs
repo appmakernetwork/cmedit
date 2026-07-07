@@ -2653,6 +2653,14 @@ main = do
     let (cL, wL) = parseConfigText (T.pack "theme = light") defaultConfig
     checkEq "config theme=light" (cfgTheme cL) ThemeLight
     checkEq "config theme parse clean" wL []
+    -- CSV header freeze: on by default, config key turns it off.
+    check "freeze-header defaults on" (cfgFreezeHeader defaultConfig)
+    checkEq "config freeze-header = off"
+            (cfgFreezeHeader (fst (parseConfigText (T.pack "freeze-header = off") defaultConfig)))
+            False
+    check "newEditor seeds edFreezeHeader from the config"
+      (edFreezeHeader (newEditor (24, 80) defaultConfig)
+       && not (edFreezeHeader (newEditor (24, 80) defaultConfig { cfgFreezeHeader = False })))
     check "bad theme warns"
       (not (null (snd (parseConfigText (T.pack "theme = solarized") defaultConfig))))
     -- The palettes actually differ where it matters (numbers on light bg).
@@ -2792,9 +2800,10 @@ main = do
         col0 e = maybe [] (\v -> [ cellAt r 0 v | r <- [0 .. nRows v - 1] ]) (edCsv e)
         col1 e = maybe [] (\v -> [ cellAt r 1 v | r <- [0 .. nRows v - 1] ]) (edCsv e)
         edS0 = mkCsv "name,n\nbravo,2\nalpha,10\ncharlie,9"
-        -- move to column n (col 1) and pin the header
-        edS = fst (update (KArrow DRight noMods) (fst (runAction' MAToggleFreezeHeader edS0)))
-        runAction' a e = update KEnter e { edFocus = FMenu, edMenu = menuStateFor e 3 a }
+        -- move to column n (col 1); the header row is pinned by default now
+        -- (config key freeze-header, on unless turned off)
+        edS = fst (update (KArrow DRight noMods) edS0)
+    check "header row is frozen by default" (edFreezeHeader edS0)
 
     -- Alt+S sorts numerically ascending, header pinned; again flips to descending.
     let edAsc = key (KAltChar 's') edS

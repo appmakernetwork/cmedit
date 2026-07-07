@@ -358,7 +358,9 @@ in `README.md`; the cross-cutting structure that matters when editing:
   stay in sync; `scrollTop` and `cellDisplay` handle vertical/horizontal
   scrolling within a tall or being-edited cell. Up/Down while editing move
   between a cell's lines (`editLineUp`/`editLineDown`) before crossing cells.
-  `edFreezeHeader` (View ▸ Freeze Header Row) pins row 0 below the column header:
+  `edFreezeHeader` (View ▸ Freeze Header Row; **on by default** via
+  `cfgFreezeHeader` / config key `freeze-header`, seeded in `newEditor`)
+  pins row 0 below the column header:
   `csvRowLayout` lays it out separately and `ensureVisible`/`csvMouse` take a
   freeze-row count so scrolling and clicks skip the pinned row.
   Rectangular cell selection is `csvSelAnchor` (the far corner); `selRect`

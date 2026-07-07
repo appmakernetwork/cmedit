@@ -65,6 +65,7 @@ data Config = Config
   , cfgShowWhitespace :: !Bool
   , cfgTrimTrailingWs :: !Bool   -- ^ Strip trailing whitespace from each line on save.
   , cfgEnsureFinalNl  :: !Bool   -- ^ Make sure the file ends with a newline on save.
+  , cfgFreezeHeader   :: !Bool   -- ^ CSV table view: pin the first row while scrolling (View ▸ Freeze Header Row toggles it per-session).
   , cfgTheme          :: !ThemeName
   } deriving (Eq, Show)
 
@@ -78,6 +79,7 @@ defaultConfig = Config
   , cfgShowWhitespace = False
   , cfgTrimTrailingWs = False
   , cfgEnsureFinalNl  = False
+  , cfgFreezeHeader   = True    -- spreadsheets almost always have a header row
   , cfgTheme          = ThemeAuto   -- follow the terminal background; dark when undetectable
   }
 
@@ -117,6 +119,7 @@ applyKey key val cfg = case key of
   "whitespace"   -> boolKey (\b -> cfg { cfgShowWhitespace = b })
   "trim-trailing-whitespace" -> boolKey (\b -> cfg { cfgTrimTrailingWs = b })
   "final-newline"            -> boolKey (\b -> cfg { cfgEnsureFinalNl = b })
+  "freeze-header"            -> boolKey (\b -> cfg { cfgFreezeHeader = b })
   "theme" -> case map toLower val of
     "dark"           -> Right cfg { cfgTheme = ThemeDark }
     "light"          -> Right cfg { cfgTheme = ThemeLight }
