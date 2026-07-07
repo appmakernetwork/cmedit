@@ -1091,7 +1091,7 @@ aboutText = T.intercalate "\n" $
   where center t = T.replicate (max 0 ((51 - T.length t) `div` 2)) " " <> t
 
 versionText :: Text
-versionText = "0.3.0"
+versionText = "0.3.1"
 
 ------------------------------------------------------------------------------
 -- Search

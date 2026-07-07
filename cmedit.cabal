@@ -1,6 +1,6 @@
 cabal-version:      2.4
 name:               cmedit
-version:            0.3.0
+version:            0.3.1
 synopsis:           Cmedit - a from-scratch terminal text editor in Haskell
 description:        A terminal text editor inspired by Microsoft Edit (msedit) and
                     nano, implemented from first principles: raw terminal control,

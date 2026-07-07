@@ -7,7 +7,7 @@ module Cmedit.Help
 import Cmedit.ConfigFile (configKeysHelp)
 
 versionString :: String
-versionString = "CMeDit 0.3.0"
+versionString = "CMeDit 0.3.1"
 
 helpString :: String
 helpString = unlines $
