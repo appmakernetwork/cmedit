@@ -5,6 +5,7 @@
 module Cmedit.Dialog
   ( DialogKind(..)
   , Field(..)
+  , Choice(..)
   , Dialog(..)
     -- * Constructors
   , mkOpen
@@ -22,11 +23,14 @@ module Cmedit.Dialog
     -- * Focus
   , focusCount
   , focusedField
+  , focusedChoice
   , focusIsButton
   , focusedButton
   , focusNext
   , focusPrev
   , setFocus
+  , cycleChoice
+  , setChoiceIx
     -- * Field editing
   , fieldInsert
   , fieldBackspace
@@ -80,13 +84,23 @@ data Field = Field
   , fCur   :: !Int    -- ^ Cursor as a character index into 'fText'.
   } deriving (Eq, Show)
 
+-- | One settings-style row: a label and a value cycled through a fixed list.
+data Choice = Choice
+  { chLabel  :: !Text
+  , chValues :: ![Text]        -- ^ non-empty; shown one at a time
+  , chIx     :: !Int           -- ^ current value index
+  , chHeader :: !(Maybe Text)  -- ^ section header drawn above this row, if it starts a group
+  , chHint   :: !Text          -- ^ one-line contextual help shown while the row is focused
+  } deriving (Eq, Show)
+
 -- | A modal dialog. Focus ranges over fields, then options (checkboxes),
--- then buttons, in that order.
+-- then choices (value pickers), then buttons, in that order.
 data Dialog = Dialog
   { dlgKind    :: !DialogKind
   , dlgTitle   :: !Text
   , dlgFields  :: ![Field]
   , dlgOptions :: ![(Text, Bool)]
+  , dlgChoices :: ![Choice]
   , dlgButtons :: ![Text]
   , dlgFocus   :: !Int
   , dlgMessage :: !Text
@@ -101,55 +115,57 @@ field lbl t = Field lbl t (T.length t)
 
 mkOpen :: Text -> Dialog
 mkOpen path = Dialog DKOpen "Open File"
-  [field "Path:" path] [] ["Open", "Cancel"] 0 "" False
+  [field "Path:" path] [] [] ["Open", "Cancel"] 0 "" False
 
 mkSaveAs :: Text -> Dialog
 mkSaveAs path = Dialog DKSaveAs "Save As"
-  [field "Path:" path] [] ["Save", "Cancel"] 0 "" False
+  [field "Path:" path] [] [] ["Save", "Cancel"] 0 "" False
 
 mkFind :: Text -> Bool -> Bool -> Dialog
 mkFind term caseSens wholeWord = Dialog DKFind "Find"
   [field "Find:" term]
   [("Match case", caseSens), ("Whole word", wholeWord)]
+  []
   ["Find", "Close"] 0 "" True
 
 mkReplace :: Text -> Text -> Bool -> Dialog
 mkReplace term repl caseSens = Dialog DKReplace "Replace"
   [field "Find:" term, field "Replace:" repl]
   [("Match case", caseSens)]
+  []
   ["Replace", "Replace All", "Close"] 0 "" True
 
 mkGoToLine :: Dialog
 mkGoToLine = Dialog DKGoToLine "Go to Line"
-  [field "Line:" ""] [] ["Go", "Cancel"] 0 "" False
+  [field "Line:" ""] [] [] ["Go", "Cancel"] 0 "" False
 
 -- | Explorer "new file/folder" prompt. @where_@ names the directory it will
 -- be created in (display only; the caller re-derives it on confirm).
 mkNewPath :: Text -> Dialog
 mkNewPath where_ = Dialog DKNewPath "New File / Folder"
-  [field "Name:" ""] [] ["Create", "Cancel"] 0
+  [field "Name:" ""] [] [] ["Create", "Cancel"] 0
   ("In " <> where_ <> "\nEnd the name with / to create a folder.") False
 
 -- | Explorer rename prompt, seeded with the current name.
 mkRename :: Text -> Dialog
 mkRename oldName = Dialog DKRename "Rename"
-  [field "New name:" oldName] [] ["Rename", "Cancel"] 0
+  [field "New name:" oldName] [] [] ["Rename", "Cancel"] 0
   ("Renaming " <> oldName) False   -- renames tweak the old name, so keep it editable
 
 mkConfirm :: DialogKind -> Text -> Text -> [Text] -> Dialog
-mkConfirm kind title msg buttons = Dialog kind title [] [] buttons 0 msg False
+mkConfirm kind title msg buttons = Dialog kind title [] [] [] buttons 0 msg False
 
 mkAbout :: Text -> Dialog
-mkAbout msg = Dialog DKAbout "About CMeDit" [] [] ["OK"] 0 msg False
+mkAbout msg = Dialog DKAbout "About CMeDit" [] [] [] ["OK"] 0 msg False
 
 mkMessage :: Text -> Text -> Dialog
-mkMessage title msg = Dialog DKMessage title [] [] ["OK"] 0 msg False
+mkMessage title msg = Dialog DKMessage title [] [] [] ["OK"] 0 msg False
 
 -- | The keyboard help card. Close (not Manual) starts focused, so Enter
 -- dismisses; the message is the card's blank canvas plus its footer
 -- ("Cmedit.HelpCard"), overlaid with styled cells by the renderer.
 mkHelp :: Text -> Dialog
-mkHelp msg = Dialog DKHelp "Keyboard Shortcuts" [] [] ["Manual", "Close"] 1 msg False
+mkHelp msg = Dialog DKHelp "Keyboard Shortcuts" [] [] [] ["Manual", "Close"] 1 msg False
 
 -- | View ▸ Theme: pick the colour theme directly — one button per mode,
 -- focus starting on the current one (@cur@ indexes the theme buttons in the
@@ -158,22 +174,25 @@ mkHelp msg = Dialog DKHelp "Keyboard Shortcuts" [] [] ["Manual", "Close"] 1 msg 
 -- button); Esc or Cancel restores what you came in with.
 mkTheme :: Int -> Dialog
 mkTheme cur = Dialog DKTheme "Theme"
-  [] [] ["Auto", "Dark", "Light", "Cherry Blossom", "Cancel"] cur
+  [] [] [] ["Auto", "Dark", "Light", "Cherry Blossom", "Cancel"] cur
   "Applies for this session; set theme = ... in the config to keep it."
   False
 
 ------------------------------------------------------------------------------
 -- Focus
 
--- | Total number of focusable elements (fields + options + buttons).
+-- | Total number of focusable elements (fields + options + choices + buttons).
 focusCount :: Dialog -> Int
-focusCount d = length (dlgFields d) + length (dlgOptions d) + length (dlgButtons d)
+focusCount d = nFields d + nOptions d + nChoices d + length (dlgButtons d)
 
 nFields :: Dialog -> Int
 nFields = length . dlgFields
 
 nOptions :: Dialog -> Int
 nOptions = length . dlgOptions
+
+nChoices :: Dialog -> Int
+nChoices = length . dlgChoices
 
 -- | If a field is focused, its index; otherwise Nothing.
 focusedField :: Dialog -> Maybe Int
@@ -187,14 +206,20 @@ focusedOption d =
   let i = dlgFocus d - nFields d
   in if i >= 0 && i < nOptions d then Just i else Nothing
 
+-- | If a choice row is focused, its index (into 'dlgChoices'); otherwise Nothing.
+focusedChoice :: Dialog -> Maybe Int
+focusedChoice d =
+  let i = dlgFocus d - nFields d - nOptions d
+  in if i >= 0 && i < nChoices d then Just i else Nothing
+
 -- | Is a button currently focused?
 focusIsButton :: Dialog -> Bool
-focusIsButton d = dlgFocus d >= nFields d + nOptions d
+focusIsButton d = dlgFocus d >= nFields d + nOptions d + nChoices d
 
 -- | The focused button index (into 'dlgButtons'), if any.
 focusedButton :: Dialog -> Maybe Int
 focusedButton d =
-  let i = dlgFocus d - nFields d - nOptions d
+  let i = dlgFocus d - nFields d - nOptions d - nChoices d
   in if i >= 0 && i < length (dlgButtons d) then Just i else Nothing
 
 focusNext :: Dialog -> Dialog
@@ -316,6 +341,24 @@ toggleOption :: Dialog -> Dialog
 toggleOption d = case focusedOption d of
   Nothing -> d
   Just i  -> d { dlgOptions = adjust i (\(t, b) -> (t, not b)) (dlgOptions d) }
+
+-- | Advance choice row @ci@'s value by @dir@ (+1 forward, -1 back), wrapping
+-- around its (non-empty) value list. A no-op for an out-of-range index or an
+-- empty value list.
+cycleChoice :: Int -> Int -> Dialog -> Dialog
+cycleChoice ci dir d
+  | ci < 0 || ci >= nChoices d = d
+  | otherwise = d { dlgChoices = adjust ci step (dlgChoices d) }
+  where step c = let n = length (chValues c)
+                 in if n == 0 then c else c { chIx = (chIx c + dir) `mod` n }
+
+-- | Set choice row @ci@'s value index directly, clamped to its value list.
+setChoiceIx :: Int -> Int -> Dialog -> Dialog
+setChoiceIx ci ix d
+  | ci < 0 || ci >= nChoices d = d
+  | otherwise = d { dlgChoices = adjust ci put (dlgChoices d) }
+  where put c = let n = length (chValues c)
+                in if n == 0 then c else c { chIx = max 0 (min (n - 1) ix) }
 
 ------------------------------------------------------------------------------
 -- Queries
