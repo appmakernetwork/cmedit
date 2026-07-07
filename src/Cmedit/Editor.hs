@@ -58,6 +58,12 @@ module Cmedit.Editor
   , fieldRowIndex
   , fieldLineWidth
   , fieldVisH
+  , choiceCols
+  , choiceLabelColW
+  , choiceValueColW
+  , choiceIndent
+  , choiceRowWidth
+  , choiceChanged
     -- * Effects
   , Effect(..)
     -- * Driving the model
@@ -822,6 +828,20 @@ menuActivate ed =
 ------------------------------------------------------------------------------
 -- Dialog-mode key handling
 
+-- | A choice row's value changed (keyboard or mouse): give the dialog's kind
+-- a chance to react (a Settings dialog would apply the setting live). All
+-- current kinds just store the updated dialog; the @case@ is the extension
+-- point for a later @DKSettings@.
+choiceChanged :: Int -> Dialog -> Editor -> Editor
+choiceChanged _ci d ed = case dlgKind d of
+  _ -> ed { edDialog = Just d }
+
+-- Cycle the focused choice's value by @dir@ and route it through 'choiceChanged'.
+cycleFocusedChoice :: Int -> Dialog -> Editor -> (Editor, [Effect])
+cycleFocusedChoice dir d ed = case focusedChoice d of
+  Just ci -> noEff (choiceChanged ci (cycleChoice ci dir d) ed)
+  Nothing -> noEff ed
+
 handleDialogKey :: Key -> Editor -> (Editor, [Effect])
 handleDialogKey key ed = case edDialog ed of
   Nothing -> noEff (ed { edFocus = FEdit })
@@ -837,15 +857,22 @@ handleDialogKey key ed = case edDialog ed of
     KArrow DDown _ | Just d' <- fieldLineDown d -> noEff ed { edDialog = Just d' }
                    | isJust (edHistPos ed)      -> noEff (histRecall (-1) ed)
                    | otherwise                  -> noEff ed { edDialog = Just (focusNext d) }
-    KArrow DLeft _  | isJust (focusedField d) -> noEff ed { edDialog = Just (fieldLeft d) }
+    -- On a choice row Left/Right cycle its value (wrapping); elsewhere they
+    -- move within a field or shift dialog focus.
+    KArrow DLeft _  | isJust (focusedField d)  -> noEff ed { edDialog = Just (fieldLeft d) }
+                    | isJust (focusedChoice d) -> cycleFocusedChoice (-1) d ed
                     | otherwise -> noEff ed { edDialog = Just (focusPrev d) }
-    KArrow DRight _ | isJust (focusedField d) -> noEff ed { edDialog = Just (fieldRight d) }
+    KArrow DRight _ | isJust (focusedField d)  -> noEff ed { edDialog = Just (fieldRight d) }
+                    | isJust (focusedChoice d) -> cycleFocusedChoice 1 d ed
                     | otherwise -> noEff ed { edDialog = Just (focusNext d) }
     KHome _     -> noEff ed { edDialog = Just (fieldHome d) }
     KEnd _      -> noEff ed { edDialog = Just (fieldEnd d) }
     KBackspace  -> noEff ed { edDialog = Just (fieldBackspace d) }
     KCtrlChar 'h' -> noEff ed { edDialog = Just (fieldDeleteWordLeft d) }
     KDelete _   -> noEff ed { edDialog = Just (fieldDelete d) }
+    -- Space on a choice row cycles it forward (like Enter); on an option it
+    -- toggles the checkbox.
+    KChar ' ' | isJust (focusedChoice d) -> cycleFocusedChoice 1 d ed
     KChar ' ' | not (isJust (focusedField d)) && not (focusIsButton d)
                   -> noEff ed { edDialog = Just (toggleOption d) }
     -- A pristine seeded term behaves like a selected value: the first typed
@@ -856,7 +883,10 @@ handleDialogKey key ed = case edDialog ed of
     KPaste s    -> noEff ed { edDialog = Just (foldl (flip fieldInsert) d (T.unpack s)) }
     KCtrlChar 'v' -> (ed, [EffPaste])                                -- paste clipboard into the focused field
     KModEnter   -> noEff ed { edDialog = Just (fieldInsert '\n' d) }  -- Shift/Ctrl+Enter: newline in field
-    KEnter      -> confirmDialog d ed
+    -- Enter on a choice row cycles forward (these rows are played with, not
+    -- confirmed); the buttons stay reachable with Tab/Down for confirming.
+    KEnter      | isJust (focusedChoice d) -> cycleFocusedChoice 1 d ed
+                | otherwise                -> confirmDialog d ed
     KMouse me   -> handleDialogMouse me ed
     _           -> noEff ed
 
@@ -888,7 +918,25 @@ handleDialogMouse me ed = case edDialog ed of
                                 Nothing -> noEff ed
                DRField fi li visH -> noEff ed { edDialog = Just (clickField fi li visH innerX innerW (meCol me) d) }
                DROption oi -> noEff ed { edDialog = Just (toggleOption (setFocus (length (dlgFields d) + oi) d)) }
+               DRChoice ci -> noEff (clickChoice ci innerX (meCol me) d ed)
                _           -> noEff ed
+
+-- A click on a choice row: focus it, and — deriving the guillemet columns from
+-- the same shared 'choiceCols' geometry the renderer draws with — cycle the
+-- value backward on '\x2039' (or left of the value) and forward on the value or
+-- '\x203a'. A click on the label just focuses. Cycles route through
+-- 'choiceChanged'.
+clickChoice :: Int -> Int -> Int -> Dialog -> Editor -> Editor
+clickChoice ci innerX clickCol d ed =
+  let base   = length (dlgFields d) + length (dlgOptions d)
+      focused = setFocus (base + ci) d
+      (open, valStart, close) = choiceCols d
+      rel = clickCol - innerX
+  in if rel >= open && rel < valStart
+       then choiceChanged ci (cycleChoice ci (-1) focused) ed   -- \x2039 / left of value
+       else if rel >= valStart && rel <= close
+       then choiceChanged ci (cycleChoice ci 1 focused) ed      -- value / \x203a
+       else ed { edDialog = Just focused }                      -- label: just focus
 
 -- Focus a field and place its cursor at the clicked cell. We map the clicked
 -- screen column/line back to a text (line, column) using the same vertical

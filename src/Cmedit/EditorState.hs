@@ -829,8 +829,12 @@ closeDialog ed = ed { edDialog = Nothing, edFocus = if edSearchMode ed then FSea
 -- A flat description of the dialog body, one entry per row.
 -- A field row carries (fieldIndex, lineWithinField, visibleHeight): a multi-line
 -- Find/Replace value occupies 'fieldVisH' consecutive rows and scrolls within
--- them, just like a tall cell in the table view.
-data DRow = DRMsg Text | DRField !Int !Int !Int | DROption Int | DRBlank | DRButtons
+-- them, just like a tall cell in the table view. A 'DRChoice' carries the choice
+-- index; a 'DRHeader' carries a section-header label drawn above a choice group.
+data DRow
+  = DRMsg Text | DRField !Int !Int !Int | DROption Int
+  | DRHeader !Text | DRChoice !Int
+  | DRBlank | DRButtons
 
 -- On-screen height of a field: its line count capped at the table view's cap, so
 -- a multi-line value shows up to 'Csv.maxCellLines' rows (taller ones scroll).
@@ -838,7 +842,8 @@ fieldVisH :: Field -> Int
 fieldVisH f = max 1 (min Csv.maxCellLines (Csv.cellLineCount (fText f)))
 
 dialogRows :: Dialog -> [DRow]
-dialogRows d = msgRows ++ fieldRows ++ optionRows ++ [DRBlank, DRButtons]
+dialogRows d =
+  msgRows ++ fieldRows ++ optionRows ++ choiceRows ++ hintRows ++ [DRBlank, DRButtons]
   where
     msgLines = if T.null (T.strip (dlgMessage d)) then [] else T.splitOn "\n" (dlgMessage d)
     msgRows  = map DRMsg msgLines
@@ -847,6 +852,20 @@ dialogRows d = msgRows ++ fieldRows ++ optionRows ++ [DRBlank, DRButtons]
                        [ let h = fieldVisH f in [ DRField i li h | li <- [0 .. h - 1] ]
                        | (i, f) <- zip [0 ..] (dlgFields d) ]
     optionRows = map DROption [0 .. length (dlgOptions d) - 1]
+    -- A choice row, optionally preceded by its section header (with a blank
+    -- separator above it — except when that header is the very first body row).
+    precedes  = not (null msgRows && null fieldRows && null optionRows)
+    choiceRows = concat
+      [ headerRows i c ++ [DRChoice i] | (i, c) <- zip [0 ..] (dlgChoices d) ]
+    headerRows i c = case chHeader c of
+      Nothing -> []
+      Just h  -> [ DRBlank | precedes || i > 0 ] ++ [DRHeader h]
+    -- One contextual-help line for the focused choice, below the rows.
+    hintRows = case focusedChoice d of
+      Just ci | ci < length (dlgChoices d)
+              , let ht = chHint (dlgChoices d !! ci)
+              , not (T.null ht) -> [DRMsg ht]
+      _ -> []
 
 -- Row index (within dialogRows) at which field @fi@'s first line is drawn.
 fieldRowIndex :: Dialog -> Int -> Int
@@ -854,6 +873,38 @@ fieldRowIndex d fi =
   let msgLines = if T.null (T.strip (dlgMessage d)) then [] else T.splitOn "\n" (dlgMessage d)
       above    = sum [ fieldVisH f | f <- take fi (dlgFields d) ]
   in length msgLines + 1 + above   -- +1 for the DRBlank preceding the fields
+
+------------------------------------------------------------------------------
+-- Choice-row geometry (shared by the renderer and mouse hit-testing).
+
+choiceIndent :: Int
+choiceIndent = 2   -- two-space indent before the label
+
+choiceGap :: Int
+choiceGap = 3      -- gap between the widest label and the value picker
+
+-- Width of the label column: the widest choice label (so values line up).
+choiceLabelColW :: Dialog -> Int
+choiceLabelColW d = maximum (0 : map (T.length . chLabel) (dlgChoices d))
+
+-- Width of the value field: the widest value of any choice (so the guillemets
+-- never jiggle as the value cycles).
+choiceValueColW :: Dialog -> Int
+choiceValueColW d =
+  maximum (0 : [ T.length v | c <- dlgChoices d, v <- chValues c ])
+
+-- Column offsets of a choice row, relative to the dialog body's inner-left
+-- (the same origin the renderer draws from), shared with mouse hit-testing:
+-- (openGuillemet, valueFieldStart, closeGuillemet).
+choiceCols :: Dialog -> (Int, Int, Int)
+choiceCols d = (open, val, close)
+  where open  = choiceIndent + choiceLabelColW d + choiceGap
+        val   = open + 2                       -- past "\x2039 "
+        close = val + choiceValueColW d + 1    -- value field, a space, then "\x203a"
+
+-- Full drawn width of a choice row (indent + label + gap + "\x2039 v \x203a").
+choiceRowWidth :: Dialog -> Int
+choiceRowWidth d = choiceIndent + choiceLabelColW d + choiceGap + choiceValueColW d + 4
 
 -- (y, x, height, width) of the dialog box on screen.
 dialogGeom :: Editor -> Dialog -> Layout -> (Int, Int, Int, Int)
@@ -874,6 +925,8 @@ dialogGeom _ d lo =
     rowWidth (DRField i 0 _) = fieldLineWidth (dlgFields d !! i)  -- size once, on line 0
     rowWidth (DRField {})    = 0
     rowWidth (DROption i) = T.length (fst (dlgOptions d !! i)) + 4
+    rowWidth (DRHeader h') = T.length h'
+    rowWidth (DRChoice _)  = choiceRowWidth d
     rowWidth DRBlank = 0
     rowWidth DRButtons = sum [ T.length b + 4 | b <- dlgButtons d ] + 2
 

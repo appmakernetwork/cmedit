@@ -917,6 +917,25 @@ drawDRow th _ed d arr cols rows r x innerW dr = case dr of
         st = if focused then thButtonFocus th else thDialog th
         box = if on then "[x] " else "[ ] "
     drawStr arr cols rows r x st (box ++ T.unpack lbl)
+  -- Section header above a choice group: the dialog's title/emphasis style.
+  DRHeader hd -> drawStr arr cols rows r x (thDialogTitle th) (T.unpack hd)
+  -- A settings-style choice row: "  Label            \x2039 value \x203a". The
+  -- value is right-aligned in a fixed column (widest value of any choice) so the
+  -- guillemets never jiggle while cycling. The focused row is highlighted across
+  -- its whole width.
+  DRChoice i -> do
+    let ch = dlgChoices d !! i
+        base = length (dlgFields d) + length (dlgOptions d)
+        focused = dlgFocus d == base + i
+        st = if focused then thButtonFocus th else thDialog th
+        (open, _valStart, _close) = choiceCols d
+        valW = choiceValueColW d
+        val  = if chIx ch >= 0 && chIx ch < length (chValues ch)
+                 then T.unpack (chValues ch !! chIx ch) else ""
+        valPadded = replicate (valW - length val) ' ' ++ val
+    fillRect arr cols rows r x 1 innerW st
+    drawStr arr cols rows r (x + choiceIndent) st (T.unpack (chLabel ch))
+    drawStr arr cols rows r (x + open) st ("\x2039 " ++ valPadded ++ " \x203a")
   DRButtons -> do
     let btns = dlgButtons d
         baseFocus = length (dlgFields d) + length (dlgOptions d)

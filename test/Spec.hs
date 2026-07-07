@@ -32,7 +32,7 @@ import Cmedit.ConfigFile
 import Cmedit.QuickOpen (QuickOpen(..))
 import qualified Cmedit.QuickOpen as Q
 import Cmedit.Menu (MenuAction(..), MenuEntry(..), MenuState(..))
-import Cmedit.Dialog (fieldValue, Field(..), Dialog(..), DialogKind(..), mkFind, fieldSetCursorLineCol, focusedButton)
+import Cmedit.Dialog (fieldValue, Field(..), Choice(..), Dialog(..), DialogKind(..), mkFind, fieldSetCursorLineCol, focusedButton, focusedChoice, focusedField, focusIsButton, focusNext, focusPrev, cycleChoice, setChoiceIx, focusCount)
 import Cmedit.Browser (Browser(..), FileNode(..))
 import qualified Cmedit.Browser as Br
 import Cmedit.Search (SearchState(..), SField(..), SearchField(..), FileResult(..), Match(..), SRow(..))
@@ -330,6 +330,85 @@ main = do
   checkEq "replace-all moves cursor to the last replacement" (edCursor raEnd) (Pos 1 3)
   checkEq "replace-all sets the friendly status" (edStatus raEnd) (T.pack "Replaced 2 matches")
   checkEq "replace-all applied to the buffer" (getLine' 1 (edBuffer raEnd)) (T.pack "aYYa")
+  -- Dialog choice rows: focus traversal with all four element kinds present;
+  -- Left/Right/Space/Enter cycling (with wrap); Enter must not confirm; and a
+  -- rendered choice shows its label, current value and the guillemets, plus the
+  -- focused row's hint line.
+  let chTheme = Choice (T.pack "Theme") [T.pack "auto", T.pack "dark", T.pack "light"] 0
+                       (Just (T.pack "Appearance")) (T.pack "Editor colour theme")
+      chTabs  = Choice (T.pack "Tab width") [T.pack "2", T.pack "4", T.pack "8"] 1
+                       Nothing (T.pack "Spaces per tab")
+      -- A dialog with a field, an option, a choice and buttons (all four kinds).
+      dAll = Dialog DKMessage (T.pack "Settings")
+               [Field (T.pack "Name:") (T.pack "") 0]
+               [(T.pack "Wrap", False)]
+               [chTheme]
+               [T.pack "OK", T.pack "Cancel"] 0 (T.pack "") False
+  let screenLines scr = [ [ cellChar (scrCells scr A.! (r * scrW scr + c)) | c <- [0 .. scrW scr - 1] ]
+                        | r <- [0 .. scrH scr - 1] ]
+  checkEq "choice focus order: 1 field + 1 option + 1 choice + 2 buttons"
+    (focusCount dAll) 5
+  check "focus 0 is the field"  (isJust' (focusedField dAll) && (focusedChoice dAll == Nothing))
+  let dAll1 = focusNext dAll; dAll2 = focusNext dAll1; dAll3 = focusNext dAll2
+  check "focus 1 is the option"  ((focusedField dAll1 == Nothing) && (focusedChoice dAll1 == Nothing) && not (focusIsButton dAll1))
+  check "focus 2 is the choice"  (focusedChoice dAll2 == Just 0 && not (focusIsButton dAll2))
+  check "focus 3 is a button"    (focusIsButton dAll3 && focusedButton dAll3 == Just 0)
+  check "focusPrev from the choice returns to the option"
+    ((focusedChoice (focusPrev dAll2) == Nothing) && (focusedField (focusPrev dAll2) == Nothing))
+
+  -- Pure cycling with wrap in both directions.
+  checkEq "cycle forward advances the value index" (chIx (head (dlgChoices (cycleChoice 0 1 dAll)))) 1
+  checkEq "cycle forward wraps at the end"
+    (chIx (head (dlgChoices (cycleChoice 0 1 (setChoiceIx 0 2 dAll))))) 0
+  checkEq "cycle backward wraps at the start"
+    (chIx (head (dlgChoices (cycleChoice 0 (-1) dAll)))) 2
+
+  -- End-to-end through 'update': choice focused, keys cycle the value.
+  let choDlg = Dialog DKMessage (T.pack "Settings") [] []
+                 [chTheme, chTabs] [T.pack "OK"] 0 (T.pack "") False
+      edCho  = ed0 { edDialog = Just choDlg, edFocus = FDialog }
+      choIx d k = chIx (dlgChoices d !! k)
+      afterKeys ks = maybe choDlg id (edDialog (feed edCho ks))
+  checkEq "Right arrow cycles the focused choice forward"
+    (choIx (afterKeys [KArrow DRight noMods]) 0) 1
+  checkEq "Left arrow cycles the focused choice backward (wraps)"
+    (choIx (afterKeys [KArrow DLeft noMods]) 0) 2
+  checkEq "Space cycles the focused choice forward"
+    (choIx (afterKeys [KChar ' ']) 0) 1
+  checkEq "Enter cycles the focused choice forward"
+    (choIx (afterKeys [KEnter]) 0) 1
+  check "Enter on a choice row does NOT close the dialog"
+    (isJust' (edDialog (feed edCho [KEnter])))
+  -- Tab past the choices reaches the button; only then does Enter confirm.
+  check "Tab/Down moves focus off the choices to the button"
+    (maybe False focusIsButton (edDialog (feed edCho [KTab, KTab])))
+  check "Enter on the button closes the dialog"
+    (edDialog (feed edCho [KTab, KTab, KEnter]) == Nothing)
+
+  -- Render: the label, current value and single guillemets appear on one row,
+  -- and the focused choice's hint appears (message-area style) below.
+  let choLines  = screenLines (renderEditor edCho)
+      hasLine s = any (s `isInfixOf`) choLines
+  check "choice row shows the label"          (hasLine "Theme")
+  check "choice row shows the current value"   (hasLine "auto")
+  check "choice row shows the left guillemet"  (any ('\x2039' `elem`) choLines)
+  check "choice row shows the right guillemet" (any ('\x203a' `elem`) choLines)
+  check "label, value and guillemets share one row"
+    (any (\l -> "Theme" `isInfixOf` l && "auto" `isInfixOf` l
+                && ['\x2039'] `isInfixOf` l && ['\x203a'] `isInfixOf` l) choLines)
+  check "focused choice's hint line is shown" (hasLine "Editor colour theme")
+  check "section header is shown above the choice" (hasLine "Appearance")
+  -- Cycling the value updates what is rendered.
+  let choLines2 = screenLines (renderEditor (feed edCho [KArrow DRight noMods]))
+  check "cycling re-renders the new value" (any ("dark" `isInfixOf`) choLines2)
+
+  -- Existing dialogs still render and confirm unchanged.
+  let findLines = screenLines (renderEditor (fst (update (KCtrlChar 'f') (setLoadedText (T.pack "hello") ed0))))
+  check "Find dialog still renders its title" (any ("Find" `isInfixOf`) findLines)
+  let edGoto = feed (fst (update (KCtrlChar 'g') (setLoadedText (T.pack "a\nb\nc\nd") ed0))) [KChar '3', KEnter]
+  check "Go-to-line confirm still works (dialog closed, cursor moved)"
+    ((edDialog edGoto == Nothing) && edCursor edGoto == Pos 2 0)
+
   let edUndo = fst (update (KCtrlChar 'z') ed1)
   check "undo shrinks" (T.length (getLine' 0 (edBuffer edUndo)) < 2)
 
