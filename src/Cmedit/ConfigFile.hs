@@ -70,6 +70,8 @@ data Config = Config
   , cfgWordWrap       :: !Bool
   , cfgLineNumbers    :: !Bool
   , cfgShowWhitespace :: !Bool
+  , cfgScrollBarV     :: !Bool   -- ^ Show the vertical scrollbar (the rightmost column is reserved only when on).
+  , cfgScrollBarH     :: !Bool   -- ^ Show the horizontal scrollbar along the bottom of the text area.
   , cfgTrimTrailingWs :: !Bool   -- ^ Strip trailing whitespace from each line on save.
   , cfgEnsureFinalNl  :: !Bool   -- ^ Make sure the file ends with a newline on save.
   , cfgFreezeHeader   :: !Bool   -- ^ CSV table view: pin the first row while scrolling (View ▸ Freeze Header Row toggles it per-session).
@@ -86,6 +88,8 @@ defaultConfig = Config
   , cfgWordWrap       = False
   , cfgLineNumbers    = False   -- gutter hidden by default (override with --line-numbers)
   , cfgShowWhitespace = False
+  , cfgScrollBarV     = True
+  , cfgScrollBarH     = True
   , cfgTrimTrailingWs = False
   , cfgEnsureFinalNl  = False
   , cfgFreezeHeader   = True    -- spreadsheets almost always have a header row
@@ -128,6 +132,8 @@ applyKey key val cfg = case key of
   "word-wrap"    -> boolKey (\b -> cfg { cfgWordWrap = b })
   "line-numbers" -> boolKey (\b -> cfg { cfgLineNumbers = b })
   "whitespace"   -> boolKey (\b -> cfg { cfgShowWhitespace = b })
+  "scrollbar-vertical"   -> boolKey (\b -> cfg { cfgScrollBarV = b })
+  "scrollbar-horizontal" -> boolKey (\b -> cfg { cfgScrollBarH = b })
   "trim-trailing-whitespace" -> boolKey (\b -> cfg { cfgTrimTrailingWs = b })
   "final-newline"            -> boolKey (\b -> cfg { cfgEnsureFinalNl = b })
   "freeze-header"            -> boolKey (\b -> cfg { cfgFreezeHeader = b })
@@ -173,6 +179,10 @@ configKeysHelp =
   , "word-wrap = BOOL     Start with word wrap on (default false)."
   , "line-numbers = BOOL  Show the line-number gutter (default false)."
   , "whitespace = BOOL    Show whitespace markers (default false)."
+  , "scrollbar-vertical = BOOL"
+  , "                     Show the vertical scrollbar (default true)."
+  , "scrollbar-horizontal = BOOL"
+  , "                     Show the horizontal scrollbar (default true)."
   , "trim-trailing-whitespace = BOOL"
   , "                     Strip trailing spaces/tabs on save (default false)."
   , "final-newline = BOOL Ensure the file ends with a newline on save"
@@ -206,6 +216,8 @@ configFields =
   , ("word-wrap",                renderBool . cfgWordWrap)
   , ("line-numbers",             renderBool . cfgLineNumbers)
   , ("whitespace",               renderBool . cfgShowWhitespace)
+  , ("scrollbar-vertical",       renderBool . cfgScrollBarV)
+  , ("scrollbar-horizontal",     renderBool . cfgScrollBarH)
   , ("trim-trailing-whitespace", renderBool . cfgTrimTrailingWs)
   , ("final-newline",            renderBool . cfgEnsureFinalNl)
   , ("freeze-header",            renderBool . cfgFreezeHeader)

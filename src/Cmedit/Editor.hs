@@ -163,6 +163,7 @@ module Cmedit.Editor
   , liveMatchSpans
   , bracketPair
   , scrollBarInfo
+  , hScrollBarInfo
   , scrollThumb
   , StatusZone(..)
   , statusRightInfo
@@ -542,11 +543,15 @@ applySettingRow k v ed = case k of
   4 -> ensureVisible ((upd (\c -> c { cfgWordWrap = on }) ed) { edWordWrap = on })
   5 -> ensureVisible ((upd (\c -> c { cfgLineNumbers = on }) ed) { edShowLineNumbers = on })
   6 -> (upd (\c -> c { cfgShowWhitespace = on }) ed) { edShowWhitespace = on }
-  7 -> upd (\c -> c { cfgTrimTrailingWs = on }) ed
-  8 -> upd (\c -> c { cfgEnsureFinalNl = on }) ed
-  9 -> let ed1 = (upd (\c -> c { cfgFreezeHeader = on }) ed) { edFreezeHeader = on }
-       in maybe ed1 (\vw -> csvPut vw ed1) (edCsv ed1)   -- re-scroll under the new freeze
-  10 ->                                                  -- master linting switch
+  -- The scrollbars change the text area's width/height, so re-anchor the
+  -- scroll like the wrap/line-number rows (csvPut when in table mode).
+  7 -> rescroll (upd (\c -> c { cfgScrollBarV = on }) ed)
+  8 -> rescroll (upd (\c -> c { cfgScrollBarH = on }) ed)
+  9 -> upd (\c -> c { cfgTrimTrailingWs = on }) ed
+  10 -> upd (\c -> c { cfgEnsureFinalNl = on }) ed
+  11 -> let ed1 = (upd (\c -> c { cfgFreezeHeader = on }) ed) { edFreezeHeader = on }
+        in maybe ed1 (\vw -> csvPut vw ed1) (edCsv ed1)   -- re-scroll under the new freeze
+  12 ->                                                  -- master linting switch
     let ed1 = upd (\c -> c { cfgLint = on }) ed
     -- Off means no future pass will ever clear diagnostics, so drop them
     -- everywhere now (active doc and zipper) — squiggles must not outlive
@@ -555,8 +560,8 @@ applySettingRow k v ed = case k of
        else ed1 { edDiags = []
                 , edBefore = map (\d -> d { docDiags = [] }) (edBefore ed1)
                 , edAfter  = map (\d -> d { docDiags = [] }) (edAfter ed1) }
-  _ | k >= 11, k - 11 < length linters ->                -- one row per linter
-        let lid = linId (linters !! (k - 11))
+  _ | k >= 13, k - 13 < length linters ->                -- one row per linter
+        let lid = linId (linters !! (k - 13))
             ed1 = upd (\c -> c { cfgLintOn = setLintOn lid on (cfgLintOn c) }) ed
         -- Turning a linter off immediately drops its squiggles on the active
         -- doc; zipper docs refresh on their next lint pass.
@@ -565,6 +570,7 @@ applySettingRow k v ed = case k of
   where
     on = v == 1
     upd f e = e { edConfig = f (edConfig e) }
+    rescroll e = maybe (ensureVisible e) (\vw -> csvPut vw e) (edCsv e)
     setLintOn lid b = map (\(i, x) -> if i == lid then (i, b) else (i, x))
 
 -- | Esc or the Cancel button: re-apply the stashed config row by row (the
@@ -635,6 +641,9 @@ dispatchKey key ed
 -- A scrollbar-thumb drag swallows mouse events until release, likewise.
 dispatchKey key ed
   | KMouse me <- key, edScrollDrag ed = noEff (scrollDragMove me ed)
+-- A horizontal scrollbar-thumb drag swallows mouse events until release too.
+dispatchKey key ed
+  | KMouse me <- key, edHScrollDrag ed = noEff (hScrollDragMove me ed)
 -- A CSV column-width drag (grabbed on a header border) swallows the mouse too.
 dispatchKey key ed
   | KMouse me <- key, Just c <- edCsvColDrag ed = noEff (csvColDragMove me c ed)
@@ -677,6 +686,8 @@ dispatchKey key ed = case edFocus ed of
   -- A press on the scrollbar column jumps there and starts a thumb drag
   -- (before the text/CSV split so it works in both).
   FEdit | KMouse me <- key, not (edMouseSelecting ed), scrollBarPress ed me -> noEff (scrollBarClick me ed)
+  -- A press on the horizontal scrollbar row jumps there and starts a drag.
+  FEdit | KMouse me <- key, not (edMouseSelecting ed), hScrollBarPress ed me -> noEff (hScrollBarClick me ed)
   -- The Ctrl+Space completion popup captures keys while it is up.
   FEdit | Just cp <- edComplete ed -> handleCompleteKey key cp ed
   -- Image view is a separate mode (like CSV) and takes priority over text/CSV.
@@ -1249,6 +1260,41 @@ scrollBarTo row ed = case scrollBarInfo ed of
                 Just v  -> csvPut (Csv.clearSel
                              (Csv.setCursor (min (Csv.nRows v - 1) target) (csvCurCol v) v)) ed
                 Nothing -> scrollLine (target - edTop ed) ed
+
+-- A left press on the horizontal scrollbar row, while a bar is showing.
+hScrollBarPress :: Editor -> MouseEvent -> Bool
+hScrollBarPress ed me = case hScrollBarInfo ed of
+  Just (row, x0, trackWidth, _, _) ->
+    mePressed me && meButton me == MBLeft && not (meDrag me)
+      && meRow me == row && meCol me >= x0 && meCol me < x0 + trackWidth
+  Nothing -> False
+
+-- Jump so the thumb lands under the click, and begin a horizontal drag.
+hScrollBarClick :: MouseEvent -> Editor -> Editor
+hScrollBarClick me ed = (hScrollBarTo (meCol me) ed) { edHScrollDrag = True }
+
+-- Continue / finish a horizontal thumb drag (any release ends it).
+hScrollDragMove :: MouseEvent -> Editor -> Editor
+hScrollDragMove me ed
+  | not (mePressed me) = ed { edHScrollDrag = False }
+  | otherwise          = hScrollBarTo (meCol me) ed
+
+-- Scroll the text view horizontally to the track position at @col@. View-only:
+-- unlike 'scrollCol' this never pulls the cursor along (exactly like the
+-- vertical bar's 'scrollLine'-based jump via 'scrollBarTo'), so the cursor may
+-- go offscreen — do NOT run 'ensureVisible' here, it would snap back.
+hScrollBarTo :: Int -> Editor -> Editor
+hScrollBarTo col ed = case hScrollBarInfo ed of
+  Nothing -> ed
+  Just (_, x0, trackWidth, totalWidth, _) ->
+    let rel    = max 0 (min (trackWidth - 1) (col - x0))
+        target = scrollTrackTarget trackWidth totalWidth rel
+    in case edCsv ed of
+         -- CSV: write the sub-column scroll (csvLeft, csvXOff) straight into the
+         -- view, bypassing csvPut/ensureVisible — after a long drag the cursor
+         -- cell is off-screen, so ensureVisible would snap the view back.
+         Just v  -> ed { edCsv = Just (Csv.hScrollTo target v) }
+         Nothing -> ed { edLeft = target }
 
 handleMouse :: MouseEvent -> Editor -> Editor
 handleMouse me ed
@@ -2394,7 +2440,9 @@ csvColDragMove me c ed = case edCsv ed of
           in ed { edCsv = Just v'
                 , edStatus = T.pack ("Column " ++ Csv.colLabel c ++ " width: " ++ show w') }
 
--- Which column index a screen x falls in, given the gutter width.
+-- Which column index a screen x falls in, given the gutter width. The
+-- accumulator starts at -csvXOff so a click in the partially clipped leftmost
+-- column still resolves to that column.
 csvColAtX :: CsvView -> Int -> Int -> Int
 csvColAtX v gut x =
   let ws = Csv.columnWidths v
@@ -2402,7 +2450,7 @@ csvColAtX v gut x =
         | c >= length ws = max 0 (length ws - 1)
         | x < gut + acc + (ws !! c) + 1 = c
         | otherwise = go (c + 1) (acc + (ws !! c) + 1)
-  in go (csvLeft v) 0
+  in go (csvLeft v) (negate (csvXOff v))
 
 ------------------------------------------------------------------------------
 -- Quick open key handling (kept in the hub: picking a command runs runAction)

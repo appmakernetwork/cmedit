@@ -31,6 +31,7 @@ module Cmedit.Csv
   , nextCellTab
   , setCursor
   , ensureVisible
+  , hScrollTo
   , editLineUp
   , editLineDown
   , cellTextPos
@@ -103,6 +104,12 @@ data CsvView = CsvView
   , csvCurCol :: !Int
   , csvTop    :: !Int                 -- ^ First visible row (vertical scroll).
   , csvLeft   :: !Int                 -- ^ First visible column (horizontal scroll).
+  , csvXOff   :: !Int                 -- ^ Extra display cells the column region is
+                                      --   shifted left past the start of column 'csvLeft'
+                                      --   (0 <= csvXOff <= effective width of that column).
+                                      --   Only the scrollbar produces sub-column offsets;
+                                      --   keyboard/cursor scrolling snaps it back to 0.
+                                      --   Pure scroll state: never touches undo/widths/modified.
   , csvEdit   :: !(Maybe (Int, Text)) -- ^ (in-cell cursor, original value) while editing.
   , csvDelim  :: !Char
   , csvUndo   :: ![Grid]
@@ -129,6 +136,7 @@ mkCsvView delim t =
       rows  = if Seq.null rows0 then Seq.singleton (Seq.singleton T.empty) else rows0
   in CsvView
        { csvRows = rows, csvCurRow = 0, csvCurCol = 0, csvTop = 0, csvLeft = 0
+       , csvXOff = 0
        , csvEdit = Nothing, csvDelim = delim, csvUndo = [], csvRedo = []
        , csvSaved = rows, csvSelAnchor = Nothing
        , csvWidths = computeWidths rows, csvUserW = Map.empty }
@@ -440,7 +448,35 @@ nextCellTab back v
 ensureVisible :: Int -> Int -> Int -> CsvView -> CsvView
 ensureVisible availLines freezeRows width v =
   let v1 = v { csvTop = scrollTop (max 1 availLines) freezeRows v }
-  in v1 { csvLeft = scrollLeft width v1 }
+  in if cellFullyVisible width v1
+       -- Already fully in view given (csvLeft, csvXOff): leave the horizontal
+       -- scroll untouched, so a scrollbar-produced sub-column offset survives a
+       -- csvPut that doesn't move the cursor.
+       then v1
+       -- Cursor-driven scrolling snaps back to a column boundary (csvXOff = 0).
+       else v1 { csvLeft = scrollLeft width v1, csvXOff = 0 }
+
+-- Absolute display-cell offset (gutter excluded) at which column @c@'s cells
+-- begin: the summed widths+separators of every earlier column.
+colRegionStart :: [Int] -> Int -> Int
+colRegionStart effs c = sum (map (+ 1) (take c effs))
+
+-- Is the current cell fully readable within @width@ display cells given the
+-- current (csvLeft, csvXOff)? A cell wider than the viewport counts as visible
+-- once it starts at the viewport's left edge (today's "left-aligned is
+-- visible-enough" semantics), so scrolling never chases an over-wide cell.
+cellFullyVisible :: Int -> CsvView -> Bool
+cellFullyVisible width v =
+  let effs    = columnWidths v
+      cc      = csvCurCol v
+      start   = colRegionStart effs (csvLeft v) + csvXOff v
+      ccStart = colRegionStart effs cc
+      wcc     = if cc < length effs then effs !! cc else 0
+  in ccStart >= start
+       -- The trailing separator (+1) is counted in "fits", matching 'scrollLeft'
+       -- exactly, so a keep/recompute decision never disagrees with it.
+       && (ccStart + wcc + 1 <= start + width
+           || (wcc + 1 > width && ccStart == start))
 
 -- Smallest top row (>= freezeRows, no greater than the current row) such that
 -- rows top..current fit within @availLines@ display lines.
@@ -479,6 +515,24 @@ scrollLeft width v =
         | otherwise = walk (l - 1) (acc + costAt l)
       lmin = min cc (walk cc 0)
   in max left0 lmin
+
+-- | Scroll horizontally to an absolute display-cell offset @x@ measured from
+-- the start of the column region (the row-number gutter excluded; column @c@
+-- spans @effWidth c + 1@ cells, its cells plus the trailing @│@). Sets
+-- (csvLeft, csvXOff) to the column containing @x@ and the remainder within it.
+-- Used only by the scrollbar drag/click; pure scroll state, so it never touches
+-- rows/widths/cursor/undo. @x@ is clamped at 0 below; the caller clamps above.
+hScrollTo :: Int -> CsvView -> CsvView
+hScrollTo x v =
+  let effs   = columnWidths v
+      n      = length effs
+      target = max 0 x
+      go c acc
+        | c >= n                          = (max 0 (n - 1), 0)  -- past the end
+        | target < acc + (effs !! c) + 1  = (c, target - acc)
+        | otherwise                       = go (c + 1) (acc + (effs !! c) + 1)
+      (l, off) = go 0 0
+  in v { csvLeft = l, csvXOff = off }
 
 ------------------------------------------------------------------------------
 -- Mapping between cells and serialised-text positions

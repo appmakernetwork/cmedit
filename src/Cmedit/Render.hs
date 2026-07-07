@@ -680,6 +680,7 @@ renderEditor ed = runST $ do
       Just idoc -> drawImage ed idoc lo arr
       Nothing   -> maybe (drawTextArea th ed lo arr) (\v -> drawCsvTable th ed v lo arr) (edCsv ed)
   maybe (pure ()) (drawVScroll th arr cols rows) (scrollBarInfo ed)
+  maybe (pure ()) (drawHScroll th arr cols rows ed lo) (loHBarRow lo)
   when (isJust (edExplorer ed)) $ drawExplorer th ed lo arr
   when (edShowMenu ed)   $ drawMenuBar th ed lo arr
   when (edShowStatus ed) $ drawStatus th ed lo arr
@@ -742,6 +743,16 @@ drawStrU arr cols rows r c0 st ui s =
     let st' = if k == ui then st { styleAttr = styleAttr st .|. attrUnderline } else st
     in putCell arr cols rows r (c0 + k) (Cell ch st')
 
+-- | 'drawStr' but clip characters that would land at a screen column below
+-- @minC@ (used by the CSV table, whose column region is shifted left by
+-- 'csvXOff' so the leftmost column is drawn partially). CSV cells emit one cell
+-- per character — there are no wide-glyph 'contChar' continuations — so simply
+-- dropping the clipped leading characters keeps the cell grid consistent.
+drawStrClipL :: Surf s -> Int -> Int -> Int -> Int -> Int -> Style -> String -> ST s ()
+drawStrClipL arr cols rows r c0 minC st s =
+  forM_ (zip [0 ..] s) $ \(k, ch) ->
+    when (c0 + k >= minC) $ putCell arr cols rows r (c0 + k) (Cell ch st)
+
 fillRow :: Surf s -> Int -> Int -> Int -> Style -> ST s ()
 fillRow arr cols rows r st =
   forM_ [0 .. cols - 1] $ \c -> putCell arr cols rows r c (Cell ' ' st)
@@ -753,6 +764,34 @@ drawVScroll th arr cols rows (x, top, h, total, win) = do
   forM_ [0 .. h - 1] $ \i ->
     putCell arr cols rows (top + i) x
       (Cell (if i >= tt && i < tt + tl then '\x2588' else '\x2502') (thScrollbar th))
+
+-- The bottom horizontal scrollbar: a track spanning the scrollable region with
+-- a proportional thumb overlaid when the content actually overflows. The
+-- sidebar/gutter cells to the left of the region are blanked with the default
+-- background so the row reads as chrome, not document content.
+drawHScroll :: Theme -> Surf s -> Int -> Int -> Editor -> Layout -> Int -> ST s ()
+drawHScroll th arr cols rows ed lo r = do
+  let x0 = case edCsv ed of
+             -- CSV pins the row-number gutter, so the track spans only the
+             -- scrollable column region (see 'hScrollBarInfo').
+             Just v  -> loContentLeft lo + csvGutterWidthFor v
+             Nothing -> loTextLeft lo
+  -- Sidebar + gutter portion: blank on the default background.
+  forM_ [0 .. x0 - 1] $ \c -> putCell arr cols rows r c (Cell ' ' (thText th))
+  -- Track from the region's left edge to the last column (a matching '─'
+  -- keeps it visually coherent with the vertical bar's track, when one is
+  -- shown in that same rightmost column). The thumb's actual range comes
+  -- from 'hScrollBarInfo', which stops one column short of the corner when
+  -- the vertical bar is enabled, or uses the full width when it is not.
+  forM_ [x0 .. cols - 1] $ \c -> putCell arr cols rows r c (Cell '\x2500' (thScrollbar th))
+  -- Thumb overlay when content overflows (track width plays the vertical bar's
+  -- track height in 'scrollThumb').
+  case hScrollBarInfo ed of
+    Just (_, tx0, trackWidth, totalWidth, offset) ->
+      let (tt, tl) = scrollThumb trackWidth totalWidth offset
+      in forM_ [0 .. tl - 1] $ \i ->
+           putCell arr cols rows r (tx0 + tt + i) (Cell '\x2588' (thScrollbar th))
+    Nothing -> pure ()
 
 fillRect :: Surf s -> Int -> Int -> Int -> Int -> Int -> Int -> Style -> ST s ()
 fillRect arr cols rows r0 c0 h w st =
@@ -1917,10 +1956,15 @@ drawCsvTable th ed v lo arr = do
   let cols = loCols lo; rows = loRows lo
       cl = loContentLeft lo
       gut = csvGutterWidthFor v
+      xoff = csvXOff v
+      minC = cl + gut                    -- left edge of the (clipped) column region
       headerRow = loTextTop lo
       ws = Csv.columnWidths v
       avail = cols - cl - gut
-      visCols = visibleCsvCols (csvLeft v) ws avail
+      -- Lay the columns out over avail+xoff so the extra column exposed at the
+      -- right edge is included; each is then drawn shifted left by xoff and
+      -- left-clipped at 'minC', so the leftmost column renders partially.
+      visCols = visibleCsvCols (csvLeft v) ws (avail + xoff)
       curRow = csvCurRow v; curCol = csvCurCol v
       (sr0, sc0, sr1, sc1) = Csv.selRect v       -- highlighted rectangle
       inSelRow r = r >= sr0 && r <= sr1
@@ -1939,8 +1983,10 @@ drawCsvTable th ed v lo arr = do
   forM_ visCols $ \(c, x) -> do
     let w = ws !! c
         st = if inSelCol c then hdrSel else hdr
-    drawStr arr cols rows headerRow (cl + gut + x) st (take w (padCenter w (Csv.colLabel c) ++ repeat ' '))
-    putCell arr cols rows headerRow (cl + gut + x + w) (Cell '\x2502' hdr)
+        sx = cl + gut + x - xoff
+    drawStrClipL arr cols rows headerRow sx minC st (take w (padCenter w (Csv.colLabel c) ++ repeat ' '))
+    when (sx + w >= minC) $
+      putCell arr cols rows headerRow (sx + w) (Cell '\x2502' hdr)
   -- Data rows (each can span several screen lines when a cell has newlines).
   forM_ (csvRowLayout (edFreezeHeader ed) v lo) $ \(r, sl, visH) -> do
     let numStr = show (r + 1)
@@ -1951,6 +1997,7 @@ drawCsvTable th ed v lo arr = do
       drawStr arr cols rows (sl + visH - 1) (cl + max 0 (gut - 2)) gstyle "+"
     forM_ visCols $ \(c, x) -> do
       let w = ws !! c
+          sx = cl + gut + x - xoff
           isCursor = r == curRow && c == curCol
           editingHere = isCursor && Csv.isEditing v
           st | isCursor              = cellSel
@@ -1960,8 +2007,9 @@ drawCsvTable th ed v lo arr = do
           mCur = if editingHere then Just (maybe 0 fst (csvEdit v)) else Nothing
           dispLines = cellDisplay w visH mCur (Csv.cellAt r c v)
       forM_ (zip [0 ..] dispLines) $ \(li, s) -> do
-        drawStr arr cols rows (sl + li) (cl + gut + x) st (take w (s ++ repeat ' '))
-        putCell arr cols rows (sl + li) (cl + gut + x + w) (Cell '\x2502' sepS)
+        drawStrClipL arr cols rows (sl + li) sx minC st (take w (s ++ repeat ' '))
+        when (sx + w >= minC) $
+          putCell arr cols rows (sl + li) (sx + w) (Cell '\x2502' sepS)
 
 -- Screen layout of the visible table rows: (tableRow, firstScreenLine, height).
 -- Rows have variable height (capped); the last one may be clipped at the bottom.
@@ -2012,9 +2060,10 @@ csvCursor ed v lo
   | otherwise = do
       let cleft = loContentLeft lo
           gut = csvGutterWidthFor v
+          xoff = csvXOff v
           ws = Csv.columnWidths v
           avail = loCols lo - cleft - gut
-          visCols = visibleCsvCols (csvLeft v) ws avail
+          visCols = visibleCsvCols (csvLeft v) ws (avail + xoff)
           w = ws !! csvCurCol v
           (cl, cc) = Csv.cursorLineCol (Csv.currentCellText v) (maybe 0 fst (csvEdit v))
       x <- lookup (csvCurCol v) visCols
@@ -2023,8 +2072,9 @@ csvCursor ed v lo
           li = cl - winTop
           off = if cc < w then 0 else cc - w + 1
           srow = sl + li
-          scol = cleft + gut + x + (cc - off)
-      if li >= 0 && li < visH && srow < loTextTop lo + loTextHeight lo && scol < loCols lo
+          scol = cleft + gut + x - xoff + (cc - off)
+      if li >= 0 && li < visH && srow < loTextTop lo + loTextHeight lo
+           && scol >= cleft + gut && scol < loCols lo
         then Just (srow, scol) else Nothing
 
 ------------------------------------------------------------------------------

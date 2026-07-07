@@ -210,7 +210,8 @@ data Editor = Editor
   , edExpWidth      :: !Int             -- ^ Desired expanded width (cells) of the explorer panel.
   , edExpCollapsed  :: !Bool            -- ^ The panel is collapsed to a single-column strip.
   , edSidebarDrag   :: !Bool            -- ^ A panel-width drag (on the divider) is in progress.
-  , edScrollDrag    :: !Bool            -- ^ A scrollbar-thumb drag is in progress (swallows mouse until release).
+  , edScrollDrag    :: !Bool            -- ^ A vertical scrollbar-thumb drag is in progress (swallows mouse until release).
+  , edHScrollDrag   :: !Bool            -- ^ A horizontal scrollbar-thumb drag is in progress (swallows mouse until release).
   , edCsvColDrag    :: !(Maybe Int)     -- ^ A CSV column-width drag (on a header border) is in progress: the column being resized.
   , edLoading       :: !(Maybe (String, Int)) -- ^ A file is loading in the background: (display name, spinner frame).
   , edAboutTick     :: !Int             -- ^ Frame counter of the About-box animation (reset when the dialog opens).
@@ -301,6 +302,7 @@ newEditor size cfg = Editor
   , edExpCollapsed  = False
   , edSidebarDrag   = False
   , edScrollDrag    = False
+  , edHScrollDrag   = False
   , edCsvColDrag    = Nothing
   , edLoading       = Nothing
   , edAboutTick     = 0
@@ -492,7 +494,7 @@ csvGutterWidthFor v = max 3 (length (show (Csv.nRows v)) + 1)
 -- screen column @x@, measured relative to 'loContentLeft'. Shared by the
 -- pointer-shape hint and the hub's column-resize hit test / drag geometry.
 csvBorderColAt :: CsvView -> Int -> Maybe Int
-csvBorderColAt v x = go (csvLeft v) (csvGutterWidthFor v)
+csvBorderColAt v x = go (csvLeft v) (csvGutterWidthFor v - csvXOff v)
   where
     ws = Csv.columnWidths v
     n = length ws
@@ -507,7 +509,7 @@ csvBorderColAt v x = go (csvLeft v) (csvGutterWidthFor v)
 csvColStartX :: CsvView -> Int -> Maybe Int
 csvColStartX v c
   | c < csvLeft v = Nothing
-  | otherwise = Just (csvGutterWidthFor v
+  | otherwise = Just (csvGutterWidthFor v - csvXOff v
                         + sum [ w + 1 | w <- take (c - csvLeft v)
                                                (drop (csvLeft v) (Csv.columnWidths v)) ])
 
@@ -524,7 +526,8 @@ pointerShapeFor ed row col
   | edShowMenu ed   && row == loMenuRow lo   = "pointer"
   | edShowStatus ed && row == loStatusRow lo = "pointer"
   | edShowHints ed  && row == loHintRow lo   = "default"
-  | col >= loCols lo - 1                     = "default"   -- scrollbar
+  | Just r <- loHBarRow lo, row == r         = "default"   -- horizontal scrollbar
+  | loVBarW lo > 0 && col >= loCols lo - 1   = "default"   -- vertical scrollbar
   | inSidebar                                = "pointer"
   | edSearchMode ed && inContent             = "pointer"   -- result rows / fields
   | isJust (edImage ed) && inContent         = "crosshair" -- drag-zoom
@@ -567,6 +570,8 @@ data Layout = Layout
   , loTextWidth  :: !Int
   , loGutter     :: !Int
   , loContentLeft :: !Int       -- ^ Absolute column where the document area (gutter included) begins = sidebar width.
+  , loHBarRow    :: !(Maybe Int) -- ^ Row of the horizontal scrollbar, directly above the status row, when one is reserved (see 'computeLayout'). The reservation is content-independent so the layout can't oscillate.
+  , loVBarW      :: !Int        -- ^ Columns reserved on the right for the vertical scrollbar: 1 when @scrollbar-vertical@ is on, 0 when off. Config-static like 'loHBarRow', so it can't oscillate with content either.
   , loStatusRow  :: !Int
   , loHintRow    :: !Int
   } deriving (Show)
@@ -585,11 +590,27 @@ computeLayout ed =
                   then max 4 (length (show nLines) + 2)
                   else 0
       textTop = menuH
-      textH   = max 1 (rows - menuH - statusH - hintH)
-      -- The terminal's rightmost column is reserved for the scrollbar (drawn
-      -- only when the content overflows, but reserved unconditionally so the
-      -- word-wrap width can't oscillate with the content height).
-      textW   = max 1 (avail - gutter - 1)
+      textH0  = rows - menuH - statusH - hintH
+      -- Reserve one row directly above the status bar for the horizontal
+      -- scrollbar, when the config enables it, the search view isn't showing,
+      -- the active view can actually scroll sideways (CSV, or plain text that
+      -- isn't an image and isn't word-wrapped), and there is still >= 1 text
+      -- row left after the reservation. Like the vertical bar's reserved
+      -- column this is content-INdependent (mode + config only), so the wrap
+      -- width can never oscillate with content.
+      wantHBar = cfgScrollBarH (edConfig ed)
+                   && not (searchViewActive ed)
+                   && (isJust (edCsv ed) || (isNothing (edImage ed) && not (edWordWrap ed)))
+                   && textH0 - 1 >= 1
+      barH    = if wantHBar then 1 else 0
+      textH   = max 1 (textH0 - barH)
+      -- The terminal's rightmost column is reserved for the vertical
+      -- scrollbar only when the config enables it (drawn only when the
+      -- content overflows, but the reservation itself is config-static —
+      -- never content-dependent — so the word-wrap width can't oscillate
+      -- with the content height).
+      vbarW   = if cfgScrollBarV (edConfig ed) then 1 else 0
+      textW   = max 1 (avail - gutter - vbarW)
   in Layout
        { loRows = rows, loCols = cols
        , loMenuRow = 0
@@ -599,8 +620,10 @@ computeLayout ed =
        , loTextWidth = textW
        , loGutter = gutter
        , loContentLeft = sideW
-       , loStatusRow = menuH + textH
-       , loHintRow = menuH + textH + statusH
+       , loHBarRow = if wantHBar then Just (menuH + textH) else Nothing
+       , loVBarW = vbarW
+       , loStatusRow = menuH + textH + barH
+       , loHintRow = menuH + textH + barH + statusH
        }
 
 pageSize :: Editor -> Int
@@ -617,6 +640,7 @@ pageSize ed = max 1 (loTextHeight (computeLayout ed) - 1)
 scrollBarInfo :: Editor -> Maybe (Int, Int, Int, Int, Int)
 scrollBarInfo ed
   | isJust (edImage ed) = Nothing
+  | not (cfgScrollBarV (edConfig ed)) = Nothing
   | otherwise =
       let lo = computeLayout ed
           h = loTextHeight lo
@@ -648,6 +672,58 @@ scrollTrackTarget h total rel =
       denom = max 1 (h - thumbLen)
       maxTop = max 0 (total - h)
   in max 0 (min maxTop (rel * maxTop `div` denom))
+
+-- | The horizontal scrollbar for the plain-text view, when its content
+-- overflows the visible width (or is already scrolled sideways):
+-- @(row, x0, trackWidth, totalWidth, offset)@. The bar lives on 'loHBarRow',
+-- spanning the scrollable region — which starts at 'loTextLeft' (so it excludes
+-- the sidebar and gutter) and stops one column short of the vertical bar's
+-- reserved rightmost column ('loVBarW'), or runs to the last column when the
+-- vertical bar is disabled. @offset@ is 'edLeft' (already display-cell
+-- granular) and @totalWidth@ is the widest display width among the currently
+-- visible buffer lines. That widest-line figure is an approximation, the
+-- horizontal analogue of the vertical bar's buffer-lines-as-visual-rows proxy:
+-- a line longer than 4096 chars contributes its plain character count instead
+-- of a tab-expanded display width, so a megabyte-long minified line can't
+-- dominate a frame. 'scrollThumb'/'scrollTrackTarget' are reused for the thumb
+-- math (orientation-agnostic: track width plays @h@, total width plays @total@,
+-- offset plays @win@).
+hScrollBarInfo :: Editor -> Maybe (Int, Int, Int, Int, Int)
+hScrollBarInfo ed = case loHBarRow lo of
+  Nothing               -> Nothing
+  Just row | Just v <- edCsv ed ->
+    -- CSV: the row-number gutter is pinned, so the bar spans only the
+    -- scrollable column region. Everything is measured in display cells (each
+    -- column costs its effective width + 1 for the trailing separator); the
+    -- offset carries the sub-column 'csvXOff'. Viewport mirrors 'csvViewportFor'.
+    let gut        = csvGutterWidthFor v
+        x0         = loContentLeft lo + gut
+        trackWidth = loCols lo - loVBarW lo - x0
+        effs       = Csv.columnWidths v
+        viewport   = max 1 (loCols lo - loContentLeft lo - gut - loVBarW lo)
+        totalWidth = sum (map (+ 1) effs)
+        offset     = sum (map (+ 1) (take (csvLeft v) effs)) + csvXOff v
+    in if trackWidth >= 1 && (totalWidth > viewport || offset > 0)
+         then Just (row, x0, trackWidth, totalWidth, offset)
+         else Nothing
+  Just row ->
+    let x0         = loTextLeft lo
+        trackWidth = loCols lo - loVBarW lo - x0
+        viewport   = loTextWidth lo
+        tabw       = tabWidthOf ed
+        top        = edTop ed
+        h          = loTextHeight lo
+        lastLine   = min (lineCount (edBuffer ed) - 1) (top + h - 1)
+        lineWidth i =
+          let ln = getLine' i (edBuffer ed)
+          in if T.length ln > 4096 then T.length ln
+                                   else colToDisplay tabw (T.length ln) ln
+        widest     = maximum (0 : [ lineWidth i | i <- [top .. lastLine] ])
+        totalWidth = max (edLeft ed + viewport) widest
+    in if trackWidth >= 1 && (totalWidth > viewport || edLeft ed > 0)
+         then Just (row, x0, trackWidth, totalWidth, edLeft ed)
+         else Nothing
+  where lo = computeLayout ed
 
 ------------------------------------------------------------------------------
 -- File explorer panel geometry
@@ -1148,7 +1224,7 @@ searchRunning ed = maybe False ssRunning (edSearch ed)
 
 -- | (top, left, height, width) of the search view's on-screen region.
 searchRegion :: Layout -> (Int, Int, Int, Int)
-searchRegion lo = (loTextTop lo, loContentLeft lo, loTextHeight lo, max 1 (loCols lo - loContentLeft lo - 1))
+searchRegion lo = (loTextTop lo, loContentLeft lo, loTextHeight lo, max 1 (loCols lo - loContentLeft lo - loVBarW lo))
 
 -- Best-guess root directory to search: the open folder, else the active file's
 -- directory, else the current directory (the driver canonicalises it).
@@ -1211,7 +1287,7 @@ pushNavIfFar tpath tpos ed
 -- "Linting" switch and rows @nEditingSettings+1 ..@ are one per 'linters'
 -- entry, in table order. A Spec test keeps this constant in step with the spec.
 nEditingSettings :: Int
-nEditingSettings = 10
+nEditingSettings = 12
 
 -- | The 'linters' entry a Settings dialog choice row maps to, if it is a
 -- per-linter row (the master switch and the editing rows return 'Nothing').

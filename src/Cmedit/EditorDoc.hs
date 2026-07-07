@@ -960,8 +960,8 @@ csvViewportFor ed v =
       frozen = if edFreezeHeader ed && Csv.nRows v > 0 then Csv.rowHeight v 0 else 0
       freezeRows = if edFreezeHeader ed && Csv.nRows v > 0 then 1 else 0
   in ( max 1 (loTextHeight lo - 1 - frozen), freezeRows
-       -- -1: the rightmost column is the scrollbar's (as in 'computeLayout')
-     , max 1 (loCols lo - loContentLeft lo - csvGutterWidthFor v - 1) )
+       -- loVBarW: the rightmost column is the scrollbar's, when enabled (as in 'computeLayout')
+     , max 1 (loCols lo - loContentLeft lo - csvGutterWidthFor v - loVBarW lo) )
 
 -- Set the table view, scrolling so the current cell is visible.
 csvPut :: CsvView -> Editor -> Editor

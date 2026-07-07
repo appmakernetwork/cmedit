@@ -188,9 +188,11 @@ escape sequences and the POSIX `termios` API.
   (Alt+W), toggleable from the View menu.
 - **Insert / overwrite** mode (Insert key), auto-indent, and tab/space
   indentation with Tab / Shift+Tab to indent and outdent selections.
-- **A scrollbar**: a right-edge track and proportional thumb whenever the
-  text, CSV table or search results overflow — click anywhere on it to jump,
-  or drag the thumb.
+- **Scrollbars**: a right-edge vertical track and proportional thumb
+  whenever the text, CSV table or search results overflow, and a bottom-edge
+  horizontal one for text/CSV that overflows sideways — click anywhere on
+  either to jump, or drag the thumb. Both can be hidden from Settings
+  (File ▸ Settings…).
 - **Resizing**: handles SIGWINCH and adapts to any terminal size; horizontal
   scrolling for long lines when word wrap is off — including with the mouse
   (Shift+wheel, or a horizontal wheel/touchpad): it pans long lines, steps

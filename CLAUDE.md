@@ -193,14 +193,32 @@ in `README.md`; the cross-cutting structure that matters when editing:
   `Cmedit.Render` depends on Editor/Menu/Dialog. Don't make Menu/Dialog import
   Editor.
 
-- **The rightmost terminal column is reserved for the scrollbar** —
-  `computeLayout` (text width), `csvViewportFor` and `searchRegion` all
-  subtract 1 for it unconditionally (conditional reservation would make the
-  wrap width oscillate with content height). `scrollBarInfo`/`scrollThumb`
-  (EditorState) are shared by `Render.drawVScroll` and the hub's
-  click/drag handlers (`scrollBarPress`/`scrollBarTo`, `edScrollDrag` swallows
-  the mouse mid-drag like the sidebar drag). Under word wrap the bar uses
-  buffer lines as a proxy for visual rows, deliberately (O(1) on huge files).
+- **The rightmost terminal column is reserved for the vertical scrollbar**,
+  conditional on the `scrollbar-vertical` config key (`cfgScrollBarV`, default
+  on) — but still content-independent: `computeLayout` folds the key into
+  `loVBarW` (1 or 0) once, and `csvViewportFor` and `searchRegion` subtract
+  that instead of a hardcoded 1 (conditional-on-*content* reservation would
+  make the wrap width oscillate with content height; conditional-on-*config*
+  cannot, since the config doesn't change mid-frame). `scrollBarInfo` returns
+  `Nothing` outright when the key is off, which disables drawing and the
+  click/drag handlers (`scrollBarPress`/`scrollBarTo`) together.
+  `scrollBarInfo`/`scrollThumb` (EditorState) are shared by
+  `Render.drawVScroll` and the hub's click/drag handlers (`edScrollDrag`
+  swallows the mouse mid-drag like the sidebar drag). Under word wrap the bar
+  uses buffer lines as a proxy for visual rows, deliberately (O(1) on huge
+  files). A sibling horizontal bar (`scrollbar-horizontal` /
+  `cfgScrollBarH`, default on) occupies a reserved row directly above the
+  status bar, when the active view can actually scroll sideways (CSV, or
+  plain text that isn't an image and isn't word-wrapped) and the search view
+  isn't showing (`loHBarRow`, `computeLayout`); `hScrollBarInfo`/
+  `Render.drawHScroll`/`edHScrollDrag` mirror the vertical set exactly. Its
+  track spans from `loTextLeft` (or, in CSV, past the pinned row-number
+  gutter) to one column short of the vertical bar's reserved corner when
+  `loVBarW` is 1, or the full width when it is 0. CSV dragging is display-cell
+  granular (`Csv.csvXOff` carries the sub-column offset; the first visible
+  column can be clipped mid-cell), while keyboard navigation stays
+  column-aligned. Both bars are Settings-dialog rows (`settingsSpec`,
+  "Vertical/Horizontal scroll bar") that apply live like every other row.
 - **Two coordinate systems.** Buffer positions (`Pos`) count *characters*; the
   screen counts *display cells*. `Cmedit.Width` maps between them
   (`colToDisplay`/`displayToCol`) and supplies a compact `wcwidth` plus tab-stop

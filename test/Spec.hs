@@ -3025,7 +3025,9 @@ main = do
       Nothing -> check "bar appears on overflow" False
       Just (x, top, h, total, win) -> do
         checkEq "bar in the reserved column" x 79
-        checkEq "bar spans the text area" (top, h) (1, 21)
+        -- The text area is 21 rows tall minus the reserved horizontal-scrollbar
+        -- row = 20 (see 'computeLayout').
+        checkEq "bar spans the text area" (top, h) (1, 20)
         checkEq "bar totals the buffer" (total, win) (300, 0)
         let (tt, tl) = scrollThumb h total win
         check "thumb at top, sane size" (tt == 0 && tl >= 1 && tl < h)
@@ -3043,7 +3045,7 @@ main = do
     check "release ends the drag" (not (edScrollDrag edR))
     -- The rendered screen shows the thumb/track glyphs in the last column.
     let scrB = renderEditor big
-        lastCol = [ cellChar (scrCells scrB A.! (r * scrW scrB + 79)) | r <- [1 .. 21] ]
+        lastCol = [ cellChar (scrCells scrB A.! (r * scrW scrB + 79)) | r <- [1 .. 20] ]
     check "track+thumb drawn" ('\x2588' `elem` lastCol && '\x2502' `elem` lastCol)
     -- CSV: the bar tracks the table and a click moves the cell cursor.
     let csvBig = T.unlines (T.pack "h1,h2" : [ T.pack (show i ++ "," ++ show i) | i <- [1 .. 200 :: Int] ])
@@ -3052,6 +3054,254 @@ main = do
     check "csv overflow shows a bar" (scrollBarInfo edCsvB /= Nothing)
     let edCsvJ = key (press 20) edCsvB
     check "csv click jumps rows" (maybe 0 csvCurRow (edCsv edCsvJ) > 100)
+
+  -- Horizontal scrollbar -----------------------------------------------------------------
+  do
+    let key k e = fst (update k e)
+
+    -- Csv.hScrollTo: an independent reference over every offset from -5 up to
+    -- past the total width, including the documented "past the end" fallback
+    -- (target >= totalWidth resets csvXOff to 0 rather than clamping to the
+    -- last valid offset; real callers never reach it because scrollTrackTarget
+    -- always hands hScrollTo a value < totalWidth).
+    let vHT = setColWidth 1 20 (mkCsvView ',' (T.pack "a,bb,ccc\ndddd,e,f")) -- widths [4,20,3]
+        effsHT = columnWidths vHT
+        nHT = length effsHT
+        startsHT = scanl (+) 0 (map (+ 1) effsHT)               -- [0, 5, 26]
+        totalHT = last startsHT                                  -- 30 (scanl's final running sum)
+        refHT x =
+          let clamped = max 0 x
+          in case [ c | c <- [0 .. nHT - 1]
+                      , clamped >= startsHT !! c, clamped <= startsHT !! c + effsHT !! c ] of
+               (c : _) -> (c, clamped - startsHT !! c)
+               []      -> (nHT - 1, 0)                          -- past the end
+        htGot x = let v' = hScrollTo x vHT in (csvLeft v', csvXOff v')
+    check "csv hScrollTo matches an independent reference across every offset"
+      (all (\x -> htGot x == refHT x) [-5 .. totalHT + 3])
+    checkEq "csv hScrollTo X=0 is the origin" (htGot 0) (0, 0)
+    checkEq "csv hScrollTo negative clamps to 0" (htGot (-40)) (0, 0)
+    check "csv hScrollTo keeps the invariant 0 <= xoff <= effWidth(csvLeft)"
+      (all (\x -> let (l, off) = htGot x in off >= 0 && off <= effsHT !! l) [-5 .. totalHT + 3])
+    check "csv hScrollTo inverse relation: prefix-sum(widths+1)+xoff == X up to the last valid offset"
+      (all (\x -> let v' = hScrollTo x vHT
+                      effs = columnWidths v'
+                  in sum (map (+ 1) (take (csvLeft v') effs)) + csvXOff v' == x)
+           [0 .. totalHT - 1])
+
+    -- Csv.ensureVisible keep-or-snap: a scrollbar-produced (csvLeft, csvXOff)
+    -- survives when the cursor cell is already fully visible; otherwise it
+    -- snaps csvXOff back to 0 and recomputes csvLeft the way 'scrollLeft'
+    -- would (reference copied from the "csv scrollLeft matches the reference"
+    -- test above, since 'scrollLeft' itself isn't exported).
+    let scrollLeftRef2 width v =
+          let ws = columnWidths v
+              cc = csvCurCol v
+              fits l = sum [ ws !! c + 1 | c <- [l .. cc], c < length ws ] <= width
+              go l | l >= cc = cc
+                   | fits l = l
+                   | otherwise = go (l + 1)
+          in go (max 0 (min (csvLeft v) cc))
+        vKS0 = mkCsvView ',' (T.pack "a,bb,ccc\ndddd,e,f")        -- widths [4,3,3]
+        vKeep = (setCursor 1 2 vKS0) { csvLeft = 1, csvXOff = 3 } -- col2 (w=3) fully visible in width 6
+        vSnap = (setCursor 1 2 vKS0) { csvLeft = 0, csvXOff = 5 } -- col2 NOT fully visible in width 6
+        vKeep' = Cmedit.Csv.ensureVisible 5 0 6 vKeep
+        vSnap' = Cmedit.Csv.ensureVisible 5 0 6 vSnap
+    checkEq "ensureVisible keeps a scrollbar sub-column offset when the cell is fully visible"
+      (csvLeft vKeep', csvXOff vKeep') (1, 3)
+    checkEq "ensureVisible snaps to (scrollLeft, 0) when the cell is not fully visible"
+      (csvLeft vSnap', csvXOff vSnap') (scrollLeftRef2 6 vSnap, 0)
+
+    -- hScrollBarInfo: plain text view. A tab-filled line keeps the char count
+    -- low while the display width (colToDisplay) overflows, so the test only
+    -- passes if hScrollBarInfo measures display cells, not characters.
+    let tabw = cfgTabWidth defaultConfig
+        tabLine = T.replicate 30 (T.pack "\t")                  -- display width 30*4 = 120
+        edShort = (newEditor (24, 80) defaultConfig)
+                    { edBuffer = fromText (T.pack "hi\nbye") }
+        edOverflow = (newEditor (24, 80) defaultConfig) { edBuffer = fromText tabLine }
+        edLefty = edShort { edLeft = 5 }
+    check "no overflow, no scroll -> Nothing" (hScrollBarInfo edShort == Nothing)
+    case hScrollBarInfo edOverflow of
+      Nothing -> check "overflowing tab line shows a bar" False
+      Just (row, x0, trackWidth, total, offset) -> do
+        let loOv = computeLayout edOverflow
+        checkEq "hbar row is loHBarRow" (Just row) (loHBarRow loOv)
+        checkEq "hbar x0 is loTextLeft" x0 (loTextLeft loOv)
+        checkEq "hbar spans to the vertical bar" trackWidth (loCols loOv - loVBarW loOv - x0)
+        check "hbar total reflects colToDisplay, not char count"
+          (total == colToDisplay tabw (T.length tabLine) tabLine && total > T.length tabLine)
+        checkEq "hbar offset is edLeft" offset 0
+    check "edLeft > 0 with short lines still shows a bar" (hScrollBarInfo edLefty /= Nothing)
+    case hScrollBarInfo edLefty of
+      Just (_, _, _, _, offset) -> checkEq "hbar offset with edLeft > 0" offset 5
+      Nothing -> check "edLeft>0 bar present" False
+    -- Disabling the vertical bar reclaims its column for the horizontal track.
+    let edOverflowNoV = edOverflow { edConfig = (edConfig edOverflow) { cfgScrollBarV = False } }
+    case (hScrollBarInfo edOverflow, hScrollBarInfo edOverflowNoV) of
+      (Just (_, _, twOn, _, _), Just (_, _, twOff, _, _)) ->
+        checkEq "hbar track extends one column when the vertical bar is off" twOff (twOn + 1)
+      _ -> check "hbar present in both V-bar configurations" False
+
+    -- hScrollBarInfo: CSV view. total is the sum of effWidth+1 (including the
+    -- user override); after a scrollbar-style hScrollTo the offset carries
+    -- through unchanged.
+    let vCsvHT = hScrollTo 10 vHT
+        edCsvHT = (newEditor (24, 80) defaultConfig) { edCsv = Just vCsvHT }
+        loCsvHT = computeLayout edCsvHT
+        gutHT = csvGutterWidthFor vCsvHT
+    case hScrollBarInfo edCsvHT of
+      Nothing -> check "csv hbar present after a nonzero xoff" False
+      Just (row, x0, trackWidth, total, offset) -> do
+        checkEq "csv hbar row is loHBarRow" (Just row) (loHBarRow loCsvHT)
+        checkEq "csv hbar x0 is loContentLeft+gutter" x0 (loContentLeft loCsvHT + gutHT)
+        checkEq "csv hbar trackWidth stops short of the vertical bar"
+          trackWidth (loCols loCsvHT - loVBarW loCsvHT - x0)
+        checkEq "csv hbar total is the sum of effWidth+1, including the override"
+          total (sum (map (+ 1) (columnWidths vCsvHT)))
+        checkEq "csv hbar offset carries the hScrollTo target through" offset 10
+
+    -- Mouse end-to-end (text): a press on the bar jumps + starts a drag, a
+    -- drag moves it again, and a release ends the drag without moving further.
+    -- 'scrollTrackTarget' isn't exported (like the vertical bar's twin), so
+    -- its trivial formula is reproduced here to predict the target exactly,
+    -- the same way 'scrollLeftRef'/'scrollLeftRef2' stand in for 'scrollLeft'.
+    let scrollTrackTargetRef h total rel =
+          let thumbLen = max 1 (min h (h * h `div` max 1 total))
+              denom = max 1 (h - thumbLen)
+              maxTop = max 0 (total - h)
+          in max 0 (min maxTop (rel * maxTop `div` denom))
+        wideLine = T.pack (replicate 300 'x')
+        edWide = (newEditor (24, 80) defaultConfig) { edBuffer = fromText wideLine }
+    case hScrollBarInfo edWide of
+      Nothing -> check "wide text line shows an hbar" False
+      Just (hbarRow, hx0, htrack, htotal, _) -> do
+        let pressH c = KMouse (MouseEvent MBLeft c hbarRow True False noMods 1)
+            dragH c = KMouse (MouseEvent MBLeft c hbarRow True True noMods 1)
+            releaseH c = KMouse (MouseEvent MBLeft c hbarRow False False noMods 1)
+            rel1 = max 0 (min (htrack - 1) 40)
+            rel2 = max 0 (min (htrack - 1) 60)
+            expect1 = scrollTrackTargetRef htrack htotal rel1
+            expect2 = scrollTrackTargetRef htrack htotal rel2
+            edWP = key (pressH (hx0 + 40)) edWide
+        checkEq "hbar press jumps edLeft to the track target" (edLeft edWP) expect1
+        check "hbar press starts a drag" (edHScrollDrag edWP)
+        let edWD = key (dragH (hx0 + 60)) edWP
+        checkEq "hbar drag moves edLeft again" (edLeft edWD) expect2
+        check "hbar drag actually changed the offset" (expect2 /= expect1)
+        let edWR = key (releaseH (hx0 + 60)) edWD
+        check "hbar release ends the drag" (not (edHScrollDrag edWR))
+        checkEq "hbar release doesn't move the scroll further" (edLeft edWR) expect2
+        -- The rendered row shows the track/thumb glyphs, like the vertical bar.
+        let scrHT = renderEditor edWide
+            hbarCells = [ cellChar (scrCells scrHT A.! (hbarRow * scrW scrHT + c))
+                        | c <- [0 .. scrW scrHT - 1] ]
+        check "hbar track+thumb drawn" ('\x2588' `elem` hbarCells && '\x2500' `elem` hbarCells)
+
+    -- Mouse end-to-end (CSV): the same press/drag/release, cross-checked
+    -- against calling Csv.hScrollTo directly on the pre-drag view, confirming
+    -- the CSV path bypasses ensureVisible/csvPut just as documented.
+    let mkWide ch = T.replicate 34 (T.pack [ch])
+        wideCsvTxt = T.intercalate (T.pack ",") [mkWide 'A', mkWide 'B', mkWide 'C']
+                       `T.append` T.pack "\n1,2,3"
+        edCsvW = setLoaded "/tmp/wide.csv" (loadFromBytes False Nothing (TE.encodeUtf8 wideCsvTxt))
+                   (newEditor (24, 80) defaultConfig)
+    case edCsv edCsvW of
+      Nothing -> check "wide csv loads as a table" False
+      Just vBefore -> case hScrollBarInfo edCsvW of
+        Nothing -> check "wide csv triggers horizontal overflow" False
+        Just (hbarRowC, hx0C, htrackC, htotalC, _) -> do
+          let pressC c = KMouse (MouseEvent MBLeft c hbarRowC True False noMods 1)
+              dragC c = KMouse (MouseEvent MBLeft c hbarRowC True True noMods 1)
+              releaseC c = KMouse (MouseEvent MBLeft c hbarRowC False False noMods 1)
+              rel1 = max 0 (min (htrackC - 1) 5)
+              rel2 = max 0 (min (htrackC - 1) 60)
+              expect1 = scrollTrackTargetRef htrackC htotalC rel1
+              expect2 = scrollTrackTargetRef htrackC htotalC rel2
+              vAfterPure1 = hScrollTo expect1 vBefore
+              edCP = key (pressC (hx0C + 5)) edCsvW
+          check "csv hbar press starts a drag" (edHScrollDrag edCP)
+          checkEq "csv hbar press matches Csv.hScrollTo applied directly"
+            (maybe (-1, -1) (\v -> (csvLeft v, csvXOff v)) (edCsv edCP))
+            (csvLeft vAfterPure1, csvXOff vAfterPure1)
+          check "csv hbar press produces a nonzero csvXOff"
+            (maybe False ((> 0) . csvXOff) (edCsv edCP))
+          case edCsv edCP of
+            Nothing -> check "csv view still active after a press" False
+            Just vAfter1 ->
+              checkEq "csvColStartX for the scrolled-to column reflects the new xoff"
+                (csvColStartX vAfter1 (csvLeft vAfter1))
+                (Just (csvGutterWidthFor vAfter1 - csvXOff vAfter1))
+          let edCD = key (dragC (hx0C + 60)) edCP
+              vAfterPure2 = hScrollTo expect2 vBefore
+          checkEq "csv hbar drag matches Csv.hScrollTo applied directly"
+            (maybe (-1, -1) (\v -> (csvLeft v, csvXOff v)) (edCsv edCD))
+            (csvLeft vAfterPure2, csvXOff vAfterPure2)
+          let edCR = key (releaseC (hx0C + 60)) edCD
+          check "csv hbar release ends the drag" (not (edHScrollDrag edCR))
+
+    -- Layout: cfgScrollBarH off drops the reserved row (its space returns to
+    -- the text area); word wrap does the same in the text view; a CSV view
+    -- keeps the bar even under word wrap.
+    let edPlainH = newEditor (24, 80) defaultConfig
+        edNoH = edPlainH { edConfig = (edConfig edPlainH) { cfgScrollBarH = False } }
+        loOn = computeLayout edPlainH
+        loOff = computeLayout edNoH
+    check "hbar on by default for a plain text view" (loHBarRow loOn /= Nothing)
+    checkEq "cfgScrollBarH off drops the reserved row" (loHBarRow loOff) Nothing
+    checkEq "the row returns to the text area" (loTextHeight loOff) (loTextHeight loOn + 1)
+    checkEq "word wrap also drops the horizontal bar"
+      (loHBarRow (computeLayout (edPlainH { edWordWrap = True }))) Nothing
+    let edCsvMode = edPlainH { edCsv = Just (mkCsvView ',' (T.pack "a,b\n1,2")) }
+    check "CSV view keeps the horizontal bar even under word wrap"
+      (loHBarRow (computeLayout (edCsvMode { edWordWrap = True })) /= Nothing)
+
+    -- cfgScrollBarV off reclaims its column.
+    let edVOff = edPlainH { edConfig = (edConfig edPlainH) { cfgScrollBarV = False } }
+    checkEq "cfgScrollBarV off -> loVBarW 0" (loVBarW (computeLayout edVOff)) 0
+    check "cfgScrollBarV off -> scrollBarInfo Nothing"
+      (scrollBarInfo (edVOff { edBuffer = fromText (T.unlines [ T.pack (show i) | i <- [1 .. 300 :: Int] ]) })
+        == Nothing)
+    checkEq "cfgScrollBarV off widens the text area by one column"
+      (loTextWidth (computeLayout edVOff)) (loTextWidth (computeLayout edPlainH) + 1)
+
+    -- applySettingRow rows 7 (Vertical scroll bar) / 8 (Horizontal scroll bar)
+    -- apply live, the same way every other settings row does.
+    check "applySettingRow 7 toggles cfgScrollBarV live"
+      (not (cfgScrollBarV (edConfig (applySettingRow 7 0 edPlainH))))
+    check "applySettingRow 7 back on restores it"
+      (cfgScrollBarV (edConfig (applySettingRow 7 1 edPlainH)))
+    check "applySettingRow 8 toggles cfgScrollBarH live"
+      (not (cfgScrollBarH (edConfig (applySettingRow 8 0 edPlainH))))
+    check "computeLayout reflects a row-7 toggle immediately"
+      (loVBarW (computeLayout (applySettingRow 7 0 edPlainH)) == 0)
+    check "computeLayout reflects a row-8 toggle immediately"
+      (loHBarRow (computeLayout (applySettingRow 8 0 edPlainH)) == Nothing)
+
+    -- openSettings -> toggle rows 7 & 8 -> Cancel restores the original
+    -- config (mirrors the existing "Esc reverts live changes" settings test).
+    let edSP = setLoaded "/tmp/hb.txt" (loadFromBytes False Nothing (TE.encodeUtf8 (T.pack "hello")))
+                 (newEditor (24, 80) defaultConfig)
+        edSSettings = key KEnter edSP { edFocus = FMenu, edMenu = menuStateFor edSP 0 MASettings }
+        focusRowH k e = e { edDialog = fmap (\d -> d { dlgFocus = k }) (edDialog e) }
+        edSV = key (KArrow DRight noMods) (focusRowH 7 edSSettings)
+        edSVH = key (KArrow DRight noMods) (focusRowH 8 edSV)
+    check "toggling settings rows 7/8 applies live"
+      (not (cfgScrollBarV (edConfig edSV)) && not (cfgScrollBarH (edConfig edSVH)))
+    let edSEsc = key KEsc edSVH
+    check "Esc restores the original scrollbar config"
+      (cfgScrollBarV (edConfig edSEsc) && cfgScrollBarH (edConfig edSEsc)
+       && edDialog edSEsc == Nothing)
+
+    -- Config file: the scrollbar keys parse and round-trip like any other key.
+    let (cSB, wSB) = parseConfigText
+                       (T.pack "scrollbar-vertical = off\nscrollbar-horizontal = off\n") defaultConfig
+    check "scrollbar-vertical = off parses" (not (cfgScrollBarV cSB))
+    check "scrollbar-horizontal = off parses" (not (cfgScrollBarH cSB))
+    checkEq "scrollbar config keys parse without warnings" wSB []
+    let wantSB = defaultConfig { cfgScrollBarV = False, cfgScrollBarH = False }
+        outSB = updateConfigText wantSB (T.pack "")
+    check "scrollbar config round-trips through write+parse"
+      (fst (parseConfigText outSB defaultConfig) == wantSB)
 
   -- CSV column sort ---------------------------------------------------------------------
   do
@@ -3251,7 +3501,7 @@ main = do
 
     -- settingsSpec / applySettingRow position sync (extends the settings tests).
     checkEq "settingsSpec has editing + master + per-linter rows"
-      (length settingsSpec) (11 + length linters)
+      (length settingsSpec) (13 + length linters)
     check "applySettingRow round-trips every spec row to its default"
       (and [ edConfig (applySettingRow k (ixOf defaultConfig) ed0) == defaultConfig
            | (k, (_, _, _, ixOf, _)) <- zip [0 ..] settingsSpec ])
@@ -3356,16 +3606,16 @@ main = do
 
     -- Master toggle off clears diagnostics everywhere (no future pass will).
     let edDirty = edLR { edDiags = [d0] }                 -- active + zipper both carry diags
-        edMOff  = applySettingRow 10 0 edDirty            -- row 10 = Linting master, 0 = off
+        edMOff  = applySettingRow 12 0 edDirty            -- row 12 = Linting master, 0 = off
     check "master lint off clears active diags" (null (edDiags edMOff))
     check "master lint off clears zipper diags"
       (all (null . docDiags) (edBefore edMOff ++ edAfter edMOff))
-    check "master lint on keeps diags" (edDiags (applySettingRow 10 1 edDirty) == [d0])
+    check "master lint on keeps diags" (edDiags (applySettingRow 12 1 edDirty) == [d0])
 
     -- lintersDetected refreshes an open Settings dialog's per-linter notes.
     let edSettingsNone = openSettings ed0                 -- edLintAvail all Nothing
         edSettingsAv = lintersDetected availAll edSettingsNone
-        ruffRow d = dlgChoices d !! 11                     -- master at 10, ruff (linters!!0) at 11
+        ruffRow d = dlgChoices d !! 13                     -- master at 12, ruff (linters!!0) at 13
     check "settings shows not-installed note before detection"
       (maybe False (\d -> maybe False (T.isInfixOf (T.pack "\x2717")) (chNote (ruffRow d)))
              (edDialog edSettingsNone))

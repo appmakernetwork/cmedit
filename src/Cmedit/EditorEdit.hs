@@ -572,6 +572,12 @@ settingsSpec =
   , ( Nothing, "Whitespace markers", offOn
     , boolIx cfgShowWhitespace
     , "Make spaces and tabs visible (Alt+W)." )
+  , ( Nothing, "Vertical scroll bar", offOn
+    , boolIx cfgScrollBarV
+    , "Show the scroll bar along the right edge." )
+  , ( Nothing, "Horizontal scroll bar", offOn
+    , boolIx cfgScrollBarH
+    , "Bottom bar; drags by character, even in table view." )
   , ( Just "Files", "Trim trailing whitespace", offOn
     , boolIx cfgTrimTrailingWs
     , "Strip line-end whitespace when saving (an undoable edit)." )
