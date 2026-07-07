@@ -1475,6 +1475,32 @@ main = do
     (case sparkleCol of
        (c : _) | c + 1 < wEC -> cellChar (cellAtEC 3 (c + 1)) == '\0'
        _                     -> False)
+  -- Zero-width formatting controls (U+200B in cali_gyms.csv row 25) are
+  -- truly invisible: no glyph, no cursor advance. Counting them as one cell
+  -- would drift every column right of the cell by one — the row-25 shift.
+  checkEq "cellWidth ignores ZWSP"
+    (cellWidth (T.pack "\x200B\&Power Plant Fitness")) 19
+  checkEq "cellWidth ignores BOM"
+    (cellWidth (T.pack "\xFEFF\&hello")) 5
+  -- VS16 must still count so ℹ️ measures as two cells (kept in step with the
+  -- terminal folding the pair into a wide emoji).
+  checkEq "cellWidth keeps VS16"
+    (cellWidth (T.pack "\x2139\xFE0F")) 2
+  -- Render integration: a ZWSP-prefixed cell aligns its column separator
+  -- with a plain-ASCII cell in the same table.
+  let edZwspCsv = setLoaded "/tmp/z.csv"
+                    (loadFromBytes False Nothing
+                      (TE.encodeUtf8
+                        (T.pack "hdr,x\n\x200B\&Power,1\ncdxxx,2\n")))
+                    (newEditor (24, 80) defaultConfig)
+      scrZW   = renderEditor edZwspCsv
+      wZW     = scrW scrZW
+      cellAtZW r c = scrCells scrZW A.! (r * wZW + c)
+      sepAtZW r = [ c | c <- [0 .. wZW - 1]
+                      , cellChar (cellAtZW r c) == '\x2502' ]
+  check "csv separator aligned across ZWSP row"
+    (let s3 = sepAtZW 3; s4 = sepAtZW 4
+     in not (null s3) && not (null s4) && head s3 == head s4)
 
   -- Browser type-ahead ----------------------------------------------------------
   let taNames = ["alpha", "beta", "apple", "cherry", "avocado", "berry"]

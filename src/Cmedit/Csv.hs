@@ -93,7 +93,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 
 import Cmedit.Types (Dir(..), ptrEq)
-import Cmedit.Width (charWidth)
+import Cmedit.Width (charWidth, isInvisibleFormat)
 
 type Row  = Seq Text
 type Grid = Seq Row
@@ -323,10 +323,16 @@ syncWidths old ws new
 -- selected by a following variation selector U+FE0F (e.g. ℹ️, ⚠️, ❤️): the
 -- selector is zero-width but the terminal folds it into a two-cell emoji,
 -- so a column that ignored it would come up one cell short and the whole
--- row's right-hand columns would shift.
+-- row's right-hand columns would shift. Truly invisible formatting controls
+-- (ZWSP, LTR/RTL marks, BOM, …) are counted as zero — terminals emit
+-- nothing for those and the cursor does not advance, so including them
+-- would over-reserve the column by one cell per occurrence.
 cellWidth :: Text -> Int
 cellWidth = maximum . (0 :) . map lineW . T.splitOn (T.pack "\n")
-  where lineW = sum . map (max 1 . charWidth) . T.unpack
+  where
+    lineW = sum . map effW . T.unpack
+    effW c | isInvisibleFormat c = 0
+           | otherwise           = max 1 (charWidth c)
 
 -- | A cell's display rows grow with embedded newlines, but a row is capped at
 -- this many lines on screen (taller cells scroll while being edited).

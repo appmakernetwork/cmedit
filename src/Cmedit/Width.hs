@@ -5,6 +5,7 @@ module Cmedit.Width
   ( charWidth
   , isControlChar
   , controlCaret
+  , isInvisibleFormat
   , colToDisplay
   , displayToCol
   , windowStart
@@ -37,6 +38,22 @@ isControlChar :: Char -> Bool
 isControlChar c =
   let n = fromEnum c
   in (n < 0x20 && c /= '\t') || (n >= 0x7f && n < 0xa0)
+
+-- | Formatting characters that are truly invisible: no glyph AND no modifier
+-- effect on a neighbour. Terminals emit nothing for these and the cursor
+-- does not advance, so the CSV table sizer / renderer treats them as zero
+-- cells (unlike, say, VS16, ZWJ, or combining marks, which *do* modify a
+-- neighbouring glyph and are worth one cell each). Kept small on purpose:
+-- ZWSP, LTR/RTL marks, the four bidirectional embeddings and overrides,
+-- the word joiner and the invisible arithmetic operators, and the BOM.
+isInvisibleFormat :: Char -> Bool
+isInvisibleFormat c =
+  let n = fromEnum c
+  in    n == 0x200B                             -- ZERO WIDTH SPACE
+     || (n >= 0x200E && n <= 0x200F)            -- LTR / RTL MARK
+     || (n >= 0x202A && n <= 0x202E)            -- LRE/RLE/PDF/LRO/RLO
+     || (n >= 0x2060 && n <= 0x2064)            -- WJ + invisible ops
+     || n == 0xFEFF                             -- BOM / ZWNBSP
 
 -- | Caret notation for a control character, e.g. @\\NUL@ -> @"^@"@,
 -- DEL -> @"^?"@.

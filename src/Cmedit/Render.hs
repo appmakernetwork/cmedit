@@ -61,7 +61,7 @@ import Cmedit.Syntax
 import Cmedit.TextBuffer
 import Cmedit.Types
 import Cmedit.Image (Image(..), ImgMode(..), renderImage)
-import Cmedit.Width (charWidth, colToDisplay, controlCaret, isControlChar, windowStart)
+import Cmedit.Width (charWidth, colToDisplay, controlCaret, isControlChar, isInvisibleFormat, windowStart)
 
 -- | A rendered frame: a flat row-major grid plus the desired cursor position.
 -- 'scrHint' describes where this frame's scrollable band sat, so the diff can
@@ -750,31 +750,41 @@ drawStrU arr cols rows r c0 st ui s =
 -- into the next grid position so the diff renderer's contChar-skip keeps
 -- the grid and the terminal cursor in step; the caller must have already
 -- trimmed the string to the column's display width (see 'takeCellsPad'),
--- since this function will otherwise happily walk past @c0 + w@.
+-- since this function will otherwise happily walk past @c0 + w@. Truly
+-- invisible formatting controls (ZWSP, BOM, LTR/RTL marks) are dropped
+-- from the emitted stream — terminals render nothing for them and the
+-- cursor does not advance, so leaving them in would desync the grid.
 drawStrClipL :: Surf s -> Int -> Int -> Int -> Int -> Int -> Style -> String -> ST s ()
 drawStrClipL arr cols rows r c0 minC st = go c0
   where
     go _ [] = pure ()
-    go !c (ch:cs) = do
-      let cw = max 1 (charWidth ch)
-      when (c >= minC) $ do
-        putCell arr cols rows r c (Cell ch st)
-        when (cw == 2) $ putCell arr cols rows r (c + 1) (Cell contChar st)
-      go (c + cw) cs
+    go !c (ch:cs)
+      | isInvisibleFormat ch = go c cs
+      | otherwise = do
+          let cw = max 1 (charWidth ch)
+          when (c >= minC) $ do
+            putCell arr cols rows r c (Cell ch st)
+            when (cw == 2) $ putCell arr cols rows r (c + 1) (Cell contChar st)
+          go (c + cw) cs
 
 -- | Trim @s@ to at most @w@ display cells, then pad with trailing spaces to
 -- exactly @w@ cells. A 2-cell glyph that would straddle the boundary is
 -- dropped (leaving a space in the last cell) so callers can rely on the
--- returned string's cells-consumed count being exactly @w@.
+-- returned string's cells-consumed count being exactly @w@. Truly invisible
+-- formatting controls consume no cells but are kept in the string, since
+-- 'drawStrClipL' drops them at emit time (skipping them here would
+-- silently mutate the cell contents relative to the buffer).
 takeCellsPad :: Int -> String -> String
 takeCellsPad w s = go w s
   where
     go !left [] = replicate (max 0 left) ' '
     go !left _ | left <= 0 = []
-    go !left (c:cs) =
-      let cw = max 1 (charWidth c)
-      in if cw <= left then c : go (left - cw) cs
-         else replicate left ' '
+    go !left (c:cs)
+      | isInvisibleFormat c = c : go left cs
+      | otherwise =
+          let cw = max 1 (charWidth c)
+          in if cw <= left then c : go (left - cw) cs
+             else replicate left ' '
 
 fillRow :: Surf s -> Int -> Int -> Int -> Style -> ST s ()
 fillRow arr cols rows r st =
@@ -2075,20 +2085,26 @@ cellDisplay w visH mCur cellText =
 -- Truncate to display cells (not code points): if @s@ overflows the column
 -- width, trim it to @w-1@ cells and append an ellipsis (which is itself
 -- one cell). A wide glyph that would sit half-in half-out is dropped whole
--- rather than split.
+-- rather than split. Truly invisible formatting controls contribute zero
+-- cells (see 'isInvisibleFormat') so ZWSP / BOM / bidi marks don't push
+-- the boundary in and eat a real character.
 clipStr :: Int -> String -> String
 clipStr w s
   | dw <= w  = s
   | otherwise = takeCells (max 0 (w - 1)) s ++ "\x2026"
   where
-    dw = sum (map (max 1 . charWidth) s)
+    dw = sum (map effW s)
+    effW c | isInvisibleFormat c = 0
+           | otherwise           = max 1 (charWidth c)
     takeCells !n = go n
       where
         go _ [] = []
         go !left _  | left <= 0 = []
-        go !left (c:cs) =
-          let cw = max 1 (charWidth c)
-          in if cw <= left then c : go (left - cw) cs else []
+        go !left (c:cs)
+          | isInvisibleFormat c = c : go left cs
+          | otherwise =
+              let cw = max 1 (charWidth c)
+              in if cw <= left then c : go (left - cw) cs else []
 
 -- Cursor for the cell being edited in CSV mode (on the right line + column of a
 -- multi-line cell). Mirrors the windowing done by 'cellDisplay'.
