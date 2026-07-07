@@ -11,7 +11,7 @@ module Cmedit.Input
 
 import Control.Exception (SomeException, catch)
 import Data.Bits ((.&.))
-import Data.Char (chr)
+import Data.Char (chr, ord)
 import Data.IORef
 import Data.List (isSuffixOf)
 import Data.Word (Word8)
@@ -265,25 +265,78 @@ interpretCSI body final =
 -- combos back to the same keys their legacy bytes would have produced.
 otherKey :: Int -> Mods -> Key
 otherKey code m
-  | code == 13 || code == 10                  = if modified then KModEnter else KEnter
-  | code == 9                                 = if hasShift m then KBackTab else KTab
-  | code == 27                                = KEsc
-  | code == 8 || code == 127                  = if hasAlt m then KAltChar '\DEL' else KBackspace
-  -- Ctrl+Shift+letter (needs the Kitty protocol; legacy bytes can't express it):
-  -- report it distinctly so workspace-wide Find/Replace (Ctrl+Shift+F/H) can be
-  -- told apart from the in-file Ctrl+F/H. Handle both the shifted (upper) and
-  -- unshifted (lower) key-code forms terminals may send.
-  | hasCtrl m && hasShift m && code >= 0x41 && code <= 0x5a = KCtrlShiftChar (chr (code + 0x20))
-  | hasCtrl m && hasShift m && code >= 0x61 && code <= 0x7a = KCtrlShiftChar (chr code)
-  | hasCtrl m && code >= 0x41 && code <= 0x5a = KCtrlChar (chr (code + 0x20))   -- Ctrl+A..Z
-  | hasCtrl m && code >= 0x61 && code <= 0x7a = KCtrlChar (chr code)            -- Ctrl+a..z
-  -- Ctrl+punctuation (e.g. Ctrl+/ for toggle-comment): legacy bytes fold these
-  -- into the C0 range, so map the disambiguated form to the same KCtrlChar.
-  | hasCtrl m && code >= 0x20 && code <  0x7f = KCtrlChar (chr code)
-  | hasAlt  m && code >= 0x20 && code <  0x7f = KAltChar (chr code)             -- Alt+printable
-  | code >= 0x20                              = KChar (chr code)
-  | otherwise                                 = KUnknown [fromIntegral (code .&. 0xff), 0x75]
-  where modified = hasShift m || hasCtrl m || hasAlt m
+  -- Kitty reports numpad keys with distinct "KP_*" functional codes in the
+  -- 57399..57427 block. Fold them onto the same keys their non-numpad twins
+  -- produce (Enter, digits, arrows, Home/End/…), or they land as PUA chars.
+  | Just c <- kittyNumpadChar code               = go (ord c)
+  | Just k <- kittyNumpadKey  code m             = k
+  | otherwise                                    = go code
+  where
+    modified = hasShift m || hasCtrl m || hasAlt m
+    go c
+      | c == 13 || c == 10                       = if modified then KModEnter else KEnter
+      | c == 9                                   = if hasShift m then KBackTab else KTab
+      | c == 27                                  = KEsc
+      | c == 8 || c == 127                       = if hasAlt m then KAltChar '\DEL' else KBackspace
+      -- Ctrl+Shift+letter (needs the Kitty protocol; legacy bytes can't express
+      -- it): report it distinctly so workspace-wide Find/Replace (Ctrl+Shift+F/H)
+      -- can be told apart from the in-file Ctrl+F/H. Handle both the shifted
+      -- (upper) and unshifted (lower) key-code forms terminals may send.
+      | hasCtrl m && hasShift m && c >= 0x41 && c <= 0x5a = KCtrlShiftChar (chr (c + 0x20))
+      | hasCtrl m && hasShift m && c >= 0x61 && c <= 0x7a = KCtrlShiftChar (chr c)
+      | hasCtrl m && c >= 0x41 && c <= 0x5a      = KCtrlChar (chr (c + 0x20))   -- Ctrl+A..Z
+      | hasCtrl m && c >= 0x61 && c <= 0x7a      = KCtrlChar (chr c)            -- Ctrl+a..z
+      -- Ctrl+punctuation (e.g. Ctrl+/ for toggle-comment): legacy bytes fold
+      -- these into the C0 range, so map the disambiguated form to the same KCtrlChar.
+      | hasCtrl m && c >= 0x20 && c <  0x7f      = KCtrlChar (chr c)
+      | hasAlt  m && c >= 0x20 && c <  0x7f      = KAltChar (chr c)             -- Alt+printable
+      | c >= 0x20                                = KChar (chr c)
+      | otherwise                                = KUnknown [fromIntegral (c .&. 0xff), 0x75]
+
+-- Kitty functional codes for numpad keys that have an obvious printable twin:
+-- digits, decimal separator, arithmetic, '=', ',', and Enter. Return the char
+-- that the non-numpad key would have carried so 'otherKey' can decode them
+-- identically (Ctrl/Alt combos and plain Enter behave the same way as the
+-- top-row keys). See https://sw.kovidgoyal.net/kitty/keyboard-protocol/.
+kittyNumpadChar :: Int -> Maybe Char
+kittyNumpadChar c = case c of
+  57399 -> Just '0'
+  57400 -> Just '1'
+  57401 -> Just '2'
+  57402 -> Just '3'
+  57403 -> Just '4'
+  57404 -> Just '5'
+  57405 -> Just '6'
+  57406 -> Just '7'
+  57407 -> Just '8'
+  57408 -> Just '9'
+  57409 -> Just '.'
+  57410 -> Just '/'
+  57411 -> Just '*'
+  57412 -> Just '-'
+  57413 -> Just '+'
+  57414 -> Just '\r'   -- KP_ENTER -> Enter
+  57415 -> Just '='
+  57416 -> Just ','
+  _     -> Nothing
+
+-- Kitty functional codes for numpad navigation keys (arrows, Home/End,
+-- PageUp/PageDown, Insert/Delete, KP_5-as-Begin). Modifiers pass through so
+-- Shift+numpad-Right still selects, etc.
+kittyNumpadKey :: Int -> Mods -> Maybe Key
+kittyNumpadKey c m = case c of
+  57417 -> Just (KArrow DLeft  m)
+  57418 -> Just (KArrow DRight m)
+  57419 -> Just (KArrow DUp    m)
+  57420 -> Just (KArrow DDown  m)
+  57421 -> Just (KPageUp   m)
+  57422 -> Just (KPageDown m)
+  57423 -> Just (KHome     m)
+  57424 -> Just (KEnd      m)
+  57425 -> Just (KInsert   m)
+  57426 -> Just (KDelete   m)
+  57427 -> Just (KHome     m)   -- KP_BEGIN (numpad 5 with NumLock off): treat as Home.
+  _     -> Nothing
 
 -- The ESC [ n ~ family.
 tildeKey :: Int -> Mods -> Key

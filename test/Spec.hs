@@ -218,6 +218,21 @@ main = do
   checkEq "esc csi-u" kEscU KEsc
   kEnterU <- parseBytes (bytesOf "\ESC[13u")         -- plain Enter (no mods) stays KEnter
   checkEq "plain enter csi-u" kEnterU KEnter
+  -- Kitty reports numpad keys with distinct KP_* functional codes; every one
+  -- must fold onto the same key its non-numpad twin produces (Enter, digits,
+  -- arrows, Home/End/…) or it lands as a PUA character.
+  kKpEnter <- parseBytes (bytesOf "\ESC[57414u")     -- KP_ENTER
+  checkEq "numpad enter csi-u" kKpEnter KEnter
+  kKpEnterC <- parseBytes (bytesOf "\ESC[57414;5u")  -- Ctrl+KP_ENTER
+  checkEq "ctrl numpad enter csi-u" kKpEnterC KModEnter
+  kKp5 <- parseBytes (bytesOf "\ESC[57404u")         -- KP_5 -> '5'
+  checkEq "numpad 5 csi-u" kKp5 (KChar '5')
+  kKpDot <- parseBytes (bytesOf "\ESC[57409u")       -- KP_DECIMAL -> '.'
+  checkEq "numpad . csi-u" kKpDot (KChar '.')
+  kKpUp <- parseBytes (bytesOf "\ESC[57419u")        -- KP_UP -> Arrow Up
+  checkEq "numpad up csi-u" kKpUp (KArrow DUp noMods)
+  kKpHome <- parseBytes (bytesOf "\ESC[57423u")      -- KP_HOME
+  checkEq "numpad home csi-u" kKpHome (KHome noMods)
   kMouse <- parseBytes (map (fromIntegral . fromEnum) "\ESC[<0;10;5M")
   case kMouse of
     KMouse me -> do
