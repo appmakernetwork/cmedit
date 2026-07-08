@@ -150,7 +150,8 @@ escape sequences and the POSIX `termios` API.
   candidate inserts immediately, and the whole thing is one undo step.
 - **External-linter integration**: cmedit auto-detects `ruff`, `flake8`,
   `eslint`, `stylelint`, `pyright` and `shellcheck` on your `PATH` (and
-  `eslint`/`stylelint` in the workspace's `node_modules/.bin`), then lints the
+  `eslint`/`stylelint` in the workspace's `node_modules/.bin`, or run through
+  `.pnp.cjs` in a Yarn Plug'n'Play workspace), then lints the
   active file automatically about half a second after you stop typing —
   buffer content goes to the tool over stdin, so unsaved changes are checked,
   with the workspace root as the working directory so project configs like

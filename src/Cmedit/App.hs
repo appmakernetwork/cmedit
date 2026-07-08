@@ -970,9 +970,12 @@ forkDetectLinters drv mroot =
 
 -- | Detect which linters are installed. For each catalogue entry: look the
 -- executable up on @PATH@; on a miss, and if the tool ships as a node package,
--- try @\<root\>/node_modules/.bin/\<cmd\>@. A found executable is probed with
--- @--version@ (its first output line is the version label; @""@ if the probe
--- fails — the tool still counts as installed).
+-- try @\<root\>/node_modules/.bin/\<cmd\>@, then a Yarn Plug'n'Play workspace
+-- ('findYarnPnp'). A found tool is probed with @--version@ (its first output
+-- line is the version label; @""@ if the probe fails — the tool still counts
+-- as installed). The exception is a PnP pseudo-executable: there a silent
+-- probe means the bootstrap could not resolve the tool, i.e. the workspace
+-- doesn't depend on it, so it counts as not installed.
 detectLinters :: Maybe FilePath -> IO LintAvail
 detectLinters mroot = forM linters $ \l -> do
   mexe <- findExecutable (linCmd l)
@@ -982,16 +985,74 @@ detectLinters mroot = forM linters $ \l -> do
       | linNodeTool l, Just root <- mroot -> do
           let cand = root </> "node_modules" </> ".bin" </> linCmd l
           there <- doesFileExist cand
-          pure (if there then Just cand else Nothing)
+          if there then pure (Just cand) else findYarnPnp root
       | otherwise -> pure Nothing
   case resolved of
     Nothing  -> pure (linId l, Nothing)
     Just exe -> do
-      mver <- runToolCapture exe ["--version"] "." Nothing
-      let ver = case mver of
-                  Just t | (v : _) <- T.lines t -> T.unpack v
-                  _                             -> ""
-      pure (linId l, Just (exe, ver))
+      let (pexe, pargs) = toolCommand (linCmd l) exe ["--version"]
+      mver <- runToolCapture pexe pargs "." Nothing
+      case mver of
+        Just t | (v : _) <- T.lines t, not (T.null v)
+          -> pure (linId l, Just (exe, T.unpack v))
+        _ | takeFileName exe == pnpMarker -> pure (linId l, Nothing)
+          | otherwise -> pure (linId l, Just (exe, ""))
+
+-- | The CommonJS entry point of a Yarn Plug'n'Play workspace, and the marker
+-- 'toolCommand' recognises a PnP pseudo-executable by.
+pnpMarker :: FilePath
+pnpMarker = ".pnp.cjs"
+
+-- | Yarn Plug'n'Play workspaces have no @node_modules@ tree to find tools in:
+-- packages stay zipped under @.yarn/cache@ and resolve through
+-- @\<root\>/.pnp.cjs@. When that file exists (and @node@ is on PATH to run
+-- the 'toolCommand' bootstrap), hand back the @.pnp.cjs@ path as the tool's
+-- pseudo-executable. Whether the workspace actually depends on the tool is
+-- settled by the @--version@ probe in 'detectLinters' — the bootstrap fails
+-- to resolve the tool otherwise.
+findYarnPnp :: FilePath -> IO (Maybe FilePath)
+findYarnPnp root = do
+  let pnp = root </> pnpMarker
+  there <- doesFileExist pnp
+  if not there
+    then pure Nothing
+    else do
+      mnode <- findExecutable "node"
+      pure (pnp <$ mnode)
+
+-- | Translate a linter's detected "executable" into the real program + args
+-- to spawn. A detected path that is a workspace's @.pnp.cjs@ (from
+-- 'findYarnPnp') is not an executable at all: the tool runs through @node@
+-- with a bootstrap that initialises Plug'n'Play, resolves the tool's bin
+-- script inside Yarn's zipped cache, and hands over argv. Anything else runs
+-- as-is.
+toolCommand :: String -> FilePath -> [String] -> (FilePath, [String])
+toolCommand cmd exe args
+  | takeFileName exe == pnpMarker = ("node", ["-e", pnpBootstrapJs, exe, cmd] ++ args)
+  | otherwise = (exe, args)
+
+-- | The @node -e@ bootstrap 'toolCommand' runs a tool through in a Yarn PnP
+-- workspace: argv is @\<pnp.cjs path\> \<tool name\> \<tool args...\>@. It
+-- initialises PnP (patching the CJS loader and fs so zipped packages load),
+-- registers the ESM loader when present (project configs are often @.mjs@),
+-- resolves the tool's @bin@ script via its @package.json@ — requiring the
+-- resolved file directly, because tools like eslint 9 no longer list their
+-- bin in the package's @exports@ map — and rewrites argv so the tool sees a
+-- normal @node \<bin\> \<args\>@ invocation.
+pnpBootstrapJs :: String
+pnpBootstrapJs = unlines
+  [ "const path=require('path'),fs=require('fs');"
+  , "const {register}=require('module'),{pathToFileURL}=require('url');"
+  , "const pnpPath=process.argv[1],tool=process.argv[2];"
+  , "const pnp=require(pnpPath);pnp.setup();"
+  , "const loader=path.join(path.dirname(pnpPath),'.pnp.loader.mjs');"
+  , "if(register&&fs.existsSync(loader))register(pathToFileURL(loader));"
+  , "const pj=pnp.resolveRequest(tool+'/package.json',path.dirname(pnpPath)+path.sep);"
+  , "let bin=require(pj).bin;if(typeof bin!=='string')bin=bin[tool];"
+  , "const binPath=path.join(path.dirname(pj),bin);"
+  , "process.argv=[process.argv[0],binPath,...process.argv.slice(3)];"
+  , "if(binPath.endsWith('.mjs'))import(pathToFileURL(binPath).href);else require(binPath);"
+  ]
 
 -- | Run an immediate lint pass of the active document, save-time tools
 -- included (used on save completion and 'EffLintNow'). No debounce.
@@ -1034,9 +1095,11 @@ runLinters outQ genVar gen req = do
           -- upward search finds nested and root configs alike. Python tools
           -- keep the root cwd (.flake8 lives there; ruff resolves from the
           -- --stdin-filename path and doesn't care).
-          let dir = if linNodeTool (linterById lid)
+          let l = linterById lid
+              dir = if linNodeTool l
                       then takeDirectory (lrPath req) else lrCwd req
-          mout <- runToolCapture exe args dir
+              (pexe, pargs) = toolCommand (linCmd l) exe args
+          mout <- runToolCapture pexe pargs dir
                     (if feed then Just (lrText req) else Nothing)
           let ds = maybe [] (parseLintOutput lid (lrPath req)) mout
           goRuns rest (ds : acc)

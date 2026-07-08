@@ -14,7 +14,7 @@ module Cmedit.Lint
   ) where
 
 import Data.Char (isAsciiUpper, isDigit, isSpace, isAlphaNum, toLower)
-import Data.List (dropWhileEnd, elemIndices, isInfixOf, isPrefixOf, sortOn, stripPrefix)
+import Data.List (dropWhileEnd, elemIndices, intercalate, isInfixOf, isPrefixOf, sortOn, stripPrefix)
 import Data.Text (Text)
 import qualified Data.Text as T
 
@@ -55,7 +55,8 @@ data Linter = Linter
   , linInstall   :: !String              -- ^ install hint: "pip install ruff"
   , linSupersededBy :: !(Maybe LinterId) -- ^ flake8 -> Just LRuff
   , linDefaultOn :: !Bool
-  , linNodeTool  :: !Bool                -- ^ also look in <root>/node_modules/.bin
+  , linNodeTool  :: !Bool                -- ^ also look in <root>/node_modules/.bin,
+                                         --   or run via <root>/.pnp.cjs (Yarn PnP)
   }
 
 -- | The linter catalogue, in a fixed order the config writer and settings UI
@@ -78,7 +79,10 @@ linters =
   , Linter { linId = LEslint, linName = "eslint"
            , linExts = [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"]
            , linCmd = "eslint"
-           , linArgs = \p -> ["--format", "unix", "--stdin", "--stdin-filename", p]
+           -- stylish, not unix: eslint 9 removed the unix/compact formatters
+           -- from core, and stylish is built into both 8 and 9. --no-color
+           -- guards against a FORCE_COLOR environment defeating the parser.
+           , linArgs = \p -> ["--format", "stylish", "--no-color", "--stdin", "--stdin-filename", p]
            , linStdin = True, linInstall = "npm install -D eslint"
            , linSupersededBy = Nothing, linDefaultOn = True, linNodeTool = True }
   , Linter { linId = LStylelint, linName = "stylelint"
@@ -138,6 +142,7 @@ parseLintOutput lid _path txt =
 
 parseLine :: LinterId -> String -> [Diag]
 parseLine LPyright s = maybe [] (: []) (parsePyright s)
+parseLine LEslint s = maybe [] (: []) (parseEslintStylish s)
 parseLine lid s =
   case scanGcc s of
     Nothing -> []
@@ -197,13 +202,7 @@ interpret LFlake8 rest =
           sev = if "E9" `isPrefixOf` c || "F8" `isPrefixOf` c then SevError else SevWarning
       in (sev, c, msg)
     _ -> (SevWarning, "", rest)
-interpret LEslint rest =
-  case splitTrailing '[' ']' rest of
-    Just (before, inner) ->
-      let (sevWord, afterSlash) = break (== '/') inner
-          code = drop 1 afterSlash          -- part after the first '/'
-      in (sevFromWord sevWord, code, before)
-    Nothing -> (SevWarning, "", rest)
+interpret LEslint rest = (SevWarning, "", rest)   -- unused: eslint has its own parser
 interpret LStylelint rest =
   case splitTrailing '[' ']' rest of
     Just (before, inner) ->
@@ -265,6 +264,57 @@ scanPyright = go
             _ -> go t
         _ -> go t
     go (_ : t) = go t
+
+-- | eslint's @stylish@ formatter (the only machine-parsable format left in
+-- core eslint 9 — @unix@ and @compact@ were removed): a file-path header
+-- line, then one indented row per problem, columns padded to 2+ spaces:
+--
+-- >   660:7  warning  'x' is assigned a value but never used  no-unused-vars
+--
+-- The trailing rule id is absent for parsing errors, and a message can itself
+-- contain a double space, so the last field only counts as the rule id when
+-- it looks like one ('isRuleId'). Header, blank and summary ("2 problems")
+-- lines all fail the leading @\<space\>...\<digits\>:\<digits\>@ shape and
+-- parse to nothing.
+parseEslintStylish :: String -> Maybe Diag
+parseEslintStylish s0 = case s0 of
+  (c0 : _) | isSpace c0 ->
+    case spanNum (dropWhile isSpace s0) of
+      Just (ln, ':' : t) ->
+        case spanNum t of
+          Just (col, rest) ->
+            case splitWide (dropWhileEnd isSpace rest) of
+              (sevWord : fs@(_ : _)) ->
+                let (msg, code) = case reverse fs of
+                      (lastF : preR@(_ : _)) | isRuleId lastF
+                        -> (intercalate "  " (reverse preR), lastF)
+                      _ -> (intercalate "  " fs, "")
+                in Just (mkDiag LEslint ln col (sevFromWord sevWord) code msg)
+              _ -> Nothing
+          _ -> Nothing
+      _ -> Nothing
+  _ -> Nothing
+
+-- | Split on runs of two or more spaces (stylish column padding); single
+-- spaces stay inside a field. Wide runs at either end produce no empty
+-- fields.
+splitWide :: String -> [String]
+splitWide = go . dropPad
+  where
+    dropPad = dropWhile (== ' ')
+    go [] = []
+    go s = let (f, r) = breakWide s in f : go (dropPad r)
+    breakWide s@(' ' : ' ' : _) = ([], s)
+    breakWide (c : r) = let (f, r2) = breakWide r in (c : f, r2)
+    breakWide [] = ([], [])
+
+-- | Does a field look like an eslint rule id (@semi@, @no-var@,
+-- @\@typescript-eslint/no-unused-vars@)? Alphanumerics plus a little
+-- punctuation and no spaces — a message tail has spaces, so this keeps real
+-- messages out of the code slot.
+isRuleId :: String -> Bool
+isRuleId t = any isAlphaNum t && all ok t
+  where ok c = isAlphaNum c || c `elem` ("@/-_+:." :: String)
 
 -- | A leading run of ASCII uppercase letters followed by digits (e.g. "E501").
 isCodeTok :: String -> Bool

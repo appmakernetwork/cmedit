@@ -3558,16 +3558,32 @@ main = do
     checkEq "flake8 sev list" (map dgSev flakeD) [SevError, SevWarning]
     checkEq "flake8 codes" (map dgCode flakeD) (map T.pack ["E999", "F401"])
 
-    -- eslint (unix): rule id after '/', severity word, "N problems" summary skipped.
-    let eslintOut = T.pack "foo.js:1:10: Unexpected var. [Error/no-var]\n\n1 problem\n"
+    -- eslint (stylish): header path line and "N problems" summary are skipped;
+    -- rows carry line:col, a severity word, the message, and usually a
+    -- trailing rule id (absent for parsing errors, which also report 0:0 —
+    -- clamped to the buffer start). A double space inside the message must not
+    -- promote its tail to a rule id unless it actually looks like one.
+    let eslintOut = T.pack $ unlines
+          [ "/w/foo.js"
+          , "   1:10  error    Unexpected var  no-var"
+          , "  12:3   warning  'y' is assigned a value but never used. Allowed unused vars must match /^_/u  @typescript-eslint/no-unused-vars"
+          , "   0:0   error    Parsing error: Unexpected token )"
+          , ""
+          , "\x2716 3 problems (2 errors, 1 warning)"
+          , "  1 error and 0 warnings potentially fixable with the `--fix` option." ]
         eslintD = parseLintOutput LEslint "foo.js" eslintOut
-    checkEq "eslint count" (length eslintD) 1
+    checkEq "eslint count" (length eslintD) 3
     case eslintD of
-      [d] -> do
-        checkEq "eslint pos" (dgLine d, dgCol d) (0, 9)
-        checkEq "eslint code" (dgCode d) (T.pack "no-var")
-        checkEq "eslint sev" (dgSev d) SevError
-        checkEq "eslint msg" (dgMsg d) (T.pack "Unexpected var.")
+      [d0, d1, d2] -> do
+        checkEq "eslint parse-error pos" (dgLine d0, dgCol d0) (0, 0)
+        checkEq "eslint parse-error code" (dgCode d0) (T.pack "")
+        checkEq "eslint parse-error msg" (dgMsg d0) (T.pack "Parsing error: Unexpected token )")
+        checkEq "eslint pos" (dgLine d1, dgCol d1) (0, 9)
+        checkEq "eslint code" (dgCode d1) (T.pack "no-var")
+        checkEq "eslint sev" (dgSev d1) SevError
+        checkEq "eslint msg" (dgMsg d1) (T.pack "Unexpected var")
+        checkEq "eslint plugin code" (dgCode d2) (T.pack "@typescript-eslint/no-unused-vars")
+        checkEq "eslint plugin sev" (dgSev d2) SevWarning
       _ -> check "eslint parsed" False
 
     -- stylelint (unix): severity in [ ], optional trailing (rule) → code.
