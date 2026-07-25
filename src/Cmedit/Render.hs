@@ -46,7 +46,7 @@ import Cmedit.Search
 import qualified Cmedit.Search as S
 import qualified Data.Sequence as Seq
 import Cmedit.Csv (CsvView(..))
-import Cmedit.Link (filePathUri, urlSpans)
+import Cmedit.Link (filePathUri, urlSpans, urlSpansIn)
 import qualified Cmedit.Csv as Csv
 import Cmedit.ConfigFile (ThemeName(..))
 import Cmedit.Definition (DefPick(..), DefItem(..))
@@ -876,7 +876,8 @@ drawTextArea th ed lo arr
               diagOver = diagOverFor th diagsOnLine line
               cells = expandLineCellsFrom tabw (edShowWhitespace ed)
                         baseAt (thSelection th) (thWhitespace th)
-                        selRange selEOL overlays diagOver (urlLinks line)
+                        selRange selEOL overlays diagOver
+                        (urlLinksIn startCol (startCol + tw + 8) line)
                         startCol startDisp (T.drop startCol line)
               visible = takeWhile (\(d, _) -> d < left + tw)
                           (dropWhile (\(d, _) -> d < left) cells)
@@ -911,7 +912,8 @@ drawTextAreaWrapped th ed lo arr = loop (edTop ed) 0
               diagOver = diagOverFor th (Map.findWithDefault [] li dmap) line
               cells = expandLineCells tabw (edShowWhitespace ed)
                         baseAt (thSelection th) (thWhitespace th)
-                        selRange False overlays diagOver (urlLinks line) line
+                        selRange False overlays diagOver
+                        (urlLinksIn 0 (T.length line) line) line
           vrow' <- drawSegs li line cells eolFlag segs 0 vrow
           loop (li + 1) vrow'
     drawSegs _ _ _ _ [] _ vrow = pure vrow
@@ -1056,12 +1058,24 @@ gutterStyleFor th ed onLine bl
       ss | minimum ss == SevError -> thGutterDiag th
          | otherwise              -> (thGutterDiag th) { styleFg = thDiagWarn th }
 
--- | The URL hyperlink spans of a document line, with the same length guard
--- as highlighting so a megabyte-long minified line can't dominate a frame.
-urlLinks :: Text -> [(Int, Int, Text)]
-urlLinks line
-  | T.length line > maxHlLine = []
-  | otherwise = urlSpans line
+-- | The URL hyperlink spans of a document line that could be visible in the
+-- character window @[from, to)@, with the same length guard as highlighting so
+-- a megabyte-long minified line can't dominate a frame.
+--
+-- Short lines are scanned whole (identical to before, and cheaper than working
+-- out a window); past 'urlWindowLine' only the window is scanned, because
+-- per-frame cost must follow what is on screen rather than how long the line
+-- happens to be.
+urlLinksIn :: Int -> Int -> Text -> [(Int, Int, Text)]
+urlLinksIn from to line
+  | len > maxHlLine      = []
+  | len <= urlWindowLine = urlSpans line
+  | otherwise            = urlSpansIn from to line
+  where len = T.length line
+
+-- Lines at or under this length are scanned for URLs in full.
+urlWindowLine :: Int
+urlWindowLine = 2000
 
 -- Map a syntax token to a display style (per-theme palette).
 tokStyle :: Theme -> Tok -> Style
@@ -1083,8 +1097,9 @@ mkBaseAt th toks
 highlightMap :: Lang -> Editor -> Int -> Int -> Map.Map Int [Tok]
 highlightMap lang ed top count =
   let buf   = edBuffer ed
+      lns   = bufLines buf
       lastL = min (lineCount buf - 1) (top + count - 1)
-      cache = refreshHlCache lang (bufLines buf) lastL (edHlCache ed)
+      cache = refreshHlCache lang lns lastL (edHlCache ed)
       go _ li acc
         | li > lastL = acc
       go st li acc =

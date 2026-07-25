@@ -26,6 +26,7 @@ module Cmedit.Search
     -- * Matching (also used by the IO walker)
   , lineMatches
   , scanMatches
+  , normCase
   , fileMatches
   , Matcher
   , compileMatcher
@@ -77,7 +78,8 @@ module Cmedit.Search
   ) where
 
 import Data.Array (Array, listArray, (!))
-import Data.Char (isSpace, isAlphaNum, toLower)
+import Data.Char (isSpace, isAlphaNum, toLower, toUpper)
+import Data.Maybe (isJust)
 import Data.Foldable (toList)
 import Data.List (foldl', findIndex)
 import Data.Sequence (Seq)
@@ -235,6 +237,14 @@ maxResultFiles = 5000
 maxFileBytesToSearch :: Integer
 maxFileBytesToSearch = 8 * 1024 * 1024
 
+-- | Case-fold for matching.
+--
+-- @T.map toLower@ was tried here (it preserves length, which @T.toLower@ does
+-- not — U+0130 lowercases to two code points, shifting every column after it)
+-- and measured 2x SLOWER in context: @T.toLower@ has a specialised UTF-8 loop,
+-- while @T.map@ goes through stream fusion and re-encodes per character. The
+-- microbenchmark that suggested otherwise was fusing @length . map@ into a
+-- count that never built the result. Left as-is deliberately.
 normCase :: Bool -> Text -> Text
 normCase cs = if cs then id else T.toLower
 
@@ -278,6 +288,22 @@ scanMatches overlap ww nterm nline
 -- | Non-overlapping (startCol, length) matches of @term@ in @line@, honouring
 -- case-insensitivity (@cs@ False = ignore case) and whole-word (@ww@).
 -- Linear in the line length whatever the options (see 'scanMatches').
+--
+-- The case-insensitive path folds the whole line, which looks wasteful — it is
+-- the default, and it runs on every line of every file searched. Two ways
+-- around it were tried and both measured WORSE over a 49 MB corpus, so it is
+-- left alone deliberately:
+--
+--  * a first-character pre-filter to skip lines that cannot match. To be
+--    correct on non-ASCII it has to compare @toLower c@ per character, which
+--    costs about what the fold it avoids costs: 239 ms for a term matching
+--    nothing, against 227 ms folding everything. (It does cut allocation 10x
+--    in that case, which is not worth a correctness-sensitive branch.)
+--  * @T.map toLower@ instead of @T.toLower@ — 2x slower in context; see
+--    'normCase'.
+--
+-- The real floor here is @T.lines@ plus the per-line scan (a case-sensitive
+-- search over the same corpus is 56 ms), not the case folding.
 lineMatches :: Bool -> Bool -> Text -> Text -> [(Int, Int)]
 lineMatches cs ww term line
   | T.null term = []

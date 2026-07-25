@@ -51,6 +51,71 @@ only on libraries that ship with GHC. Please keep it that way:
   architecture.
 - Run `make test` and make sure it prints `failed 0` before opening a PR.
 
+### Performance invariants
+
+CMeDit is meant to stay fast in a session that has been open all day. A handful
+of rules cover almost everything that has gone wrong here before; each one cost
+real memory or real milliseconds when it was broken.
+
+1. **A bound must be structural, never a lazy `take`.** `take n (x : xs)`
+   retains everything it promises to drop — the cap only applies if something
+   walks the list that far, and nothing does. Use `Cmedit.History.pushHist`
+   (a `Seq` with `Seq.take`). *Measured when broken: 51 MB of undo history live
+   after 200 000 edits against a nominal 1 000-entry cap.*
+2. **A `Text` that outlives its buffer must be `detach`ed**
+   (`Cmedit.EditorState.detach`). `Data.Text` values are slices of a shared
+   array and a buffer's lines are slices of the whole file, so one escaped slice
+   pins the entire file. Applies to the clipboard, search terms, persisted
+   history, completion candidates and result snippets. *Measured when broken:
+   ten retained lines of a 49 MB file held 49 MB.*
+3. **Per-frame work is per-*visible*-cell work.** Anything the renderer does per
+   line must be proportional to the visible window, not the line length.
+   *Measured when broken: 7.9 ms per keystroke on 3 000-character lines with no
+   highlighting at all.*
+4. **When the caller knows what changed, tell the callee.** Rediscovering it by
+   diffing is O(collection). *Measured when broken: 7.4 ms and 22 MB per
+   keystroke on a 300 000-row CSV, spent working out which cell had just been
+   edited.*
+5. **Bound anything that grows with session length**, and say what the bound is
+   in a comment: undo/redo, navigation stops, input history, search results,
+   paste payloads, in-flight background jobs.
+6. **One background job of each kind in flight.** A generation counter that only
+   discards stale *results* still pays for the work.
+7. **Storage into a `Seq` is element-lazy.** `Seq.update i x` is
+   `adjust (const x) i` and stores a thunk capturing the old element; use
+   `Seq.adjust'` and force what you store, or versions chain and none can be
+   collected.
+
+### Soak testing
+
+`make soak` runs 60 000 scripted editor operations and fails if live heap,
+allocation per operation or time per operation grows with session length.
+`make soak-long` runs ten times as many. It is not part of `make test` (it takes
+tens of seconds), but run it before merging anything that touches editing state,
+caches or background work.
+
+### Measuring
+
+The test suite builds at `-O0`, which is right for correctness and wrong for
+performance. Build a harness against `src/` instead — `docs/plans/bench/`
+has one, its exact command line, and the PTY probes that measure the real
+binary's startup, RSS and idle behaviour.
+
+Two traps in this codebase produce plausible numbers that are simply wrong, in
+opposite directions:
+
+- **Force your inputs before timing.** Building the test buffer is O(file) and
+  is otherwise charged to whatever you measure first.
+- **Force your outputs meaningfully.** `Screen`'s cells are lazy, so forcing a
+  `Screen` to WHNF renders nothing; a render benchmark must run the real
+  `renderFrame` diff. Likewise `length . map` over `Text` fuses into a count
+  that never builds the result.
+
+To diagnose a real session, `cmedit +RTS -hT -i5` gives a heap census by closure
+type and `+RTS -s` a summary — both work on the shipped binary (it is built with
+`-rtsopts`), no profiling libraries needed. A data constructor and `THUNK_*`
+appearing in identical byte counts is the "lazy accumulator" signature.
+
 ## Reporting bugs
 
 Open an issue with the terminal you're using, the steps to reproduce, and what

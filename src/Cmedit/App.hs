@@ -6,16 +6,18 @@ module Cmedit.App
   ( run
   ) where
 
-import Control.Concurrent (forkIO, getNumCapabilities, myThreadId)
+import Control.Concurrent (ThreadId, forkIO, getNumCapabilities, killThread, myThreadId)
 import Control.Concurrent.STM
 import GHC.Conc (getNumProcessors, setNumCapabilities)
-import Control.Exception (SomeException, bracket, bracket_, finally, handle, try)
+import Control.Exception (SomeException, bracket, bracket_, catch, finally, handle, mask_, throwIO, try)
 import Control.Monad (foldM, forM, forM_, unless, void, when)
 import qualified Data.ByteString as BS
 import Data.ByteString.Builder (Builder, char7, hPutBuilder)
+import Data.Foldable (toList)
 import Data.IORef
 import Data.List (isPrefixOf, sort, sortOn)
 import qualified Data.Map.Strict as M
+import qualified Data.Sequence as Seq
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Time.Clock (UTCTime)
 import Data.Word (Word8)
@@ -24,6 +26,8 @@ import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Encoding.Error as TEE
 import qualified Data.Text.IO as TIO
 import GHC.Clock (getMonotonicTime)
+import GHC.Stats
+import Text.Printf (printf)
 import System.Directory
   ( canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, doesFileExist
   , findExecutable, getCurrentDirectory, getFileSize, getModificationTime, listDirectory
@@ -33,6 +37,7 @@ import System.IO
 import System.Process
   ( CreateProcess(..), StdStream(CreatePipe), proc
   , terminateProcess, waitForProcess, withCreateProcess )
+import System.Mem (performMajorGC)
 import System.Timeout (timeout)
 
 import Cmedit.About (aboutTickUs)
@@ -64,16 +69,16 @@ import Cmedit.Types
 -- | Run the editor: open any named files, then loop until the user quits.
 -- @cfgWarns@ are problems found in the user's config file, surfaced on the
 -- status line once the screen is up.
-run :: Config -> [String] -> [FilePath] -> Bool -> IO ()
-run cfg cfgWarns files readOnly = do
+run :: Config -> [String] -> [FilePath] -> Bool -> Bool -> IO ()
+run cfg cfgWarns files readOnly statsOnExit = do
   inTty  <- hIsTerminalDevice stdin
   outTty <- hIsTerminalDevice stdout
   if not (inTty && outTty)
     then hPutStrLn stderr "cmedit: stdin and stdout must be a terminal"
-    else runTui cfg cfgWarns files readOnly
+    else runTui cfg cfgWarns files readOnly statsOnExit
 
-runTui :: Config -> [String] -> [FilePath] -> Bool -> IO ()
-runTui cfg cfgWarns files readOnly = do
+runTui :: Config -> [String] -> [FilePath] -> Bool -> Bool -> IO ()
+runTui cfg cfgWarns files readOnly statsOnExit = do
   -- Configure the handles BEFORE entering raw mode. GHC's hSetBuffering /
   -- hSetEcho snapshot the current terminal state and restore it when the
   -- standard handles are finalised at exit; if we entered raw mode first, that
@@ -93,7 +98,10 @@ runTui cfg cfgWarns files readOnly = do
     recents <- loadRecentFile
     (findHist, replHist) <- loadHistoryFile
     ed0'' <- buildInitialEditor cfg recents size files readOnly
-    let ed0' = ed0'' { edFindHist = findHist, edReplHist = replHist }
+    -- The on-disk history is a plain list; the editor keeps it in a bounded
+    -- Seq (see Cmedit.History), so convert at this boundary only.
+    let ed0' = ed0'' { edFindHist = Seq.fromList findHist
+                     , edReplHist = Seq.fromList replHist }
     -- Config-file problems beat the welcome text (the user should fix them),
     -- but not a real load message.
     let ed0 = case cfgWarns of
@@ -126,8 +134,13 @@ runTui cfg cfgWarns files readOnly = do
     lintGen   <- newTVarIO 0
     lintFpRef <- newIORef (lintFingerprint ed0Px)
     lintAvRef <- newIORef (edLintAvail ed0Px)
+    lintRunRef <- newIORef Nothing
+    lintLastRef <- newIORef 0
+    jobsRef <- newIORef M.empty
+    stats <- newDrvStats
     let drv = Drv loadQ searchQ searchGen defGen dirMtimes focused recentsRef quickGen
-                  capsRef pointerRef themeRef gfxRef lintGen lintFpRef lintAvRef
+                  capsRef pointerRef themeRef gfxRef lintGen lintFpRef lintAvRef lintRunRef
+                  lintLastRef stats jobsRef
     src       <- mkHandleSource stdin
     clickRef  <- newIORef (ClickState 0 (-1) (-1) 0)
     mainTid   <- myThreadId
@@ -152,7 +165,9 @@ runTui cfg cfgWarns files readOnly = do
         -- find/replace history on the way out — including SIGTERM/SIGHUP.
         `finally` (do edF <- readIORef editorRef
                       saveRecentFile (recentsForPersist edF)
-                      saveHistoryFile (edFindHist edF) (edReplHist edF)))
+                      saveHistoryFile (toList (edFindHist edF))
+                                      (toList (edReplHist edF))))
+    when statsOnExit (reportStats drv)
 
 -- Construct the starting editor. Directory arguments open as the workspace
 -- folder (the explorer panel); file arguments are loaded (the first becomes the
@@ -196,6 +211,69 @@ loadInitialFiles cfg recents size files readOnly = do
         OutText p lr  -> addDocument p lr e
         OutImage p im -> addImageDocument p im e
         OutError _    -> e
+
+-- | Refresh the status bar's live counters when @debug-stats@ is on (and clear
+-- them if it was just turned off). Returns whether anything changed, so the
+-- caller only repaints when it must.
+refreshStatsLine :: Drv -> IORef Editor -> IO Bool
+refreshStatsLine drv editorRef = do
+  ed <- readIORef editorRef
+  if not (cfgDebugStats (edConfig ed))
+    then if isJust (edStats ed)
+           then modifyIORef' editorRef (setStatsLine Nothing) >> pure True
+           else pure False
+    else do
+      let st = drvStats drv
+      frames <- readIORef (stFrames st)
+      totMs  <- readIORef (stFrameMs st)
+      maxMs  <- readIORef (stFrameMax st)
+      jobs   <- readIORef (stJobs st)
+      enabled <- getRTSStatsEnabled
+      live <- if enabled
+                then (\s -> gcdetails_live_bytes (gc s) `div` (1024 * 1024)) <$> getRTSStats
+                else pure 0
+      let avg = if frames == 0 then 0 else totMs / fromIntegral frames
+          txt = T.pack (printf "f %.1f/%.0fms %dMB j%d" avg maxMs live jobs)
+      if edStats ed == Just txt
+        then pure False
+        else modifyIORef' editorRef (setStatsLine (Just txt)) >> pure True
+
+-- | The @--stats-on-exit@ summary, printed to stderr after the terminal has
+-- been restored. Everything here is a counter read or an RTS stat, so it costs
+-- nothing during the session — and it turns "it felt slower after a while" into
+-- numbers someone can act on.
+reportStats :: Drv -> IO ()
+reportStats drv = do
+  let st = drvStats drv
+  now    <- getMonotonicTime
+  keys   <- readIORef (stKeys st)
+  frames <- readIORef (stFrames st)
+  totMs  <- readIORef (stFrameMs st)
+  maxMs  <- readIORef (stFrameMax st)
+  jobs   <- readIORef (stJobs st)
+  killed <- readIORef (stKilled st)
+  lints  <- readIORef (stLints st)
+  idle   <- readIORef (stIdleGcs st)
+  opened <- readIORef (stOpened st)
+  enabled <- getRTSStatsEnabled
+  rts <- if enabled then Just <$> getRTSStats else pure Nothing
+  let secs = now - stStart st
+      hh   = floor (secs / 3600) :: Int
+      mm   = floor ((secs - fromIntegral hh * 3600) / 60) :: Int
+      ss   = floor (secs - fromIntegral hh * 3600 - fromIntegral mm * 60) :: Int
+      mb b = show (b `div` (1024 * 1024)) ++ " MB"
+      avgMs = if frames == 0 then 0 else totMs / fromIntegral frames
+      r1 = printf "cmedit: session %dh%02dm%02ds, %d keys, %d frames (avg %.2fms, max %.0fms)"
+                  hh mm ss keys frames avgMs maxMs :: String
+      r2 = case rts of
+             Nothing -> "        (build with +RTS -T for memory figures)"
+             Just s  -> printf "        live %s, peak %s, allocated %s, %d major GCs (%.0fms total)"
+                          (mb (gcdetails_live_bytes (gc s))) (mb (max_live_bytes s))
+                          (mb (allocated_bytes s)) (major_gcs s)
+                          (fromIntegral (gc_elapsed_ns s) / 1e6 :: Double)
+      r3 = printf "        %d files opened, %d background jobs (%d cancelled), %d lint passes, %d idle collections"
+                  opened jobs killed lints idle :: String
+  mapM_ (hPutStrLn stderr) [r1, r2, r3]
 
 ------------------------------------------------------------------------------
 -- Terminal screen lifecycle
@@ -281,7 +359,48 @@ data Drv = Drv
   , drvLintGen   :: !(TVar Int)       -- ^ id of the newest lint pass; a stale runner's result is dropped.
   , drvLintFp    :: !(IORef LintFp)   -- ^ Last-seen lint fingerprint; the debounce arms when it changes.
   , drvLintAvail :: !(IORef LintAvail) -- ^ Driver copy of detected linters (the runner reads it; the editor's copy drives the pure side).
+  , drvLintRun   :: !(IORef (Maybe (Int, ThreadId)))
+      -- ^ The lint pass currently in flight, if any: (generation, runner).
+      --   Starting a pass kills the previous one — see 'startLintRun'.
+  , drvLintLast  :: !(IORef Double)   -- ^ Monotonic time the last pass started (rate floor).
+  , drvStats     :: !DrvStats        -- ^ Session counters for @--stats-on-exit@.
+  , drvJobs      :: !(IORef (M.Map JobKind ThreadId))
+      -- ^ At most one background job of each kind. Starting one cancels the
+      --   previous: the generation counters already made a superseded result be
+      --   dropped, but the work itself carried on — a retyped search term left
+      --   the old walk reading files nobody would look at.
   }
+
+-- | Cheap session counters. Bumped with 'modifyIORef'' at a handful of sites
+-- and read once, at exit, by @--stats-on-exit@ — the single most useful thing
+-- to attach to a bug report about a long session, and it needs no UI.
+data DrvStats = DrvStats
+  { stKeys    :: !(IORef Int)      -- ^ Key events applied.
+  , stFrames  :: !(IORef Int)      -- ^ Frames rendered.
+  , stBytes   :: !(IORef Integer)  -- ^ Bytes written to the terminal.
+  , stFrameMs :: !(IORef Double)   -- ^ Total time spent rendering.
+  , stFrameMax :: !(IORef Double)  -- ^ Slowest single frame.
+  , stJobs    :: !(IORef Int)      -- ^ Background jobs started.
+  , stKilled  :: !(IORef Int)      -- ^ Background jobs cancelled by a newer one.
+  , stLints   :: !(IORef Int)      -- ^ Lint passes started.
+  , stIdleGcs :: !(IORef Int)      -- ^ Idle collections performed.
+  , stOpened  :: !(IORef Int)      -- ^ Files opened.
+  , stStart   :: !Double           -- ^ Monotonic start time.
+  }
+
+newDrvStats :: IO DrvStats
+newDrvStats = DrvStats
+  <$> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef 0
+  <*> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef 0
+  <*> getMonotonicTime
+
+bump :: (DrvStats -> IORef Int) -> Drv -> IO ()
+bump f drv = modifyIORef' (f (drvStats drv)) (+ 1)
+
+-- | Kinds of background work the driver supervises. At most one of each runs;
+-- the input reader and the main loop are deliberately not in this list.
+data JobKind = JSearch | JDefs | JQuickOpen | JLoad | JReplace
+  deriving (Eq, Ord, Show)
 
 -- | What the driver watches to decide a fresh lint pass is due: the active
 -- document path, its edit counter, and the linting configuration/availability.
@@ -326,12 +445,27 @@ maybePersistRecents drv editorRef = do
     saveRecentFile (recentsForPersist ed)
     writeIORef (drvRecents drv) paths
 
+-- | Collapse a run of consecutive drag events (same button) to its last one.
+--
+-- A terminal reporting motion can deliver dozens of drag events per batch; only
+-- the final position matters, since each simply moves the selection end. The
+-- intermediate ones cost a full pure update each and change nothing that is
+-- ever displayed. Presses, releases and any other key break the run.
+coalesceDrags :: [Key] -> [Key]
+coalesceDrags (KMouse a : rest@(KMouse b : _))
+  | meDrag a && meDrag b && meButton a == meButton b = coalesceDrags rest
+coalesceDrags (k : ks) = k : coalesceDrags ks
+coalesceDrags []       = []
+
 -- A message from a background search/replace worker to the main loop.
 data SearchMsg
   = SMFile     !Int !FileResult   -- ^ gen, one file's disk matches.
   | SMProgress !Int !Int          -- ^ gen, files scanned so far.
   | SMDone     !Int !Bool         -- ^ gen, whether the global cap was hit.
   | SMReplaceDone !Int            -- ^ total occurrences replaced (open + on-disk).
+  | SMStaged !ReplaceReq ![(FilePath, LoadResult)]
+      -- ^ Files read for a staged Replace All; the loop applies the (pure)
+      --   staging and reveals them.
   | SMDefFile  !Int !FileResult   -- ^ def-gen, one file's definition sites.
   | SMDefDone  !Int               -- ^ def-gen, the definition scan finished.
   | SMQuickFiles !Int ![FilePath] -- ^ quick-gen, a batch of workspace-relative file paths.
@@ -344,7 +478,7 @@ data SearchMsg
 
 -- One thing the loop woke up for.
 data LoopAction = GotKey !Key | GotLoad !LoadOutcome | GotSearch !SearchMsg
-                | Tick | FsTick | ImgTick | LintTick
+                | Tick | FsTick | ImgTick | LintTick | IdleTick
 
 -- Spinner animation interval (µs) while a background file load is in progress.
 spinnerDelayUs :: Int
@@ -361,21 +495,51 @@ fsPollDelayUs = 2000000
 lintDebounceUs :: Int
 lintDebounceUs = 500000
 
+-- Minimum (µs) between the starts of two lint passes. The debounce alone has no
+-- rate limit: typing in 600 ms bursts starts a pass per burst, each spawning
+-- external processes over the whole buffer. A pass that would start too soon is
+-- deferred, not dropped — the debounce re-arms and it runs when the floor lifts.
+lintMinIntervalUs :: Int
+lintMinIntervalUs = 2000000
+
 -- Hard cap (µs) on any one linter invocation; a tool that hangs is terminated
 -- and yields no diagnostics rather than wedging the runner thread.
 lintTimeoutUs :: Int
 lintTimeoutUs = 10000000
 
+-- Hard cap (µs) on a whole lint pass, however many tools it runs.
+lintPassTimeoutUs :: Int
+lintPassTimeoutUs = 20000000
+
+-- Quiet period (µs) after which the editor runs one major collection so the
+-- heap left behind by a big transient (a CSV parse, a workspace search, a
+-- closed document) is actually collected and handed back.
+--
+-- Without it nothing is ever collected while the user is reading rather than
+-- typing: the mutator stops allocating, so no GC is scheduled, so the process
+-- keeps the high-water mark of everything it has ever opened — measured
+-- 2.5 GB still resident after opening *and closing* a 32 MB CSV. Fires at most
+-- once per idle period (it re-arms only when something happens), so a session
+-- left open overnight costs exactly one collection.
+idleGcDelayUs :: Int
+idleGcDelayUs = 30000000
+
 eventLoop :: IORef Editor -> IORef (Maybe Screen) -> IORef String
           -> TQueue Key -> Drv -> ByteSource -> IO ()
-eventLoop editorRef prevRef titleRef q drv _src =
-  registerDelay fsPollDelayUs >>= \pollT -> loop pollT Nothing
+eventLoop editorRef prevRef titleRef q drv _src = do
+  pollT0 <- registerDelay fsPollDelayUs
+  idle0  <- armIdle
+  loop pollT0 Nothing idle0
   where
     loadQ   = drvLoadQ drv
     searchQ = drvSearchQ drv
-    -- The loop carries two software timers: 'pollT' (filesystem freshness) and
-    -- 'mlint' (the lint debounce, armed only when the lint fingerprint changes).
-    loop pollT mlint = do
+    -- Arm the idle-collection timer. Re-armed by every branch that does work,
+    -- so it only fires after a genuinely quiet stretch.
+    armIdle = Just <$> registerDelay idleGcDelayUs
+    -- The loop carries three software timers: 'pollT' (filesystem freshness),
+    -- 'mlint' (the lint debounce, armed when the lint fingerprint changes) and
+    -- 'midle' (the idle collection, disarmed once it has fired).
+    loop pollT mlint midle = do
       -- While a file is loading or a search is running, arm a timer so the
       -- spinner animates; otherwise block purely on input / load / search results.
       ed0 <- readIORef editorRef
@@ -408,6 +572,9 @@ eventLoop editorRef prevRef titleRef q drv _src =
         `orElse` (case mlint of
                     Just tv -> readTVar tv >>= check >> pure LintTick
                     Nothing -> retry)
+        `orElse` (case midle of
+                    Just tv -> readTVar tv >>= check >> pure IdleTick
+                    Nothing -> retry)
         `orElse` (readTVar pollT >>= check >> pure FsTick)
       case action of
         -- A background load finished: install it, apply any pending result-jump,
@@ -422,7 +589,8 @@ eventLoop editorRef prevRef titleRef q drv _src =
           renderNow drv editorRef prevRef titleRef
           -- A load installed a fresh buffer (fingerprint changed): (re-)arm lint.
           mlint' <- maybeArmLint mlint
-          loop pollT mlint'
+          idle' <- armIdle
+          loop pollT mlint' idle'
         -- A streamed search/replace result: drain the whole backlog and fold it
         -- in before a *single* repaint — a broad search (a common word over a huge
         -- tree) floods thousands of results, and repainting per result would peg
@@ -441,40 +609,60 @@ eventLoop editorRef prevRef titleRef q drv _src =
           -- Detection completing (SMLintAvail) changes the fingerprint, which
           -- arms the initial lint for a file opened before any keystroke.
           mlint' <- maybeArmLint mlint
-          loop pollT mlint'
+          idle' <- armIdle
+          loop pollT mlint' idle'
         -- Advance the spinner(s) / About animation one frame.
         Tick -> do
           modifyIORef' editorRef (tickLoading . searchTick . tickAbout)
           renderNow drv editorRef prevRef titleRef
-          loop pollT mlint
+          armIdle >>= loop pollT mlint
         -- Advance the animated image one frame ('tickImage' re-checks that
         -- the editor still owns playback before stepping).
         ImgTick -> do
           modifyIORef' editorRef tickImage
           renderNow drv editorRef prevRef titleRef
-          loop pollT mlint
+          armIdle >>= loop pollT mlint
         -- The debounce fired: run the linters for the active document (if any
         -- still apply) and disarm the timer.
         LintTick -> do
-          fireLint
-          loop pollT Nothing
+          started <- fireLint
+          -- Deferred by the rate floor: keep the timer armed so it runs shortly.
+          mlint' <- if started then pure Nothing
+                               else Just <$> registerDelay lintMinIntervalUs
+          armIdle >>= loop pollT mlint'
+        -- The editor has been quiet: collect once, so a transient spike (a
+        -- parsed table, a finished search, a closed document) is released
+        -- instead of held for the rest of the session. Not re-armed — the next
+        -- thing that happens arms it again.
+        IdleTick -> do
+          bump stIdleGcs drv
+          performMajorGC
+          loop pollT mlint Nothing
         -- Periodic filesystem freshness pass; repaint only if it changed anything.
         FsTick -> do
           changed <- pollFs drv editorRef
-          when changed $ renderNow drv editorRef prevRef titleRef
-          registerDelay fsPollDelayUs >>= \pt -> loop pt mlint
+          -- The live counters ride the freshness poll rather than arming a
+          -- timer of their own: a 2 s cadence is plenty for a diagnostic, and
+          -- with the key off this is one Bool test every two seconds.
+          statsChanged <- refreshStatsLine drv editorRef
+          when (changed || statsChanged) $ renderNow drv editorRef prevRef titleRef
+          -- A quiet poll is not activity: keep the idle timer running so a
+          -- 2-second poll can never starve the idle collection.
+          midle' <- if changed then armIdle else pure midle
+          registerDelay fsPollDelayUs >>= \pt -> loop pt mlint midle'
         -- A key: drain everything else already queued and apply the whole batch
         -- before a single repaint (so held keys / fast typing never lag).
         GotKey k -> do
           rest <- atomically (flushTQueue q)
-          keep <- applyBatch (k : rest)
+          keep <- applyBatch (coalesceDrags (k : rest))
           if keep
             then do
               maybePersistRecents drv editorRef
               renderNow drv editorRef prevRef titleRef
               -- Edits/undo/redo/file-switch changed the fingerprint → debounce.
               mlint' <- maybeArmLint mlint
-              loop pollT mlint'
+              idle' <- armIdle
+              loop pollT mlint' idle'
             else pure ()   -- quit or EOF: stop the loop
 
     handleSearchMsg msg = case msg of
@@ -492,9 +680,20 @@ eventLoop editorRef prevRef titleRef q drv _src =
       SMDefDone gen     -> modifyIORef' editorRef (defDone gen)
       SMQuickFiles gen ps -> modifyIORef' editorRef (quickFilesFound gen (map T.pack ps))
       SMQuickDone gen   -> modifyIORef' editorRef (quickDone gen)
+      -- Staged Replace All: apply the replacement to each file that was read,
+      -- then reveal the now-dirty documents in the explorer.
+      SMStaged req loaded -> do
+        ed0' <- readIORef editorRef
+        let subst = replaceSubst (rrCase req) (rrWord req) (rrRegex req) (rrTerm req) (rrRepl req)
+            (edStaged, staged) =
+              foldl (\(e, c) (p, lr) -> let (e', k) = addStagedDoc p lr subst e
+                                        in (e', c + k)) (ed0', 0) loaded
+        edRevealed <- revealInExplorer (modifiedDocPaths edStaged) edStaged
+        writeIORef editorRef (stageReplaceDone (rrOpenCount req + staged)
+                                (endLoading edRevealed))
       SMReplaceDone tot -> do
         ed <- readIORef editorRef
-        let (ed1, effs) = replaceDone tot ed
+        let (ed1, effs) = replaceDone tot (endLoading ed)
         ed2 <- performEffects drv effs ed1
         writeIORef editorRef ed2
         notifyUnfocused drv ("Replace All finished: " ++ show tot
@@ -517,6 +716,10 @@ eventLoop editorRef prevRef titleRef q drv _src =
     lintAffectsView ed m = case m of
       SMLint _ path _ -> edPath ed == Just path
       SMLintAvail _   -> isJust (edDialog ed)
+      -- These change the open documents and clear the loading overlay, so they
+      -- must repaint whatever is on screen.
+      SMStaged _ _    -> True
+      SMReplaceDone _ -> True
       _               -> False
 
     -- Re-arm the lint debounce when the fingerprint changed since last time
@@ -538,11 +741,19 @@ eventLoop editorRef prevRef titleRef q drv _src =
               Just <$> registerDelay lintDebounceUs
 
     -- Run the debounced lint pass for the active document (edit-time tools).
+    -- Returns False when the rate floor deferred it, so the caller re-arms.
     fireLint = do
       ed <- readIORef editorRef
       case lintRequest False ed of
-        Nothing  -> pure ()
-        Just req -> startLintRun drv req
+        Nothing  -> pure True
+        Just req -> do
+          now  <- getMonotonicTime
+          prev <- readIORef (drvLintLast drv)
+          if now - prev < fromIntegral lintMinIntervalUs / 1e6
+            then pure False
+            else do writeIORef (drvLintLast drv) now
+                    startLintRun drv req
+                    pure True
 
     -- Apply each key in order (side effects still run per key). Returns False to
     -- stop the loop (quit or EOF) without a trailing render.
@@ -574,6 +785,7 @@ eventLoop editorRef prevRef titleRef q drv _src =
         applyReplyIO drv editorRef rep
         applyBatch ks
       _ -> do
+        bump stKeys drv
         -- Hover feedback: suggest a pointer shape for whatever the mouse is
         -- over (emitted only on transitions; ignored by plain terminals).
         case k of
@@ -761,15 +973,18 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
       Left err      -> pure (setError err ed')
 
   EffOpen path -> do
+    bump stOpened drv
     -- Canonicalise so the already-open check (in setLoadedNew/imageLoadedNew)
     -- matches files opened earlier by any route.
     cpath <- canonicalizeSafe path
     msz <- fileSizeSafe cpath
+    isImg <- looksLikeImage cpath
+    let asyncBar = if isImg then imageAsyncBytes else asyncThresholdBytes
     case msz of
       -- Big (but openable) files load on a background thread with a spinner, so
       -- the event loop keeps painting; small/new/oversized files resolve inline.
-      Just sz | sz > asyncThresholdBytes && sz <= maxOpenBytes -> do
-        void $ forkIO (classifyFile cpath >>= atomically . writeTQueue loadQ)
+      Just sz | sz > asyncBar && sz <= maxOpenBytes -> do
+        startJob drv JLoad (classifyFile cpath >>= atomically . writeTQueue loadQ)
         pure (beginLoading (takeFileName cpath) ed)
       -- Small files install inline; apply any pending result-jump immediately.
       _ -> applyPendingJump . flip (applyOutcome setLoadedNew imageLoadedNew) ed <$> classifyFile cpath
@@ -872,7 +1087,7 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
         seed = searchOpenDocs canonRoot req' ed
         ed1  = searchSeed (sqGen req) canonRoot seed ed
     atomically (writeTVar (drvSearchGen drv) (sqGen req))
-    void $ forkIO (runWalker (drvSearchQ drv) (drvSearchGen drv) req')
+    startJob drv JSearch (runWalker (drvSearchQ drv) (drvSearchGen drv) req')
     pure ed1
 
   -- Start a quick-open walk: canonicalise the root, seed the recents-first
@@ -880,7 +1095,7 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
   EffQuickOpen gen root -> do
     canonRoot <- canonicalizeSafe root
     atomically (writeTVar (drvQuickGen drv) gen)
-    void $ forkIO (runQuickWalker (drvSearchQ drv) (drvQuickGen drv) gen canonRoot)
+    startJob drv JQuickOpen (runQuickWalker (drvSearchQ drv) (drvQuickGen drv) gen canonRoot)
     pure (quickOpenSeed gen canonRoot ed)
 
   -- Kick off a background go-to-definition scan (the pure layer has already
@@ -888,32 +1103,37 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
   EffFindDefs req -> do
     canonRoot <- canonicalizeSafe (dfRoot req)
     atomically (writeTVar (drvDefGen drv) (dfGen req))
-    void $ forkIO (runDefWalker (drvSearchQ drv) (drvDefGen drv) req { dfRoot = canonRoot })
+    startJob drv JDefs (runDefWalker (drvSearchQ drv) (drvDefGen drv) req { dfRoot = canonRoot })
     pure ed
 
   -- Rewrite the closed files for a large workspace Replace All, then report the total.
+  -- Rewriting hundreds of files is not something to do on the main thread: it
+  -- froze the editor for the whole operation, with no spinner and no way to
+  -- repaint. Forked and supervised like the walkers; the result arrives as a
+  -- message.
   EffReplaceOnDisk req -> do
     let subst = replaceSubst (rrCase req) (rrWord req) (rrRegex req) (rrTerm req) (rrRepl req)
-    diskCount <- foldM (\acc p -> do
-                          r <- replaceInFile p subst
-                          pure (acc + either (const 0) id r)) 0 (rrPaths req)
-    atomically (writeTQueue (drvSearchQ drv) (SMReplaceDone (rrOpenCount req + diskCount)))
-    pure ed
+    startJob drv JReplace $ handle (replaceFailed drv req) $ do
+      diskCount <- foldM (\acc p -> do
+                            r <- replaceInFile p subst
+                            pure (acc + either (const 0) id r)) 0 (rrPaths req)
+      atomically (writeTQueue (drvSearchQ drv) (SMReplaceDone (rrOpenCount req + diskCount)))
+    pure (beginLoading "Replace All" ed)
 
   -- Staged Replace All: open each closed file with the replacement applied (as an
   -- unsaved document), then expand the explorer so the changed files are visible.
+  -- Staged Replace All: the *reads* go to a background thread (they are the
+  -- slow part and they touch no editor state); the staging itself is pure and
+  -- happens in the event loop when the results land.
   EffStageReplace req -> do
-    let subst = replaceSubst (rrCase req) (rrWord req) (rrRegex req) (rrTerm req) (rrRepl req)
-    (edStaged, staged) <- foldM (\(e, c) p -> do
+    startJob drv JReplace $ handle (replaceFailed drv req) $ do
+      loaded <- forM (rrPaths req) $ \p -> do
         ebs <- try (BS.readFile p) :: IO (Either SomeException BS.ByteString)
-        case ebs of
-          Right bs | not (looksBinary bs) ->
-            let lr      = loadFromBytes False Nothing bs
-                (e', k) = addStagedDoc p lr subst e
-            in pure (e', c + k)
-          _ -> pure (e, c)) (ed, 0) (rrPaths req)
-    edRevealed <- revealInExplorer (modifiedDocPaths edStaged) edStaged
-    pure (stageReplaceDone (rrOpenCount req + staged) edRevealed)
+        pure $ case ebs of
+          Right bs | not (looksBinary bs) -> Just (p, loadFromBytes False Nothing bs)
+          _                               -> Nothing
+      atomically (writeTQueue (drvSearchQ drv) (SMStaged req [ x | Just x <- loaded ]))
+    pure (beginLoading "Replace All" ed)
 
   -- Save every open document that has unsaved changes (File ▸ Save All).
   EffSaveAll -> do
@@ -1056,26 +1276,77 @@ pnpBootstrapJs = unlines
 
 -- | Run an immediate lint pass of the active document, save-time tools
 -- included (used on save completion and 'EffLintNow'). No debounce.
+-- | An immediate pass (save completion, 'EffLintNow'). Deliberately bypasses
+-- the rate floor — the user just asked for it — but records the time so the
+-- debounced path does not immediately start another.
 forkLintNow :: Drv -> Editor -> IO ()
 forkLintNow drv ed = case lintRequest True ed of
   Nothing  -> pure ()
-  Just req -> startLintRun drv req
+  Just req -> do
+    getMonotonicTime >>= writeIORef (drvLintLast drv)
+    startLintRun drv req
 
 -- | Bump the lint generation and fork a runner for this request. The new
 -- generation supersedes any in-flight pass (its result is dropped).
+-- | A replace job died (an IO error, or a newer replace cancelled it). Post the
+-- completion message anyway: it is what clears the loading overlay, and an
+-- overlay that outlives its job would leave the editor swallowing input.
+replaceFailed :: Drv -> ReplaceReq -> SomeException -> IO ()
+replaceFailed drv req _ =
+  atomically (writeTQueue (drvSearchQ drv) (SMReplaceDone (rrOpenCount req)))
+
+-- | Fork a supervised background job, cancelling any previous job of the same
+-- kind. The job removes itself from the table when it finishes.
+startJob :: Drv -> JobKind -> IO () -> IO ()
+startJob drv kind act = mask_ $ do
+  prev <- atomicModifyIORef' (drvJobs drv) (\m -> (M.delete kind m, M.lookup kind m))
+  forM_ prev killThread
+  bump stJobs drv
+  forM_ prev (const (bump stKilled drv))
+  tid <- forkIO (act `finally` clear)
+  modifyIORef' (drvJobs drv) (M.insert kind tid)
+  where
+    clear = do
+      me <- myThreadId
+      atomicModifyIORef' (drvJobs drv) $ \m ->
+        (M.update (\t -> if t == me then Nothing else Just t) kind m, ())
+
+-- | Start a lint pass, cancelling whatever was in flight.
+--
+-- The generation counter already made a superseded pass's *result* be dropped,
+-- but the work still ran: with a slow tool (a Yarn PnP bootstrap, pyright, a
+-- large eslint project) and a 500 ms debounce, a burst-pause-burst typing
+-- rhythm could leave a handful of external processes running at once, each
+-- handed the whole buffer on stdin. Killing the previous runner is safe because
+-- every tool runs under 'withCreateProcess' in 'runToolCapture', so unwinding
+-- closes the pipes, terminates the child and reaps it.
 startLintRun :: Drv -> LintReq -> IO ()
-startLintRun drv req = do
+startLintRun drv req = mask_ $ do
   gen <- atomically $ do
            modifyTVar' (drvLintGen drv) (+ 1)
            readTVar (drvLintGen drv)
-  void $ forkIO (runLinters (drvSearchQ drv) (drvLintGen drv) gen req)
+  prev <- readIORef (drvLintRun drv)
+  bump stLints drv
+  forM_ prev $ \(_, tid) -> killThread tid
+  tid <- forkIO (runLinters (drvSearchQ drv) (drvLintGen drv) gen req
+                   `finally` clearIfCurrent gen)
+  writeIORef (drvLintRun drv) (Just (gen, tid))
+  where
+    -- Only clear the slot if it still describes this pass: a newer pass may
+    -- have replaced it (and killed us) before the exception arrived.
+    clearIfCurrent gen = atomicModifyIORef' (drvLintRun drv) $ \cur ->
+      case cur of
+        Just (g, _) | g == gen -> (Nothing, ())
+        _                      -> (cur, ())
 
 -- | Run each tool of a request in turn, parse its output, and post the merged
 -- diagnostics as one 'SMLint'. Bails between tools if a newer pass superseded
 -- this one; posts even an empty list (so stale squiggles clear).
 runLinters :: TQueue SearchMsg -> TVar Int -> Int -> LintReq -> IO ()
 runLinters outQ genVar gen req = do
-    perTool <- goRuns (lrRuns req) []
+    -- Bound the whole pass, not just each tool: a file matching three linters
+    -- could otherwise hold a slot for 3 x lintTimeoutUs.
+    perTool <- fromMaybe [] <$> timeout lintPassTimeoutUs (goRuns (lrRuns req) [])
     cur <- readTVarIO genVar
     when (gen == cur) $ do
       let merged = take maxDiagsPerFile
@@ -1118,8 +1389,9 @@ runToolCapture exe args dir mstdin = handle onErr $
   -- runs often and leaked fds would accumulate over a session.
   withCreateProcess
     (proc exe args) { cwd = Just dir, std_in = CreatePipe
-                     , std_out = CreatePipe, std_err = CreatePipe }
-    $ \mIn mOut mErr ph -> do
+                     , std_out = CreatePipe, std_err = CreatePipe
+                     }
+    $ \mIn mOut mErr ph -> handleCancel ph $ do
         -- Feed stdin from its own thread and drain stderr concurrently: the
         -- child interleaves reads/writes across all three pipes, so doing
         -- either sequentially deadlocks once a ~64K pipe buffer fills (a big
@@ -1149,8 +1421,20 @@ runToolCapture exe args dir mstdin = handle onErr $
           pure out
         case res of
           Just out -> pure (Just out)
-          Nothing  -> terminateProcess ph >> pure Nothing
+          Nothing  -> stopChild ph >> pure Nothing
   where
+    -- A newer pass killed this thread: terminate the child rather than leave it
+    -- finishing work nobody will read. Only the child itself — signalling its
+    -- process group was tried and rejected, because with 'create_group' off the
+    -- signal can reach the caller's own group (the user's shell), and the one
+    -- case it would help is narrow: a linter that is a shell wrapper whose
+    -- grandchild outlives it.
+    handleCancel ph act = act `catch` \e -> do
+      stopChild ph
+      throwIO (e :: SomeException)
+    stopChild ph = do
+      _ <- try (terminateProcess ph) :: IO (Either SomeException ())
+      pure ()
     onErr :: SomeException -> IO (Maybe T.Text)
     onErr _ = pure Nothing
     ignoreErr :: SomeException -> IO ()
@@ -1217,6 +1501,21 @@ openPath installText installImage path ed =
 -- with a spinner, so the UI stays responsive; smaller ones load inline.
 asyncThresholdBytes :: Integer
 asyncThresholdBytes = 2 * 1024 * 1024
+
+-- | The same threshold for images, which is far lower because bytes on disk say
+-- nothing about an image's decode cost: a 603 KiB JPEG expands to 5 MB of RGBA
+-- and takes over a second of pure computation — a second of frozen editor, with
+-- no spinner, under the file-size rule.
+imageAsyncBytes :: Integer
+imageAsyncBytes = 64 * 1024
+
+-- | Does this file start with an image magic number? One short read; used to
+-- pick the async threshold, not to decide the format (that is 'classifyFile').
+looksLikeImage :: FilePath -> IO Bool
+looksLikeImage path = do
+  r <- try (withBinaryFile path ReadMode (\h -> BS.hGet h 16))
+         :: IO (Either SomeException BS.ByteString)
+  pure (either (const False) (isJust . sniffImage) r)
 
 -- List a directory for the file browser as (fullPath, isDirectory, size) tuples
 -- (size is Nothing for directories). Unreadable directories yield an empty
@@ -1472,10 +1771,15 @@ runScan spec = do
                             && path `notElem` scSkip spec) $
                         atomically (writeTBQueue pathQ (Just path))
 
-  forM_ [1 .. nWorkers] $ \_ -> forkIO worker
-  walk (scRoot spec)
-  forM_ [1 .. nWorkers] $ \_ -> atomically (writeTBQueue pathQ Nothing)
-  atomically (readTVar doneVar >>= \d -> check (d == nWorkers))
+  -- The pool is bracketed: if this walk is cancelled (a newer search
+  -- superseded it), the workers must go with it — they would otherwise sit on
+  -- the queue forever, and the end-of-walk wait below would never complete.
+  bracket (forM [1 .. nWorkers] (\_ -> forkIO worker))
+          (mapM_ killThread)
+          $ \_ -> do
+    walk (scRoot spec)
+    forM_ [1 .. nWorkers] $ \_ -> atomically (writeTBQueue pathQ Nothing)
+    atomically (readTVar doneVar >>= \d -> check (d == nWorkers))
   ok <- alive
   when ok $ do
     n     <- readIORef scannedRef
@@ -1493,6 +1797,7 @@ listDirNames dir = do
 
 renderNow :: Drv -> IORef Editor -> IORef (Maybe Screen) -> IORef String -> IO ()
 renderNow drv editorRef prevRef titleRef = do
+  tStart <- getMonotonicTime
   ed0 <- readIORef editorRef
   prev <- readIORef prevRef
   caps <- readIORef (drvCaps drv)
@@ -1534,6 +1839,13 @@ renderNow drv editorRef prevRef titleRef = do
           <> endSync)
   hFlush stdout
   writeIORef prevRef (Just scr)
+  -- Session counters (read once by --stats-on-exit; two IORef bumps a frame).
+  tEnd <- getMonotonicTime
+  let st = drvStats drv
+      ms = (tEnd - tStart) * 1000
+  modifyIORef' (stFrames st) (+ 1)
+  modifyIORef' (stFrameMs st) (+ ms)
+  modifyIORef' (stFrameMax st) (max ms)
 
 -- A visible cursor for a dark theme, a dark one for light backgrounds
 -- (cherry blossom gets its raspberry accent, midnight its periwinkle).

@@ -52,6 +52,7 @@ module Cmedit.TextBuffer
   , looksBinary
   , canWrite
   , saveFile
+  , bufferBuilder
   , replaceInFile
   , DiskTime
   , fileMtime
@@ -73,7 +74,10 @@ import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Encoding.Error as TEE
 import Data.Time.Clock (UTCTime)
 import System.Directory (Permissions, doesFileExist, removeFile, renameFile, getPermissions, writable, getModificationTime)
-import System.IO (withBinaryFile, IOMode(WriteMode), hFlush)
+import qualified Data.ByteString.Builder as BB
+import System.IO
+  ( withBinaryFile, IOMode(WriteMode), hFlush, hTell, hSetBuffering
+  , BufferMode(BlockBuffering) )
 
 import Cmedit.Types (Pos(..), origin)
 
@@ -147,6 +151,24 @@ clampCol l c b = max 0 (min c (lineLen l b))
 fromText :: Text -> Buffer
 fromText t = mkBuffer (fst (splitContent t))
 
+-- | Serialise a buffer straight into a 'Builder': no whole-file 'Text', no
+-- whole-file 'ByteString'. The Builder's own chunk buffer bounds the memory
+-- used regardless of file size — 'bufferToText' + 'TE.encodeUtf8' + the BOM
+-- append materialised the file three times over, costing 440 MB of allocation
+-- to write a 49 MB file.
+bufferBuilder :: Encoding -> LineEnding -> Bool -> Buffer -> BB.Builder
+bufferBuilder enc le final (Buffer ls _) =
+  (if enc == Utf8Bom then BB.byteString bomBytes else mempty) <> go (toList ls)
+  where
+    sep = BB.byteString (TE.encodeUtf8 (lineEndingText le))
+    go []       = if final then sep else mempty
+    go [l]      = TE.encodeUtf8Builder l <> (if final then sep else mempty)
+    go (l : rest) = TE.encodeUtf8Builder l <> sep <> go rest
+
+-- | The UTF-8 byte-order mark.
+bomBytes :: BS.ByteString
+bomBytes = BS.pack [0xEF, 0xBB, 0xBF]
+
 bufferToText :: LineEnding -> Bool -> Buffer -> Text
 bufferToText le final (Buffer ls _) =
   let sep    = lineEndingText le
@@ -154,14 +176,23 @@ bufferToText le final (Buffer ls _) =
   in if final then joined <> sep else joined
 
 -- Split raw text into lines plus a flag for whether it ended with a newline.
-splitContent :: Text -> (Seq Text, Bool)
-splitContent t0 =
-  let t        = normalizeNewlines t0
+-- | Split raw text into lines plus "did it end with a newline".
+--
+-- @normalizeNewlines@ is two full copies of the text, so it is skipped when the
+-- caller has already established there is no CR to normalise ('detectLineEnding'
+-- returning 'LF' means exactly that). 'fromText' has no such knowledge and pays
+-- for the check.
+splitContentWith :: Bool -> Text -> (Seq Text, Bool)
+splitContentWith needsNorm t0 =
+  let t        = if needsNorm then normalizeNewlines t0 else t0
       hadFinal = not (T.null t) && T.last t == '\n'
       body     = if hadFinal then T.init t else t
       ls       = T.splitOn (T.pack "\n") body
       ls'      = if null ls then [T.empty] else ls
   in (Seq.fromList ls', hadFinal)
+
+splitContent :: Text -> (Seq Text, Bool)
+splitContent = splitContentWith True
 
 normalizeNewlines :: Text -> Text
 normalizeNewlines =
@@ -170,12 +201,22 @@ normalizeNewlines =
 ------------------------------------------------------------------------------
 -- Editing
 
+-- 'Seq.adjust'' (strict), not 'Seq.update': a 'Seq' is spine-strict but
+-- element-LAZY, and @Seq.update i x = adjust (const x) i@ stores an
+-- unevaluated @const x oldLine@ — a thunk that captures the line it replaced.
+-- Every undo snapshot then holds one, so the versions chain together and none
+-- of them can ever be collected: measured 44 MB retained after 40 000 edits on
+-- a 34 KB buffer, all of it released by forcing one line per snapshot. (At -O2
+-- the simplifier rewrites @const x old@ to @x@ and the chain never forms,
+-- which is why this stayed invisible — but the space behaviour of the buffer
+-- must not depend on the optimiser.) The bang on @new@ likewise guarantees the
+-- append has really happened before the line is stored.
 withLine :: Int -> (Text -> Text) -> Buffer -> Buffer
 withLine i f b@(Buffer ls n)
   | i >= 0 && i < Seq.length ls =
-      let old = Seq.index ls i
-          new = f old
-      in Buffer (Seq.update i new ls) (n + T.length new - T.length old)
+      let old  = Seq.index ls i
+          !new = f old
+      in Buffer (Seq.adjust' (const new) i ls) (n + T.length new - T.length old)
   | otherwise = b
 
 -- | Insert a single (non-newline) character, returning the new cursor.
@@ -208,10 +249,10 @@ insertText pos txt b
              ( withLine l (const (before <> single <> after)) b
              , Pos l (c + T.length single) )
            _ ->
-             let firstL  = before <> head segs
+             let !firstL  = before <> head segs
                  lastSeg = last segs
                  midL    = init (tail segs)              -- middle whole lines
-                 newLast = lastSeg <> after
+                 !newLast = lastSeg <> after
                  inserted = Seq.fromList (firstL : midL ++ [newLast])
                  (pre, post) = Seq.splitAt l (bufLines b)
                  rest        = Seq.drop 1 post
@@ -226,8 +267,8 @@ splitLineAt :: Pos -> Buffer -> (Buffer, Pos)
 splitLineAt pos b =
   let Pos l c   = clampPos pos b
       line      = getLine' l b
-      before    = T.take c line
-      after     = T.drop c line
+      !before   = T.take c line
+      !after    = T.drop c line
       (pre, post) = Seq.splitAt l (bufLines b)
       rest        = Seq.drop 1 post
       ls'         = pre >< Seq.fromList [before, after] >< rest
@@ -257,7 +298,7 @@ deleteForward pos b =
             , Pos l c )
        else if l < lineCount b - 1
          then let nextLine = getLine' (l + 1) b
-                  merged   = getLine' l b <> nextLine
+                  !merged  = getLine' l b <> nextLine
                   (pre, post) = Seq.splitAt l (bufLines b)
                   rest        = Seq.drop 2 post
                   ls'         = pre >< Seq.singleton merged >< rest
@@ -268,7 +309,7 @@ deleteForward pos b =
 joinLineWithPrev :: Int -> Text -> Buffer -> Buffer
 joinLineWithPrev l cur b =
   let prev        = getLine' (l - 1) b
-      merged      = prev <> cur
+      !merged     = prev <> cur
       (pre, post) = Seq.splitAt (l - 1) (bufLines b)
       rest        = Seq.drop 2 post
   in Buffer (pre >< Seq.singleton merged >< rest) (bufChars b)
@@ -285,7 +326,7 @@ deleteRange a0 b0 b =
        else
          let firstPart  = T.take ca (getLine' la b)
              lastPart   = T.drop cc (getLine' lc b)
-             merged     = firstPart <> lastPart
+             !merged    = firstPart <> lastPart
              (pre, post) = Seq.splitAt la (bufLines b)
              rest        = Seq.drop (lc - la + 1) post
              ls'         = pre >< Seq.singleton merged >< rest
@@ -298,7 +339,7 @@ deleteRange a0 b0 b =
 trimTrailingWs :: Buffer -> Maybe Buffer
 trimTrailingWs (Buffer ls n) =
   let step (!removed, acc) t =
-        let t' = T.stripEnd t
+        let !t' = T.stripEnd t
             d = T.length t - T.length t'
         in if d == 0 then (removed, acc Seq.|> t) else (removed + d, acc Seq.|> t')
       (removed, ls') = foldl' step (0, Seq.empty) ls
@@ -567,7 +608,9 @@ loadFromBytes ro mt bs =
   let (enc, bs') = stripBom bs
       txt        = TE.decodeUtf8With TEE.lenientDecode bs'
       le         = detectLineEnding txt
-      (ls, fin)  = splitContent txt
+      -- le == LF means the scan found no CR at all, so normalisation is a
+      -- no-op — skip its two whole-file copies (the common case on Unix).
+      (ls, fin)  = splitContentWith (le /= LF) txt
   in LoadResult (mkBuffer ls) le enc fin ro mt
 
 -- | A cheap "is this a binary (non-text) file?" heuristic: a NUL byte anywhere
@@ -600,10 +643,7 @@ canWrite path = do
 saveFile :: FilePath -> Encoding -> LineEnding -> Bool -> Buffer
          -> IO (Either String (Int, Maybe DiskTime))
 saveFile path enc le final b = do
-  let txt   = bufferToText le final b
-      body  = TE.encodeUtf8 txt
-      bom   = if enc == Utf8Bom then BS.pack [0xEF, 0xBB, 0xBF] else BS.empty
-      bytes = bom <> body
+  let bytes = bufferBuilder enc le final b
       tmp   = path ++ ".cmedit-tmp"
   -- Refuse to clobber an existing read-only file: the atomic temp+rename would
   -- otherwise silently replace it (a writable directory is enough), so check the
@@ -616,14 +656,14 @@ saveFile path enc le final b = do
   if exists && not canWrite
     then pure (Left (path ++ " is read-only \x2014 use Save As to write a copy"))
     else do
-      r <- try (writeAtomic tmp path bytes) :: IO (Either IOException ())
+      r <- try (writeAtomic tmp path bytes) :: IO (Either IOException Integer)
       case r of
         Left e  -> do
           _ <- try (removeFile tmp) :: IO (Either SomeException ())
           pure (Left (saveErrorMessage path e))
-        Right () -> do
+        Right n -> do
           mt <- fileMtime path
-          pure (Right (BS.length bytes, mt))
+          pure (Right (fromIntegral n, mt))
 
 -- | Read a file, apply a whole-text substitution and write it back atomically,
 -- preserving its BOM and (unnormalised) line endings. The substitution — the
@@ -647,11 +687,11 @@ replaceInFile path subst = do
                  let bom = if enc == Utf8Bom then BS.pack [0xEF, 0xBB, 0xBF] else BS.empty
                      out = bom <> TE.encodeUtf8 txt'
                      tmp = path ++ ".cmedit-tmp"
-                 r <- try (writeAtomic tmp path out) :: IO (Either IOException ())
+                 r <- try (writeAtomic tmp path (BB.byteString out)) :: IO (Either IOException Integer)
                  case r of
                    Left e   -> do _ <- try (removeFile tmp) :: IO (Either SomeException ())
                                   pure (Left (saveErrorMessage path e))
-                   Right () -> pure (Right cnt)
+                   Right _  -> pure (Right cnt)
 
 -- A readable reason for a failed write (without leaking the temp file name).
 saveErrorMessage :: FilePath -> IOException -> String
@@ -661,9 +701,16 @@ saveErrorMessage path e
   | isAlreadyInUseError e  = path ++ " is in use by another program"
   | otherwise              = "Could not save " ++ path ++ ": " ++ ioeGetErrorString e
 
-writeAtomic :: FilePath -> FilePath -> BS.ByteString -> IO ()
-writeAtomic tmp path bytes = do
-  withBinaryFile tmp WriteMode $ \h -> do
-    BS.hPut h bytes
-    hFlush h
+-- | Write a 'Builder' to @tmp@ and rename it over @path@, returning the number
+-- of bytes written. Streaming: the payload is never materialised whole. The
+-- temp-file + rename is the atomicity guarantee — a partial write leaves a
+-- partial *temp* file that is never renamed, so never write to @path@ directly.
+writeAtomic :: FilePath -> FilePath -> BB.Builder -> IO Integer
+writeAtomic tmp path bld = do
+  n <- withBinaryFile tmp WriteMode $ \h -> do
+         hSetBuffering h (BlockBuffering (Just 65536))
+         BB.hPutBuilder h bld
+         hFlush h
+         hTell h
   renameFile tmp path
+  pure n

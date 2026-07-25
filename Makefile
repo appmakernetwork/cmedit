@@ -10,6 +10,21 @@ GHC      ?= ghc
 OUTDIR   := dist-build
 TESTDIR  := dist-test
 
+# RTS options baked into every shipped binary.
+#
+#   --disable-delayed-os-memory-return
+#       By default the RTS hands freed memory back with MADV_FREE, which leaves
+#       the pages counted in RSS until the kernel needs them. For a long-lived
+#       editor that means "2.5 GB resident" after opening one large CSV, even
+#       though the memory is collected and reusable — alarming in top, and
+#       enough to trip container memory limits. MADV_DONTNEED returns it for
+#       real: measured 2065 MB -> 16 MB after one collection.
+#   -T  Cheap RTS counters, so `debug-stats` / GHC.Stats can report live heap.
+#   -I2 Idle GC every 2s rather than 0.3s; the editor is idle constantly and
+#       schedules its own collection after a quiet stretch (see idleGcDelayUs).
+# -rtsopts lets a user add +RTS -s / -hT when chasing a problem.
+RTSOPTS = -rtsopts "-with-rtsopts=--disable-delayed-os-memory-return -T -I2"
+
 # Packages shared by every platform; POSIX targets add -package unix.
 PKGS = -package base -package bytestring -package text -package containers \
        -package array -package process -package stm \
@@ -33,19 +48,19 @@ PLATFORM_WINDOWS = platform/windows/Cmedit/Term.hs
 # GHC shared libs present at runtime, add -dynamic.
 SMALL = -split-sections -optl-Wl,--gc-sections -optl-s
 
-.PHONY: all small static test run clean deb windows windows-check
+.PHONY: all small static test run clean deb windows windows-check soak soak-long
 
 all: cmedit
 
 cmedit: app/Main.hs $(SRC) $(PLATFORM_POSIX) cbits/cmedit_term.c
 	$(GHC) --make app/Main.hs -isrc -iplatform/posix cbits/cmedit_term.c -o $@ \
-	    -threaded -O2 -outputdir $(OUTDIR) $(PKGS_POSIX) $(EXTS) $(WARN)
+	    -threaded -O2 $(RTSOPTS) -outputdir $(OUTDIR) $(PKGS_POSIX) $(EXTS) $(WARN)
 
 # Smallest self-contained binary. Builds into a separate outputdir so it does
 # not clobber the regular `make` objects.
 small: app/Main.hs $(SRC) $(PLATFORM_POSIX) cbits/cmedit_term.c
 	$(GHC) --make app/Main.hs -isrc -iplatform/posix cbits/cmedit_term.c -o cmedit \
-	    -threaded -O2 $(SMALL) -outputdir $(OUTDIR)-small $(PKGS_POSIX) $(EXTS) $(WARN)
+	    -threaded -O2 $(RTSOPTS) $(SMALL) -outputdir $(OUTDIR)-small $(PKGS_POSIX) $(EXTS) $(WARN)
 
 # Portable release binary: -optl-static also links the C libraries (libc, gmp,
 # ffi, numa) in, so the result has no versioned glibc references and runs on
@@ -55,7 +70,7 @@ small: app/Main.hs $(SRC) $(PLATFORM_POSIX) cbits/cmedit_term.c
 # never calls. This is what `make deb` ships.
 static: app/Main.hs $(SRC) $(PLATFORM_POSIX) cbits/cmedit_term.c
 	$(GHC) --make app/Main.hs -isrc -iplatform/posix cbits/cmedit_term.c -o cmedit \
-	    -threaded -O2 -optl-static $(SMALL) -outputdir $(OUTDIR)-static \
+	    -threaded -O2 $(RTSOPTS) -optl-static $(SMALL) -outputdir $(OUTDIR)-static \
 	    $(PKGS_POSIX) $(EXTS) $(WARN)
 
 # Native Windows build (cmedit.exe). Run it on Windows itself — GHC via
@@ -67,7 +82,7 @@ static: app/Main.hs $(SRC) $(PLATFORM_POSIX) cbits/cmedit_term.c
 windows: app/Main.hs $(SRC) $(PLATFORM_WINDOWS)
 ifeq ($(OS),Windows_NT)
 	$(GHC) --make app/Main.hs -isrc -iplatform/windows -o cmedit.exe \
-	    -threaded -O2 -outputdir $(OUTDIR)-windows $(PKGS) $(EXTS) $(WARN)
+	    -threaded -O2 $(RTSOPTS) -outputdir $(OUTDIR)-windows $(PKGS) $(EXTS) $(WARN)
 else
 	@echo "make windows builds the native Windows port and must run on Windows"
 	@echo "(GHC via ghcup + make from MSYS2). To typecheck the Windows"
@@ -82,12 +97,44 @@ windows-check: app/Main.hs $(SRC) $(PLATFORM_WINDOWS)
 	$(GHC) --make app/Main.hs -isrc -iplatform/windows -fno-code \
 	    -outputdir $(OUTDIR)-wincheck $(PKGS) $(EXTS) $(WARN)
 
+# -with-rtsopts=-T turns on the RTS stat counters so the suite's memory-
+# retention guards (GHC.Stats.getRTSStats) can measure live bytes. It costs
+# nothing at runtime and needs no profiling libraries.
 cmedit-test: test/Spec.hs $(SRC) $(PLATFORM_POSIX) cbits/cmedit_term.c
 	$(GHC) --make test/Spec.hs -isrc -iplatform/posix cbits/cmedit_term.c -o $@ \
-	    -threaded -O0 -outputdir $(TESTDIR) $(PKGS_POSIX) $(EXTS) $(WARN)
+	    -threaded -O0 -rtsopts "-with-rtsopts=-T" -outputdir $(TESTDIR) \
+	    $(PKGS_POSIX) $(EXTS) $(WARN)
 
-test: cmedit-test
+test: cmedit-test lint-invariants
 	./cmedit-test
+
+# Long-session soak (see docs/plans/completed/0005-...). Built at -O2 with the
+# RTS counters on, because it measures memory and cost over time — the opposite
+# of what the -O0 correctness suite needs. Not part of `make test`: it takes
+# tens of seconds, and a slow `make test` is a test people stop running.
+cmedit-soak: soak/Soak.hs $(SRC) $(PLATFORM_POSIX) cbits/cmedit_term.c
+	$(GHC) --make soak/Soak.hs -isrc -iplatform/posix cbits/cmedit_term.c -o $@ \
+	    -threaded -O2 -rtsopts "-with-rtsopts=-T" -outputdir dist-soak \
+	    $(PKGS_POSIX) $(EXTS) $(WARN)
+
+soak: cmedit-soak
+	./cmedit-soak 60000
+
+soak-long: cmedit-soak
+	./cmedit-soak 600000
+
+# Guard for the first performance invariant in CONTRIBUTING.md: a bounded
+# history must use Cmedit.History.pushHist, never a lazy `take` over a list,
+# which retains everything it claims to drop (measured: 51 MB of undo history
+# live against a nominal 1000-entry cap). Matches the exact idiom that broke —
+# assigning a `take` to one of the history fields.
+.PHONY: lint-invariants
+lint-invariants:
+	@if grep -rnE "(edUndo|edRedo|docUndo|docRedo|csvUndo|csvRedo|edNavBack|edNavFwd|edFindHist|edReplHist) = take" src/ ; then \
+	    echo "ERROR: lazy 'take' used to bound a history — use Cmedit.History.pushHist"; \
+	    echo "       (see CONTRIBUTING.md, Performance invariants #1)"; \
+	    exit 1; \
+	fi
 
 run: cmedit
 	./cmedit
@@ -98,4 +145,5 @@ deb:
 
 clean:
 	rm -rf $(OUTDIR) $(OUTDIR)-small $(OUTDIR)-static $(OUTDIR)-windows \
-	    $(OUTDIR)-wincheck $(TESTDIR) dist-deb cmedit cmedit.exe cmedit-test *.deb
+	    $(OUTDIR)-wincheck $(TESTDIR) dist-soak dist-deb cmedit cmedit.exe \
+	    cmedit-test cmedit-soak *.deb

@@ -44,6 +44,7 @@ module Cmedit.Editor
   , openSettings
   , applySettingRow
   , setDetectedDark
+  , setStatsLine
   , setCellPx
   , cellAspect
   , cellPxKey
@@ -72,6 +73,10 @@ module Cmedit.Editor
   , choiceChanged
     -- * Effects
   , Effect(..)
+    -- * Bounded histories (undo/redo, navigation, input recall)
+  , maxUndo
+  , maxNavStops
+  , pushHist
     -- * Driving the model
   , update
   , resize
@@ -210,6 +215,7 @@ import System.FilePath (takeDirectory, takeExtension, takeFileName)
 import Data.Array (Array)
 
 import Cmedit.Types
+import Cmedit.History (pushHist)
 import Cmedit.TextBuffer
 import Cmedit.Width (colToDisplay, displayToCol, wrapLine)
 import Cmedit.ConfigFile
@@ -620,6 +626,13 @@ update :: Key -> Editor -> (Editor, [Effect])
 -- load (the driver applies the result and clears the flag). Resize/EOF are
 -- handled by the driver before reaching here, so they still work.
 update _ ed | isJust (edLoading ed) = noEff ed
+-- An over-long paste arrives truncated (the parser caps it rather than letting
+-- the terminal choose how much memory to hand us). Normalise it to a plain
+-- paste here so every consumer — buffer, dialog field, CSV cell, search field —
+-- keeps working, and say so on the status line rather than silently losing text.
+update (KPasteTruncated t) ed =
+  let (ed', effs) = update (KPaste t) ed
+  in (setStatus "Paste was too large \x2014 only the first part was inserted" ed', effs)
 update key ed =
   let (ed', effs) = dispatchKey key ed
   -- When a menu has just been opened, refresh the active file's stale-on-disk
@@ -1839,8 +1852,8 @@ renamePaths old new ed = ed
   , edBefore = map rewDoc (edBefore ed)
   , edAfter = map rewDoc (edAfter ed)
   , edRecent = [ e { rePath = rew (rePath e) } | e <- edRecent ed ]
-  , edNavBack = [ s { nsPath = fmap rew (nsPath s) } | s <- edNavBack ed ]
-  , edNavFwd  = [ s { nsPath = fmap rew (nsPath s) } | s <- edNavFwd ed ]
+  , edNavBack = fmap (\s -> s { nsPath = fmap rew (nsPath s) }) (edNavBack ed)
+  , edNavFwd  = fmap (\s -> s { nsPath = fmap rew (nsPath s) }) (edNavFwd ed)
   }
   where
     rew p | p == old = new

@@ -17,6 +17,8 @@ import Data.List (isSuffixOf)
 import Data.Word (Word8)
 import System.IO (Handle, hWaitForInput)
 import qualified Data.ByteString as BS
+import Data.ByteString.Builder (Builder, byteString, toLazyByteString)
+import qualified Data.ByteString.Lazy as BL
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Encoding.Error as TEE
@@ -29,6 +31,8 @@ import Cmedit.Types
 data ByteSource = ByteSource
   { srcNext        :: IO (Maybe Word8)        -- ^ Block for the next byte (Nothing on EOF).
   , srcNextTimeout :: Int -> IO (Maybe Word8) -- ^ Wait at most N ms for a byte.
+  , srcChunk       :: IO BS.ByteString        -- ^ Whatever is buffered, or one fresh read; empty on EOF. Bulk path for paste payloads.
+  , srcPushBack    :: BS.ByteString -> IO ()  -- ^ Return unconsumed bytes to the front of the stream.
   }
 
 -- How long to wait for a byte after ESC before deciding it was a bare Esc.
@@ -71,7 +75,23 @@ mkHandleSource h = do
           Nothing -> do
             ready <- hWaitForInput h ms `catch` \(_ :: SomeException) -> pure False
             if ready then next else pure Nothing
-  pure (ByteSource next nextTO)
+      -- Hand over everything buffered at once (refilling first if empty). The
+      -- byte-at-a-time path costs an IORef round trip and a boxed Word8 per
+      -- byte, which is fine for keystrokes and ruinous for a megabyte paste.
+      chunk :: IO BS.ByteString
+      chunk = do
+        pend <- readIORef ref
+        if not (BS.null pend)
+          then writeIORef ref BS.empty >> pure pend
+          else do
+            ok <- fill
+            if ok then do { p <- readIORef ref; writeIORef ref BS.empty; pure p }
+                  else pure BS.empty
+      pushBack :: BS.ByteString -> IO ()
+      pushBack bs
+        | BS.null bs = pure ()
+        | otherwise  = modifyIORef' ref (bs <>)
+  pure (ByteSource next nextTO chunk pushBack)
 
 -- | Read and decode a single key event. Blocks until at least one byte is
 -- available. Returns 'KUnknown' @[]@ to signal end-of-input.
@@ -402,21 +422,58 @@ parseMouse body final =
        , meClicks  = 1          -- the driver upgrades this to 2/3 for multi-clicks
        }
 
+-- | Largest bracketed-paste payload accepted. Past this the rest of the paste
+-- is still drained (so the parser stays in step with the byte stream — losing
+-- sync would garble every following keystroke) but discarded, and the editor
+-- reports the truncation. Without a cap the payload is whatever the terminal
+-- chooses to send, which is a memory bound set by someone else.
+maxPasteBytes :: Int
+maxPasteBytes = 32 * 1024 * 1024
+
 -- Read a bracketed-paste payload until the ESC [ 201 ~ terminator.
+--
+-- Scanned in whole chunks with 'BS.breakSubstring' rather than byte by byte: a
+-- list-accumulating version cost ~279 bytes of allocation per pasted byte (a
+-- 4 MiB paste took 592 ms and 1.1 GB). A terminator can straddle a chunk
+-- boundary, so the last five bytes of a terminator-free chunk are carried into
+-- the next scan, and whatever follows the terminator in the same read is
+-- pushed back for the parser to pick up as ordinary keys.
 readPaste :: ByteSource -> IO Key
-readPaste src = go []
+readPaste src = go mempty 0 False BS.empty
   where
-    terminator = reverse [0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e] -- bytes of ESC[201~, reversed
-    go acc = do
-      mb <- srcNext src
-      case mb of
-        Nothing -> pure (finish acc)
-        Just b ->
-          let acc' = b : acc
-          in if take 6 acc' == terminator
-               then pure (finish (drop 6 acc'))
-               else go acc'
-    finish acc = KPaste (decodeUtf8Bytes (reverse acc))
+    endMark = BS.pack [0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e]   -- ESC[201~
+    carry = BS.length endMark - 1
+
+    go !acc !n !trunc pending = do
+      chunk <- srcChunk src
+      if BS.null chunk
+        then pure (finish (acc <> byteString pending) (n + BS.length pending) trunc)  -- EOF
+        else do
+          let buf = if BS.null pending then chunk else pending <> chunk
+              (before, rest) = BS.breakSubstring endMark buf
+          if BS.null rest
+            then do
+              -- No terminator yet: emit all but a possible straddling prefix.
+              let keep = max 0 (BS.length buf - carry)
+                  (emit, pending') = BS.splitAt keep buf
+                  (acc', n', trunc') = add acc n trunc emit
+              go acc' n' trunc' pending'
+            else do
+              srcPushBack src (BS.drop (BS.length endMark) rest)
+              let (acc', n', trunc') = add acc n trunc before
+              pure (finish acc' n' trunc')
+
+    -- Append under the cap; past it the bytes are dropped and the flag set.
+    add acc n trunc bs
+      | BS.null bs      = (acc, n, trunc)
+      | n >= maxPasteBytes = (acc, n, True)
+      | room >= BS.length bs = (acc <> byteString bs, n + BS.length bs, trunc)
+      | otherwise = (acc <> byteString (BS.take room bs), maxPasteBytes, True)
+      where room = maxPasteBytes - n
+
+    finish acc _ trunc =
+      let txt = TE.decodeUtf8With TEE.lenientDecode (BL.toStrict (toLazyByteString acc))
+      in if trunc then KPasteTruncated txt else KPaste txt
 
 ------------------------------------------------------------------------------
 -- Parameter helpers

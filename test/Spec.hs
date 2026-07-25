@@ -5,11 +5,18 @@ module Main (main) where
 
 import Control.Monad (forM_, unless)
 import Data.Bits (shiftR, (.&.))
+import Data.Foldable (toList)
 import Data.IORef
 import Data.Word (Word8)
 import Data.Either (isLeft)
-import Data.List (intercalate, isInfixOf, isPrefixOf, isSuffixOf, tails)
+import Data.List (foldl', intercalate, isInfixOf, isPrefixOf, isSuffixOf, tails)
+import System.Directory (getTemporaryDirectory, removeFile)
+import System.FilePath ((</>))
+import Control.Exception (SomeException, try)
 import System.Exit (exitFailure, exitSuccess)
+import GHC.Clock (getMonotonicTime)
+import GHC.Stats (getRTSStats, getRTSStatsEnabled, gc, gcdetails_live_bytes)
+import System.Mem (performMajorGC)
 import qualified Data.ByteString as BS
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -59,6 +66,56 @@ import Cmedit.Lint
   , linters, linterById, lintersForPath
   , parseLintOutput, diagSpans, diagAt, maxDiagsPerFile )
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
+
+-- | Live heap in MB after a major collection (needs the -T RTS flag, which the
+-- Makefile's test target sets). Used by the retention guards below.
+liveMB :: IO Double
+liveMB = do
+  performMajorGC
+  s <- getRTSStats
+  pure (fromIntegral (gcdetails_live_bytes (gc s)) / 1048576)
+
+-- | Retention guard for plan 0014. A 'Data.Text' value is a slice of a shared
+-- byte array, so a clipboard entry cut from a buffer would pin that buffer's
+-- whole file for the rest of the session unless it is 'detach'ed. Copies one
+-- 100-character line out of a ~4 MB document, drops the document, and reports
+-- what is still live. Returns (liveAfter, documentSizeMB).
+clipboardRetentionMB :: IO (Double, Double)
+clipboardRetentionMB = do
+  let nLines = 20000
+      lineW  = 200
+      big    = T.unlines (replicate nLines (T.replicate lineW (T.pack "x")))
+      docMB  = fromIntegral (nLines * (lineW + 1)) / 1048576
+      ed0    = setLoaded "big.txt" (emptyLoadResult { lrBuffer = fromText big })
+                         (newEditor (40, 120) defaultConfig)
+      ed1    = ed0 { edSelAnchor = Just (Pos 0 0), edCursor = Pos 0 100 }
+      (ed2, _) = update (KCtrlChar 'c') ed1
+      clip   = edClipboard ed2
+  T.length clip `seq` pure ()
+  live <- liveMB                    -- only @clip@ is reachable from here on
+  pure (live + fromIntegral (T.length clip) * 0, docMB)
+
+-- | Retention guard for plan 0001: how much does the *undo history* keep alive
+-- after @n@ snapshot-pushing edits? Every snapshot's lines are forced first, so
+-- what is measured is the history structure itself rather than unevaluated
+-- thunks (an unoptimised build leaves plenty of those, and they swamp the
+-- signal). With the old lazy @take maxUndo@ bound this grew linearly with @n@ —
+-- the cap was never applied, so every snapshot ever pushed stayed reachable;
+-- with the structural 'pushHist' bound it is flat at the cap.
+undoRetentionMB :: Int -> IO (Double, Int)
+undoRetentionMB n = do
+  let ed0 = setLoaded "big.txt"
+              (emptyLoadResult { lrBuffer = fromText (T.unlines (replicate 200 (T.pack "some line of text"))) })
+              (newEditor (40, 120) defaultConfig)
+      -- foldl' because the real editor applies each keystroke before the next
+      -- arrives; a lazy fold would measure its own thunk chain instead.
+      step e i = fst (update (if even (i :: Int) then KChar 'x' else KBackspace) e)
+      edN = foldl' step ed0 [1 .. n]
+      !forced = sum [ T.length t | u <- toList (edUndo edN)
+                                 , t <- toList (bufLines (usBuffer u)) ]
+  forced `seq` pure ()
+  live <- liveMB                 -- edN is still reachable (used just below)
+  pure (live, Seq.length (edUndo edN))
 
 -- Build an ordered 'DiskTime' from a small integer, for the stale-file tests.
 mt :: Int -> DiskTime
@@ -912,6 +969,223 @@ main = do
   -- A pragma on one line is coloured as a decorator.
   checkEq "hs pragma" (hsTokAt "{-# LANGUAGE OverloadedStrings #-}" 0) TkDecorator
 
+  statsOn <- getRTSStatsEnabled
+
+  -- Live session counters on the status bar (plan 0006) ----------------------
+  do
+    let edPlain = setLoaded "s.txt" (mkLR "hello") (newEditor (24, 100) defaultConfig)
+        edWith  = setStatsLine (Just (T.pack "f 1.2/9ms 42MB j1")) edPlain
+        (txtOff, zonesOff) = statusRightInfo edPlain
+        (txtOn,  zonesOn)  = statusRightInfo edWith
+    check "no stats segment when the driver has not set one"
+          (not ("42MB" `isInfixOf` txtOff))
+    check "stats segment appears when set" ("f 1.2/9ms 42MB j1" `isInfixOf` txtOn)
+    -- The click zones must still land on the right columns: the segment is
+    -- plain text, but it shifts everything after it.
+    checkEq "status click zones survive the stats segment"
+            (map (\(_, _, z) -> z) zonesOn) (map (\(_, _, z) -> z) zonesOff)
+    let shift = length txtOn - length txtOff
+    checkEq "stats segment shifts the zones by its own width"
+            [ c - shift | (c, _, _) <- zonesOn ] [ c | (c, _, _) <- zonesOff ]
+    -- Config key round-trips like any other.
+    checkEq "debug-stats parses"
+            (cfgDebugStats (fst (parseConfigText "debug-stats = on" defaultConfig))) True
+    check "debug-stats is off by default" (not (cfgDebugStats defaultConfig))
+
+  -- Save/load round-trip matrix (plan 0013) ----------------------------------
+  -- Saving is the one operation where a bug silently corrupts the user's file,
+  -- so pin the exact bytes for every combination of line ending, BOM and final
+  -- newline BEFORE touching the writer.
+  do
+    tmpDir <- getTemporaryDirectory
+    let tmp = tmpDir </> "cmedit-save-roundtrip.txt"
+        cases =
+          [ ("lf, final nl",        LF,   Utf8,    True,  ["alpha", "beta"])
+          , ("lf, no final nl",     LF,   Utf8,    False, ["alpha", "beta"])
+          , ("crlf, final nl",      CRLF, Utf8,    True,  ["alpha", "beta"])
+          , ("crlf, no final nl",   CRLF, Utf8,    False, ["alpha", "beta"])
+          , ("cr, final nl",        CR,   Utf8,    True,  ["alpha", "beta"])
+          , ("bom + lf",            LF,   Utf8Bom, True,  ["alpha", "beta"])
+          , ("bom + crlf",          CRLF, Utf8Bom, True,  ["alpha", "beta"])
+          , ("empty buffer",        LF,   Utf8,    True,  [""])
+          , ("single line, no nl",  LF,   Utf8,    False, ["only"])
+          , ("trailing empty line", LF,   Utf8,    True,  ["a", ""])
+          , ("blank lines",         LF,   Utf8,    True,  ["", "", "x", ""])
+          , ("unicode + wide",      LF,   Utf8,    True,  ["\27979\35797 \128512", "caf\233"])
+          , ("embedded cr",         LF,   Utf8,    True,  ["a\rb"])
+          , ("long line",           LF,   Utf8,    True,  [T.unpack (T.replicate 5000 (T.pack "x"))])
+          ]
+    forM_ cases $ \(nm, le, enc, fin, lns) -> do
+      let buf = fromText (T.intercalate (lineEndingText le) (map T.pack lns))
+      res <- saveFile tmp enc le fin buf
+      case res of
+        Left e -> check ("save " ++ nm ++ ": " ++ e) False
+        Right (n, _) -> do
+          raw <- BS.readFile tmp
+          checkEq ("save " ++ nm ++ ": byte count matches") n (BS.length raw)
+          -- The BOM is present iff requested, and exactly once.
+          checkEq ("save " ++ nm ++ ": BOM") (BS.take 3 raw == BS.pack [0xEF,0xBB,0xBF])
+                  (enc == Utf8Bom)
+          -- Reloading reproduces the buffer, the line ending and the final-newline flag.
+          lr <- loadFile tmp
+          case lr of
+            Left e -> check ("reload " ++ nm ++ ": " ++ e) False
+            Right r -> do
+              checkEq ("reload " ++ nm ++ ": encoding") (lrEncoding r) enc
+              checkEq ("reload " ++ nm ++ ": final newline") (lrFinalNewline r) fin
+              -- Content survives. Compared in LF form against the buffer that
+              -- was actually saved: the loader normalises CR/CRLF to LF, so an
+              -- embedded CR comes back as a line break.
+              checkEq ("reload " ++ nm ++ ": content")
+                      (bufferToText LF False (lrBuffer r))
+                      (T.replace (T.pack "\r") (T.pack "\n") (bufferToText LF False buf))
+              -- Re-saving what was loaded must reproduce the same bytes exactly.
+              res2 <- saveFile tmp (lrEncoding r) (lrLineEnding r) (lrFinalNewline r) (lrBuffer r)
+              raw2 <- BS.readFile tmp
+              check ("re-save " ++ nm ++ ": byte-identical")
+                    (either (const False) (const True) res2 && raw2 == raw)
+    _ <- try (removeFile tmp) :: IO (Either SomeException ())
+    pure ()
+
+  -- Case-insensitive literal search: pre-filter must not change results (0019)
+  -- The optimisation is only safe if it is invisible, so compare it against the
+  -- straightforward fold-everything implementation over an awkward corpus.
+  let refMatches cs ww term line
+        | T.null term = []
+        | otherwise =
+            let norm t = if cs then t else T.toLower t
+                len = T.length term
+            in [ (i, len) | i <- S.scanMatches False ww (norm term) (norm line) ]
+      corpusLines = map T.pack
+        [ "hello world", "HELLO WORLD", "HeLLo", "no match here", ""
+        , "ends with hell", "hellhello", "\1052\1086\1089\1082\1074\1072 Moscow"
+        , "\223 sharp s", "SS sharp", "i\775 dotted", "\304stanbul", "istanbul"
+        , "tab\there", "\27581\26412\35486 hello", "emoji \128512 hello", "  hello  " ]
+      corpusTerms = map T.pack
+        [ "hello", "HELLO", "Hello", "hell", "o w", "\1052\1086\1089", "\223", "SS"
+        , "\304", "i", "x", " ", "\128512" ]
+  forM_ corpusTerms $ \term -> forM_ corpusLines $ \ln -> forM_ [False, True] $ \ww ->
+    forM_ [False, True] $ \cs ->
+      checkEq ("lineMatches agrees with the reference (term " ++ show term
+               ++ ", line " ++ show ln ++ ", cs=" ++ show cs ++ ", ww=" ++ show ww ++ ")")
+              (S.lineMatches cs ww term ln) (refMatches cs ww term ln)
+
+  -- Bracketed paste: bulk-scanned, straddle-safe, capped (plan 0017) ---------
+  let pasteStart = [0x1b, 0x5b, 0x32, 0x30, 0x30, 0x7e]      -- ESC[200~
+      pasteEnd   = [0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e]      -- ESC[201~
+      bytesOf    = BS.unpack . TE.encodeUtf8 . T.pack
+      wrapped p  = pasteStart ++ bytesOf p ++ pasteEnd
+  -- The terminator can land at any offset within a chunk, including split
+  -- across two: run every chunk size from 1 (byte at a time) upwards.
+  forM_ [1, 2, 3, 4, 5, 6, 7, 13, 4096] $ \k -> do
+    kp <- parseBytesChunked k (wrapped "hello\nworld")
+    checkEq ("paste reassembles across chunk size " ++ show k) kp (KPaste (T.pack "hello\nworld"))
+  -- Bytes after the terminator must not be swallowed: typing right after a
+  -- paste is the regression this guards.
+  forM_ [1, 3, 6, 4096] $ \k -> do
+    (kp, nxt) <- parseTwoChunked k (wrapped "abc" ++ [0x7a])   -- 'z'
+    checkEq ("paste then key, chunk " ++ show k) (kp, nxt) (KPaste (T.pack "abc"), KChar 'z')
+  -- A payload containing a partial terminator is not mistaken for the end.
+  do kp <- parseBytesChunked 4096 (wrapped "a\ESC[201b")
+     checkEq "partial terminator inside the payload" kp (KPaste (T.pack "a\ESC[201b"))
+  -- Unterminated paste ends at EOF with what it has.
+  do kp <- parseBytesChunked 4096 (pasteStart ++ bytesOf "tail")
+     checkEq "unterminated paste ends at EOF" kp (KPaste (T.pack "tail"))
+  -- Invalid UTF-8 decodes leniently, exactly as before.
+  do kp <- parseBytesChunked 4096 (pasteStart ++ [0xff, 0x41] ++ pasteEnd)
+     checkEq "invalid UTF-8 in a paste is replaced"
+             (case kp of KPaste t -> T.unpack t; _ -> "?") "\65533A"
+  -- Empty paste.
+  do kp <- parseBytesChunked 4096 (pasteStart ++ pasteEnd)
+     checkEq "empty paste" kp (KPaste T.empty)
+  -- KPasteTruncated is normalised to a paste plus a status note, so every
+  -- consumer keeps working.
+  let edTrunc = fst (update (KPasteTruncated (T.pack "abc")) (newEditor (24, 80) defaultConfig))
+  checkEq "truncated paste still inserts" (getLine' 0 (edBuffer edTrunc)) (T.pack "abc")
+  check "truncated paste says so" (T.isInfixOf (T.pack "too large") (edStatus edTrunc))
+
+  -- Bounded histories really are bounded (plan 0001) -------------------------
+  -- The cap must be structural: `take n (x:xs)` retains everything it claims to
+  -- drop, so undo history grew for the whole session.
+  let manyEdits n e = foldl (\acc i -> fst (update (if even (i :: Int) then KChar 'q'
+                                                     else KBackspace) acc)) e [1 .. n]
+      edDeep = manyEdits (maxUndo + 500) (newEditor (24, 80) defaultConfig)
+  -- (`undoDepth` is used because a local `edUndo` binding above shadows the
+  -- record selector for the rest of `main`.)
+  checkEq "undo stack is capped at maxUndo" (undoDepth edDeep) maxUndo
+  -- pushHist itself: capped, newest first, and the tail is really gone.
+  checkEq "pushHist caps" (Seq.length (foldl (flip (pushHist 3)) Seq.empty [1 .. 10 :: Int])) 3
+  checkEq "pushHist keeps newest first"
+          (toList (foldl (flip (pushHist 3)) Seq.empty [1 .. 10 :: Int])) [10, 9, 8]
+  -- Nav history and input history use the same bound.
+  -- Nav history uses the same bound: Ctrl+Home/End jumps across a long file are
+  -- "far", so alternating them fills the trail.
+  let edFar0 = setLoaded "/f.txt"
+                 (emptyLoadResult { lrBuffer = fromText (T.unlines (replicate 500 (T.pack "x"))) })
+                 (newEditor (24, 80) defaultConfig)
+      edNav = foldl (\e i -> fst (update (if even (i :: Int) then KEnd (Mods False True False)
+                                                              else KHome (Mods False True False)) e))
+                    edFar0 [1 .. 2 * (maxNavStops + 50)]
+  check ("nav history is capped (" ++ show (Seq.length (edNavBack edNav)) ++ " stops)")
+        (Seq.length (edNavBack edNav) <= maxNavStops)
+  if not statsOn
+    then check "undo retention guard skipped (build with -with-rtsopts=-T)" True
+    else do
+      (liveSmall, depthSmall) <- undoRetentionMB 4000
+      (liveBig,   depthBig)   <- undoRetentionMB 40000
+      checkEq "undo depth is the cap at 4k edits"  depthSmall maxUndo
+      checkEq "undo depth is the cap at 40k edits" depthBig maxUndo
+      -- 10x the edits must not mean 10x the retained history: the cap is the
+      -- same in both runs, so the heap must be too. Without the structural
+      -- bound the 40k run keeps 40 000 snapshots instead of 1 000.
+      check ("undo history does not grow with session length (live "
+             ++ show (round liveSmall :: Int) ++ " MB at 4k edits, "
+             ++ show (round liveBig :: Int) ++ " MB at 40k)")
+            (liveBig < liveSmall * 2 + 2)
+
+  -- Text slices must not pin the buffers they came from (plan 0014) ----------
+  if not statsOn
+    then check "clipboard retention guard skipped (build with -with-rtsopts=-T)" True
+    else do
+      (live, docMB) <- clipboardRetentionMB
+      -- Without 'detach' the 100-character clipboard entry keeps the whole
+      -- ~4 MB document alive. Half the document is a generous ceiling that
+      -- still fails loudly if the copy ever goes back to being a slice.
+      check ("clipboard does not pin its source buffer (live " ++ show (round live :: Int)
+             ++ " MB after copying one line out of " ++ show (round docMB :: Int) ++ " MB)")
+            (live < docMB / 2)
+
+  -- Lexer cost is LINEAR in the line length -----------------------------------
+  -- 'lexWith' used to clamp each step's count with @min n (length cs)@, walking
+  -- the whole remainder per token: O(line²). A 3000-column minified line then
+  -- cost ~800ms *per frame* (the renderer re-lexes every visible line). This is
+  -- a ratio guard, not an absolute one, so it survives any machine: linear
+  -- gives ~4x for 4x the input, the old quadratic gave ~16x.
+  let lexTime lang txt = do
+        let go 0 !acc = pure acc
+            go k !acc = do
+              t0 <- getMonotonicTime
+              let (ts, st) = lexLine lang initialState txt
+              length ts `seq` st `seq` pure ()
+              t1 <- getMonotonicTime
+              go (k - 1 :: Int) (min acc (t1 - t0))
+        go 3 (1 / 0)
+      longLine n = T.pack (take n (cycle "var alpha = beta + 12; foo(bar, baz); "))
+  forM_ [("JS", JS), ("Python", Python), ("SQL", SQL)] $ \(nm, lang) -> do
+    tSmall <- lexTime lang (longLine 2000)
+    tBig   <- lexTime lang (longLine 8000)
+    -- 4x the input: linear ~4x, quadratic ~16x. 10x is the dividing line.
+    check ("lexer is not quadratic in line length (" ++ nm ++ ", ratio "
+           ++ show (round (tBig / max 1e-9 tSmall) :: Int) ++ "x for 4x input)")
+          (tBig < tSmall * 10)
+  -- The clamp it replaced still holds: exactly one token per character.
+  forM_ [ "x = 'abc' + \"def\";  // trailing"
+        , "\t\tif (a && b) { return c; }"
+        , "select a, b from t where x = 1 -- c" ] $ \src ->
+    forM_ [JS, Python, SQL, Haskell, YAML] $ \lang ->
+      checkEq "lexLine emits one token per character"
+              (length (fst (lexLine lang initialState (T.pack src)))) (length src)
+
   -- Highlight-state cache (HlCache) ---------------------------------------------
   -- Brute-force reference: state before line i is entry i of this scan.
   let bruteStates lang lns = scanl (\st ln -> snd (lexLine lang st ln)) initialState lns
@@ -1349,12 +1623,49 @@ main = do
         ("\ESC_Ga=d,d=A\ESC\\" `isPrefixOf` kitB
            && "a=T,f=32" `isInfixOf` kitB && "m=0" `isInfixOf` kitB)
 
+  -- CSV parser: Text version must equal the String version it replaced (0016)
+  -- Compared against the previous String implementation, kept as an oracle.
+  -- Cases where a closing quote is followed by stray text are excluded here and
+  -- pinned separately below: the old parser *reversed* the field in that path
+  -- (a latent bug), so agreeing with it there would be wrong.
+  let csvCorpus =
+        [ "a,b,c", "a,b,c\n1,2,3", "", "\n", "a", "a,", ",a", ",,"
+        , "\"quoted\",b", "\"with,delim\",b", "\"with\nnewline\",b"
+        , "\"doubled\"\"quote\",b", "\"unterminated"
+        , "\"\",x", "a\r\nb", "a\rb", "a\n\nb", "x,y\n", "x,y\n\n"
+        , "\"a\"\"\",\"b\"", "ragged,row\nshort", "one\ntwo,three,four"
+        , "\27979,\35797\n\128512,x", "  spaced  ,  cells  "
+        , "\"multi\nline\ncell\",z", "tab\tinside,b" ]
+  forM_ csvCorpus $ \src ->
+    checkEq ("csvParse matches the reference (" ++ show src ++ ")")
+            (csvParse ',' (T.pack src)) (csvParseRef ',' (T.pack src))
+  -- Other delimiters, with data that actually uses them.
+  forM_ [ (';', "a;b\n\"q;q\";c"), ('\t', "a\tb\n\"q\tq\"\tc"), ('|', "a|b|\"c\"") ] $
+    \(d, src) ->
+      checkEq ("csvParse matches the reference (delim " ++ show d ++ ")")
+              (csvParse d (T.pack src)) (csvParseRef d (T.pack src))
+  -- Stray text after a closing quote: tolerated (not rejected), and now
+  -- appended in order. The old parser emitted it reversed — "tyartsail".
+  checkEq "stray text after a closing quote is appended, not reversed"
+          (csvParse ',' (T.pack "\"stray\"tail,b"))
+          (Seq.fromList [Seq.fromList [T.pack "straytail", T.pack "b"]])
+  checkEq "escaped quote at the end of a field"
+          (csvParse ',' (T.pack "\"a\"\"\",\"b\""))
+          (Seq.fromList [Seq.fromList [T.pack "a\"", T.pack "b"]])
+  -- Parsing is idempotent once serialised (a trailing empty record collapses on
+  -- the first pass, so compare the second and third generations).
+  forM_ csvCorpus $ \src ->
+    let once = csvToText (mkCsvView ',' (T.pack src))
+        twice = csvToText (mkCsvView ',' once)
+    in checkEq ("csv text is stable after one normalisation (" ++ show src ++ ")")
+               (csvToText (mkCsvView ',' twice)) twice
+
   -- CSV column-width cache ------------------------------------------------------
   -- The cache maintained by withRows/undo/redo must always equal a fresh
   -- recomputation (serialise -> reparse is the ground truth), across cell
   -- edits, multi-line cells, row/column inserts/deletes and undo/redo.
   let widthsOk v = columnWidths v == columnWidths (mkCsvView (csvDelim v) (csvToText v))
-      csvOp r v = case r `mod` 10 of
+      csvOp r v = case r `mod` 13 of
         0 -> setCurrentCell (T.pack (replicate (1 + r `mod` 40) 'x')) v
         1 -> setCurrentCell (T.pack "s") v
         2 -> insertRowBelow v
@@ -1364,6 +1675,13 @@ main = do
         6 -> Cmedit.Csv.undo v
         7 -> Cmedit.Csv.redo v
         8 -> commitEdit (editInsert 'q' (editInsert '\n' (beginEditFresh 'w' v)))
+        -- Typing into a cell, one keystroke at a time and NOT committing
+        -- between them: the per-keystroke width-cache path (plan 0016).
+        9 -> foldl (\acc c -> editInsert c acc) (beginEdit v) ("widen" :: String)
+        -- Shrinking a cell that may have been its column's widest: the one
+        -- case where the cache cannot be updated in O(1).
+        10 -> commitEdit (editBackspace (editBackspace (beginEdit v)))
+        11 -> cancelEdit (editInsert 'z' (beginEdit v))
         _ -> setCursor (r `mod` (nRows v + 1)) ((r `div` 7) `mod` (nCols v + 1)) v
       csvFuzzStep (v, s, ok) _ =
         let s' = lcg s
@@ -1372,9 +1690,9 @@ main = do
                        -- pointer-accelerated modified flag == plain equality
                        && Cmedit.Csv.isModified v' == (csvRows v' /= csvSaved v'))
       vw0 = mkCsvView ',' (T.pack "a,bb,ccc\ndddd,e,f\ng,hh,i")
-      (_, _, csvWidthsOk) = foldl csvFuzzStep (vw0, 7, True) [1 .. 250 :: Int]
+      (_, _, csvWidthsOk) = foldl csvFuzzStep (vw0, 7, True) [1 .. 600 :: Int]
   check "csv width cache correct at load" (widthsOk vw0)
-  check "csv width cache survives 250 random ops" csvWidthsOk
+  check "csv width cache survives 600 random ops" csvWidthsOk
   -- scrollLeft agrees with the (cubic) reference it replaced.
   let scrollLeftRef width v =
         let ws = columnWidths v
@@ -2725,10 +3043,10 @@ main = do
     -- Go to Line pushes the origin; Alt+Left returns; Alt+Right re-jumps.
     let edGoto = key KEnter (typeIn "150" (key (KCtrlChar 'g') ed0))
     checkEq "goto moved" (posLine (edCursor edGoto)) 149
-    checkEq "goto pushed one stop" (map nsPos (edNavBack edGoto)) [Pos 0 0]
+    checkEq "goto pushed one stop" (map nsPos (toList (edNavBack edGoto))) [Pos 0 0]
     let (edBack, _) = update altL edGoto
     checkEq "Alt+Left returns to origin" (edCursor edBack) (Pos 0 0)
-    checkEq "forward trail recorded" (map nsPos (edNavFwd edBack)) [Pos 149 0]
+    checkEq "forward trail recorded" (map nsPos (toList (edNavFwd edBack))) [Pos 149 0]
     let (edFwdE, _) = update altR edBack
     checkEq "Alt+Right re-visits" (posLine (edCursor edFwdE)) 149
     -- A short jump does not pollute the history.
@@ -2804,13 +3122,13 @@ main = do
     let edDocs = (newEditor (24, 80) defaultConfig)
                    { edPath = Just "/w/adir/deep/a.hs"
                    , edRecent = [RecentEntry "/w/adir/deep/a.hs" 3 1, RecentEntry "/w/other" 0 0]
-                   , edNavBack = [NavStop (Just "/w/adir/deep/a.hs") (Pos 1 0)] }
+                   , edNavBack = Seq.fromList [NavStop (Just "/w/adir/deep/a.hs") (Pos 1 0)] }
         edRw = renamePaths "/w/adir" "/w/bdir" edDocs
     checkEq "rename rewrites active path" (edPath edRw) (Just "/w/bdir/deep/a.hs")
     checkEq "rename rewrites recents"
       (map rePath (edRecent edRw)) ["/w/bdir/deep/a.hs", "/w/other"]
     checkEq "rename rewrites nav stops"
-      (map nsPath (edNavBack edRw)) [Just "/w/bdir/deep/a.hs"]
+      (map nsPath (toList (edNavBack edRw))) [Just "/w/bdir/deep/a.hs"]
 
   -- Find/replace input history --------------------------------------------------------
   do
@@ -2825,7 +3143,7 @@ main = do
         find t e = key KEnter (typeIn t (key (KCtrlChar 'f') e))
         ed2 = find "beta" (find "alpha" ed0)
     checkEq "history records searches, newest first"
-      (edFindHist ed2) (map T.pack ["beta", "alpha"])
+      (toList (edFindHist ed2)) (map T.pack ["beta", "alpha"])
     -- Up recalls: newest, then older; Down comes back; typing resumes fresh.
     let edDlg = key (KCtrlChar 'f') ed2      -- Find field seeded with "beta"
         edU1 = key up edDlg
@@ -3877,6 +4195,18 @@ parseBytes ws = do
   src <- listSource ws
   nextKey src
 
+-- Parse a byte stream where the source hands out at most @k@ bytes at a time.
+parseBytesChunked :: Int -> [Word8] -> IO Key
+parseBytesChunked k ws = chunkedSource k ws >>= nextKey
+
+-- Parse two keys in a row from one stream (paste, then whatever followed it).
+parseTwoChunked :: Int -> [Word8] -> IO (Key, Key)
+parseTwoChunked k ws = do
+  src <- chunkedSource k ws
+  a <- nextKey src
+  b <- nextKey src
+  pure (a, b)
+
 -- Build a Kitty/fixterms "CSI code ; mods u" byte sequence.
 csiU :: Int -> Int -> [Word8]
 csiU code mods = [0x1b, 0x5b] ++ digits code ++ [0x3b] ++ digits mods ++ [0x75]
@@ -3890,11 +4220,72 @@ listSource ws0 = do
         case xs of
           []       -> pure Nothing
           (b : bs) -> writeIORef ref bs >> pure (Just b)
-  pure (ByteSource next (const next))
+      -- Hand the whole remainder over at once, so the paste path's chunk
+      -- scanner is exercised; push-back returns bytes to the front.
+      chunk = do
+        xs <- readIORef ref
+        writeIORef ref []
+        pure (BS.pack xs)
+      pushBack bs = modifyIORef' ref (BS.unpack bs ++)
+  pure (ByteSource next (const next) chunk pushBack)
+
+-- | A source that hands out at most @k@ bytes per chunk, so a paste terminator
+-- straddling a chunk boundary is exercised at every offset.
+chunkedSource :: Int -> [Word8] -> IO ByteSource
+chunkedSource k ws0 = do
+  ref <- newIORef ws0
+  let next = do
+        xs <- readIORef ref
+        case xs of
+          []       -> pure Nothing
+          (b : bs) -> writeIORef ref bs >> pure (Just b)
+      chunk = do
+        xs <- readIORef ref
+        let (a, b) = splitAt (max 1 k) xs
+        writeIORef ref b
+        pure (BS.pack a)
+      pushBack bs = modifyIORef' ref (BS.unpack bs ++)
+  pure (ByteSource next (const next) chunk pushBack)
+
+-- | The CSV parser as it was before plan 0016 replaced it (String-based), kept
+-- as an oracle so the Text version can be proved identical on a corpus.
+csvParseRef :: Char -> T.Text -> Seq.Seq (Seq.Seq T.Text)
+csvParseRef delim = Seq.fromList . map Seq.fromList . rows . T.unpack
+  where
+    rows [] = []
+    rows str = let (row, rest, more) = oneRow str
+               in row : if more then rows rest else []
+    oneRow str = collect str []
+    collect str acc =
+      let (f, rest, term) = fld str
+      in case term of
+           0 -> collect rest (f : acc)
+           1 -> (reverse (f : acc), rest, not (null rest))
+           _ -> (reverse (f : acc), rest, False)
+    fld ('"' : cs) = quoted cs []
+    fld cs         = unquoted cs []
+    quoted ('"' : '"' : cs) acc = quoted cs ('"' : acc)
+    quoted ('"' : cs) acc       = close cs (reverse acc)
+    quoted (c : cs) acc         = quoted cs (c : acc)
+    quoted [] acc               = (T.pack (reverse acc), [], 2 :: Int)
+    close (c : cs) val
+      | c == delim = (T.pack val, cs, 0)
+      | c == '\n'  = (T.pack val, cs, 1)
+      | c == '\r'  = (T.pack val, dropLF cs, 1)
+      | otherwise  = unquoted cs (reverse (c : reverse val))
+    close [] val = (T.pack val, [], 2)
+    unquoted (c : cs) acc
+      | c == delim = (T.pack (reverse acc), cs, 0)
+      | c == '\n'  = (T.pack (reverse acc), cs, 1)
+      | c == '\r'  = (T.pack (reverse acc), dropLF cs, 1)
+      | otherwise  = unquoted cs (c : acc)
+    unquoted [] acc = (T.pack (reverse acc), [], 2)
+    dropLF ('\n' : cs) = cs
+    dropLF cs          = cs
 
 -- Undo-stack depth (a local `edUndo` binding in main shadows the selector).
 undoDepth :: Editor -> Int
-undoDepth = length . edUndo
+undoDepth = Seq.length . edUndo
 
 isJust' :: Maybe a -> Bool
 isJust' = maybe False (const True)

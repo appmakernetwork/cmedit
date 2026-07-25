@@ -17,6 +17,7 @@ data Options = Options
   { optConfig   :: Config
   , optFiles    :: [FilePath]
   , optReadOnly :: Bool
+  , optStats    :: Bool
   , optHelp     :: Bool
   , optVersion  :: Bool
   , optError    :: Maybe String
@@ -27,6 +28,7 @@ baseOptions cfg = Options
   { optConfig   = cfg
   , optFiles    = []
   , optReadOnly = False
+  , optStats    = False
   , optHelp     = False
   , optVersion  = False
   , optError    = Nothing
@@ -46,7 +48,8 @@ main = do
     Nothing
       | optHelp opts    -> putStr helpString >> exitSuccess
       | optVersion opts -> putStrLn versionString >> exitSuccess
-      | otherwise       -> run (optConfig opts) cfgWarns (reverse (optFiles opts)) (optReadOnly opts)
+      | otherwise       -> run (optConfig opts) cfgWarns (reverse (optFiles opts))
+                               (optReadOnly opts) (optStats opts)
 
 parseArgs :: [String] -> Options -> Options
 parseArgs [] o = o
@@ -61,6 +64,7 @@ parseArgs (a : rest) o = case a of
   "--line-numbers"    -> parseArgs rest o { optConfig = (optConfig o) { cfgLineNumbers = True } }
   "--no-auto-indent"  -> parseArgs rest o { optConfig = (optConfig o) { cfgAutoIndent = False } }
   "--readonly" -> parseArgs rest o { optReadOnly = True }
+  "--stats-on-exit" -> parseArgs rest o { optStats = True }
   "-t" -> takeTabWidth rest o
   "--tab-width" -> takeTabWidth rest o
   _ | take 2 a == "--" -> o { optError = Just ("unknown option " ++ a) }

@@ -113,6 +113,7 @@ data Key
   | KEsc
   | KMouse !MouseEvent
   | KPaste !Text          -- ^ Bracketed-paste payload (Text: giant pastes must not materialise as a char list).
+  | KPasteTruncated !Text -- ^ As 'KPaste', but the payload hit 'maxPasteBytes' and the rest was discarded. Normalised to 'KPaste' (plus a status note) at the top of 'Cmedit.Editor.update'.
   | KResize               -- ^ Terminal was resized (injected, not parsed).
   | KFocus !Bool          -- ^ Terminal gained (True) / lost focus (CSI I / CSI O).
   | KReply !TermReply     -- ^ A terminal reply to one of our queries (driver-consumed, like 'KFocus').

@@ -21,6 +21,7 @@ import Data.Array (Array)
 
 import Cmedit.Types
 import Cmedit.TextBuffer
+import Cmedit.History (pushHist)
 import Cmedit.Width (colToDisplay, displayToCol, wrapLine)
 import Cmedit.ConfigFile
   ( Config(..), ThemeName(..), defaultConfig, RecentEntry(..)
@@ -118,8 +119,8 @@ data Document = Document
   , docSavedEnc     :: !Encoding           -- ^ Encoding (BOM) as last loaded/saved.
   , docFinalNewline :: !Bool
   , docReadOnly     :: !Bool
-  , docUndo         :: ![UndoState]
-  , docRedo         :: ![UndoState]
+  , docUndo         :: !(Seq UndoState)
+  , docRedo         :: !(Seq UndoState)
   , docLastEdit     :: !EditKind
   , docOverwrite    :: !Bool
   , docDiscard      :: !Bool
@@ -175,8 +176,8 @@ data Editor = Editor
   , edSavedEnc      :: !Encoding           -- ^ Encoding (BOM) as last loaded/saved.
   , edFinalNewline  :: !Bool
   , edReadOnly      :: !Bool
-  , edUndo          :: ![UndoState]
-  , edRedo          :: ![UndoState]
+  , edUndo          :: !(Seq UndoState)
+  , edRedo          :: !(Seq UndoState)
   , edLastEdit      :: !EditKind
   , edSize          :: !(Int, Int)         -- (rows, cols)
   , edStatus        :: !Text
@@ -222,10 +223,10 @@ data Editor = Editor
   , edDefGen        :: !Int             -- ^ Monotonic id of the newest definition scan (stale results are dropped).
   , edQuickOpen     :: !(Maybe QuickOpen) -- ^ The Ctrl+P go-to-file picker, when open.
   , edQuickGen      :: !Int             -- ^ Monotonic id of the newest quick-open walk.
-  , edNavBack       :: ![NavStop]       -- ^ Locations to go back to (Alt+Left), most recent first.
-  , edNavFwd        :: ![NavStop]       -- ^ Locations undone by Go Back (Alt+Right re-visits them).
-  , edFindHist      :: ![Text]          -- ^ Previous search terms, newest first (Up in the Find field recalls them).
-  , edReplHist      :: ![Text]          -- ^ Previous replacement terms.
+  , edNavBack       :: !(Seq NavStop)   -- ^ Locations to go back to (Alt+Left), most recent first (bounded by 'pushHist').
+  , edNavFwd        :: !(Seq NavStop)   -- ^ Locations undone by Go Back (Alt+Right re-visits them).
+  , edFindHist      :: !(Seq Text)      -- ^ Previous search terms, newest first (Up in the Find field recalls them).
+  , edReplHist      :: !(Seq Text)      -- ^ Previous replacement terms.
   , edHistPos       :: !(Maybe Int)     -- ^ Index being browsed in the focused field's history, if any.
   , edHistStash     :: !Text            -- ^ The in-progress field text stashed while browsing history.
   , edComplete      :: !(Maybe Complete) -- ^ The Ctrl+Space word-completion popup, when open.
@@ -244,6 +245,7 @@ data Editor = Editor
   , edDiags         :: ![Diag]           -- ^ Linter diagnostics for the active document (sorted by line,col; the renderer draws squiggles/counts from these; per-doc twin 'docDiags').
   , edLintAvail     :: !LintAvail         -- ^ Which linters the driver has detected as installed (drives the run list and the Settings availability notes); global, refreshed by 'EffDetectLinters'.
   , edEditSeq       :: !Int              -- ^ Monotonic edit counter bumped at every buffer edit/undo/redo/load; the driver fingerprints it to debounce lint passes.
+  , edStats         :: !(Maybe Text)     -- ^ Live session counters for the status bar (@debug-stats@). Pre-rendered by the driver so the pure side stays IO-free; 'Nothing' when the key is off.
   } deriving (Show)
 
 -- | A fresh editor for the given terminal size and config.
@@ -266,8 +268,8 @@ newEditor size cfg = Editor
   , edSavedEnc      = Utf8
   , edFinalNewline  = True
   , edReadOnly      = False
-  , edUndo          = []
-  , edRedo          = []
+  , edUndo          = Seq.empty
+  , edRedo          = Seq.empty
   , edLastEdit      = EKNone
   , edSize          = size
   , edStatus        = ""
@@ -313,10 +315,10 @@ newEditor size cfg = Editor
   , edDefGen        = 0
   , edQuickOpen     = Nothing
   , edQuickGen      = 0
-  , edNavBack       = []
-  , edNavFwd        = []
-  , edFindHist      = []
-  , edReplHist      = []
+  , edNavBack       = Seq.empty
+  , edNavFwd        = Seq.empty
+  , edFindHist      = Seq.empty
+  , edReplHist      = Seq.empty
   , edHistPos       = Nothing
   , edHistStash     = ""
   , edComplete      = Nothing
@@ -335,6 +337,7 @@ newEditor size cfg = Editor
   , edDiags         = []
   , edLintAvail     = [ (linId l, Nothing) | l <- linters ]
   , edEditSeq       = 0
+  , edStats         = Nothing
   }
 
 -- | The theme buttons of the 'DKTheme' picker, in button order
@@ -366,6 +369,26 @@ resolvedTheme ed = case base of
              , Just b <- focusedButton d
              , b < length themeChoices -> themeChoices !! b
       _ -> cfgTheme (edConfig ed)
+
+-- | Detach a 'Text' from the array it was sliced out of.
+--
+-- @Data.Text@ values are slices — an offset and a length into a shared byte
+-- array — so @T.take@ \/ @T.drop@ \/ @T.splitOn@ never copy. Since a buffer's
+-- lines are slices of the whole decoded file, **any slice that outlives the
+-- buffer pins the entire file**: measured, ten lines (680 characters) kept out
+-- of a 49 MB file held 49 MB live. Copy at every boundary where a 'Text'
+-- escapes its document — the clipboard, search\/replace terms and their
+-- persisted history, completion candidates — exactly as "Cmedit.Search" does
+-- for result snippets. Values that were freshly built (an @'<>'@, an
+-- @intercalate@) are already detached; copying them again is only wasted work.
+detach :: Text -> Text
+detach = T.copy
+
+-- | Driver callback: install the pre-rendered @debug-stats@ segment (or clear
+-- it). Kept as text because the pure model has no business knowing what an
+-- RTS statistic is.
+setStatsLine :: Maybe Text -> Editor -> Editor
+setStatsLine t ed = ed { edStats = t }
 
 -- | Record the OSC 11 verdict (driver callback).
 setDetectedDark :: Bool -> Editor -> Editor
@@ -1167,7 +1190,7 @@ aboutText = T.intercalate "\n" $
   where center t = T.replicate (max 0 ((51 - T.length t) `div` 2)) " " <> t
 
 versionText :: Text
-versionText = "0.3.1"
+versionText = "0.4.0"
 
 ------------------------------------------------------------------------------
 -- Search
@@ -1272,8 +1295,9 @@ currentStop ed = NavStop (edPath ed) (activeCursorPos ed)
 pushNavIfFar :: Maybe FilePath -> Pos -> Editor -> Editor
 pushNavIfFar tpath tpos ed
   | not isFar = ed
-  | (s : _) <- edNavBack ed, s == cur = ed { edNavFwd = [] }
-  | otherwise = ed { edNavBack = take maxNavStops (cur : edNavBack ed), edNavFwd = [] }
+  | (s Seq.:< _) <- Seq.viewl (edNavBack ed), s == cur = ed { edNavFwd = Seq.empty }
+  | otherwise = ed { edNavBack = pushHist maxNavStops cur (edNavBack ed)
+                   , edNavFwd = Seq.empty }
   where
     cur = currentStop ed
     isFar = tpath /= edPath ed

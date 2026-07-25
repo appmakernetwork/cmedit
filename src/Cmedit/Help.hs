@@ -7,7 +7,7 @@ module Cmedit.Help
 import Cmedit.ConfigFile (configKeysHelp)
 
 versionString :: String
-versionString = "CMeDit 0.3.1"
+versionString = "CMeDit 0.4.0"
 
 helpString :: String
 helpString = unlines $
@@ -32,6 +32,7 @@ helpString = unlines $
   , "        --line-numbers      Show the line-number gutter."
   , "        --no-auto-indent    Do not copy indentation onto new lines."
   , "        --readonly          Open the file read-only."
+  , "        --stats-on-exit     Print a session summary (frames, memory, GC) on exit."
   , ""
   , "\ESC[1mCONFIGURATION\ESC[0m"
   , "    Defaults are read from ~/.config/cmedit/config (XDG_CONFIG_HOME is"

@@ -45,6 +45,7 @@ import Cmedit.Clipboard (CopyOutcome(..))
 import Cmedit.Image (Image(..), ImgMode(..), renderImage, viewFit)
 import Cmedit.Syntax (HlCache, CommentSyntax(..), langComment, langForPath)
 
+import Cmedit.History (pushHist)
 import Cmedit.EditorState
 import Cmedit.EditorEdit
 import Cmedit.EditorDoc
@@ -78,10 +79,13 @@ openReplace ed = refreshFindCount (openDialog (mkReplace (findSeed ed) (edReplac
 -- "select a word, hit Replace" fills it in); otherwise the last search term.
 -- Multi-line selections are fine — the search engine matches across lines — but
 -- in CSV mode edBuffer/edSelAnchor are stale, so fall back to the last term.
+-- Detached: the seed flows into the dialog field, 'edSearchTerm', the input
+-- history (persisted, session-long) and workspace 'SearchReq's, all of which
+-- outlive the document — an undetached slice would pin its whole file.
 findSeed :: Editor -> Text
 findSeed ed
   | Nothing <- edCsv ed
-  , Just (a, b) <- getSelection ed = textInRange a b (edBuffer ed)
+  , Just (a, b) <- getSelection ed = detach (textInRange a b (edBuffer ed))
   | otherwise = edSearchTerm ed
 
 -- Match start indices in a line (overlapping, for find-next), honouring case-
@@ -489,23 +493,29 @@ csvReplaceOne ed v
 ------------------------------------------------------------------------------
 -- Find / replace input history (Up/Down in the dialog fields)
 
+-- The history is kept for the whole session and written to ~/.config/cmedit,
+-- so its entries must be 'detach'ed from whatever buffer they came from.
 pushFindHist :: Text -> Editor -> Editor
-pushFindHist t ed
-  | T.null t = ed
-  | otherwise = ed { edFindHist = take maxHistoryEntries (t : filter (/= t) (edFindHist ed)) }
+pushFindHist t0 ed
+  | T.null t0 = ed
+  | otherwise = let t = detach t0
+                in ed { edFindHist = pushHist maxHistoryEntries t
+                                       (Seq.filter (/= t) (edFindHist ed)) }
 
 pushReplHist :: Text -> Editor -> Editor
-pushReplHist t ed
-  | T.null t = ed
-  | otherwise = ed { edReplHist = take maxHistoryEntries (t : filter (/= t) (edReplHist ed)) }
+pushReplHist t0 ed
+  | T.null t0 = ed
+  | otherwise = let t = detach t0
+                in ed { edReplHist = pushHist maxHistoryEntries t
+                                       (Seq.filter (/= t) (edReplHist ed)) }
 
 -- Does the focused field of this dialog have a recall history?
-histFieldOf :: Editor -> Dialog -> Maybe (Int, [Text])
+histFieldOf :: Editor -> Dialog -> Maybe (Int, Seq Text)
 histFieldOf ed d
   | dlgKind d `elem` [DKFind, DKReplace] = do
       i <- focusedField d
       let hist = if i == 0 then edFindHist ed else edReplHist ed
-      if null hist then Nothing else Just (i, hist)
+      if Seq.null hist then Nothing else Just (i, hist)
   | otherwise = Nothing
 
 -- | Step through the focused field's history: @dir@ 1 = older, -1 = newer.
@@ -515,8 +525,8 @@ histRecall dir ed = case edDialog ed of
   Just d | Just (i, hist) <- histFieldOf ed d ->
     let cur   = fromMaybe (-1) (edHistPos ed)
         stash = if cur == -1 then fieldValue i d else edHistStash ed
-        pos   = max (-1) (min (length hist - 1) (cur + dir))
-        newT  = if pos == -1 then stash else hist !! pos
+        pos   = max (-1) (min (Seq.length hist - 1) (cur + dir))
+        newT  = if pos == -1 then stash else Seq.index hist pos
     in ed { edDialog = Just (setFieldText i newT d)
           , edHistPos = if pos == -1 then Nothing else Just pos
           , edHistStash = stash }
@@ -537,7 +547,8 @@ openSearchPanel showRepl ed =
       -- from the editor — re-invoking inside the panel must keep the typed term.
       seedTerm
         | edFocus ed /= FSearch, Nothing <- edCsv ed, Just (a, b) <- getSelection ed
-        , not (hasNewline (textInRange a b (edBuffer ed))) = textInRange a b (edBuffer ed)
+        , not (hasNewline (textInRange a b (edBuffer ed)))
+                                                           = detach (textInRange a b (edBuffer ed))
         | not (T.null (sfText (ssFind base)))              = sfText (ssFind base)
         | otherwise                                        = edSearchTerm ed
       -- F4 opens a find-only view; F6 shows the replace row.
@@ -767,7 +778,8 @@ stagedDoc path lr buf' = Document
   , docLineEnding = lrLineEnding lr, docSavedEol = lrLineEnding lr
   , docEncoding = lrEncoding lr, docSavedEnc = lrEncoding lr
   , docFinalNewline = lrFinalNewline lr, docReadOnly = lrReadOnly lr
-  , docUndo = [UndoState (lrBuffer lr) origin Nothing], docRedo = [], docLastEdit = EKNone
+  , docUndo = Seq.singleton (UndoState (lrBuffer lr) origin Nothing)
+  , docRedo = Seq.empty, docLastEdit = EKNone
   , docOverwrite = False, docDiscard = False
   , docCsv = Nothing, docCsvStash = Nothing, docImage = Nothing
   , docHlCache = Nothing
@@ -810,7 +822,8 @@ replaceInOpenDocs subst paths ed =
         | hit d = let snap   = UndoState (docBuffer d) (docCursor d) (docSelAnchor d)
                       (b, c) = doBuf (docBuffer d)
                   in (d { docBuffer = b, docModified = True
-                        , docUndo = take maxUndo (snap : docUndo d), docRedo = [] }, c)
+                        , docUndo = pushHist maxUndo snap (docUndo d)
+                        , docRedo = Seq.empty }, c)
         | otherwise = (d, 0)
       (before', bc) = unzipSum (map onDoc (edBefore edA))
       (after',  ac) = unzipSum (map onDoc (edAfter edA))

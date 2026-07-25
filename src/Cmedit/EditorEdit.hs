@@ -47,6 +47,7 @@ import Cmedit.Image (Image(..), ImgMode(..), renderImage, viewFit)
 import Cmedit.Syntax (HlCache, CommentSyntax(..), langComment, langForPath)
 import Cmedit.Lint (Linter(..), Severity(..), Diag(..), LintAvail, linters, linterById)
 
+import Cmedit.History (pushHist)
 import Cmedit.EditorState
 
 
@@ -232,19 +233,19 @@ bufModified ed buf =
 -- coalesced with the previous edit of the same kind.
 beginEdit :: EditKind -> Editor -> Editor
 beginEdit kind ed
-  | coalesces && kind == edLastEdit ed = ed { edRedo = [] }
-  | otherwise = ed { edUndo = take maxUndo (snapshot ed : edUndo ed)
-                   , edRedo = []
+  | coalesces && kind == edLastEdit ed = ed { edRedo = Seq.empty }
+  | otherwise = ed { edUndo = pushHist maxUndo (snapshot ed) (edUndo ed)
+                   , edRedo = Seq.empty
                    , edLastEdit = kind }
   where coalesces = kind == EKType || kind == EKDelete || kind == EKMoveLine
 
 undo :: Editor -> Editor
-undo ed = case edUndo ed of
-  [] -> ed { edStatus = "Nothing to undo" }
-  (u : us) ->
+undo ed = case Seq.viewl (edUndo ed) of
+  Seq.EmptyL -> ed { edStatus = "Nothing to undo" }
+  (u Seq.:< us) ->
     ensureVisible ed
       { edUndo = us
-      , edRedo = snapshot ed : edRedo ed
+      , edRedo = pushHist maxUndo (snapshot ed) (edRedo ed)
       , edBuffer = usBuffer u
       , edCursor = clampPos (usCursor u) (usBuffer u)
       , edSelAnchor = usAnchor u
@@ -255,12 +256,12 @@ undo ed = case edUndo ed of
       }
 
 redo :: Editor -> Editor
-redo ed = case edRedo ed of
-  [] -> ed { edStatus = "Nothing to redo" }
-  (u : us) ->
+redo ed = case Seq.viewl (edRedo ed) of
+  Seq.EmptyL -> ed { edStatus = "Nothing to redo" }
+  (u Seq.:< us) ->
     ensureVisible ed
       { edRedo = us
-      , edUndo = snapshot ed : edUndo ed
+      , edUndo = pushHist maxUndo (snapshot ed) (edUndo ed)
       , edBuffer = usBuffer u
       , edCursor = clampPos (usCursor u) (usBuffer u)
       , edSelAnchor = usAnchor u
@@ -400,10 +401,14 @@ deleteWordRight ed0
 ------------------------------------------------------------------------------
 -- Clipboard actions
 
+-- The clipboard outlives the document it was copied from, so a single-line
+-- selection (a 'textInRange' slice) would otherwise pin the whole file's byte
+-- array for the rest of the session — see 'detach'. The whole-line cases below
+-- append a newline, which already builds a fresh array.
 copy :: Editor -> (Editor, [Effect])
 copy ed = case getSelection ed of
   Just (a, b) ->
-    let txt = textInRange a b (edBuffer ed)
+    let txt = detach (textInRange a b (edBuffer ed))
     in (ed { edClipboard = txt, edStatus = "Copied" }, [EffCopy txt])
   Nothing ->
     let l   = posLine (edCursor ed)
@@ -415,7 +420,7 @@ cut ed0
   | edReadOnly ed0 = (ed0 { edStatus = "File is read-only" }, [])
   | otherwise = case getSelection ed0 of
       Just (a, b) ->
-        let txt = textInRange a b (edBuffer ed0)
+        let txt = detach (textInRange a b (edBuffer ed0))
             ed1 = setDesired (afterEdit (removeSelection (beginEdit EKOther ed0)))
         in (ed1 { edClipboard = txt, edStatus = "Cut" }, [EffCopy txt])
       Nothing ->
@@ -479,9 +484,9 @@ applySaveFixupsAll ed0 =
                          d { docBuffer = b'
                            , docCursor = clampPos (docCursor d) b'
                            , docSelAnchor = fmap (`clampPos` b') (docSelAnchor d)
-                           , docUndo = take maxUndo
-                               (UndoState (docBuffer d) (docCursor d) (docSelAnchor d) : docUndo d)
-                           , docRedo = [], docLastEdit = EKNone }
+                           , docUndo = pushHist maxUndo
+                               (UndoState (docBuffer d) (docCursor d) (docSelAnchor d)) (docUndo d)
+                           , docRedo = Seq.empty, docLastEdit = EKNone }
                        _ -> d
             in if cfgEnsureFinalNl cfg && not (docFinalNewline d1)
                  then d1 { docFinalNewline = True }
@@ -665,7 +670,12 @@ statusRightInfo ed = flatten segs
               tools = intercalate "+" (diagToolNames ed)
               diagSeg = if null (edDiags ed) then []
                         else [ zone SZDiagnostics (tools ++ ": " ++ show nE ++ "E " ++ show nW ++ "W"), plain "  " ]
-          in diagSeg ++
+              -- Live counters first, so they never displace the zones whose
+              -- click offsets matter (they are plain text, no zone of their own).
+              statsSeg = case edStats ed of
+                Nothing -> []
+                Just t  -> [ plain (T.unpack t ++ "  ") ]
+          in statsSeg ++ diagSeg ++
           [ zone SZGoTo ("Ln " ++ show (l + 1) ++ ", Col " ++ show (c + 1))
           , plain selInfo, plain "   "
           , zone SZOverwrite ovr, plain "  "
@@ -1081,7 +1091,11 @@ collectCandidates prefix ed = go maxCompleteLines Set.empty srcLines []
     go budget seen (ln : rest) acc
       | budget <= 0 || length acc >= maxCompleteItems = reverse acc
       | otherwise =
-          let ws = [ w | w <- T.split (not . isWordCh) ln, keep w, not (Set.member w seen) ]
+          -- 'detach': a candidate is a slice of a document line and can end up
+          -- in the popup (and, once accepted, in the buffer) after that document
+          -- is closed, pinning its whole file. Words are tiny; copying is free.
+          let ws = [ detach w | w <- T.split (not . isWordCh) ln, keep w
+                              , not (Set.member w seen) ]
               fresh = nubQuick ws
               seen' = foldr Set.insert seen fresh
           in go (budget - 1) seen' rest (reverse fresh ++ acc)

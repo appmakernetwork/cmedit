@@ -76,6 +76,7 @@ data Config = Config
   , cfgEnsureFinalNl  :: !Bool   -- ^ Make sure the file ends with a newline on save.
   , cfgFreezeHeader   :: !Bool   -- ^ CSV table view: pin the first row while scrolling (View ▸ Freeze Header Row toggles it per-session).
   , cfgTheme          :: !ThemeName
+  , cfgDebugStats     :: !Bool   -- ^ Show live session counters (frames, heap, jobs) on the status bar.
   , cfgLint           :: !Bool                -- ^ Master switch for external-linter diagnostics.
   , cfgLintOn         :: ![(LinterId, Bool)]  -- ^ Per-linter enable flags, one entry per 'Cmedit.Lint.linters' row.
   } deriving (Eq, Show)
@@ -94,6 +95,7 @@ defaultConfig = Config
   , cfgEnsureFinalNl  = False
   , cfgFreezeHeader   = True    -- spreadsheets almost always have a header row
   , cfgTheme          = ThemeAuto   -- follow the terminal background; dark when undetectable
+  , cfgDebugStats     = False
   , cfgLint           = True
   , cfgLintOn         = [ (linId l, linDefaultOn l) | l <- linters ]
   }
@@ -149,6 +151,7 @@ applyKey key val cfg = case key of
     "flashbang"      -> Right cfg { cfgTheme = ThemeFlashbang }
     "midnight"       -> Right cfg { cfgTheme = ThemeMidnight }
     _ -> Left "theme expects 'auto', 'dark-terminal', 'light-terminal', 'cherry-blossom', 'flashbang' or 'midnight'"
+  "debug-stats" -> boolKey (\b -> cfg { cfgDebugStats = b })
   "lint" -> boolKey (\b -> cfg { cfgLint = b })
   _ | Just suffix <- stripPrefix' "lint-" key
     , Just l <- lookupLinter suffix ->
@@ -199,6 +202,9 @@ configKeysHelp =
   , "                     true). Per-linter switches: lint-ruff, lint-flake8,"
   , "                     lint-eslint, lint-stylelint, lint-pyright,"
   , "                     lint-shellcheck (each = on|off)."
+  , "debug-stats = BOOL   Show live session counters (frame time, heap, jobs)"
+  , "                     on the status bar (default off). For a one-shot"
+  , "                     summary instead, run with --stats-on-exit."
   ]
 
 ------------------------------------------------------------------------------
@@ -222,6 +228,7 @@ configFields =
   , ("final-newline",            renderBool . cfgEnsureFinalNl)
   , ("freeze-header",            renderBool . cfgFreezeHeader)
   , ("theme",                    renderTheme . cfgTheme)
+  , ("debug-stats",              renderBool . cfgDebugStats)
   , ("lint",                     renderBool . cfgLint)
   ] ++
   [ ( T.pack ("lint-" ++ linName l)

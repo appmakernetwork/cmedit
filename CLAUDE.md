@@ -219,6 +219,33 @@ in `README.md`; the cross-cutting structure that matters when editing:
   column can be clipped mid-cell), while keyboard navigation stays
   column-aligned. Both bars are Settings-dialog rows (`settingsSpec`,
   "Vertical/Horizontal scroll bar") that apply live like every other row.
+- **Bounded histories are structural (`Cmedit.History`).** Undo/redo (text and
+  CSV), the Alt+←/→ navigation trail and the find/replace input history are
+  `Seq`s pushed through `pushHist`, *never* lists capped with `take`: `take n
+  (x : xs)` retains everything it promises to drop (the cap only applies if
+  something walks the list that far, and nothing does), which grew undo history
+  for the whole session. `Cmedit.History` is a leaf module so `Csv` and
+  `EditorState` can both use it. Anything else that accumulates with session
+  length needs the same treatment.
+- **A `Text` that outlives its buffer must be `detach`ed** (`EditorState.detach`
+  = `T.copy`). `Data.Text` values are slices of a shared array, and a buffer's
+  lines are slices of the whole decoded file, so one escaped slice pins the
+  entire file: ten retained lines of a 49 MB file held 49 MB. The clipboard,
+  find/replace terms and their persisted history, completion candidates and
+  `Search`/`Definition` snippets all copy; values that were freshly built (an
+  `<>`, an `intercalate`) are already detached.
+- **Buffer writes are explicitly strict.** `Seq` is spine-strict but
+  element-*lazy*, and `Seq.update i x = adjust (const x) i` stores a thunk
+  capturing the line it replaced — which every undo snapshot then holds, so the
+  versions chain. `TextBuffer` uses `Seq.adjust'` and bangs the lines it stores.
+  `-O2` happens to remove the chain; the space behaviour must not depend on it.
+- **The event loop collects when idle** (`App.idleGcDelayUs`, 30 s, re-armed by
+  every branch that does work, disarmed once it fires). An idle editor never
+  allocates, so nothing is ever collected and the process keeps the high-water
+  mark of everything it has opened. The shipped RTS options
+  (`Makefile` `RTSOPTS`) pair it with `--disable-delayed-os-memory-return`,
+  without which freed pages stay in RSS (`MADV_FREE`) — together they took
+  "2.5 GB after opening and closing a 32 MB CSV" to 33 MB.
 - **Two coordinate systems.** Buffer positions (`Pos`) count *characters*; the
   screen counts *display cells*. `Cmedit.Width` maps between them
   (`colToDisplay`/`displayToCol`) and supplies a compact `wcwidth` plus tab-stop

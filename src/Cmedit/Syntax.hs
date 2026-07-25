@@ -270,9 +270,21 @@ lexWith step st0 line = loop st0 (T.unpack line)
     loop st [] = ([], st)
     loop st cs =
       let (n, tok, st') = step st cs
-          n' = max 1 (min n (length cs))
+          n' = max 1 (clampLen n cs)
           (rest, stEnd) = loop st' (drop n' cs)
       in (replicate n' tok ++ rest, stEnd)
+
+-- @min n (length xs)@, stopping as soon as @n@ elements have been seen. The
+-- clamp exists to survive a step that over-reports its count; measuring the
+-- whole remainder to find that out made every lexer O(line²) — a 3000-column
+-- minified line cost ~800ms per frame, which is a hung editor. Steps never
+-- over-report in practice, so the bounded walk is pure insurance.
+clampLen :: Int -> [a] -> Int
+clampLen n xs0 = go 0 xs0
+  where
+    go !k _ | k >= n = n
+    go !k [] = k
+    go !k (_ : r) = go (k + 1) r
 
 -- Index of the first occurrence of a substring.
 findSub :: String -> String -> Maybe Int

@@ -3,6 +3,7 @@ dist-*/
 /cmedit
 /cmedit.exe
 /cmedit-test
+/cmedit-soak
 *.deb
 *.o
 *.hi

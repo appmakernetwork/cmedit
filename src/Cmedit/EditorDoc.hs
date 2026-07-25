@@ -46,6 +46,7 @@ import Cmedit.Clipboard (CopyOutcome(..))
 import Cmedit.Image (Image(..), ImgMode(..), renderImage, viewFit)
 import Cmedit.Syntax (HlCache, CommentSyntax(..), langComment, langForPath)
 
+import Cmedit.History (pushHist)
 import Cmedit.EditorState
 import Cmedit.EditorEdit
 
@@ -79,7 +80,7 @@ setLoaded path lr ed =
         , edSavedEnc = lrEncoding lr
         , edFinalNewline = lrFinalNewline lr
         , edReadOnly = lrReadOnly lr
-        , edUndo = [], edRedo = [], edLastEdit = EKNone
+        , edUndo = Seq.empty, edRedo = Seq.empty, edLastEdit = EKNone
         , edStatus = T.pack ("Opened " ++ path
                       ++ (if lrReadOnly lr then " [read-only]" else ""))
         , edFocus = FEdit, edDialog = Nothing, edSearchMode = False
@@ -282,7 +283,7 @@ docFromLoad path lr = Document
   , docLineEnding = lrLineEnding lr, docSavedEol = lrLineEnding lr
   , docEncoding = lrEncoding lr, docSavedEnc = lrEncoding lr
   , docFinalNewline = lrFinalNewline lr, docReadOnly = lrReadOnly lr
-  , docUndo = [], docRedo = [], docLastEdit = EKNone, docOverwrite = False
+  , docUndo = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone, docOverwrite = False
   , docDiscard = False
   , docCsvStash = Nothing
   , docImage = Nothing
@@ -310,7 +311,7 @@ imageLoaded path frames ed = touchRecent path $ refreshImage $ ensureVisible ed
   , edLineEnding = LF, edSavedEol = LF, edEncoding = Utf8, edSavedEnc = Utf8
   , edFinalNewline = True
   , edReadOnly = True
-  , edUndo = [], edRedo = [], edLastEdit = EKNone
+  , edUndo = Seq.empty, edRedo = Seq.empty, edLastEdit = EKNone
   , edStatus = T.pack ("Viewing image  " ++ imgFmt img ++ " "
                 ++ show (imgW img) ++ "x" ++ show (imgH img)
                 ++ (if nframes > 1 then ", " ++ show nframes ++ " frames" else "")
@@ -352,7 +353,7 @@ imageDocSnapshot path frames = Document
   , docDiskMtime = Nothing, docDiskChanged = False
   , docLineEnding = LF, docSavedEol = LF, docEncoding = Utf8, docSavedEnc = Utf8
   , docFinalNewline = True, docReadOnly = True
-  , docUndo = [], docRedo = [], docLastEdit = EKNone, docOverwrite = False
+  , docUndo = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone, docOverwrite = False
   , docDiscard = False, docCsv = Nothing, docCsvStash = Nothing
   , docImage = Just (mkImageDoc frames)
   , docHlCache = Nothing
@@ -702,7 +703,7 @@ doNew ed = ensureVisible ed
   , edDiskMtime = Nothing, edDiskChanged = False
   , edLineEnding = LF, edSavedEol = LF, edEncoding = Utf8, edSavedEnc = Utf8
   , edFinalNewline = True, edReadOnly = False
-  , edUndo = [], edRedo = [], edLastEdit = EKNone
+  , edUndo = Seq.empty, edRedo = Seq.empty, edLastEdit = EKNone
   , edStatus = "New file", edFocus = FEdit, edDialog = Nothing, edSearchMode = False
   , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
   , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing
@@ -729,7 +730,7 @@ openManual ed0 = case findOpenIndex manualPath ed of
          , edLineEnding = LF, edSavedEol = LF, edEncoding = Utf8, edSavedEnc = Utf8
          , edFinalNewline = True
          , edReadOnly = True
-         , edUndo = [], edRedo = [], edLastEdit = EKNone
+         , edUndo = Seq.empty, edRedo = Seq.empty, edLastEdit = EKNone
          , edStatus = manualStatus
          , edFocus = FEdit, edDialog = Nothing, edSearchMode = False
          , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
@@ -862,23 +863,23 @@ savedAll saved ed =
 -- the forward trail). Stops in untitled buffers are only reachable while that
 -- buffer is still active; dead ones are dropped.
 navBack :: Editor -> (Editor, [Effect])
-navBack ed = case edNavBack ed of
-  [] -> noEff ed { edStatus = "No earlier location" }
-  (s : rest)
+navBack ed = case Seq.viewl (edNavBack ed) of
+  Seq.EmptyL -> noEff ed { edStatus = "No earlier location" }
+  (s Seq.:< rest)
     | not (stopReachable s ed) -> navBack ed { edNavBack = rest }
     | otherwise ->
         gotoStop s ed { edNavBack = rest
-                      , edNavFwd = take maxNavStops (currentStop ed : edNavFwd ed) }
+                      , edNavFwd = pushHist maxNavStops (currentStop ed) (edNavFwd ed) }
 
 -- | Alt+Right: re-visit a location undone by Go Back.
 navFwd :: Editor -> (Editor, [Effect])
-navFwd ed = case edNavFwd ed of
-  [] -> noEff ed { edStatus = "No later location" }
-  (s : rest)
+navFwd ed = case Seq.viewl (edNavFwd ed) of
+  Seq.EmptyL -> noEff ed { edStatus = "No later location" }
+  (s Seq.:< rest)
     | not (stopReachable s ed) -> navFwd ed { edNavFwd = rest }
     | otherwise ->
         gotoStop s ed { edNavFwd = rest
-                      , edNavBack = take maxNavStops (currentStop ed : edNavBack ed) }
+                      , edNavBack = pushHist maxNavStops (currentStop ed) (edNavBack ed) }
 
 stopReachable :: NavStop -> Editor -> Bool
 stopReachable (NavStop Nothing _) ed = isNothing (edPath ed)
