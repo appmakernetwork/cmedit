@@ -50,6 +50,7 @@ module Cmedit.TextBuffer
   , loadFile
   , loadFromBytes
   , looksBinary
+  , stripBom
   , canWrite
   , saveFile
   , bufferBuilder

@@ -48,6 +48,8 @@ import Cmedit.Definition (DefLang(..), DefPick(..), DefItem(..), DefReq(..))
 import qualified Cmedit.Definition as D
 import qualified Cmedit.Regex as Rx
 import qualified Data.Sequence as Seq
+import Cmedit.Pager (PagerDoc(..))
+import qualified Cmedit.Pager as Pg
 import Cmedit.Csv
 import Cmedit.Image (Image(..), ImgMode(..), decodeImage, decodeFrames, decodeGIFFrames, sniffImage, renderImage, viewFit, scaleRGBA)
 import Cmedit.Render (renderEditor, renderFrame, scrollPlan, Screen(..), ScrollHint(..), Theme(..), defaultTheme, lightTheme, themeFor, FileKind(..), fileKind, expandLineCells)
@@ -991,6 +993,102 @@ main = do
     checkEq "debug-stats parses"
             (cfgDebugStats (fst (parseConfigText "debug-stats = on" defaultConfig))) True
     check "debug-stats is off by default" (not (cfgDebugStats defaultConfig))
+
+  -- Paged read-only view of huge files (plan 0012) ---------------------------
+  -- The index is the whole basis of the view: if an offset is wrong, the file
+  -- is shown incorrectly with no way for the user to tell. Check it against a
+  -- brute-force split for every awkward shape.
+  do
+    tmpDir <- getTemporaryDirectory
+    let tmp = tmpDir </> "cmedit-pager-test.bin"
+        cases =
+          [ ("plain lf",            "a\nb\nc\n")
+          , ("no final newline",    "a\nb\nc")
+          , ("crlf",                "a\r\nb\r\nc\r\n")
+          , ("cr only",             "a\rb\rc\r")
+          , ("blank lines",         "\n\n\nx\n\n")
+          , ("single line no nl",   "only one line")
+          , ("empty file",          "")
+          , ("bom + lf",            "\239\187\191a\nb\n")
+          , ("utf8 multibyte",      "\27979\35797\n\128512 emoji\ncaf\233\n")
+          , ("trailing blank",      "a\n\n")
+          ]
+    forM_ cases $ \(nm, content) -> do
+      BS.writeFile tmp (TE.encodeUtf8 (T.pack content))
+      sz <- fromIntegral . BS.length <$> BS.readFile tmp
+      r <- Pg.buildPagerIndex tmp sz
+      case r of
+        Left e -> check ("pager index " ++ nm ++ ": " ++ e) False
+        Right pg -> do
+          -- Reference: how the ordinary loader would split the same text.
+          -- Mirror TextBuffer.splitContent exactly: normalise the WHOLE text
+          -- first, then strip one trailing newline, then split.
+          let refLines = let t = T.pack content
+                             norm = T.replace (T.pack "\r") (T.pack "\n")
+                                      (T.replace (T.pack "\r\n") (T.pack "\n") t)
+                             body = if not (T.null norm) && T.last norm == '\n'
+                                      then T.init norm else norm
+                         in if T.null t then [T.empty] else T.splitOn (T.pack "\n") body
+          checkEq ("pager index " ++ nm ++ ": line count")
+                  (pgLineCount pg) (max 1 (length refLines))
+          -- Every line must read back exactly, through the index+seek path.
+          w <- Pg.readPagerWindow pg 0 (pgLineCount pg)
+          checkEq ("pager window " ++ nm ++ ": content")
+                  (toList w) (take (pgLineCount pg) refLines)
+    -- A file big enough to need several index entries: every line must be
+    -- reachable by seeking, including across stride boundaries.
+    let nBig = Pg.pagerStride * 3 + 7
+    BS.writeFile tmp (TE.encodeUtf8 (T.pack (unlines [ "line " ++ show i | i <- [1 .. nBig] ])))
+    szBig <- fromIntegral . BS.length <$> BS.readFile tmp
+    rBig <- Pg.buildPagerIndex tmp szBig
+    case rBig of
+      Left e -> check ("pager big index: " ++ e) False
+      Right pg -> do
+        checkEq "pager index: line count across strides" (pgLineCount pg) nBig
+        forM_ [0, 1, Pg.pagerStride - 1, Pg.pagerStride, Pg.pagerStride + 1
+              , 2 * Pg.pagerStride, nBig - 1] $ \ln -> do
+          w <- Pg.readPagerWindow pg ln 1
+          checkEq ("pager seek to line " ++ show ln)
+                  (toList w) [T.pack ("line " ++ show (ln + 1))]
+        -- Windows that straddle a stride boundary come back in order.
+        w2 <- Pg.readPagerWindow pg (Pg.pagerStride - 2) 4
+        checkEq "pager window across a stride boundary" (toList w2)
+                [ T.pack ("line " ++ show i) | i <- [Pg.pagerStride - 1 .. Pg.pagerStride + 2] ]
+        -- Movement clamps and keeps the cursor on screen.
+        let h = 10
+            pgEnd = Pg.pagerBottom h pg
+        checkEq "pager: Ctrl+End lands on the last line" (pgCursor pgEnd) (nBig - 1)
+        check "pager: the last line is visible after Ctrl+End"
+              (pgCursor pgEnd >= pgTop pgEnd && pgCursor pgEnd < pgTop pgEnd + h)
+        checkEq "pager: movement clamps at the top" (pgCursor (Pg.pagerMoveBy h (-999) pg)) 0
+        -- A viewport outside the loaded window asks for a refill; one inside
+        -- does not (that is what keeps scrolling from re-reading constantly).
+        check "pager: empty window needs a fill" (isJust' (Pg.pagerNeedsFill h pg))
+        w3 <- Pg.readPagerWindow pg 0 (3 * h + 2 * Pg.pagerStride)
+        let pgLoaded = Pg.pagerFilled 0 w3 pg
+        check "pager: loaded window needs no fill" (not (isJust' (Pg.pagerNeedsFill h pgLoaded)))
+        check "pager: scrolling far away needs a fill"
+              (isJust' (Pg.pagerNeedsFill h (Pg.pagerMoveTo h (nBig - 1) pgLoaded)))
+    -- A file with NO separator at all: the window reader must not concatenate
+    -- the whole thing looking for one. Before the cap, a 120 MB single-line
+    -- file drove the editor to 51 GB resident; the guard here is that reading
+    -- one line of a no-newline file yields at most maxPagerLine characters and
+    -- returns promptly.
+    let hugeLine = 400000 :: Int
+    BS.writeFile tmp (BS.replicate hugeLine 120)      -- 'x' repeated, no newline
+    szOne <- fromIntegral . BS.length <$> BS.readFile tmp
+    rOne <- Pg.buildPagerIndex tmp szOne
+    case rOne of
+      Left e -> check ("pager one-line index: " ++ e) False
+      Right pg -> do
+        checkEq "pager: a file with no newline is one line" (pgLineCount pg) 1
+        w <- Pg.readPagerWindow pg 0 1
+        checkEq "pager: one window line returned" (Seq.length w) 1
+        check ("pager: an enormous line is capped (got "
+               ++ show (maybe 0 T.length (Seq.lookup 0 w)) ++ " chars)")
+              (maybe 0 T.length (Seq.lookup 0 w) <= Pg.maxPagerLine)
+    _ <- try (removeFile tmp) :: IO (Either SomeException ())
+    pure ()
 
   -- Save/load round-trip matrix (plan 0013) ----------------------------------
   -- Saving is the one operation where a bug silently corrupts the user's file,

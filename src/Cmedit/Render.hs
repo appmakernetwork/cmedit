@@ -47,6 +47,8 @@ import qualified Cmedit.Search as S
 import qualified Data.Sequence as Seq
 import Cmedit.Csv (CsvView(..))
 import Cmedit.Link (filePathUri, urlSpans, urlSpansIn)
+import Cmedit.Pager (PagerDoc(..))
+import qualified Cmedit.Pager as Pg
 import qualified Cmedit.Csv as Csv
 import Cmedit.ConfigFile (ThemeName(..))
 import Cmedit.Definition (DefPick(..), DefItem(..))
@@ -678,7 +680,9 @@ renderEditor ed = runST $ do
     then maybe (pure ()) (\ss -> drawSearch th ss lo arr) (edSearch ed)
     else case edImage ed of
       Just idoc -> drawImage ed idoc lo arr
-      Nothing   -> maybe (drawTextArea th ed lo arr) (\v -> drawCsvTable th ed v lo arr) (edCsv ed)
+      Nothing   -> case edPager ed of
+        Just pg -> drawPager th ed pg lo arr
+        Nothing -> maybe (drawTextArea th ed lo arr) (\v -> drawCsvTable th ed v lo arr) (edCsv ed)
   maybe (pure ()) (drawVScroll th arr cols rows) (scrollBarInfo ed)
   maybe (pure ()) (drawHScroll th arr cols rows ed lo) (loHBarRow lo)
   when (isJust (edExplorer ed)) $ drawExplorer th ed lo arr
@@ -878,6 +882,58 @@ drawTextArea th ed lo arr
                         baseAt (thSelection th) (thWhitespace th)
                         selRange selEOL overlays diagOver
                         (urlLinksIn startCol (startCol + tw + 8) line)
+                        startCol startDisp (T.drop startCol line)
+              visible = takeWhile (\(d, _) -> d < left + tw)
+                          (dropWhile (\(d, _) -> d < left) cells)
+          forM_ visible $ \(d, cell) ->
+            putCell arr cols rows sr (loTextLeft lo + (d - left)) cell
+
+-- | The paged read-only view of a file too large to load.
+--
+-- Structurally simpler than 'drawTextArea': there is no selection, no cursor
+-- column, no word wrap and no diagnostics — only a window of lines that the
+-- driver has read from disk, drawn with the same gutter and horizontal scroll.
+-- A line that is not in the loaded window yet renders as a dim placeholder
+-- rather than blank, so scrolling never looks like data loss.
+--
+-- Syntax highlighting deliberately lexes each visible line from 'initialState':
+-- the state before it would require reading from the top of a multi-gigabyte
+-- file. A construct opened earlier (a block comment, a triple-quoted string) is
+-- therefore not carried in — the honest trade for a view that costs O(screen).
+drawPager :: Theme -> Editor -> PagerDoc -> Layout -> Surf s -> ST s ()
+drawPager th ed pg lo arr = do
+  let cols = loCols lo; rows = loRows lo
+      gut  = loGutter lo
+      cl   = loContentLeft lo
+      tw   = loTextWidth lo
+      tabw = tabWidthOf ed
+      left = pgLeft pg
+      mlang = langForPath (edPath ed)
+  forM_ [0 .. loTextHeight lo - 1] $ \row -> do
+    let bl = pgTop pg + row
+        sr = loTextTop lo + row
+    when (bl < pgLineCount pg) $ do
+      when (gut > 0) $ do
+        let numStr = show (bl + 1)
+            pad = gut - 1 - length numStr
+            gstyle = if bl == pgCursor pg then thGutterCur th else thGutter th
+        drawStr arr cols rows sr (cl + max 0 pad) gstyle numStr
+      case Pg.pagerLine pg bl of
+        Nothing ->
+          drawStr arr cols rows sr (loTextLeft lo) (thGutter th) "\x2026"
+        Just line -> do
+          let toks = case mlang of
+                       Just lang | T.length line <= maxHlLine ->
+                         fst (lexLine lang initialState line)
+                       _ -> []
+              baseAt0 = mkBaseAt th toks
+              -- The cursor line is reverse-highlighted: with no editable
+              -- cursor to place, the line itself is the position indicator.
+              baseAt = if bl == pgCursor pg then const (thSelection th) else baseAt0
+              (startCol, startDisp) = windowStart tabw left line
+              cells = expandLineCellsFrom tabw (edShowWhitespace ed)
+                        baseAt (thSelection th) (thWhitespace th)
+                        Nothing False [] [] (urlLinksIn startCol (startCol + tw + 8) line)
                         startCol startDisp (T.drop startCol line)
               visible = takeWhile (\(d, _) -> d < left + tw)
                           (dropWhile (\(d, _) -> d < left) cells)

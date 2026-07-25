@@ -13,11 +13,12 @@ for how to build it, which mode produced which number, and the two
 laziness traps that make naive measurements of this codebase wrong in
 *both* directions).
 
-## Status — 16 of 20 closed (v0.4.0)
+## Status — 17 of 20 closed (v0.4.1)
 
-**Every confirmed defect is fixed**, and every non-capability plan is closed —
-either implemented, or closed on a measurement showing it was unnecessary.
-Four capability plans remain, plus one partially-landed renderer plan.
+**Every confirmed defect is fixed**, every non-capability plan is closed —
+either implemented, or closed on a measurement showing it was unnecessary — and
+the huge-file paged view (`0012`) has landed. Two capability plans remain, plus
+one partially-landed renderer plan.
 
 | | Before | After |
 |---|---|---|
@@ -32,6 +33,8 @@ Four capability plans remain, plus one partially-landed renderer plan.
 | A 4 MiB paste | 592 ms, 1 142 MB | **8 ms, 22 MB** |
 | `scaleRGBA` per image placement | 66 ms, 63 MB | **17 ms, 21 MB** |
 | Concurrent linter processes while typing | 5 | **1** |
+| Opening a 281 MB log (4 M lines) | refused | **opens, 32 MB RSS** |
+| Opening a 120 MB single-line file | refused | **opens, 30 MB RSS** |
 
 Verification: `make test` 1 138 → **2 214 passing**, `make soak` (new) flat on
 all three axes, `make windows-check` clean. Every guard was checked to *fail*
@@ -133,7 +136,7 @@ recording what shipped and the before/after measurement.
 | [0009](completed/0009-undo-as-edit-log.md) | Undo as an edit log instead of snapshots | memory (design change) | ⛔ **CLOSED** — its own gate not met (undo memory is flat) | — |
 | [0010](completed/0010-background-work-supervision.md) | Supervising background threads and cancellation | resource stability | ✅ **DONE** (load-outcome gen → noted) | — |
 | [0011](incomplete/0011-crash-safe-journal-and-session-restore.md) | Crash-safe edit journal and session restore | capability | 3–4 days | medium |
-| [0012](incomplete/0012-huge-file-read-only-paging.md) | Huge files: paged read-only view | capability | 3–4 days | medium |
+| [0012](completed/0012-huge-file-read-only-paging.md) | Huge files: paged read-only view | capability | ✅ **DONE** (in-file search deferred) | — |
 | [0013](completed/0013-streaming-save-and-lower-copy-load.md) | Streaming save; lower-copy load | memory spike | ✅ **DONE** (per-line decode → `0005`) | — |
 | [0014](completed/0014-text-slice-pinning.md) | Text slice pinning at escape boundaries | memory leak | ✅ **DONE** (§4.1; compaction deferred to `0005`) | — |
 | [0015](incomplete/0015-incremental-workspace-index.md) | Incremental workspace index (quick open, definitions, symbols) | capability + amortised perf | 3–4 days | medium |

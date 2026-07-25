@@ -47,6 +47,8 @@ import Cmedit.Image (Image(..), ImgMode(..), renderImage, viewFit)
 import Cmedit.Syntax (HlCache, CommentSyntax(..), langComment, langForPath)
 
 import Cmedit.History (pushHist)
+import Cmedit.Pager (PagerDoc(..))
+import qualified Cmedit.Pager as Pg
 import Cmedit.EditorState
 import Cmedit.EditorEdit
 
@@ -158,6 +160,7 @@ captureDoc ed = Document
   , docCsv = edCsv ed
   , docCsvStash = edCsvStash ed
   , docImage = edImage ed
+  , docPager = edPager ed
   , docHlCache = edHlCache ed
   , docDiags = edDiags ed
   }
@@ -177,6 +180,7 @@ restoreDoc d ed = refreshImage $ ensureVisible ed
   , edCsv = docCsv d
   , edCsvStash = docCsvStash d
   , edImage = docImage d
+  , edPager = docPager d
   , edHlCache = docHlCache d
   , edDiags = docDiags d
   , edFocus = FEdit, edDialog = Nothing, edSearchMode = False
@@ -287,6 +291,7 @@ docFromLoad path lr = Document
   , docDiscard = False
   , docCsvStash = Nothing
   , docImage = Nothing
+  , docPager = Nothing
   , docHlCache = Nothing
   , docDiags = []
   , docCsv = if isCsvPath path
@@ -340,6 +345,62 @@ imageLoadedNew path frames ed = case switchToOpen path ed of
     | isPristine ed -> imageLoaded path frames ed
     | otherwise     -> imageLoaded path frames ed { edBefore = edBefore ed ++ [captureDoc ed] }
 
+-- | Install a paged (too-large-to-load) file as the active document. The index
+-- pass has already run; the first window arrives via 'EffPagerFill'.
+pagerLoaded :: PagerDoc -> Editor -> Editor
+pagerLoaded pg ed = touchRecent (pgPath pg) ed
+  { edBuffer = emptyBuffer, edSavedBuffer = emptyBuffer
+  , edCursor = origin, edSelAnchor = Nothing, edDesiredCol = 0
+  , edTop = 0, edLeft = 0
+  , edPath = Just (pgPath pg), edModified = False
+  , edDiskMtime = Nothing, edDiskChanged = False
+  , edLineEnding = pgEol pg, edSavedEol = pgEol pg
+  , edEncoding = pgEnc pg, edSavedEnc = pgEnc pg
+  , edFinalNewline = True
+  , edReadOnly = True
+  , edUndo = Seq.empty, edRedo = Seq.empty, edLastEdit = EKNone
+  , edStatus = T.pack ("Viewing " ++ takeFileName (pgPath pg) ++ "  "
+                ++ Pg.humanBytes (pgSize pg) ++ ", " ++ show (pgLineCount pg)
+                ++ " lines  \x2014 read-only paged view")
+    -- Same rule as the image view: an open from the explorer panel keeps its
+    -- focus, because a read-only view has no keystroke editing to receive it.
+  , edFocus = if edFocus ed == FExplorer then FExplorer else FEdit
+  , edDialog = Nothing, edSearchMode = False
+  , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
+  , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing
+  , edPager = Just pg
+  , edHlCache = Nothing, edDiags = []
+  }
+
+-- | 'pagerLoaded' for a new document (switching to it if already open).
+pagerLoadedNew :: PagerDoc -> Editor -> Editor
+pagerLoadedNew pg ed = case switchToOpen (pgPath pg) ed of
+  Just ed'
+    | edFocus ed == FExplorer -> ed' { edFocus = FExplorer }
+    | otherwise               -> ed'
+  Nothing
+    | isPristine ed -> pagerLoaded pg ed
+    | otherwise     -> pagerLoaded pg ed { edBefore = edBefore ed ++ [captureDoc ed] }
+
+-- | Append a paged document to the open-files list (startup, 2nd+ file).
+addPagerDocument :: PagerDoc -> Editor -> Editor
+addPagerDocument pg ed =
+  touchRecent (pgPath pg) ed { edAfter = edAfter ed ++ [pagerDocSnapshot pg] }
+
+-- | Install a window of lines read for the paged view (driver callback).
+pagerFilled :: Int -> Seq Text -> Editor -> Editor
+pagerFilled from lns ed = case edPager ed of
+  Nothing -> ed
+  Just pg -> ed { edPager = Just (Pg.pagerFilled from lns pg) }
+
+-- | The window the paged view needs for the current viewport, if any. The hub
+-- turns this into an 'EffPagerFill' after every key.
+pagerFillRequest :: Editor -> Maybe (FilePath, Int, Int)
+pagerFillRequest ed = do
+  pg <- edPager ed
+  (from, n) <- Pg.pagerNeedsFill (pagerHeight ed) pg
+  pure (pgPath pg, from, n)
+
 -- | Append an image document to the open-files list (startup, 2nd+ file).
 addImageDocument :: FilePath -> [(Image, Int)] -> Editor -> Editor
 addImageDocument path frames ed =
@@ -356,6 +417,27 @@ imageDocSnapshot path frames = Document
   , docUndo = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone, docOverwrite = False
   , docDiscard = False, docCsv = Nothing, docCsvStash = Nothing
   , docImage = Just (mkImageDoc frames)
+  , docPager = Nothing
+  , docHlCache = Nothing
+  , docDiags = []
+  }
+
+-- | A 'Document' snapshot for a paged (too-large-to-load) file, so it can sit
+-- in the open-files zipper like any other. There is no buffer: the view reads
+-- what it needs from disk (see "Cmedit.Pager").
+pagerDocSnapshot :: PagerDoc -> Document
+pagerDocSnapshot pg = Document
+  { docBuffer = emptyBuffer, docSavedBuffer = emptyBuffer, docCursor = origin
+  , docSelAnchor = Nothing, docDesiredCol = 0, docTop = 0, docLeft = 0
+  , docPath = Just (pgPath pg), docModified = False
+  , docDiskMtime = Nothing, docDiskChanged = False
+  , docLineEnding = pgEol pg, docSavedEol = pgEol pg
+  , docEncoding = pgEnc pg, docSavedEnc = pgEnc pg
+  , docFinalNewline = True, docReadOnly = True
+  , docUndo = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone, docOverwrite = False
+  , docDiscard = False, docCsv = Nothing, docCsvStash = Nothing
+  , docImage = Nothing
+  , docPager = Just pg
   , docHlCache = Nothing
   , docDiags = []
   }
@@ -772,6 +854,14 @@ saveAsDialogFlow ed = openDialog (mkSaveAs (T.pack (seed (edPath ed)))) ed
     seed Nothing  = ""
 
 gotoLine :: Text -> Editor -> Editor
+-- In the paged view there is no buffer to move a cursor in: jump the viewer
+-- instead. This is the one in-file navigation the paged view does support, and
+-- the reason it exists — "show me line 4 million of this log".
+gotoLine t ed | Just pg <- edPager ed =
+  case reads (T.unpack (T.strip t)) :: [(Int, String)] of
+    ((n, _) : _) ->
+      ed { edPager = Just (Pg.pagerMoveTo (pagerHeight ed) (n - 1) pg), edStatus = "" }
+    _ -> ed { edStatus = "Invalid line number" }
 gotoLine t ed =
   case reads (T.unpack (T.strip t)) :: [(Int, String)] of
     ((n, _) : _) ->

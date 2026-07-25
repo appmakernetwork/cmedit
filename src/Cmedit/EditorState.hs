@@ -45,6 +45,8 @@ import Cmedit.About (aboutCanvasH, aboutCanvasMinW, aboutTotalFrames)
 import Cmedit.HelpCard (helpCanvasMinW, helpDialogText)
 import Cmedit.Clipboard (CopyOutcome(..))
 import Cmedit.Image (Image(..), ImgMode(..), renderImage, viewFit)
+import Cmedit.Pager (PagerDoc(..), pagerStatus)
+import qualified Cmedit.Pager as Pg
 import Cmedit.Syntax (HlCache, CommentSyntax(..), langComment, langForPath)
 import Cmedit.Lint
   ( Diag(..), Severity(..), LintAvail, LinterId, Linter(..), linters, linterById
@@ -127,6 +129,7 @@ data Document = Document
   , docCsv          :: !(Maybe CsvView)
   , docCsvStash      :: !(Maybe CsvView)  -- ^ Table model kept while in plain-text view (preserves CSV undo).
   , docImage         :: !(Maybe ImageDoc) -- ^ Image-view model when this doc is an image.
+  , docPager         :: !(Maybe PagerDoc) -- ^ Paged read-only view when this doc is too big to load.
   , docHlCache       :: !(Maybe HlCache)  -- ^ Cached syntax-highlight lexer states (perf only; self-validating).
   , docDiags         :: ![Diag]           -- ^ Latest linter diagnostics for this doc (sorted by line,col; @[]@ until a lint pass posts).
   } deriving (Show)
@@ -233,6 +236,7 @@ data Editor = Editor
   , edCsv           :: !(Maybe CsvView) -- ^ Table view, when the active doc is in CSV mode.
   , edCsvStash      :: !(Maybe CsvView) -- ^ Table model retained while viewing a CSV doc as plain text (keeps its undo across toggles).
   , edImage         :: !(Maybe ImageDoc) -- ^ Image view, when the active doc is an image (a separate mode to text/CSV).
+  , edPager         :: !(Maybe PagerDoc) -- ^ Paged read-only view, when the active doc is too big to hold in a buffer (a fourth view mode; see "Cmedit.Pager").
   , edHlCache       :: !(Maybe HlCache) -- ^ Cached syntax-highlight lexer states for the active doc (perf only; self-validating against the buffer).
   , edRecent        :: ![RecentEntry]   -- ^ Recently-opened files, most recent first (global; persisted by the driver).
   , edDetectedDark  :: !(Maybe Bool)    -- ^ OSC 11 verdict: the terminal background is dark (drives @theme = auto@; Nothing until the terminal answers).
@@ -325,6 +329,7 @@ newEditor size cfg = Editor
   , edCsv           = Nothing
   , edCsvStash      = Nothing
   , edImage         = Nothing
+  , edPager         = Nothing
   , edHlCache       = Nothing
   , edRecent        = []
   , edDetectedDark  = Nothing
@@ -389,6 +394,15 @@ detach = T.copy
 -- RTS statistic is.
 setStatsLine :: Maybe Text -> Editor -> Editor
 setStatsLine t ed = ed { edStats = t }
+
+-- | Is the active document the paged read-only view?
+pagerActive :: Editor -> Bool
+pagerActive = isJust . edPager
+
+-- | The viewport height available to the paged view (same text area as a
+-- normal document; the pager never word-wraps).
+pagerHeight :: Editor -> Int
+pagerHeight = loTextHeight . computeLayout
 
 -- | Record the OSC 11 verdict (driver callback).
 setDetectedDark :: Bool -> Editor -> Editor
@@ -605,7 +619,9 @@ computeLayout ed =
       menuH   = if edShowMenu ed then 1 else 0
       statusH = if edShowStatus ed then 1 else 0
       hintH   = if edShowHints ed then 1 else 0
-      nLines  = lineCount (edBuffer ed)
+      nLines  = case edPager ed of
+                  Just pg -> pgLineCount pg     -- the buffer is empty in paged view
+                  Nothing -> lineCount (edBuffer ed)
       sideW   = sidebarWidth ed
       avail   = max 1 (cols - sideW)
       gutter  = if isJust (edImage ed) then 0      -- image view uses the full width
@@ -623,7 +639,8 @@ computeLayout ed =
       -- width can never oscillate with content.
       wantHBar = cfgScrollBarH (edConfig ed)
                    && not (searchViewActive ed)
-                   && (isJust (edCsv ed) || (isNothing (edImage ed) && not (edWordWrap ed)))
+                   && (isJust (edCsv ed)
+                       || (isNothing (edImage ed) && (isJust (edPager ed) || not (edWordWrap ed))))
                    && textH0 - 1 >= 1
       barH    = if wantHBar then 1 else 0
       textH   = max 1 (textH0 - barH)
@@ -907,6 +924,11 @@ data Effect
   | EffOpenUrl !String       -- ^ Open a URL in the system browser (fire-and-forget; driver reports a missing opener via 'setError').
   | EffSaveConfig !Config    -- ^ Write the user config file (comment-preserving) and report via the status line.
   | EffDetectLinters         -- ^ Re-probe which linters are installed (driver replies via 'lintersDetected').
+  | EffPagerFill !FilePath !Int !Int
+      -- ^ Read @count@ lines of a paged (too-large-to-load) file starting at a
+      --   line number, for the read-only viewer (driver replies via
+      --   'pagerFilled'). Bounded by construction — a few screens — so this is
+      --   a seek and a short read, not a file slurp.
   | EffLintNow               -- ^ Run an immediate lint pass of the active document, save-time tools included (driver runs 'lintRequest' True and replies via 'lintResults'); emitted on save completion / settings change.
   deriving (Show)
 
@@ -1190,7 +1212,7 @@ aboutText = T.intercalate "\n" $
   where center t = T.replicate (max 0 ((51 - T.length t) `div` 2)) " " <> t
 
 versionText :: Text
-versionText = "0.4.0"
+versionText = "0.4.1"
 
 ------------------------------------------------------------------------------
 -- Search
@@ -1269,7 +1291,7 @@ docText :: Document -> Text
 docText = bufferToText LF False . docBuffer
 
 isPlainDoc :: Document -> Bool
-isPlainDoc d = isNothing (docCsv d) && isNothing (docImage d)
+isPlainDoc d = isNothing (docCsv d) && isNothing (docImage d) && isNothing (docPager d)
 
 plural :: Int -> String
 plural n = if n == 1 then "" else "s"

@@ -48,6 +48,8 @@ import Cmedit.Syntax (HlCache, CommentSyntax(..), langComment, langForPath)
 import Cmedit.Lint (Linter(..), Severity(..), Diag(..), LintAvail, linters, linterById)
 
 import Cmedit.History (pushHist)
+import Cmedit.Pager (PagerDoc(..))
+import qualified Cmedit.Pager as Pg
 import Cmedit.EditorState
 
 
@@ -640,7 +642,13 @@ statusRightInfo ed = flatten segs
     ovr = if edOverwrite ed then "OVR" else "INS"
     plain s = (s, Nothing)
     zone z s = (s, Just z)
-    segs = case edImage ed of
+    -- The paged view has no cursor column, no selection and no encoding to
+    -- toggle; what matters is where you are in a very large file. Clicking it
+    -- opens Go To Line, which is the one in-file jump the view supports.
+    segs = case edPager ed of
+      Just pg -> [ zone SZGoTo (Pg.pagerStatus pg) ]
+      Nothing -> segsDoc
+    segsDoc = case edImage ed of
       Just idoc ->
         let img = idImage idoc
             m   = case idMode idoc of HalfBlock -> "colour"; Ascii -> "ASCII"

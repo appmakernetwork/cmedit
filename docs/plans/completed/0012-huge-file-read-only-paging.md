@@ -1,9 +1,81 @@
 # 0012 — Huge files: a paged read-only view instead of a refusal
 
 **Theme:** capability, with a hard memory-safety rationale
-**Status:** proposal
-**Estimated effort:** 3–4 days
-**Risk:** medium (a fourth view mode; must not leak into the edit paths)
+**Status:** ✅ **RESOLVED** — implemented 2026-07-26
+**Risk (as shipped):** medium — a fourth view mode, read-only by construction
+
+## Resolved
+
+A file over `maxOpenBytes` now opens in a read-only paged view instead of being
+refused. Measured against the real binary through a PTY:
+
+| File | Result |
+|---|---|
+| 281 MB log, 4 000 000 lines | opens, **32 MB** RSS; 44 MB after 40 page-downs |
+| Go To Line 2 000 000 in that file | lands exactly on the right line, 37 MB RSS |
+| 120 MB file that is **one single line** | opens, **30 MB** RSS |
+
+**`Cmedit.Pager`** owns the model and the two file operations (the
+`TextBuffer` precedent for load/save living beside the format knowledge):
+
+- `buildPagerIndex` — one streaming pass in 64 KiB blocks recording a byte
+  offset every `pagerStride` (1000) lines, and sniffing the BOM and line ending.
+  `pgEol` then *selects the byte the index and reader split on*, so a CR-only
+  file pages correctly rather than appearing as one enormous line.
+- `readPagerWindow` — seek to the nearest index entry, decode forward. Bounded
+  three ways: the stride skipped, the `count` decoded, and `maxPagerLine`
+  (64 KiB) per line.
+- the pure view state: window, viewport, cursor line, movement, status.
+
+Wiring: `edPager`/`docPager` (captured and restored by the zipper),
+`EffPagerFill` → `pagerFilled` for key-driven scrolling, plus `fillPagerNow`
+for the paths that never reach the key handler (startup, a background load
+landing, a resize). `Render.drawPager` draws the window with the gutter and
+horizontal scroll; a line not yet loaded shows `…` rather than blank, so
+scrolling never looks like data loss. `paged-view = off` restores the old
+refusal.
+
+Read-only is enforced, not assumed: editing keys are swallowed with a status
+note, Save/Save All/Revert are refused, and the in-file Find/definition menu
+entries are pruned as they are for images — **except Go To Line**, which is the
+entire point of a log viewer.
+
+### Two bugs the testing caught
+
+Both in the same place, and both would have been catastrophic in the field:
+
+1. **The window reader made no progress without a separator.** For a file with
+   no newlines it concatenated block after block looking for one — a 120 MB
+   single-line file drove the editor to **51 GB resident** before it was fixed.
+   It now caps each line and stops early once the last line it needs has
+   reached the cap, so that file costs one block read.
+2. **The index pass carried an unbounded partial line** for the same reason.
+
+`test/Spec.hs` gained 40+ assertions: the index and window checked against a
+brute-force split for LF/CRLF/CR-only/BOM/empty/no-final-newline/blank-line/
+multi-byte-UTF-8 files; seeks to lines either side of stride boundaries in a
+3000-line file; windows straddling a boundary; movement clamping; the
+refill predicate firing only when the viewport leaves the window; and the
+no-separator case as a regression guard for (1).
+
+### Deliberately not done
+
+- **In-file search** (§ "What works"). It needs a streaming matcher over the
+  file rather than a buffer scan; until that exists the Find entries are
+  *absent* in this mode rather than quietly broken. Go To Line covers the
+  common need.
+- **Word wrap and CSV table mode** in the paged view, as the plan already
+  scoped out.
+- **Re-indexing on growth** (a live log). The index is a snapshot; a file that
+  grows keeps showing its old extent until reopened. The hook exists (`pollFs`
+  already notices mtime changes) but follow-mode is a feature of its own.
+- **The `activeView` refactor** suggested under Risks. There are now four modes
+  and the dispatch is four `Maybe` checks deep; worth doing before a fifth, but
+  bundling it with this change would have made the diff much harder to review.
+
+The plan below is the original analysis, kept for the record.
+
+---
 
 ---
 

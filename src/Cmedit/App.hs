@@ -18,6 +18,7 @@ import Data.IORef
 import Data.List (isPrefixOf, sort, sortOn)
 import qualified Data.Map.Strict as M
 import qualified Data.Sequence as Seq
+import qualified Data.Sequence as Seq
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Time.Clock (UTCTime)
 import Data.Word (Word8)
@@ -54,6 +55,8 @@ import qualified Cmedit.Definition as D
 import Cmedit.Editor
 import Cmedit.Gfx
 import Cmedit.Image (Image, imgW, imgH, sniffImage, decodeFrames, scaleRGBA)
+import Cmedit.Pager (PagerDoc(..))
+import qualified Cmedit.Pager as Pg
 import Cmedit.Input
 import Cmedit.Lint
   ( LinterId, Linter(..), Diag(..), LintAvail
@@ -159,7 +162,8 @@ runTui cfg cfgWarns files readOnly statsOnExit = do
     bracket_
       (enterScreen ed0)
       leaveScreen
-      ((do renderNow drv editorRef prevRef titleRef
+      ((do fillPagerNow drv editorRef      -- a paged file named on the command line
+           renderNow drv editorRef prevRef titleRef
            eventLoop editorRef prevRef titleRef q drv src)
         -- Always record the recents (with final cursor positions) and the
         -- find/replace history on the way out — including SIGTERM/SIGHUP.
@@ -206,10 +210,11 @@ loadInitialFiles cfg recents size files readOnly = do
     -- 2nd+ files named on the command line; silently skip binary/too-large ones.
     addOne e f0 = do
       f <- canonicalizeSafe f0
-      o <- classifyFile f
+      o <- classifyFileWith (cfgPagedView cfg) f
       pure $ case o of
         OutText p lr  -> addDocument p lr e
         OutImage p im -> addImageDocument p im e
+        OutPaged pg   -> addPagerDocument pg e
         OutError _    -> e
 
 -- | Refresh the status bar's live counters when @debug-stats@ is on (and clear
@@ -581,10 +586,12 @@ eventLoop editorRef prevRef titleRef q drv _src = do
         -- and drop the spinner.
         GotLoad o -> do
           modifyIORef' editorRef (applyPendingJump . endLoading . applyOutcome setLoadedNew imageLoadedNew o)
+          fillPagerNow drv editorRef
           maybePersistRecents drv editorRef
           case o of
             OutText p _  -> notifyUnfocused drv ("Finished loading " ++ takeFileName p)
             OutImage p _ -> notifyUnfocused drv ("Finished loading " ++ takeFileName p)
+            OutPaged pg  -> notifyUnfocused drv ("Finished indexing " ++ takeFileName (pgPath pg))
             OutError _   -> pure ()
           renderNow drv editorRef prevRef titleRef
           -- A load installed a fresh buffer (fingerprint changed): (re-)arm lint.
@@ -657,6 +664,9 @@ eventLoop editorRef prevRef titleRef q drv _src = do
           keep <- applyBatch (coalesceDrags (k : rest))
           if keep
             then do
+              -- A resize (or any path that moved the paged view without going
+              -- through its key handler) may need a different window.
+              fillPagerNow drv editorRef
               maybePersistRecents drv editorRef
               renderNow drv editorRef prevRef titleRef
               -- Edits/undo/redo/file-switch changed the fingerprint → debounce.
@@ -984,10 +994,12 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
       -- Big (but openable) files load on a background thread with a spinner, so
       -- the event loop keeps painting; small/new/oversized files resolve inline.
       Just sz | sz > asyncBar && sz <= maxOpenBytes -> do
-        startJob drv JLoad (classifyFile cpath >>= atomically . writeTQueue loadQ)
+        startJob drv JLoad (classifyFileWith (cfgPagedView (edConfig ed)) cpath
+                              >>= atomically . writeTQueue loadQ)
         pure (beginLoading (takeFileName cpath) ed)
       -- Small files install inline; apply any pending result-jump immediately.
-      _ -> applyPendingJump . flip (applyOutcome setLoadedNew imageLoadedNew) ed <$> classifyFile cpath
+      _ -> applyPendingJump . flip (applyOutcome setLoadedNew imageLoadedNew) ed
+             <$> classifyFileWith (cfgPagedView (edConfig ed)) cpath
 
   -- Reload the active file in place, discarding unsaved edits (the Revert
   -- command). Goes through the same magic-byte sniff as opening.
@@ -1168,6 +1180,14 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
 
   -- Run an immediate lint pass of the active document (save-time tools too),
   -- bypassing the debounce. Emitted by pure sites that want fresh diagnostics.
+  -- Refill the paged view's window. A seek plus a few screens: it resolves
+  -- inside this event-loop iteration, before the frame is drawn.
+  EffPagerFill path from n -> case edPager ed of
+    Just pg | pgPath pg == path -> do
+      lns <- Pg.readPagerWindow pg from n
+      pure (pagerFilled from lns ed)
+    _ -> pure ed
+
   EffLintNow -> do
     forkLintNow drv ed
     pure ed
@@ -1444,6 +1464,7 @@ runToolCapture exe args dir mstdin = handle onErr $
 data LoadOutcome
   = OutText  !FilePath !LoadResult
   | OutImage !FilePath ![(Image, Int)]   -- ^ Frames + delays (ms); singleton for a still.
+  | OutPaged !PagerDoc                   -- ^ Too large for a buffer: the read-only paged view.
   | OutError !String
 
 -- Read and classify a path without touching the editor. Refuses files that are
@@ -1453,16 +1474,33 @@ data LoadOutcome
 -- file still works). This runs on the main thread for small files and on a
 -- background thread for large ones.
 classifyFile :: FilePath -> IO LoadOutcome
-classifyFile path = do
+classifyFile = classifyFileWith True
+
+-- | 'classifyFile', with the paged view for over-large files switchable off
+-- (the @paged-view@ config key).
+classifyFileWith :: Bool -> FilePath -> IO LoadOutcome
+classifyFileWith pagedOK path = do
   exists <- doesFileExist path
   if not exists
     then pure (OutText path emptyLoadResult)  -- new file
     else do
       msz <- fileSizeSafe path
       case msz of
-        Just sz | sz > maxOpenBytes ->
-          pure (OutError (takeFileName path ++ ": too large to open ("
-                          ++ humanSize sz ++ ", limit " ++ humanSize maxOpenBytes ++ ")"))
+        -- Too large for a buffer. Rather than refusing outright, offer the
+        -- read-only paged view — the common case behind this refusal is a log
+        -- or a dump that the user wants to *look* at (see Cmedit.Pager). A
+        -- binary blob of that size is still refused: the index pass would be a
+        -- pointless scan of a file nothing can display.
+        Just sz | sz > maxOpenBytes -> do
+          hdr <- readHead path 8192
+          if not pagedOK || maybe True looksBinary hdr
+            then pure (OutError (takeFileName path ++ ": too large to open ("
+                                 ++ humanSize sz ++ ", limit " ++ humanSize maxOpenBytes ++ ")"))
+            else do
+              r <- Pg.buildPagerIndex path sz
+              pure $ case r of
+                Left err -> OutError (takeFileName path ++ ": " ++ err)
+                Right pg -> OutPaged pg
         _ -> do
           ebs <- try (BS.readFile path) :: IO (Either SomeException BS.ByteString)
           case ebs of
@@ -1480,6 +1518,30 @@ classifyFile path = do
                     mt <- fileMtime path
                     pure (OutText path (loadFromBytes ro mt bs))
 
+-- | Top up the paged view's window if the viewport has moved off what is
+-- loaded. Cheap: a pure 'pagerFillRequest' query, and when it does fire, a seek
+-- plus a few screens' worth of lines. Called wherever the view can move without
+-- passing through its own key handler — startup, a background load landing, a
+-- resize.
+fillPagerNow :: Drv -> IORef Editor -> IO ()
+fillPagerNow _drv ref = do
+  ed <- readIORef ref
+  case pagerFillRequest ed of
+    Nothing -> pure ()
+    Just (path, from, n) -> case edPager ed of
+      Just pg | pgPath pg == path -> do
+        lns <- Pg.readPagerWindow pg from n
+        modifyIORef' ref (pagerFilled from lns)
+      _ -> pure ()
+
+-- | Read at most @n@ bytes from the front of a file (for magic-number and
+-- binary sniffing without slurping).
+readHead :: FilePath -> Int -> IO (Maybe BS.ByteString)
+readHead path n = do
+  r <- try (withBinaryFile path ReadMode (\h -> BS.hGet h n))
+         :: IO (Either SomeException BS.ByteString)
+  pure (either (const Nothing) Just r)
+
 -- Apply a load outcome to the editor via the matching pure installer.
 applyOutcome :: (FilePath -> LoadResult -> Editor -> Editor)
              -> (FilePath -> [(Image, Int)] -> Editor -> Editor)
@@ -1487,6 +1549,9 @@ applyOutcome :: (FilePath -> LoadResult -> Editor -> Editor)
 applyOutcome installText installImage o ed = case o of
   OutText p lr  -> installText p lr ed
   OutImage p im -> installImage p im ed
+  -- Paged documents have no "already open" subtlety worth a second installer:
+  -- they are read-only, so switching to an open copy is the only sane result.
+  OutPaged pg   -> pagerLoadedNew pg ed
   OutError msg  -> setError msg ed
 
 -- Open a path synchronously (used at startup and for Revert). The interactive
@@ -1495,7 +1560,8 @@ openPath :: (FilePath -> LoadResult -> Editor -> Editor)
          -> (FilePath -> [(Image, Int)] -> Editor -> Editor)
          -> FilePath -> Editor -> IO Editor
 openPath installText installImage path ed =
-  flip (applyOutcome installText installImage) ed <$> classifyFile path
+  flip (applyOutcome installText installImage) ed
+    <$> classifyFileWith (cfgPagedView (edConfig ed)) path
 
 -- Files larger than this (but within 'maxOpenBytes') load on a background thread
 -- with a spinner, so the UI stays responsive; smaller ones load inline.

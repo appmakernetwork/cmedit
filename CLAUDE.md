@@ -246,6 +246,28 @@ in `README.md`; the cross-cutting structure that matters when editing:
   (`Makefile` `RTSOPTS`) pair it with `--disable-delayed-os-memory-return`,
   without which freed pages stay in RSS (`MADV_FREE`) — together they took
   "2.5 GB after opening and closing a 32 MB CSV" to 33 MB.
+- **Paged view for huge files (`Cmedit.Pager`, `edPager`/`docPager`).** A
+  fourth read-only view mode, alongside CSV and image. A file over
+  `maxOpenBytes` used to be refused; it now opens in a viewer whose memory is
+  independent of the file's size — measured 30–44 MB resident for a 281 MB log
+  and for a 120 MB single-line file. Two structures make that work: a **sparse
+  index** of byte offsets, one per `pagerStride` (1000) lines, built by one
+  streaming pass (`buildPagerIndex`, which also sniffs the BOM and line
+  ending — `pgEol` selects the byte the index and reader split on, so CR-only
+  files page correctly), and a **window** of decoded lines around the viewport
+  (`readPagerWindow`, refilled via `EffPagerFill` → `pagerFilled`, or
+  driver-side by `fillPagerNow` for paths that don't pass through the key
+  handler: startup, a background load landing, a resize). Every read is bounded
+  three ways — a stride of skipped lines, `count` decoded lines, and
+  `maxPagerLine` (64 KiB) per line. That last cap is not a nicety: without it a
+  file with no separators makes the reader concatenate the whole file (a 120 MB
+  single-line file drove the editor to 51 GB resident before it was added).
+  The mode is read-only by construction (there is no buffer), so editing keys
+  are swallowed, Save/Revert are refused, and the Find/definition menu entries
+  are pruned like the image view's — except **Go To Line**, which is the point
+  of the view. Syntax highlighting lexes each visible line from `initialState`,
+  since the state before it would mean reading from the top of a multi-gigabyte
+  file. Switchable with `paged-view = off`.
 - **Two coordinate systems.** Buffer positions (`Pos`) count *characters*; the
   screen counts *display cells*. `Cmedit.Width` maps between them
   (`colToDisplay`/`displayToCol`) and supplies a compact `wcwidth` plus tab-stop

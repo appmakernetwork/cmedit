@@ -29,6 +29,15 @@ module Cmedit.Editor
   , imageLoaded
   , imageLoadedNew
   , addImageDocument
+    -- * Paged view (files too large to load)
+  , PagerDoc(..)
+  , pagerLoaded
+  , pagerLoadedNew
+  , addPagerDocument
+  , pagerFilled
+  , pagerFillRequest
+  , pagerActive
+  , pagerHeight
   , refreshImage
   , imageCrop
   , imageAnim
@@ -216,6 +225,8 @@ import Data.Array (Array)
 
 import Cmedit.Types
 import Cmedit.History (pushHist)
+import Cmedit.Pager (PagerDoc(..))
+import qualified Cmedit.Pager as Pg
 import Cmedit.TextBuffer
 import Cmedit.Width (colToDisplay, displayToCol, wrapLine)
 import Cmedit.ConfigFile
@@ -268,6 +279,58 @@ handleImageKey key idoc ed = case key of
   _           -> noEff ed
   where otherMode HalfBlock = Ascii
         otherMode Ascii     = HalfBlock
+
+-- | Keys in the paged read-only view of a too-large file.
+--
+-- Navigation only: there is no buffer to edit, and the file is far too big to
+-- turn into one, so editing keys are swallowed rather than silently doing
+-- nothing surprising. Global shortcuts (menus, window switching, quit, the
+-- navigation history) still reach 'handleEditKey', exactly as in the image
+-- view. Every branch ends with 'withPagerFill', which asks the driver for more
+-- lines when the viewport has moved outside the window currently in memory.
+handlePagerKey :: Key -> PagerDoc -> Editor -> (Editor, [Effect])
+handlePagerKey key pg ed = case key of
+  KArrow DDown _   -> move 1
+  KArrow DUp _     -> move (-1)
+  KArrow DRight _  -> scrollH 8
+  KArrow DLeft _   -> scrollH (-8)
+  KPageDown _      -> move h
+  KPageUp _        -> move (-h)
+  KHome m | hasCtrl m -> go (Pg.pagerTop h pg)
+  KEnd m  | hasCtrl m -> go (Pg.pagerBottom h pg)
+  KHome _          -> go pg { pgLeft = 0 }
+  KMouse me
+    | meButton me == MBWheelDown -> go (Pg.pagerScroll h 3 pg)
+    | meButton me == MBWheelUp   -> go (Pg.pagerScroll h (-3) pg)
+    | mePressed me && not (meDrag me) && meButton me == MBLeft ->
+        let lo = computeLayout ed
+            row = meRow me - loTextTop lo
+        in if row >= 0 && row < h then go (Pg.pagerMoveTo h (pgTop pg + row) pg)
+                                  else withPagerFill (noEff ed)
+    | otherwise -> withPagerFill (noEff ed)
+  -- Editing is impossible here; say so once rather than appearing to work.
+  KChar _     -> readOnlyNote
+  KEnter      -> readOnlyNote
+  KBackspace  -> readOnlyNote
+  KDelete _   -> readOnlyNote
+  KTab        -> readOnlyNote
+  KPaste _    -> readOnlyNote
+  _           -> withPagerFill (handleEditKey key ed)
+  where
+    h = max 1 (pagerHeight ed)
+    go pg' = withPagerFill (noEff ed { edPager = Just pg' })
+    move d = go (Pg.pagerMoveBy h d pg)
+    scrollH d = go pg { pgLeft = max 0 (pgLeft pg + d) }
+    readOnlyNote =
+      withPagerFill (noEff ed { edStatus = "File is too large to edit \x2014 read-only paged view" })
+
+-- | Attach a window-fill request to a paged-view result, if the viewport has
+-- moved off what is loaded. The read is a seek plus a few screens, so it
+-- resolves within the same event-loop iteration, before the frame is drawn.
+withPagerFill :: (Editor, [Effect]) -> (Editor, [Effect])
+withPagerFill (ed, effs) = case pagerFillRequest ed of
+  Just (path, from, n) -> (ed, effs ++ [EffPagerFill path from n])
+  Nothing              -> (ed, effs)
 
 -- | Mouse on the image view: left-drag selects a rectangle that becomes the new
 -- (zoomed) view; a single click — or Esc — snaps back to the whole image.
@@ -329,14 +392,14 @@ pruneEntries ed = map (relabelEntry ed)
       | otherwise = filter (\e -> case e of MEItem _ _ MANextProblem -> False; _ -> True) es
     -- Line ending / BOM are meaningless for a read-only image.
     dropFileProps es
-      | isJust (edImage ed) = tidySeps (filter keep es)
+      | isJust (edImage ed) || isJust (edPager ed) = tidySeps (filter keep es)
       | otherwise = es
       where keep (MEItem _ _ a) = a `notElem` [MACycleLineEnding, MAToggleBom]
             keep MESep          = True
     -- Line operations act on the text buffer, which is stale/absent in the
     -- table and image views — hide the whole group there.
     dropLineOps es
-      | isJust (edCsv ed) || isJust (edImage ed) = tidySeps (filter keep es)
+      | isJust (edCsv ed) || isJust (edImage ed) || isJust (edPager ed) = tidySeps (filter keep es)
       | otherwise = es
       where keep (MEItem _ _ a) = a `notElem` lineOpActions
             keep MESep          = True
@@ -344,11 +407,12 @@ pruneEntries ed = map (relabelEntry ed)
     -- In the read-only image view there is no text to search: drop the in-file
     -- Find / Replace / Go to Line entries (workspace Find/Replace in Files stay).
     dropImageFind es
-      | isJust (edImage ed) =
+      | isJust (edImage ed) || isJust (edPager ed) =
           let es' = filter keep es
           in if length es' == length es then es else tidySeps es'
       | otherwise = es
-      where keep (MEItem _ _ a) = a `notElem` imageDisabledFind
+      where disabled = if isJust (edPager ed) then pagerDisabledFind else imageDisabledFind
+            keep (MEItem _ _ a) = a `notElem` disabled
             keep MESep          = True
     -- Save All only appears when more than one file is open and something is
     -- unsaved (there's nothing to "save all" of a single file).
@@ -383,6 +447,13 @@ dropTextToggles es = dropTrailingSep (filter (not . isTextToggle) es)
 -- text to search or line to jump to). Workspace Find/Replace in Files still do.
 imageDisabledFind :: [MenuAction]
 imageDisabledFind = [MAFind, MAFindNext, MAFindPrev, MAReplace, MAGoToLine, MAGoToDef, MAGoToBracket, MANextProblem]
+
+-- | The same, for the paged read-only view — except 'MAGoToLine', which is
+-- exactly what a viewer of a multi-gigabyte log is for. In-file *search* needs
+-- a streaming matcher over the file rather than a buffer scan; until that
+-- exists it is honestly absent rather than quietly broken.
+pagerDisabledFind :: [MenuAction]
+pagerDisabledFind = [MAFind, MAFindNext, MAFindPrev, MAReplace, MAGoToDef, MAGoToBracket, MANextProblem]
 
 -- Rewrite value-carrying menu labels to show the document's current setting.
 relabelEntry :: Editor -> MenuEntry -> MenuEntry
@@ -450,6 +521,10 @@ runAction a ed0 =
        -- In-file find is meaningless on a read-only image (also blocks the
        -- keyboard shortcuts Ctrl+F/R/G and F3, which bypass the pruned menu).
        then noEff ed { edStatus = "Not available in image view" }
+     else if isJust (edPager ed) && a `elem` pagerDisabledFind
+       then noEff ed { edStatus = "Not available in the paged view of a large file" }
+     else if isJust (edPager ed) && a `elem` [MASave, MASaveAll, MARevert]
+       then noEff ed { edStatus = "This file is open read-only (too large to edit)" }
      else case a of
        MANew        -> noEff (newFileFlow ed)
        MAOpen       -> openBrowser ed
@@ -705,6 +780,7 @@ dispatchKey key ed = case edFocus ed of
   FEdit | Just cp <- edComplete ed -> handleCompleteKey key cp ed
   -- Image view is a separate mode (like CSV) and takes priority over text/CSV.
   FEdit | Just idoc <- edImage ed -> handleImageKey key idoc ed
+  FEdit | Just pg <- edPager ed    -> handlePagerKey key pg ed
   FEdit    -> case edCsv ed of
                 Just v  -> handleCsvKey key v ed
                 Nothing -> handleEditKey key ed

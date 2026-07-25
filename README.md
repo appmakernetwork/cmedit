@@ -85,6 +85,15 @@ escape sequences and the POSIX `termios` API.
   column** — numeric-aware, case-insensitive for text, empties last; press it
   again to flip descending. The frozen header row stays pinned, the cursor
   follows its row, and one undo restores the previous order.
+- **Paged view for huge files**: a file too large to load as an editable buffer
+  (over 100 MB) used to be refused outright. It now opens in a read-only paged
+  viewer whose memory does not depend on the file's size — a 281 MB, 4-million
+  line log, or a 120 MB file that is one single line, both sit at around 30 MB
+  resident. One streaming pass indexes a byte offset every thousand lines, and
+  only a window of lines around the viewport is ever decoded, so scrolling,
+  Ctrl+Home/End and **Go To Line** (jump straight to line 2 000 000 of a log)
+  are all instant. Syntax highlighting still applies per visible line. Turn it
+  off with `paged-view = off` to get the old refusal back.
 - **Image view mode**: opening a `.bmp`, `.gif`, `.jpg`/`.jpeg`, `.png`,
   `.webp`, or `.ppm`/`.pgm`/`.pbm` (detected by magic bytes) shows a read-only,
   scaled rendering of the picture — useful for glancing at images over SSH where
@@ -351,6 +360,7 @@ logic unit-testable without a terminal.
 | `Cmedit.Syntax` | Per-language lexers (one token per character) |
 | `Cmedit.Csv` | CSV parse/serialise + spreadsheet table model |
 | `Cmedit.Image` | From-scratch BMP/PNM/GIF/PNG/JPEG (baseline+progressive)/WebP (VP8L+VP8) decoders + image→cell scaler |
+| `Cmedit.Pager` | Read-only paged view of files too large to load: sparse line index + windowed reads |
 | `Cmedit.About` | The About box's animated wordmark (pure frame→cells generation) |
 | `Cmedit.Render` | Model → cell grid, and the diff to escape codes |
 | `Cmedit.App` | IO driver: setup/teardown, reader thread, event loop |

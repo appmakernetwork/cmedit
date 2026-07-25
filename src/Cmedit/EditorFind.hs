@@ -46,6 +46,8 @@ import Cmedit.Image (Image(..), ImgMode(..), renderImage, viewFit)
 import Cmedit.Syntax (HlCache, CommentSyntax(..), langComment, langForPath)
 
 import Cmedit.History (pushHist)
+import Cmedit.Pager (PagerDoc(..))
+import qualified Cmedit.Pager as Pg
 import Cmedit.EditorState
 import Cmedit.EditorEdit
 import Cmedit.EditorDoc
@@ -782,6 +784,7 @@ stagedDoc path lr buf' = Document
   , docRedo = Seq.empty, docLastEdit = EKNone
   , docOverwrite = False, docDiscard = False
   , docCsv = Nothing, docCsvStash = Nothing, docImage = Nothing
+  , docPager = Nothing
   , docHlCache = Nothing
   , docDiags = []
   }
