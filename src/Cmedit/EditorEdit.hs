@@ -50,6 +50,7 @@ import Cmedit.Lint (Linter(..), Severity(..), Diag(..), LintAvail, linters, lint
 import Cmedit.History (pushHist)
 import Cmedit.Pager (PagerDoc(..))
 import qualified Cmedit.Pager as Pg
+import qualified Cmedit.Rtf as Rtf
 import Cmedit.EditorState
 
 
@@ -547,6 +548,7 @@ themeLabel :: ThemeName -> String
 themeLabel ThemeDark = "dark-terminal"; themeLabel ThemeLight = "light-terminal"
 themeLabel ThemeAuto = "auto"; themeLabel ThemeCherryBlossom = "cherry-blossom"
 themeLabel ThemeFlashbang = "flashbang"; themeLabel ThemeMidnight = "midnight"
+themeLabel ThemeGraphite = "graphite"
 
 ------------------------------------------------------------------------------
 -- The Settings dialog (File ▸ Settings…)
@@ -647,7 +649,13 @@ statusRightInfo ed = flatten segs
     -- opens Go To Line, which is the one in-file jump the view supports.
     segs = case edPager ed of
       Just pg -> [ zone SZGoTo (Pg.pagerStatus pg) ]
-      Nothing -> segsDoc
+      -- The formatted view has no cursor and no selection, and its line
+      -- numbers are laid-out rows rather than file lines, so Go To Line does
+      -- not apply. The line ending still does: the buffer underneath is a
+      -- real text file that Save writes.
+      Nothing -> case edRtf ed of
+        Just rd -> [ plain (Rtf.rtfStatus rd), zone SZLineEnding eol, plain " " ]
+        Nothing -> segsDoc
     segsDoc = case edImage ed of
       Just idoc ->
         let img = idImage idoc

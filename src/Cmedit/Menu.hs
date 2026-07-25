@@ -47,11 +47,12 @@ data MenuAction
   | MAToggleWordWrap | MAToggleLineNumbers | MAToggleWhitespace
   | MAToggleExplorer           -- ^ Show/focus/hide the file-explorer panel.
   | MAToggleCsv                -- ^ Toggle CSV table view (for .csv files).
+  | MAToggleRtf                -- ^ Toggle the formatted RTF view (for .rtf files); shares Alt+T with 'MAToggleCsv', which no file can also be.
   | MAToggleFreezeHeader       -- ^ Freeze the first table row while scrolling.
   | MASortColumn               -- ^ Sort the table by the current column (toggles asc/desc).
   | MACycleLineEnding          -- ^ Switch the saved line ending (LF ⇄ CRLF).
   | MAToggleBom                -- ^ Toggle the UTF-8 BOM written on save.
-  | MAToggleTheme              -- ^ Open the theme picker dialog (auto / dark-terminal / light-terminal / cherry-blossom / flashbang / midnight, live-previewed).
+  | MAToggleTheme              -- ^ Open the theme picker dialog (auto / dark-terminal / light-terminal / cherry-blossom / flashbang / midnight / graphite, live-previewed).
   | MASwitchFile !Int          -- ^ Switch to the open file at this index.
   | MARecentFile !Int          -- ^ Open the k-th entry of the File menu's recent-files list.
   | MANextFile | MAPrevFile
@@ -132,6 +133,9 @@ menuBar =
       [ MEItem "&Table View (CSV)" "Alt+T" MAToggleCsv
       , MEItem "&Freeze Header Row" "" MAToggleFreezeHeader
       , MEItem "S&ort by Column"   "Alt+S" MASortColumn
+      -- Mutually exclusive with the table rows above: a file is .csv or .rtf,
+      -- so at most one of these groups survives 'Cmedit.Editor.pruneEntries'.
+      , MEItem "For&matted View (RTF)" "Alt+T" MAToggleRtf
       , MESep
       , MEItem "&Word Wrap"       "Alt+Z" MAToggleWordWrap
       , MEItem "&Line Numbers"    "Alt+L" MAToggleLineNumbers

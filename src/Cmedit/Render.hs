@@ -15,6 +15,7 @@ module Cmedit.Render
   , cherryBlossomTheme
   , flashbangTheme
   , midnightTheme
+  , graphiteTheme
   , themeFor
   , FileKind(..)
   , fileKind
@@ -49,6 +50,8 @@ import Cmedit.Csv (CsvView(..))
 import Cmedit.Link (filePathUri, urlSpans, urlSpansIn)
 import Cmedit.Pager (PagerDoc(..))
 import qualified Cmedit.Pager as Pg
+import Cmedit.Rtf (RtfDoc(..), RtfLine(..), RtfFmt(..))
+import qualified Cmedit.Rtf as Rtf
 import qualified Cmedit.Csv as Csv
 import Cmedit.ConfigFile (ThemeName(..))
 import Cmedit.Definition (DefPick(..), DefItem(..))
@@ -533,6 +536,120 @@ midnightRemap st@(Style fg bg _) = st { styleFg = fg', styleBg = mapBg bg }
       Color256{} -> c
       _          -> mnDeep
 
+-- | Graphite: a dark 24-bit theme painting a neutral near-black page — the
+-- grey counterpart to Midnight's navy, in the spirit of the mainstream
+-- dark-IDE palettes (orchid keywords, gold function names, terracotta
+-- strings, moss comments over a colourless ground).
+--
+-- One thing sets it apart from the other forced-background themes: its
+-- chrome is /darker/ than the page (@gpBar@ below @gpBase@), so the menu and
+-- status bars recede instead of standing proud. Cherry Blossom and Midnight
+-- both assume the opposite, which is why 'graphiteRemap' maps the hardcoded
+-- @White@ panel backgrounds onto a shade barely above the page rather than a
+-- lighter one — panels are separated by their borders and their accent, not
+-- by being brighter.
+graphiteTheme :: Theme
+graphiteTheme = Theme
+  { thText        = Style gpText gpBase attrNone
+  , thGutter      = Style gpDim gpBase attrNone
+  , thGutterCur   = Style gpAccFg gpBase attrBold
+  , thMenuBar     = Style gpBright gpBar attrNone
+  , thMenuActive  = Style gpOnAcc gpAccent attrNone
+  , thMenuItem    = Style gpText gpDrop attrNone
+  , thMenuAccel   = Style gpDim gpDrop attrNone
+  , thMenuSel     = Style gpOnAcc gpAccent attrNone
+  , thStatus      = Style gpBright gpBar attrNone
+  , thStatusKey   = Style gpAccFg gpBar attrBold
+  , thHint        = Style (rgb 138 138 145) gpBase attrNone
+  , thHintKey     = Style gpOnAcc gpAccent attrNone
+  , thSelection   = Style gpBright gpSel attrNone
+  , thDialog      = Style gpText gpDlg attrNone
+  , thDialogTitle = Style gpOnAcc gpAccent attrBold
+  , thField       = Style gpBright (rgb 43 43 47) attrNone
+  , thFieldFocus  = Style gpBright gpSel attrNone
+  , thButton      = Style gpText (rgb 51 51 56) attrNone
+  , thButtonFocus = Style gpOnAcc gpAccent attrBold
+  , thWhitespace  = Style (rgb 55 55 59) gpBase attrNone
+  , thFindMatch   = Style gpInk gpAmber attrNone
+  , thBracket     = Style gpAccFg gpBase (attrBold .|. attrUndercurl)
+  , thScrollbar   = Style (rgb 66 66 70) gpBase attrNone
+  , thDiagErr     = rgb 241 76 76
+  , thDiagWarn    = rgb 204 167 0
+  , thDiagInfo    = rgb 55 148 255
+  , thGutterDiag  = Style (rgb 241 76 76) gpBase attrNone
+  , thDialogDim   = Style gpText gpDlg attrDim
+  , thTokens      = graphiteTokens
+  , thRemap       = Just graphiteRemap
+  }
+  where rgb = ColorRGB
+
+-- The Graphite palette: a colourless near-black page, chrome a shade below
+-- it, one clear blue accent and a steel-blue selection.
+gpBase, gpText, gpBright, gpInk, gpDim, gpBar, gpDrop, gpDlg, gpSel,
+  gpAccent, gpAccFg, gpOnAcc, gpAmber :: Color
+gpBase   = ColorRGB 31 31 33      -- page: neutral near-black
+gpText   = ColorRGB 204 204 204   -- body text: soft grey, never pure white
+gpBright = ColorRGB 239 239 239   -- emphasized text
+gpInk    = ColorRGB 26 26 28      -- dark ink on the light grounds (find match)
+gpDim    = ColorRGB 110 118 129   -- gutter numbers, accelerators
+gpBar    = ColorRGB 23 23 25      -- menu/status bars: *below* the page
+gpDrop   = ColorRGB 32 32 35      -- dropdowns, panels
+gpDlg    = ColorRGB 38 38 42      -- dialogs
+gpSel    = ColorRGB 38 79 120     -- text selection: desaturated steel
+gpAccent = ColorRGB 0 120 212     -- accent used as a background
+gpAccFg  = ColorRGB 79 166 245    -- the same accent, legible as a foreground
+gpOnAcc  = ColorRGB 255 255 255   -- ink on the accent
+gpAmber  = ColorRGB 215 186 125   -- find-match ground
+
+-- Remap one finished cell style onto the Graphite palette, the same job
+-- 'midnightRemap' does for the navy page: the explorer, search view,
+-- quick-open, CSV table, browser and About wordmark hardcode ANSI names
+-- chosen for light chrome, and none of them may reach the terminal or the
+-- forced background breaks. Every ground here is dark bar the find-match
+-- amber and pure BrightWhite, so foregrounds go light almost everywhere.
+graphiteRemap :: Style -> Style
+graphiteRemap st@(Style fg bg _) = st { styleFg = fg', styleBg = mapBg bg }
+  where
+    fg' = if bg == Yellow || bg == BrightWhite then darkFg fg else lightFg fg
+    mapBg c = case c of
+      Default     -> gpBase
+      Black       -> gpBar                     -- deepest chrome
+      Blue        -> gpSel                     -- selections, table headers
+      Cyan        -> ColorRGB 31 70 97         -- secondary highlight
+      White       -> gpDrop                    -- light chrome panels go graphite
+      BrightWhite -> gpBright
+      BrightBlack -> ColorRGB 61 61 66         -- unfocused selection
+      Yellow      -> gpAmber                   -- find-match amber
+      Green       -> ColorRGB 30 62 40
+      Red         -> ColorRGB 92 40 44
+      Magenta     -> ColorRGB 66 46 74
+      other       -> other                     -- RGB / 256 pass through
+    -- Light hues for the graphite grounds (nearly everything).
+    lightFg c = case c of
+      Default       -> gpText
+      Black         -> gpBright                -- was dark-on-light chrome text
+      White         -> ColorRGB 165 165 172
+      BrightWhite   -> gpBright
+      BrightBlack   -> ColorRGB 128 128 136
+      Red           -> ColorRGB 241 76 76
+      BrightRed     -> ColorRGB 255 106 106
+      Green         -> ColorRGB 137 178 110
+      BrightGreen   -> ColorRGB 166 208 138
+      Yellow        -> gpAmber
+      BrightYellow  -> ColorRGB 229 202 148
+      Blue          -> gpAccFg
+      BrightBlue    -> ColorRGB 124 189 255
+      Magenta       -> ColorRGB 197 134 192    -- the signature orchid
+      BrightMagenta -> ColorRGB 216 160 211
+      Cyan          -> ColorRGB 78 201 176
+      BrightCyan    -> ColorRGB 118 216 195
+      _             -> c                       -- RGB / 256 pass through
+    -- Dark ink for the few light grounds.
+    darkFg c = case c of
+      ColorRGB{} -> c
+      Color256{} -> c
+      _          -> gpInk
+
 -- | Pick the palette the editor's config asks for.
 themeFor :: ThemeName -> Theme
 themeFor ThemeDark  = defaultTheme
@@ -540,6 +657,7 @@ themeFor ThemeLight = lightTheme
 themeFor ThemeCherryBlossom = cherryBlossomTheme
 themeFor ThemeFlashbang = flashbangTheme
 themeFor ThemeMidnight  = midnightTheme
+themeFor ThemeGraphite  = graphiteTheme
 themeFor ThemeAuto  = defaultTheme   -- resolved before we get here ('resolvedTheme'); dark is the fallback
 
 darkTokens :: Tok -> Style
@@ -661,6 +779,32 @@ midnightTokens t = case t of
   TkProperty  -> on (ColorRGB 122 162 247) attrNone
   where on fg = Style fg Default
 
+-- Mainstream dark-IDE hues for the Graphite page (the Default backgrounds
+-- become the near-black via 'graphiteRemap'): orchid keywords, gold function
+-- names, terracotta strings, moss comments and pale-sky properties — colour
+-- carried entirely by the tokens, since the ground has none.
+graphiteTokens :: Tok -> Style
+graphiteTokens t = case t of
+  TkText      -> Style Default Default attrNone
+  TkPunct     -> Style Default Default attrNone
+  TkKeyword   -> on (ColorRGB 197 134 192) attrBold
+  TkType      -> on (ColorRGB 78 201 176) attrNone
+  TkString    -> on (ColorRGB 206 145 120) attrNone
+  TkComment   -> on (ColorRGB 106 153 85) attrItalic
+  TkNumber    -> on (ColorRGB 181 206 168) attrNone
+  TkFunction  -> on (ColorRGB 220 220 170) attrNone
+  TkBuiltin   -> on (ColorRGB 86 156 214) attrNone
+  TkDecorator -> on (ColorRGB 215 186 125) attrNone
+  TkTag       -> on (ColorRGB 86 156 214) attrNone
+  TkAttr      -> on (ColorRGB 156 220 254) attrNone
+  TkHeading   -> on (ColorRGB 86 156 214) attrBold
+  TkEmph      -> Style Default Default attrItalic
+  TkStrong    -> Style Default Default attrBold
+  TkCode      -> on (ColorRGB 206 145 120) attrNone
+  TkLink      -> on (ColorRGB 79 166 245) attrUnderline
+  TkProperty  -> on (ColorRGB 156 220 254) attrNone
+  where on fg = Style fg Default
+
 ------------------------------------------------------------------------------
 -- Pure render to a cell grid
 
@@ -682,7 +826,9 @@ renderEditor ed = runST $ do
       Just idoc -> drawImage ed idoc lo arr
       Nothing   -> case edPager ed of
         Just pg -> drawPager th ed pg lo arr
-        Nothing -> maybe (drawTextArea th ed lo arr) (\v -> drawCsvTable th ed v lo arr) (edCsv ed)
+        Nothing -> case edRtf ed of
+          Just rd -> drawRtf th ed rd lo arr
+          Nothing -> maybe (drawTextArea th ed lo arr) (\v -> drawCsvTable th ed v lo arr) (edCsv ed)
   maybe (pure ()) (drawVScroll th arr cols rows) (scrollBarInfo ed)
   maybe (pure ()) (drawHScroll th arr cols rows ed lo) (loHBarRow lo)
   when (isJust (edExplorer ed)) $ drawExplorer th ed lo arr
@@ -939,6 +1085,92 @@ drawPager th ed pg lo arr = do
                           (dropWhile (\(d, _) -> d < left) cells)
           forM_ visible $ \(d, cell) ->
             putCell arr cols rows sr (loTextLeft lo + (d - left)) cell
+
+-- | The formatted RTF view: a word-processor document drawn as text.
+--
+-- The layout is already done ("Cmedit.Rtf" wrapped, indented and aligned every
+-- line for this width), so this only has to place styled cells — and it does
+-- that through the very same 'expandLineCellsFrom' the plain text view uses,
+-- handing it a @baseAt@ built from the document's own formatting runs instead
+-- of from a lexer's tokens. Tabs, wide glyphs and their continuation cells
+-- therefore behave identically to everywhere else.
+drawRtf :: Theme -> Editor -> RtfDoc -> Layout -> Surf s -> ST s ()
+drawRtf th ed rd lo arr = do
+  let cols = loCols lo; rows = loRows lo
+      tabw = tabWidthOf ed
+      dark = isDarkTheme (resolvedTheme ed)
+      ls   = Rtf.rtfLines rd
+  forM_ [0 .. loTextHeight lo - 1] $ \row -> do
+    let li = rdTop rd + row
+        sr = loTextTop lo + row
+    case Seq.lookup li ls of
+      Nothing -> pure ()
+      Just l
+        -- A page or section break, drawn as a rule across the text area.
+        | rlRule l ->
+            drawStr arr cols rows sr (loTextLeft lo) (thGutter th)
+              (replicate (loTextWidth lo) '\x2500')
+        | otherwise -> do
+            let baseAt = rtfBaseAt th dark (rlSpans l)
+                cells  = expandLineCells tabw False baseAt (thSelection th) (thWhitespace th)
+                           Nothing False [] []
+                           (urlLinksIn 0 (T.length (rlText l)) (rlText l))
+                           (rlText l)
+                -- The layout's leading pad is indent plus alignment; clip
+                -- anything that a narrow window pushes past the right edge.
+                x0 = loTextLeft lo + rlPad l
+            forM_ (takeWhile (\(d, _) -> rlPad l + d < loTextWidth lo) cells) $ \(d, cell) ->
+              putCell arr cols rows sr (x0 + d) cell
+
+-- A per-character base-style lookup over a laid-out RTF line's formatting
+-- runs — the formatted view's answer to 'mkBaseAt'. Runs are few per line and
+-- in order, so a linear scan is cheaper than building an array per row.
+rtfBaseAt :: Theme -> Bool -> [(Int, Int, RtfFmt)] -> (Int -> Style)
+rtfBaseAt th dark spans = \i ->
+  case [ f | (s, e, f) <- spans, i >= s, i < e ] of
+    (f : _) -> rtfStyle th dark f
+    []      -> thText th
+
+-- Map RTF character formatting onto a terminal style.
+--
+-- Colour needs care that the other attributes do not: a document's colour
+-- table names absolute colours, and the body text of nearly every real RTF
+-- file is *black*, which on a dark terminal is invisible. So a colour is only
+-- honoured when it would actually read against the theme's background
+-- ('legibleOn'); otherwise the theme's own text colour wins. Font size has no
+-- terminal analogue, so a run set noticeably larger than the body default
+-- reads as bold — which is what a heading is doing there anyway.
+rtfStyle :: Theme -> Bool -> RtfFmt -> Style
+rtfStyle th dark f = base { styleFg = fg, styleAttr = styleAttr base .|. attrs }
+  where
+    base  = thText th
+    heading = rfSize f >= 28          -- half-points: 14pt and up
+    attrs = orAttrs
+      [ (rfBold f || heading, attrBold)
+      , (rfItalic f,          attrItalic)
+      , (rfUnder f,           attrUnderline)
+      , (rfStrike f,          attrStrike)
+      ]
+    fg = case rfColor f of
+           Just c | legibleOn dark c -> c
+           _                         -> styleFg base
+    orAttrs = foldr (\(on, a) acc -> if on then a .|. acc else acc) attrNone
+
+-- Would this colour be readable against the theme's background? Perceptual
+-- luminance against a threshold at each end: near-black text is dropped on a
+-- dark theme and near-white on a light one, which is exactly the case that
+-- makes a document's own colours dangerous to honour blindly.
+legibleOn :: Bool -> Color -> Bool
+legibleOn dark col = case col of
+  ColorRGB r g b ->
+    let lum = (299 * fromIntegral r + 587 * fromIntegral g + 114 * fromIntegral b)
+                `div` (1000 :: Int)
+    in if dark then lum >= 60 else lum <= 205
+  _ -> True
+
+-- Does the resolved theme paint light text on a dark ground?
+isDarkTheme :: ThemeName -> Bool
+isDarkTheme t = t `notElem` [ThemeLight, ThemeCherryBlossom, ThemeFlashbang]
 
 -- Word-wrapped text rendering: each buffer line occupies one or more visual
 -- rows. Tab stops and selection styling are taken from the full line so they
@@ -2224,6 +2456,13 @@ computeCursor ed lo = case edFocus ed of
   -- through to the text path would blink a cursor over the picture at the
   -- stale buffer's position, so hide it.
   FEdit | isJust (edImage ed) -> Nothing
+  -- Likewise the formatted RTF view: it is a projection of the buffer, with
+  -- no position of its own for a cursor to mean. Falling through would park a
+  -- blinking cursor wherever the buffer cursor happens to sit, which is a
+  -- point in the *markup* and so lands somewhere arbitrary on screen. (If the
+  -- view ever grows a text selection to copy from, that selection — not the
+  -- buffer's cursor — is what would want showing here.)
+  FEdit | isJust (edRtf ed) -> Nothing
   FEdit | Just v <- edCsv ed -> csvCursor ed v lo
   FEdit | edWordWrap ed ->
     let Pos l c = edCursor ed

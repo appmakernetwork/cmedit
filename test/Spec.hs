@@ -12,7 +12,7 @@ import Data.Either (isLeft)
 import Data.List (foldl', intercalate, isInfixOf, isPrefixOf, isSuffixOf, tails)
 import System.Directory (getTemporaryDirectory, removeFile)
 import System.FilePath ((</>))
-import Control.Exception (SomeException, try)
+import Control.Exception (SomeException, evaluate, try)
 import System.Exit (exitFailure, exitSuccess)
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats (getRTSStats, getRTSStatsEnabled, gc, gcdetails_live_bytes)
@@ -50,6 +50,8 @@ import qualified Cmedit.Regex as Rx
 import qualified Data.Sequence as Seq
 import Cmedit.Pager (PagerDoc(..))
 import qualified Cmedit.Pager as Pg
+import Cmedit.Rtf (RtfDoc(..))
+import qualified Cmedit.Rtf as Rtf
 import Cmedit.Csv
 import Cmedit.Image (Image(..), ImgMode(..), decodeImage, decodeFrames, decodeGIFFrames, sniffImage, renderImage, viewFit, scaleRGBA)
 import Cmedit.Render (renderEditor, renderFrame, scrollPlan, Screen(..), ScrollHint(..), Theme(..), defaultTheme, lightTheme, themeFor, FileKind(..), fileKind, expandLineCells)
@@ -994,6 +996,41 @@ main = do
             (cfgDebugStats (fst (parseConfigText "debug-stats = on" defaultConfig))) True
     check "debug-stats is off by default" (not (cfgDebugStats defaultConfig))
 
+  -- JPEG decoding (plan 0018) ------------------------------------------------
+  -- Structure worth checking: hard colour edges (JPEG ringing), a gradient
+  -- region, a 1-pixel checkerboard (the worst case for chroma subsampling) and
+  -- the image corners, which exercise the upsampler's edge clamping.
+  case decodeImage jpegGray8 of
+    Left e -> check ("grayscale JPEG: " ++ e) False
+    Right im -> do
+      checkEq "jpeg gray: dimensions" (imgW im, imgH im) (32, 24)
+      checkEq "jpeg gray: format" (imgFmt im) "JPEG"
+      -- Grayscale decodes to equal R=G=B.
+      let (r0,g0,b0,a0) = pixelAt im 4 4
+      checkEq "jpeg gray: neutral pixel" (r0 == g0 && g0 == b0, a0) (True, 255)
+      checkEq "jpeg gray: red block luma"   (pixelAt im 4 4)   (76,76,76,255)
+      checkEq "jpeg gray: green block luma" (pixelAt im 12 6)  (150,150,150,255)
+      checkEq "jpeg gray: corner"           (pixelAt im 31 23) (0,0,0,255)
+  case decodeImage jpegColour420 of
+    Left e -> check ("colour JPEG: " ++ e) False
+    Right im -> do
+      checkEq "jpeg 4:2:0: dimensions" (imgW im, imgH im) (32, 24)
+      -- Saturated blocks survive the round trip through YCbCr and chroma
+      -- upsampling; these are the exact values the decoder produced before the
+      -- IDCT was rewritten, so they pin the arithmetic as well as the plumbing.
+      checkEq "jpeg 4:2:0: red block"    (pixelAt im 0 0)   (253,0,1,255)
+      checkEq "jpeg 4:2:0: red block b"  (pixelAt im 4 4)   (252,1,0,255)
+      checkEq "jpeg 4:2:0: green block"  (pixelAt im 12 6)  (2,255,0,255)
+      checkEq "jpeg 4:2:0: gradient"     (pixelAt im 20 12) (158,121,121,255)
+      checkEq "jpeg 4:2:0: corner"       (pixelAt im 31 23) (0,0,0,255)
+      checkEq "jpeg 4:2:0: checkerboard" (pixelAt im 28 9)  (255,255,255,255)
+      -- Every pixel is opaque and in range (a decoder that walks off a plane
+      -- tends to produce zeros or garbage alpha).
+      let alphas = [ a | y <- [0 .. imgH im - 1], x <- [0 .. imgW im - 1]
+                       , let (_,_,_,a) = pixelAt im x y ]
+      checkEq "jpeg 4:2:0: fully opaque" (all (== 255) alphas, length alphas) (True, 32*24)
+  check "truncated JPEG -> error" (isLeft (decodeImage (BS.take 120 jpegColour420)))
+
   -- Paged read-only view of huge files (plan 0012) ---------------------------
   -- The index is the whole basis of the view: if an offset is wrong, the file
   -- is shown incorrectly with no way for the user to tell. Check it against a
@@ -1089,6 +1126,237 @@ main = do
               (maybe 0 T.length (Seq.lookup 0 w) <= Pg.maxPagerLine)
     _ <- try (removeFile tmp) :: IO (Either SomeException ())
     pure ()
+
+  -- RTF formatted view --------------------------------------------------------
+  -- The parser's job is to render the document and ignore everything else, so
+  -- the tests are mostly "did the markup disappear and the text survive".
+  do
+    let rtfDoc = T.pack $ concat
+          [ "{\\rtf1\\ansi\\ansicpg1252\\deff0"
+          , "{\\fonttbl{\\f0\\froman Times;}}"
+          , "{\\colortbl;\\red0\\green0\\blue0;\\red200\\green0\\blue0;}"
+          , "{\\*\\generator Riched20;}{\\info{\\title Secret}}"
+          , "\\pard\\qc\\b Heading\\b0\\par\n"
+          , "\\pard\\ql Plain \\i slanted\\i0  and \\cf2 red\\cf0  and \\ul under\\ulnone .\\par\n"
+          , "\\pard\\v hidden\\v0 shown\\par\n"
+          , "\\pard Caf\\'e9 \\u233?X \\ldblquote q\\rdblquote \\emdash end\\par\n"
+          , "}" ]
+        pars = toList (Rtf.parseRtf rtfDoc)
+        parText p = T.concat (map Rtf.rrText (Rtf.rpRuns p))
+        allText = T.intercalate (T.pack "\n") (map parText pars)
+    check "rtf looksLikeRtf" (Rtf.looksLikeRtf rtfDoc)
+    check "rtf not looksLikeRtf on plain text" (not (Rtf.looksLikeRtf (T.pack "hello")))
+    -- Destinations that are not document text must leave no trace at all.
+    forM_ ["fonttbl", "Times", "colortbl", "Riched20", "Secret", "\\par", "\\pard"] $ \s ->
+      check ("rtf drops " ++ s) (not (s `isInfixOf` T.unpack allText))
+    checkEq "rtf paragraph count" (length pars) 4
+    checkEq "rtf heading text" (parText (head pars)) (T.pack "Heading")
+    checkEq "rtf heading centred" (Rtf.rpAlign (head pars)) Rtf.AlignCenter
+    -- \v hidden text is dropped the way a word processor hides it.
+    checkEq "rtf hidden text dropped" (parText (pars !! 2)) (T.pack "shown")
+    -- cp1252 \'hh, \uN with its fallback char skipped, and the shorthands.
+    checkEq "rtf escapes" (parText (pars !! 3))
+      (T.pack "Caf\233 \233X \8220q\8221\8212end")
+    -- Character formatting lands on the right runs.
+    let body = pars !! 1
+        runOf t = [ r | r <- Rtf.rpRuns body, Rtf.rrText r == T.pack t ]
+    check "rtf italic run" (all (Rtf.rfItalic . Rtf.rrFmt) (runOf "slanted"))
+    check "rtf underline run" (all (Rtf.rfUnder . Rtf.rrFmt) (runOf "under"))
+    check "rtf colour run" (all ((== Just (ColorRGB 200 0 0)) . Rtf.rfColor . Rtf.rrFmt) (runOf "red"))
+    check "rtf plain run has no formatting"
+      (all ((== Rtf.defaultFmt) . Rtf.rrFmt) (runOf "Plain "))
+    -- The bold heading must not leak into the following paragraph.
+    check "rtf bold ends at \\b0" (not (any (Rtf.rfBold . Rtf.rrFmt) (Rtf.rpRuns body)))
+
+    -- Layout: every laid-out line fits the width it was laid out for, and the
+    -- spans stay inside their line's text (the renderer indexes with them).
+    forM_ [20, 40, 80] $ \w -> do
+      let ls = toList (Rtf.layoutRtf 8 w (Seq.fromList pars))
+      check ("rtf layout fits width " ++ show w)
+        (all (\l -> Rtf.rlPad l + lineDisplayWidth 8 (Rtf.rlText l) <= w) ls)
+      check ("rtf layout spans in range " ++ show w)
+        (all (\l -> all (\(s, e, _) -> s >= 0 && e <= T.length (Rtf.rlText l) && s <= e)
+                        (Rtf.rlSpans l)) ls)
+      check ("rtf layout keeps all text " ++ show w)
+        (T.filter (not . isSpace) (T.concat (map Rtf.rlText ls))
+           == T.filter (not . isSpace) (T.concat (map parText pars)))
+    -- Narrower wrapping can only produce more lines, never fewer.
+    check "rtf narrower wraps to more lines"
+      (Seq.length (Rtf.layoutRtf 8 20 (Seq.fromList pars)) >= Seq.length (Rtf.layoutRtf 8 80 (Seq.fromList pars)))
+
+    -- Alignment places the text, since the view has no other way to show it.
+    let ctr = head (toList (Rtf.layoutRtf 8 40 (Seq.fromList (take 1 pars))))
+    checkEq "rtf centred pad" (Rtf.rlPad ctr) ((40 - 7) `div` 2)
+
+    -- \ucN says how many fallback characters follow each \uN, and getting it
+    -- wrong either duplicates text or eats the document after it. A control
+    -- word, a \'hh escape and a plain character each count as one.
+    let ucText n s = T.concat (map Rtf.rrText (Rtf.rpRuns (head (toList
+                       (Rtf.parseRtf (T.pack ("{\\rtf1\\uc" ++ show (n :: Int) ++ " " ++ s ++ "}")))))))
+    checkEq "rtf uc1 skips one char" (ucText 1 "[\\u233?]") (T.pack "[\233]")
+    checkEq "rtf uc2 skips two chars" (ucText 2 "[\\u233??]") (T.pack "[\233]")
+    checkEq "rtf uc0 skips nothing" (ucText 0 "[\\u233]x") (T.pack "[\233]x")
+    checkEq "rtf uc skips a \\'hh fallback" (ucText 1 "[\\u233\\'e9]") (T.pack "[\233]")
+    checkEq "rtf uc skips a control-word fallback" (ucText 1 "[\\u9731\\loch ]") (T.pack "[\9731]")
+    checkEq "rtf uc never eats a group delimiter"
+      (ucText 2 "[\\u233{}]") (T.pack "[\233]")
+    -- A negative \u is a code point above 32767 written as signed 16 bits.
+    checkEq "rtf negative \\u wraps to 16 bits" (ucText 0 "[\\u-1]") (T.pack "[\65535]")
+    -- Lone surrogates are not characters; they must not reach 'chr'.
+    checkEq "rtf lone surrogate becomes U+FFFD" (ucText 0 "[\\u55357]") (T.pack "[\65533]")
+    -- A nonsense parameter must still yield exactly one character, with none
+    -- of its digits leaking out as document text.
+    checkEq "rtf absurd \\u yields one char, no leaked digits"
+      (T.length (ucText 0 "[\\u111411200000000]")) 3
+
+    -- Malformed input must degrade, not diverge.
+    forM_ [ "{\\rtf1", "{\\rtf1\\b", "}}}}", "{\\rtf1 \\u", "{\\rtf1 \\'z", "{\\rtf1 \\'"
+          , "{\\rtf1 {\\*\\unknown", "{\\rtf1 \\uc99 \\u65?x" ] $ \s ->
+      check ("rtf survives " ++ s)
+        (Seq.length (Rtf.parseRtf (T.pack s)) >= 0)
+
+    -- The view: entering it derives from the buffer and never writes back;
+    -- toggling out leaves the buffer byte-identical.
+    let ed0 = setLoaded "doc.rtf"
+                (emptyLoadResult { lrBuffer = fromText rtfDoc })
+                (newEditor (24, 80) defaultConfig)
+    check "rtf opens in the formatted view" (isJust' (edRtf ed0))
+    checkEq "rtf buffer untouched on open" (bufferToText LF False (edBuffer ed0)) rtfDoc
+    let edRaw = toggleRtf ed0
+        edFmt = toggleRtf edRaw
+    check "rtf Alt+T leaves the formatted view" (not (isJust' (edRtf edRaw)))
+    check "rtf Alt+T returns to it" (isJust' (edRtf edFmt))
+    checkEq "rtf round-trip preserves the buffer exactly"
+      (bufferToText LF False (edBuffer edFmt)) rtfDoc
+    -- Read-only: an editing keystroke must not reach the buffer.
+    let edTyped = fst (update (KChar 'X') edFmt)
+    checkEq "rtf typing does not edit the buffer"
+      (bufferToText LF False (edBuffer edTyped)) rtfDoc
+    check "rtf typing is not treated as a modification" (not (edModified edTyped))
+    -- ...but the raw view is an ordinary editable buffer.
+    let edRawTyped = fst (update (KChar 'X') edRaw)
+    check "rtf raw view accepts edits" (edModified edRawTyped)
+    -- Only .rtf files offer the view.
+    let edTxt = setLoaded "notes.txt"
+                  (emptyLoadResult { lrBuffer = fromText rtfDoc })
+                  (newEditor (24, 80) defaultConfig)
+    check "non-rtf does not open formatted" (not (isJust' (edRtf edTxt)))
+    check "non-rtf refuses the toggle" (not (isJust' (edRtf (toggleRtf edTxt))))
+    -- Opening the file to land on a position in it (a workspace search hit, a
+    -- definition site) matched the *markup*, which the formatted view neither
+    -- shows nor has a cursor for — so that open stays in the raw view.
+    let edJump = setLoaded "doc.rtf"
+                   (emptyLoadResult { lrBuffer = fromText rtfDoc })
+                   (newEditor (24, 80) defaultConfig)
+                     { edPendingJump = Just ("doc.rtf", 1, 0, 3) }
+    check "rtf open-with-pending-jump stays raw" (not (isJust' (edRtf edJump)))
+    let edJumpOther = setLoaded "doc.rtf"
+                        (emptyLoadResult { lrBuffer = fromText rtfDoc })
+                        (newEditor (24, 80) defaultConfig)
+                          { edPendingJump = Just ("other.txt", 1, 0, 3) }
+    check "rtf open with a jump pending elsewhere still formats"
+      (isJust' (edRtf edJumpOther))
+
+    -- The derived view re-parses when the buffer moves under it. Every real
+    -- buffer mutation bumps 'edEditSeq', which is what the view watches.
+    let edEdited = refreshRtf edFmt { edBuffer = fromText (T.pack "{\\rtf1 One\\par Two\\par}")
+                                    , edEditSeq = edEditSeq edFmt + 1 }
+    checkEq "rtf view re-derives from a changed buffer"
+      (fmap (Seq.length . rdPars) (edRtf edEdited)) (Just 2)
+    check "rtf view does not re-derive when nothing was edited"
+      (not (Rtf.rtfStale (edEditSeq edFmt) (maybe (error "no view") id (edRtf edFmt))))
+    -- Scrolling must not re-parse. This is a *timing* test because the bug it
+    -- guards was invisible to every structural check: the view looked right,
+    -- it was simply rebuilt from scratch on each keystroke (a 1.6 MB document
+    -- cost ~170 ms per arrow key). Compare a scroll against the one-time parse
+    -- of the same document — the operation being accidentally repeated.
+    do
+      let bigRtf = T.concat
+            [ T.pack "{\\rtf1\\ansi{\\colortbl;\\red0\\green0\\blue0;}"
+            , T.concat [ T.pack ("\\pard\\ql Paragraph " ++ show i
+                                 ++ " with \\b some bold\\b0  and \\i italic\\i0"
+                                 ++ " text in it to wrap.\\par\n")
+                       | i <- [1 :: Int .. 2000] ]
+            , T.pack "}" ]
+          edBig = setLoaded "big.rtf"
+                    (emptyLoadResult { lrBuffer = fromText bigRtf })
+                    (newEditor (30, 100) defaultConfig)
+          scroll e = fst (update (KArrow DDown noMods) e)
+      -- Force the view so the parse is not still a thunk when we time scrolls.
+      _ <- evaluate (maybe 0 Rtf.rtfLineCount (edRtf edBig))
+      tParse <- do
+        t0 <- getMonotonicTime
+        _ <- evaluate (Seq.length (Rtf.parseRtf bigRtf))
+        t1 <- getMonotonicTime
+        pure (t1 - t0)
+      tScroll <- do
+        t0 <- getMonotonicTime
+        e <- evaluate (foldl' (\e' _ -> scroll e') edBig [1 :: Int .. 100])
+        _ <- evaluate (maybe 0 rdTop (edRtf e))
+        t1 <- getMonotonicTime
+        pure (t1 - t0)
+      -- 100 scrolls that each re-parsed would be ~100x one parse. Anything
+      -- near or below a single parse means the cache is doing its job.
+      check ("rtf 100 scrolls cost less than one parse (parse "
+             ++ show (round (tParse * 1000) :: Int) ++ " ms, 100 scrolls "
+             ++ show (round (tScroll * 1000) :: Int) ++ " ms)")
+            (tScroll < max 0.05 tParse)
+
+    -- No cursor in the formatted view: it has no position of its own, so the
+    -- buffer's cursor would blink at an arbitrary spot in the rendered text.
+    check "rtf formatted view shows no cursor"
+      (not (isJust' (scrCursor (renderEditor edFmt))))
+    check "rtf raw view does show a cursor"
+      (isJust' (scrCursor (renderEditor edRaw)))
+
+    -- The vertical scrollbar must drive the view the bar is measuring. It is
+    -- drawn from 'scrollBarInfo' but moved by 'scrollBarTo', and those are two
+    -- separate view splits: teaching only the first about a new mode gives a
+    -- bar that tracks correctly and does nothing when you drag it.
+    do
+      let manyPars = T.concat
+            [ T.pack "{\\rtf1\\ansi"
+            , T.concat [ T.pack ("\\pard Paragraph number " ++ show i ++ ".\\par\n")
+                       | i <- [1 :: Int .. 400] ]
+            , T.pack "}" ]
+          edS = setLoaded "bar.rtf"
+                  (emptyLoadResult { lrBuffer = fromText manyPars })
+                  (newEditor (24, 80) defaultConfig)
+          topOf e = maybe (-1) rdTop (edRtf e)
+          click row col pressed dragging =
+            KMouse (MouseEvent MBLeft col row pressed dragging noMods 1)
+      case scrollBarInfo edS of
+        Nothing -> check "rtf scrollbar is showing for a long document" False
+        Just (bx, btop, bh, total, _) -> do
+          check "rtf scrollbar measures laid-out rows"
+            (total == maybe 0 Rtf.rtfLineCount (edRtf edS))
+          -- A press two-thirds down the track jumps roughly two-thirds in.
+          let edMid = fst (update (click (btop + (2 * bh) `div` 3) bx True False) edS)
+          check ("rtf scrollbar click scrolls the formatted view (top "
+                 ++ show (topOf edMid) ++ " of " ++ show total ++ ")")
+            (topOf edMid > total `div` 3)
+          -- Dragging the thumb keeps moving it, and a release ends the drag.
+          let edDrag = fst (update (click (btop + bh - 1) bx True True) edMid)
+          check "rtf scrollbar drag keeps scrolling" (topOf edDrag > topOf edMid)
+          let edUp = fst (update (click btop bx True True) edDrag)
+          check "rtf scrollbar drag scrolls back up" (topOf edUp < topOf edDrag)
+          checkEq "rtf scrollbar click never moves the hidden buffer cursor"
+            (edCursor edMid) (edCursor edS)
+          -- A click on the rendered document is swallowed: it must not start a
+          -- selection drag, which would then gate the scrollbar guard.
+          let edText = fst (update (click 5 5 True False) edS)
+          check "rtf text click does not start a selection drag"
+            (not (edMouseSelecting edText))
+          checkEq "rtf text click leaves the buffer cursor alone"
+            (edCursor edText) (edCursor edS)
+          checkEq "rtf text click does not scroll" (topOf edText) (topOf edS)
+
+    -- Scrolling is clamped to the laid-out document.
+    let Just rd = edRtf edFmt
+        h = 5
+    checkEq "rtf scroll clamps at the top" (rdTop (Rtf.rtfScroll h (-99) rd)) 0
+    check "rtf scroll clamps at the bottom"
+      (rdTop (Rtf.rtfScroll h 999 rd) <= max 0 (Rtf.rtfLineCount rd - h))
 
   -- Save/load round-trip matrix (plan 0013) ----------------------------------
   -- Saving is the one operation where a bug silently corrupts the user's file,
@@ -1697,6 +1965,19 @@ main = do
   checkEq "pointer: text area is a beam" (pointerShapeFor edPtr 5 10) "text"
   checkEq "pointer: menu bar is a hand" (pointerShapeFor edPtr 0 3) "pointer"
   checkEq "pointer: scrollbar column is default" (pointerShapeFor edPtr 5 79) "default"
+  -- The explorer divider and a CSV column border are the same width-drag
+  -- gesture, so they hint the same shape — hovering the handle and mid-drag.
+  let edPanel = explorerStart "/w" [("/w/a.txt", False, Just 3)] edPtr
+      divCol  = loContentLeft (computeLayout edPanel) - 1
+      panelRow = loTextTop (computeLayout edPanel) + 1
+  checkEq "pointer: explorer divider offers col-resize"
+          (pointerShapeFor edPanel panelRow divCol) "col-resize"
+  checkEq "pointer: explorer rows stay a hand"
+          (pointerShapeFor edPanel panelRow (divCol - 2)) "pointer"
+  checkEq "pointer: a panel-width drag holds col-resize anywhere"
+          (pointerShapeFor edPanel { edSidebarDrag = True } 5 60) "col-resize"
+  checkEq "pointer: the collapsed strip is a hand, not a resize handle"
+          (pointerShapeFor edPanel { edExpCollapsed = True } panelRow 0) "pointer"
 
   -- Pixel-graphics encoders ----------------------------------------------------
   checkEq "base64: RFC vector" (builderStr (base64B (BS.pack (map (fromIntegral . fromEnum) ("Man" :: String))))) "TWFu"
@@ -3435,7 +3716,37 @@ main = do
             (cfgTheme (edConfig (key KEnter
               (edDlg { edDialog = fmap (\d -> d { dlgFocus = 5 }) (edDialog edDlg) }))))
             ThemeMidnight
-    -- The seven-button picker no longer fits one 80-column row: its buttons
+    checkEq "picking Graphite applies it"
+            (cfgTheme (edConfig (key KEnter
+              (edDlg { edDialog = fmap (\d -> d { dlgFocus = 6 }) (edDialog edDlg) }))))
+            ThemeGraphite
+
+    -- Graphite: the neutral-grey forced-background theme. Its config word
+    -- parses, it paints every cell, its palette is its own, and — the detail
+    -- that makes it read like an IDE rather than a grey Midnight — its
+    -- chrome sits *below* the page rather than above it.
+    checkEq "config theme=graphite"
+            (cfgTheme (fst (parseConfigText (T.pack "theme = graphite") defaultConfig)))
+            ThemeGraphite
+    let scrG = renderEditor edT { edConfig = (edConfig edT) { cfgTheme = ThemeGraphite } }
+    check "graphite forces an RGB background on every cell"
+      (all (isRGB . styleBg . cellStyle) (A.elems (scrCells scrG)))
+    check "graphite and midnight keyword colours differ"
+      (thTokens (themeFor ThemeGraphite) TkKeyword /= thTokens (themeFor ThemeMidnight) TkKeyword)
+    let lum c = case c of ColorRGB r g b -> Just (fromIntegral r * 0.3
+                                                  + fromIntegral g * 0.59
+                                                  + fromIntegral b * 0.11 :: Double)
+                          _ -> Nothing
+        thG = themeFor ThemeGraphite
+    check "graphite's bars sit below its page"
+      (case (lum (styleBg (thMenuBar thG)), lum (styleBg (thText thG))) of
+         (Just bar, Just page) -> bar < page
+         _ -> False)
+    check "graphite's page is neutral (no colour cast)"
+      (case styleBg (thText thG) of
+         ColorRGB r g b -> maximum [r, g, b] - minimum [r, g, b] <= 4
+         _ -> False)
+    -- The eight-button picker no longer fits one 80-column row: its buttons
     -- wrap ('buttonRows'), every button lands on exactly one row, and the
     -- box still fits the terminal.
     checkEq "theme picker buttons wrap to two rows"
@@ -4380,6 +4691,101 @@ csvParseRef delim = Seq.fromList . map Seq.fromList . rows . T.unpack
     unquoted [] acc = (T.pack (reverse acc), [], 2)
     dropLF ('\n' : cs) = cs
     dropLF cs          = cs
+
+-- Two real JPEGs, 32x24, produced by an independent encoder: a baseline
+-- grayscale one and a 4:2:0 colour one. The decoder had NO test coverage at
+-- all before the performance work of plan 0018 — which meant a decoder rewrite
+-- had nothing to check itself against. Expected pixels below were captured
+-- from the decoder as it stood before that work.
+jpegGray8 :: BS.ByteString
+jpegGray8 = BS.pack $
+  [ 255,216,255,224,0,16,74,70,73,70,0,1,1,0,0,1
+  , 0,1,0,0,255,219,0,67,0,5,3,4,4,4,3,5
+  , 4,4,4,5,5,5,6,7,12,8,7,7,7,7,15,11
+  , 11,9,12,17,15,18,18,17,15,17,17,19,22,28,23,19
+  , 20,26,21,17,17,24,33,24,26,29,29,31,31,31,19,23
+  , 34,36,34,30,36,28,30,31,30,255,192,0,11,8,0,24
+  , 0,32,1,1,17,0,255,196,0,31,0,0,1,5,1,1
+  , 1,1,1,1,0,0,0,0,0,0,0,0,1,2,3,4
+  , 5,6,7,8,9,10,11,255,196,0,181,16,0,2,1,3
+  , 3,2,4,3,5,5,4,4,0,0,1,125,1,2,3,0
+  , 4,17,5,18,33,49,65,6,19,81,97,7,34,113,20,50
+  , 129,145,161,8,35,66,177,193,21,82,209,240,36,51,98,114
+  , 130,9,10,22,23,24,25,26,37,38,39,40,41,42,52,53
+  , 54,55,56,57,58,67,68,69,70,71,72,73,74,83,84,85
+  , 86,87,88,89,90,99,100,101,102,103,104,105,106,115,116,117
+  , 118,119,120,121,122,131,132,133,134,135,136,137,138,146,147,148
+  , 149,150,151,152,153,154,162,163,164,165,166,167,168,169,170,178
+  , 179,180,181,182,183,184,185,186,194,195,196,197,198,199,200,201
+  , 202,210,211,212,213,214,215,216,217,218,225,226,227,228,229,230
+  , 231,232,233,234,241,242,243,244,245,246,247,248,249,250,255,218
+  , 0,8,1,1,0,0,63,0,242,202,247,106,241,43,13,19
+  , 167,201,250,87,164,255,0,199,191,253,59,249,31,246,203,202
+  , 217,255,0,126,124,189,159,101,255,0,166,27,62,203,255,0
+  , 46,191,100,255,0,137,31,150,215,187,87,59,97,162,116,249
+  , 41,191,241,239,255,0,78,254,71,253,178,242,182,127,223,159
+  , 47,103,217,127,233,134,207,178,255,0,203,175,217,63,226,71
+  , 229,181,238,213,212,216,232,157,62,74,243,47,248,247,255,0
+  , 167,127,35,254,217,121,91,63,239,207,151,179,236,191,244,195
+  , 103,217,127,229,215,236,159,241,35,255,217
+  ]
+
+jpegColour420 :: BS.ByteString
+jpegColour420 = BS.pack $
+  [ 255,216,255,224,0,16,74,70,73,70,0,1,1,0,0,1
+  , 0,1,0,0,255,219,0,67,0,5,3,4,4,4,3,5
+  , 4,4,4,5,5,5,6,7,12,8,7,7,7,7,15,11
+  , 11,9,12,17,15,18,18,17,15,17,17,19,22,28,23,19
+  , 20,26,21,17,17,24,33,24,26,29,29,31,31,31,19,23
+  , 34,36,34,30,36,28,30,31,30,255,219,0,67,1,5,5
+  , 5,7,6,7,14,8,8,14,30,20,17,20,30,30,30,30
+  , 30,30,30,30,30,30,30,30,30,30,30,30,30,30,30,30
+  , 30,30,30,30,30,30,30,30,30,30,30,30,30,30,30,30
+  , 30,30,30,30,30,30,30,30,30,30,30,30,30,30,255,192
+  , 0,17,8,0,24,0,32,3,1,34,0,2,17,1,3,17
+  , 1,255,196,0,31,0,0,1,5,1,1,1,1,1,1,0
+  , 0,0,0,0,0,0,0,1,2,3,4,5,6,7,8,9
+  , 10,11,255,196,0,181,16,0,2,1,3,3,2,4,3,5
+  , 5,4,4,0,0,1,125,1,2,3,0,4,17,5,18,33
+  , 49,65,6,19,81,97,7,34,113,20,50,129,145,161,8,35
+  , 66,177,193,21,82,209,240,36,51,98,114,130,9,10,22,23
+  , 24,25,26,37,38,39,40,41,42,52,53,54,55,56,57,58
+  , 67,68,69,70,71,72,73,74,83,84,85,86,87,88,89,90
+  , 99,100,101,102,103,104,105,106,115,116,117,118,119,120,121,122
+  , 131,132,133,134,135,136,137,138,146,147,148,149,150,151,152,153
+  , 154,162,163,164,165,166,167,168,169,170,178,179,180,181,182,183
+  , 184,185,186,194,195,196,197,198,199,200,201,202,210,211,212,213
+  , 214,215,216,217,218,225,226,227,228,229,230,231,232,233,234,241
+  , 242,243,244,245,246,247,248,249,250,255,196,0,31,1,0,3
+  , 1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,1
+  , 2,3,4,5,6,7,8,9,10,11,255,196,0,181,17,0
+  , 2,1,2,4,4,3,4,7,5,4,4,0,1,2,119,0
+  , 1,2,3,17,4,5,33,49,6,18,65,81,7,97,113,19
+  , 34,50,129,8,20,66,145,161,177,193,9,35,51,82,240,21
+  , 98,114,209,10,22,36,52,225,37,241,23,24,25,26,38,39
+  , 40,41,42,53,54,55,56,57,58,67,68,69,70,71,72,73
+  , 74,83,84,85,86,87,88,89,90,99,100,101,102,103,104,105
+  , 106,115,116,117,118,119,120,121,122,130,131,132,133,134,135,136
+  , 137,138,146,147,148,149,150,151,152,153,154,162,163,164,165,166
+  , 167,168,169,170,178,179,180,181,182,183,184,185,186,194,195,196
+  , 197,198,199,200,201,202,210,211,212,213,214,215,216,217,218,226
+  , 227,228,229,230,231,232,233,234,242,243,244,245,246,247,248,249
+  , 250,255,218,0,12,3,1,0,2,17,3,17,0,63,0,242
+  , 202,247,106,240,154,247,106,252,103,62,255,0,151,127,63,208
+  , 244,62,149,95,243,42,255,0,184,255,0,251,132,241,43,13
+  , 19,167,201,250,87,164,255,0,199,191,253,59,249,31,246,203
+  , 202,217,255,0,126,124,189,159,101,255,0,166,27,62,203,255
+  , 0,46,191,100,255,0,137,27,172,52,78,159,37,55,254,61
+  , 255,0,233,223,200,255,0,182,94,86,207,251,243,229,236,251
+  , 47,253,48,217,246,95,249,117,251,39,252,72,255,0,112,197
+  , 99,62,179,47,67,183,55,199,253,114,149,45,118,191,227,99
+  , 203,107,221,168,162,191,15,207,191,229,223,207,244,56,190,149
+  , 95,243,42,255,0,184,255,0,251,132,234,108,116,78,159,37
+  , 121,151,252,123,255,0,211,191,145,255,0,108,188,173,159,247
+  , 231,203,217,246,95,250,97,179,236,191,242,235,246,79,248,145
+  , 148,87,233,185,77,89,84,149,78,111,47,212,249,252,182,180
+  , 234,210,247,186,31,255,217
+  ]
 
 -- Undo-stack depth (a local `edUndo` binding in main shadows the selector).
 undoDepth :: Editor -> Int

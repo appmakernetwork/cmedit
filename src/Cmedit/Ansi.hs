@@ -307,6 +307,7 @@ attrCodes caps a =
   optc attrDim       ";2" <>
   optc attrItalic    ";3" <>
   underlinePart      <>
+  optc attrStrike    ";9" <>
   optc attrReverse   ";7"
   where
     optc flag s = if hasAttr flag a then string7 s else mempty

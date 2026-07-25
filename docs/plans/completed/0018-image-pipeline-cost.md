@@ -32,13 +32,78 @@ was frozen for the whole decode with nothing on screen.
 
 - **§2.3 (resize-drag debounce)** — with the scaler 4× faster this is no longer
   obviously worth an extra timer; revisit if a resize drag still stutters.
-- **§2.4 (the decoders)** — `decodeImage` is still 679 ms / 829 MB for that
-  JPEG. It is a one-off per image, it now happens off the main thread, and
-  attacking it properly needs a profile that this environment cannot produce
-  (no profiling libraries). Left as a known cost with the numbers recorded.
+- **§2.4 (the decoders)** — **since done, 2026-07-26.** See below.
 - A pointer-based writer (`unsafeCreate` + pokes) would remove the ~11 bytes per
   output byte that `unfoldrN`'s per-element `Maybe` still costs. Not taken:
   `unfoldrN` is safe, and 17 ms already meets the plan's target.
+
+## §2.4 follow-up: the JPEG decoder (2026-07-26)
+
+First, a correction to the framing above: **829 MB was never memory in use.**
+It is cumulative allocation churn; peak RSS for that decode is 35 MB and the
+result is 5 MB of RGBA. But at GHC's allocation rate the churn *was* most of
+the 679 ms, so it was worth attacking as a speed problem.
+
+| | Before | After |
+|---|---|---|
+| decode (1280×1014 JPEG, 603 KiB) | 679 ms | **~280 ms** |
+| allocation churn | 830 MB | 485 MB |
+| peak RSS | 35 MB | 35 MB (never the problem) |
+
+**Output is byte-identical** — verified by content hash over the full RGBA
+buffer for four images (4:2:0, 4:4:4, grayscale, and the 1280×1014 photo) at
+every step of the change.
+
+What shipped:
+
+1. **Separable IDCT** with scratch buffers allocated once and reused, replacing
+   a direct 8⁴ double sum per block plus a fresh 64-element list and `UArray`
+   per block (~30 000 of each on that photo).
+2. **Unboxed cosine table** — measured **20% faster on its own** (285 ms against
+   358 ms).
+3. **Unboxed bit-reader state** — four `STRef Int`s became one `STUArray`.
+4. **Hoisted per-pixel component lookups**, plus a fast path that skips bilinear
+   upsampling for a full-resolution component (always true of luma), where it
+   provably reduces to a single read.
+5. A strict `forLoop` helper for the hot loops.
+
+### What the measurements refuted
+
+Nearly every prediction I made was wrong, and only bisecting found the truth:
+
+- **The bit reader** was supposed to be the dominant cost. Worth 84 MB — GHC
+  was already unboxing most of the `STRef` traffic.
+- **The per-pixel output loop** was the next suspect. Stubbing it out entirely
+  changed allocation by *zero*.
+- **`forM_ [a..b]` lists** in the hot loops: 12 MB. Already fused.
+- **Unboxing the Huffman tables** (`Huff`) made it **worse** — 504 MB against
+  485 MB on the same tree, with equal time — and was reverted. The elements are
+  already-evaluated `Int`s, so a boxed lookup returns a pointer to an existing
+  box, while an unboxed lookup must build a fresh box to return the value
+  through `ST`. Unboxing pays where the read *fuses into arithmetic* (the
+  cosine table) and costs where it is returned monadically. That distinction is
+  now recorded in the code.
+- One of my own harnesses polluted the numbers: summing 5.2 M pixels to "force"
+  the image measured the summing. `imgPix` is a `runSTUArray`, so forcing it to
+  WHNF *is* the decode. Third instance of that trap in this codebase.
+
+The bisect that actually located the cost: with the IDCT stubbed out, allocation
+was still 477 MB, so **~95% of what remains is the entropy decode** — the
+per-bit `nextBit`/`getBitsJ`/`decodeHuffJ` path, whose `let`-bound actions GHC
+will not inline out of the enclosing `do` block. Getting further means lifting
+the bit reader to top-level `INLINE` functions over the state array. That is a
+real refactor of the decoder's core and was not attempted here.
+
+### Test coverage, which did not exist
+
+The JPEG decoder had **no tests at all** — a decoder rewrite had nothing to
+check itself against. `test/Spec.hs` now embeds two real 32×24 JPEGs produced by
+an independent encoder (baseline grayscale and 4:2:0 colour) and pins 15
+assertions: dimensions, format, neutral grayscale, saturated colour blocks
+across hard edges, a gradient region, the checkerboard that stresses chroma
+upsampling, corner pixels (the upsampler's edge clamping), full opacity across
+every pixel, and truncated input. Verified to fail on a one-bit change to the
+IDCT output.
 
 The plan below is the original analysis, kept for the record.
 

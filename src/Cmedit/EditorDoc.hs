@@ -48,15 +48,18 @@ import Cmedit.Syntax (HlCache, CommentSyntax(..), langComment, langForPath)
 
 import Cmedit.History (pushHist)
 import Cmedit.Pager (PagerDoc(..))
+import Cmedit.Rtf (RtfDoc(..))
+import qualified Cmedit.Rtf as Rtf
 import qualified Cmedit.Pager as Pg
 import Cmedit.EditorState
 import Cmedit.EditorEdit
 
 
--- Re-clamp scrolling / re-scale an image after a layout change (e.g. the panel
--- width or collapse state changed, which shifts the text area).
+-- Re-clamp scrolling / re-scale an image / re-wrap the formatted RTF view
+-- after a layout change (e.g. the panel width or collapse state changed,
+-- which shifts the text area).
 relayout :: Editor -> Editor
-relayout = refreshImage . ensureVisible
+relayout = refreshRtf . refreshImage . ensureVisible
 
 ------------------------------------------------------------------------------
 -- Files / lifecycle
@@ -88,11 +91,27 @@ setLoaded path lr ed =
         , edFocus = FEdit, edDialog = Nothing, edSearchMode = False
         , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
         , edCsv = Nothing, edCsvStash = Nothing
-        , edImage = Nothing
+        , edImage = Nothing, edRtf = Nothing
         , edDiags = []                        -- a reloaded file's stale diags must not survive
         , edEditSeq = edEditSeq ed + 1         -- fresh buffer: the driver must re-lint (also covers Revert)
         }
-      ed2 = if isCsvPath path then enterCsv ed1 else restoreRecentPos path ed1
+      -- CSV/TSV open in the table view and RTF in the formatted view: for both
+      -- the markup is the thing you least often want to look at. Alt+T shows
+      -- the text underneath.
+      --
+      -- Except when we are opening this file *to land on a position in it* —
+      -- a workspace search result, a definition site. Those matched the
+      -- markup, which the formatted view does not show and has no cursor to
+      -- put anywhere, so the raw view is the only one where the jump means
+      -- anything. (CSV maps text positions back to cells, so it needs no such
+      -- exception.)
+      jumpingHere = case edPendingJump ed of
+                      Just (p, _, _, _) -> p == path
+                      Nothing           -> False
+      ed2 | isCsvPath path                  = enterCsv ed1
+          | isRtfPath path && jumpingHere   = restoreRecentPos path ed1
+          | isRtfPath path                  = enterRtf ed1
+          | otherwise                       = restoreRecentPos path ed1
   in touchRecent path ed2
 
 -- Parse the current buffer into a fresh CSV table view (used when first opening
@@ -145,6 +164,57 @@ plainToCsv ed =
       (r, cc)  = Csv.textPosCell v l c
   in (csvPut (Csv.setCursor r cc v) ed { edCsvStash = Nothing }) { edStatus = "Table mode" }
 
+------------------------------------------------------------------------------
+-- RTF formatted view (read-only). Structurally the CSV toggle's simpler
+-- sibling: same per-document field, same Alt+T, but the traffic is one-way.
+--
+-- The CSV view *is* the document while it is showing, so it serialises back
+-- into the buffer ('syncCsvToBuffer') on save and on toggling out. The RTF
+-- view must not: it models bold, colour, alignment and indentation, and a
+-- real document also carries style sheets, tables, embedded pictures and
+-- revision marks that it does not. Writing this model back would silently
+-- drop all of that, so nothing ever writes it back — the buffer stays the
+-- document, Save writes the buffer, and leaving the view simply discards the
+-- projection. Editing an RTF file means editing its markup (Alt+T).
+
+-- | Build the formatted view from the current buffer.
+enterRtf :: Editor -> Editor
+enterRtf ed =
+  let rd = Rtf.mkRtfDoc (edEditSeq ed) (bufLines (edBuffer ed))
+      -- Say so rather than showing a document that quietly stops early.
+      warn | bufChars (edBuffer ed) > Rtf.maxRtfChars =
+               "Formatted view \x2014 only the first "
+                 ++ show (Rtf.maxRtfChars `div` (1024 * 1024)) ++ " MB is shown"
+           | Rtf.looksLikeRtf (bufferToText LF False (edBuffer ed)) = "Formatted view"
+           | otherwise = "Formatted view \x2014 this file does not begin like RTF"
+  in refreshRtf ed { edRtf = Just rd, edStatus = T.pack warn }
+
+-- | Toggle between the formatted view and the raw RTF markup (Alt+T, the same
+-- key the CSV table view uses — a file is one or the other).
+toggleRtf :: Editor -> Editor
+toggleRtf ed
+  | not (isRtfFile ed) = ed { edStatus = "Formatted view is only for .rtf files" }
+  | isJust (edRtf ed) =
+      ensureVisible ed { edRtf = Nothing, edStatus = "Raw RTF markup \x2014 editable" }
+  | otherwise = enterRtf ed
+
+-- | Re-derive and re-lay-out the formatted view when anything it is computed
+-- from has moved: the buffer (a workspace replace, a revert), or the width it
+-- was wrapped to (a resize, the explorer panel opening). Called from the same
+-- places as 'refreshImage', whose cache this mirrors — a comparison per
+-- keystroke, real work only when the key changes.
+refreshRtf :: Editor -> Editor
+refreshRtf ed = case edRtf ed of
+  Nothing -> ed
+  Just rd ->
+    let lo   = computeLayout ed
+        rd1  = if Rtf.rtfStale (edEditSeq ed) rd
+                 then (Rtf.mkRtfDoc (edEditSeq ed) (bufLines (edBuffer ed)))
+                        { rdTop = rdTop rd }
+                 else rd
+    in ed { edRtf = Just (Rtf.rtfRelayout (tabWidthOf ed) (loTextWidth lo)
+                            (loTextHeight lo) rd1) }
+
 -- Capture the active document fields into a saveable 'Document'.
 captureDoc :: Editor -> Document
 captureDoc ed = Document
@@ -161,13 +231,14 @@ captureDoc ed = Document
   , docCsvStash = edCsvStash ed
   , docImage = edImage ed
   , docPager = edPager ed
+  , docRtf = edRtf ed
   , docHlCache = edHlCache ed
   , docDiags = edDiags ed
   }
 
 -- Make a saved 'Document' the active one.
 restoreDoc :: Document -> Editor -> Editor
-restoreDoc d ed = refreshImage $ ensureVisible ed
+restoreDoc d ed = refreshRtf $ refreshImage $ ensureVisible ed
   { edBuffer = docBuffer d, edSavedBuffer = docSavedBuffer d, edCursor = docCursor d, edSelAnchor = docSelAnchor d
   , edDesiredCol = docDesiredCol d, edTop = docTop d, edLeft = docLeft d
   , edPath = docPath d, edModified = docModified d
@@ -181,6 +252,7 @@ restoreDoc d ed = refreshImage $ ensureVisible ed
   , edCsvStash = docCsvStash d
   , edImage = docImage d
   , edPager = docPager d
+  , edRtf = docRtf d
   , edHlCache = docHlCache d
   , edDiags = docDiags d
   , edFocus = FEdit, edDialog = Nothing, edSearchMode = False
@@ -276,10 +348,14 @@ noteDiskMtimes stats ed =
 -- | Append a document to the end of the open-files list (used at startup for
 -- the second and subsequent files named on the command line).
 addDocument :: FilePath -> LoadResult -> Editor -> Editor
-addDocument path lr ed = touchRecent path ed { edAfter = edAfter ed ++ [docFromLoad path lr] }
+addDocument path lr ed =
+  touchRecent path ed { edAfter = edAfter ed ++ [docFromLoad (edEditSeq ed) path lr] }
 
-docFromLoad :: FilePath -> LoadResult -> Document
-docFromLoad path lr = Document
+-- The edit counter is threaded in so an RTF document parsed here is stamped
+-- with the same value 'refreshRtf' will compare against when it first becomes
+-- active; otherwise it would be re-parsed for nothing on the first switch to it.
+docFromLoad :: Int -> FilePath -> LoadResult -> Document
+docFromLoad seqNow path lr = Document
   { docBuffer = lrBuffer lr, docSavedBuffer = lrBuffer lr, docCursor = origin, docSelAnchor = Nothing
   , docDesiredCol = 0, docTop = 0, docLeft = 0
   , docPath = Just path, docModified = False
@@ -297,6 +373,11 @@ docFromLoad path lr = Document
   , docCsv = if isCsvPath path
                then Just (Csv.mkCsvView (csvDelimForPath path)
                             (bufferToText LF False (lrBuffer lr)))
+               else Nothing
+    -- Parsed now, laid out when it first becomes the active document and a
+    -- window width exists to wrap to (restoreDoc -> refreshRtf).
+  , docRtf = if isRtfPath path
+               then Just (Rtf.mkRtfDoc seqNow (bufLines (lrBuffer lr)))
                else Nothing
   }
 
@@ -367,7 +448,7 @@ pagerLoaded pg ed = touchRecent (pgPath pg) ed
   , edFocus = if edFocus ed == FExplorer then FExplorer else FEdit
   , edDialog = Nothing, edSearchMode = False
   , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
-  , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing
+  , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edRtf = Nothing
   , edPager = Just pg
   , edHlCache = Nothing, edDiags = []
   }
@@ -417,7 +498,7 @@ imageDocSnapshot path frames = Document
   , docUndo = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone, docOverwrite = False
   , docDiscard = False, docCsv = Nothing, docCsvStash = Nothing
   , docImage = Just (mkImageDoc frames)
-  , docPager = Nothing
+  , docPager = Nothing, docRtf = Nothing
   , docHlCache = Nothing
   , docDiags = []
   }
@@ -436,7 +517,7 @@ pagerDocSnapshot pg = Document
   , docFinalNewline = True, docReadOnly = True
   , docUndo = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone, docOverwrite = False
   , docDiscard = False, docCsv = Nothing, docCsvStash = Nothing
-  , docImage = Nothing
+  , docImage = Nothing, docRtf = Nothing
   , docPager = Just pg
   , docHlCache = Nothing
   , docDiags = []
@@ -788,7 +869,7 @@ doNew ed = ensureVisible ed
   , edUndo = Seq.empty, edRedo = Seq.empty, edLastEdit = EKNone
   , edStatus = "New file", edFocus = FEdit, edDialog = Nothing, edSearchMode = False
   , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
-  , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing
+  , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edRtf = Nothing
   }
 
 -- | Open the built-in manual ("Cmedit.Manual") as a read-only Markdown
@@ -816,7 +897,7 @@ openManual ed0 = case findOpenIndex manualPath ed of
          , edStatus = manualStatus
          , edFocus = FEdit, edDialog = Nothing, edSearchMode = False
          , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
-         , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing
+         , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edRtf = Nothing
          }
   where
     ed = pushNavIfFar (Just manualPath) origin ed0

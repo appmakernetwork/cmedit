@@ -46,6 +46,8 @@ import Cmedit.HelpCard (helpCanvasMinW, helpDialogText)
 import Cmedit.Clipboard (CopyOutcome(..))
 import Cmedit.Image (Image(..), ImgMode(..), renderImage, viewFit)
 import Cmedit.Pager (PagerDoc(..), pagerStatus)
+import Cmedit.Rtf (RtfDoc(..))
+import qualified Cmedit.Rtf as Rtf
 import qualified Cmedit.Pager as Pg
 import Cmedit.Syntax (HlCache, CommentSyntax(..), langComment, langForPath)
 import Cmedit.Lint
@@ -130,6 +132,7 @@ data Document = Document
   , docCsvStash      :: !(Maybe CsvView)  -- ^ Table model kept while in plain-text view (preserves CSV undo).
   , docImage         :: !(Maybe ImageDoc) -- ^ Image-view model when this doc is an image.
   , docPager         :: !(Maybe PagerDoc) -- ^ Paged read-only view when this doc is too big to load.
+  , docRtf           :: !(Maybe RtfDoc)   -- ^ Formatted read-only view when this doc is an RTF file being shown as a document.
   , docHlCache       :: !(Maybe HlCache)  -- ^ Cached syntax-highlight lexer states (perf only; self-validating).
   , docDiags         :: ![Diag]           -- ^ Latest linter diagnostics for this doc (sorted by line,col; @[]@ until a lint pass posts).
   } deriving (Show)
@@ -237,6 +240,7 @@ data Editor = Editor
   , edCsvStash      :: !(Maybe CsvView) -- ^ Table model retained while viewing a CSV doc as plain text (keeps its undo across toggles).
   , edImage         :: !(Maybe ImageDoc) -- ^ Image view, when the active doc is an image (a separate mode to text/CSV).
   , edPager         :: !(Maybe PagerDoc) -- ^ Paged read-only view, when the active doc is too big to hold in a buffer (a fourth view mode; see "Cmedit.Pager").
+  , edRtf           :: !(Maybe RtfDoc)  -- ^ Formatted RTF view, when the active doc is an @.rtf@ shown as a document rather than as its markup (a fifth view mode; see "Cmedit.Rtf"). Read-only and derived: the buffer stays the document and is the only thing saved.
   , edHlCache       :: !(Maybe HlCache) -- ^ Cached syntax-highlight lexer states for the active doc (perf only; self-validating against the buffer).
   , edRecent        :: ![RecentEntry]   -- ^ Recently-opened files, most recent first (global; persisted by the driver).
   , edDetectedDark  :: !(Maybe Bool)    -- ^ OSC 11 verdict: the terminal background is dark (drives @theme = auto@; Nothing until the terminal answers).
@@ -330,6 +334,7 @@ newEditor size cfg = Editor
   , edCsvStash      = Nothing
   , edImage         = Nothing
   , edPager         = Nothing
+  , edRtf           = Nothing
   , edHlCache       = Nothing
   , edRecent        = []
   , edDetectedDark  = Nothing
@@ -347,11 +352,12 @@ newEditor size cfg = Editor
 
 -- | The theme buttons of the 'DKTheme' picker, in button order
 -- ('Cmedit.Dialog.mkTheme' lists them as Auto, Dark Terminal, Light Terminal,
--- Cherry Blossom, Flashbang, Midnight; anything past this list is its Cancel
--- button).
+-- Cherry Blossom, Flashbang, Midnight, Graphite; anything past this list is
+-- its Cancel button).
 themeChoices :: [ThemeName]
 themeChoices = [ ThemeAuto, ThemeDark, ThemeLight
-               , ThemeCherryBlossom, ThemeFlashbang, ThemeMidnight ]
+               , ThemeCherryBlossom, ThemeFlashbang, ThemeMidnight
+               , ThemeGraphite ]
 
 -- | The 'themeChoices' index of a theme (the initial focus for 'mkTheme').
 themeIndex :: ThemeName -> Int
@@ -398,6 +404,14 @@ setStatsLine t ed = ed { edStats = t }
 -- | Is the active document the paged read-only view?
 pagerActive :: Editor -> Bool
 pagerActive = isJust . edPager
+
+-- | Is the active document showing its RTF formatted view?
+rtfActive :: Editor -> Bool
+rtfActive = isJust . edRtf
+
+-- | The viewport height available to the formatted RTF view.
+rtfHeight :: Editor -> Int
+rtfHeight = loTextHeight . computeLayout
 
 -- | The viewport height available to the paged view (same text area as a
 -- normal document; the pager never word-wraps).
@@ -555,17 +569,23 @@ csvColStartX v c
 -- clickable chrome (menu bar, status zones, explorer rows, search results),
 -- a crosshair over the image view's zoom-drag area, and the default arrow
 -- elsewhere. Purely advisory — terminals without OSC 22 ignore it.
+--
+-- Dragging the explorer divider and dragging a CSV column border are the
+-- same gesture, so they share the same shape — both while hovering the
+-- handle and for the duration of the drag.
 pointerShapeFor :: Editor -> Int -> Int -> String
 pointerShapeFor ed row col
   | isJust (edLoading ed)   = "wait"
   | isJust (edCsvColDrag ed) = "col-resize"                -- mid column-width drag
+  | edSidebarDrag ed         = "col-resize"                -- mid panel-width drag
   | edFocus ed `elem` [FDialog, FBrowser, FDefPick, FQuickOpen, FMenu] = "default"
   | edShowMenu ed   && row == loMenuRow lo   = "pointer"
   | edShowStatus ed && row == loStatusRow lo = "pointer"
   | edShowHints ed  && row == loHintRow lo   = "default"
   | Just r <- loHBarRow lo, row == r         = "default"   -- horizontal scrollbar
   | loVBarW lo > 0 && col >= loCols lo - 1   = "default"   -- vertical scrollbar
-  | inSidebar                                = "pointer"
+  | onDivider                                = "col-resize" -- panel width handle
+  | inPanel                                  = "pointer"
   | edSearchMode ed && inContent             = "pointer"   -- result rows / fields
   | isJust (edImage ed) && inContent         = "crosshair" -- drag-zoom
   | Just v <- edCsv ed, row == loTextTop lo, inContent
@@ -577,7 +597,11 @@ pointerShapeFor ed row col
   where
     lo = computeLayout ed
     inRows    = row >= loTextTop lo && row < loTextTop lo + loTextHeight lo
-    inSidebar = loContentLeft lo > 0 && col < loContentLeft lo - 1 && inRows
+    -- The panel region, matching 'Cmedit.Editor.inExplorerRegion' exactly, and
+    -- its rightmost column: the width-drag handle when the panel is expanded,
+    -- the one-cell click-to-expand strip when it is collapsed.
+    inPanel   = loContentLeft lo > 0 && col < loContentLeft lo && inRows
+    onDivider = inPanel && col == loContentLeft lo - 1 && not (edExpCollapsed ed)
     inContent = inRows && col >= loContentLeft lo
     inText    = inRows && col >= loTextLeft lo
 
@@ -624,7 +648,10 @@ computeLayout ed =
                   Nothing -> lineCount (edBuffer ed)
       sideW   = sidebarWidth ed
       avail   = max 1 (cols - sideW)
-      gutter  = if isJust (edImage ed) then 0      -- image view uses the full width
+      -- The image and formatted-RTF views use the full width: neither has
+      -- buffer lines to number (an RTF line number would count laid-out rows,
+      -- which move with the window width and mean nothing in the file).
+      gutter  = if isJust (edImage ed) || isJust (edRtf ed) then 0
                 else if edShowLineNumbers ed
                   then max 4 (length (show nLines) + 2)
                   else 0
@@ -637,10 +664,13 @@ computeLayout ed =
       -- row left after the reservation. Like the vertical bar's reserved
       -- column this is content-INdependent (mode + config only), so the wrap
       -- width can never oscillate with content.
+      -- The formatted RTF view wraps to the window, so it never scrolls
+      -- sideways and takes no horizontal bar (like an image, unlike the pager).
       wantHBar = cfgScrollBarH (edConfig ed)
                    && not (searchViewActive ed)
                    && (isJust (edCsv ed)
-                       || (isNothing (edImage ed) && (isJust (edPager ed) || not (edWordWrap ed))))
+                       || (isNothing (edImage ed) && isNothing (edRtf ed)
+                           && (isJust (edPager ed) || not (edWordWrap ed))))
                    && textH0 - 1 >= 1
       barH    = if wantHBar then 1 else 0
       textH   = max 1 (textH0 - barH)
@@ -692,8 +722,13 @@ scrollBarInfo ed
                   Just ss -> bar (length (S.resultRows ss)) (ssTop ss)
                   Nothing -> Nothing
            else case edCsv ed of
-                  Just v  -> bar (Csv.nRows v) (csvTop v)
-                  Nothing -> bar (lineCount (edBuffer ed)) (edTop ed)
+             Just v  -> bar (Csv.nRows v) (csvTop v)
+             Nothing -> case edRtf ed of
+               -- The formatted view scrolls over laid-out rows, which is
+               -- exactly what the bar measures here (no wrapped-line proxy
+               -- needed: the layout already is the visual rows).
+               Just rd -> bar (Rtf.rtfLineCount rd) (rdTop rd)
+               Nothing -> bar (lineCount (edBuffer ed)) (edTop ed)
 
 -- | Thumb placement within a bar: @(thumbTop, thumbLen)@ for a @h@-row track
 -- showing a @total@-row document scrolled to @win@.
@@ -955,6 +990,15 @@ isCsvPath p = map toLower (takeExtension p) `elem` [".csv", ".tsv"]
 isCsvFile :: Editor -> Bool
 isCsvFile ed = maybe False isCsvPath (edPath ed)
 
+-- | Is this a Rich Text Format file (by extension)? RTF is text, so the file
+-- opens and edits as its markup like any other; the extension is what decides
+-- whether the formatted view is offered for it.
+isRtfPath :: FilePath -> Bool
+isRtfPath p = map toLower (takeExtension p) == ".rtf"
+
+isRtfFile :: Editor -> Bool
+isRtfFile ed = maybe False isRtfPath (edPath ed)
+
 csvDelimForPath :: FilePath -> Char
 csvDelimForPath p = if map toLower (takeExtension p) == ".tsv" then '\t' else ','
 
@@ -1212,7 +1256,7 @@ aboutText = T.intercalate "\n" $
   where center t = T.replicate (max 0 ((51 - T.length t) `div` 2)) " " <> t
 
 versionText :: Text
-versionText = "0.4.1"
+versionText = "0.5.0"
 
 ------------------------------------------------------------------------------
 -- Search
@@ -1291,6 +1335,11 @@ docText :: Document -> Text
 docText = bufferToText LF False . docBuffer
 
 isPlainDoc :: Document -> Bool
+-- Note an RTF document counts as plain whichever view it is showing: unlike
+-- CSV (whose buffer goes stale) and image/pager (which have no buffer), the
+-- formatted view is derived from a buffer that stays live and authoritative,
+-- so workspace replace and the other buffer consumers are correct on it. The
+-- view re-derives itself when the buffer moves under it ('refreshRtf').
 isPlainDoc d = isNothing (docCsv d) && isNothing (docImage d) && isNothing (docPager d)
 
 plural :: Int -> String

@@ -38,6 +38,15 @@ module Cmedit.Editor
   , pagerFillRequest
   , pagerActive
   , pagerHeight
+    -- * Formatted RTF view
+  , RtfDoc(..)
+  , toggleRtf
+  , enterRtf
+  , refreshRtf
+  , rtfActive
+  , rtfHeight
+  , isRtfPath
+  , isRtfFile
   , refreshImage
   , imageCrop
   , imageAnim
@@ -227,6 +236,8 @@ import Cmedit.Types
 import Cmedit.History (pushHist)
 import Cmedit.Pager (PagerDoc(..))
 import qualified Cmedit.Pager as Pg
+import Cmedit.Rtf (RtfDoc(..))
+import qualified Cmedit.Rtf as Rtf
 import Cmedit.TextBuffer
 import Cmedit.Width (colToDisplay, displayToCol, wrapLine)
 import Cmedit.ConfigFile
@@ -324,6 +335,49 @@ handlePagerKey key pg ed = case key of
     readOnlyNote =
       withPagerFill (noEff ed { edStatus = "File is too large to edit \x2014 read-only paged view" })
 
+-- | Keys in the formatted RTF view. A reader's view: it scrolls, and nothing
+-- else touches it. Editing keys are swallowed with a note pointing at Alt+T
+-- rather than silently editing markup the view is not showing, and everything
+-- unhandled falls through to 'handleEditKey' so the global shortcuts (menus,
+-- file switching, the explorer, workspace search) keep working.
+handleRtfKey :: Key -> RtfDoc -> Editor -> (Editor, [Effect])
+handleRtfKey key rd ed = case key of
+  KArrow DDown _  -> scroll 1
+  KArrow DUp _    -> scroll (-1)
+  KPageDown _     -> scroll h
+  KPageUp _       -> scroll (-h)
+  KHome m | hasCtrl m -> go (Rtf.rtfGoTop rd)
+  KEnd m  | hasCtrl m -> go (Rtf.rtfGoBottom h rd)
+  KHome _         -> go (Rtf.rtfGoTop rd)
+  KEnd _          -> go (Rtf.rtfGoBottom h rd)
+  KMouse me
+    | meButton me == MBWheelDown -> scroll 3
+    | meButton me == MBWheelUp   -> scroll (-3)
+    -- Anything else in the text area is swallowed. The chrome that *does*
+    -- take mouse input (menu bar, explorer, status zones, both scrollbars) is
+    -- matched by 'dispatchKey' before it ever gets here; what is left is a
+    -- click on the rendered document, and this view has no cursor to move.
+    -- Falling through to 'handleEditKey' would drag a selection through the
+    -- invisible markup buffer — and set 'edMouseSelecting', which gates the
+    -- scrollbar guard, so a stray click would then jam the scrollbar too.
+    | otherwise -> noEff ed
+  -- The formatted view is a projection; typing belongs to the markup.
+  KChar _     -> readOnlyNote
+  KEnter      -> readOnlyNote
+  KModEnter   -> readOnlyNote
+  KBackspace  -> readOnlyNote
+  KDelete _   -> readOnlyNote
+  KTab        -> readOnlyNote
+  KBackTab    -> readOnlyNote
+  KPaste _    -> readOnlyNote
+  _           -> handleEditKey key ed
+  where
+    h = max 1 (rtfHeight ed)
+    go rd' = noEff ed { edRtf = Just rd' }
+    scroll d = go (Rtf.rtfScroll h d rd)
+    readOnlyNote =
+      noEff ed { edStatus = "Formatted view is read-only \x2014 Alt+T edits the RTF markup" }
+
 -- | Attach a window-fill request to a paged-view result, if the viewport has
 -- moved off what is loaded. The read is a seek plus a few screens, so it
 -- resolves within the same event-loop iteration, before the frame is drawn.
@@ -397,21 +451,27 @@ pruneEntries ed = map (relabelEntry ed)
       where keep (MEItem _ _ a) = a `notElem` [MACycleLineEnding, MAToggleBom]
             keep MESep          = True
     -- Line operations act on the text buffer, which is stale/absent in the
-    -- table and image views — hide the whole group there.
+    -- table and image views and is not what the formatted RTF view shows —
+    -- hide the whole group there.
     dropLineOps es
-      | isJust (edCsv ed) || isJust (edImage ed) || isJust (edPager ed) = tidySeps (filter keep es)
+      | isJust (edCsv ed) || isJust (edImage ed) || isJust (edPager ed)
+        || isJust (edRtf ed) = tidySeps (filter keep es)
       | otherwise = es
       where keep (MEItem _ _ a) = a `notElem` lineOpActions
             keep MESep          = True
-    dropTV es   = if isCsvFile ed then es else dropTableView es
+    -- Each view-mode entry survives only for the file type it applies to.
+    dropTV = dropViewModes (\a -> if a == MAToggleRtf then not (isRtfFile ed)
+                                                      else not (isCsvFile ed))
     -- In the read-only image view there is no text to search: drop the in-file
     -- Find / Replace / Go to Line entries (workspace Find/Replace in Files stay).
     dropImageFind es
-      | isJust (edImage ed) || isJust (edPager ed) =
+      | isJust (edImage ed) || isJust (edPager ed) || isJust (edRtf ed) =
           let es' = filter keep es
           in if length es' == length es then es else tidySeps es'
       | otherwise = es
-      where disabled = if isJust (edPager ed) then pagerDisabledFind else imageDisabledFind
+      where disabled | isJust (edPager ed) = pagerDisabledFind
+                     | isJust (edRtf ed)   = rtfDisabledActions
+                     | otherwise           = imageDisabledFind
             keep (MEItem _ _ a) = a `notElem` disabled
             keep MESep          = True
     -- Save All only appears when more than one file is open and something is
@@ -422,8 +482,9 @@ pruneEntries ed = map (relabelEntry ed)
     dropCloseFolder es
       | isJust (edExplorer ed) = es
       | otherwise = filter (\e -> case e of MEItem _ _ MACloseFolder -> False; _ -> True) es
-    -- In the table view the text-rendering toggles do nothing, so hide them.
-    dropToggles es = if isJust (edCsv ed) then dropTextToggles es else es
+    -- In the table view, and in the formatted RTF view (which does its own
+    -- wrapping and has no gutter), the text-rendering toggles do nothing.
+    dropToggles es = if isJust (edCsv ed) || isJust (edRtf ed) then dropTextToggles es else es
     dropDelete es
       | isJust (getSelection ed) = es
       | otherwise = filter (\e -> case e of MEItem _ _ MADelete -> False; _ -> True) es
@@ -455,6 +516,20 @@ imageDisabledFind = [MAFind, MAFindNext, MAFindPrev, MAReplace, MAGoToLine, MAGo
 pagerDisabledFind :: [MenuAction]
 pagerDisabledFind = [MAFind, MAFindNext, MAFindPrev, MAReplace, MAGoToDef, MAGoToBracket, MANextProblem]
 
+-- | Actions that make no sense while the formatted RTF view is showing.
+--
+-- Everything here addresses the /buffer/ — the markup — through a cursor and
+-- selection the formatted view does not have: a find would highlight a match
+-- in text that is not on screen, and a paste would edit the markup invisibly.
+-- The buffer is still the document and Save still writes it; the way to reach
+-- it is Alt+T. (Undo and Redo are deliberately absent: they act on the buffer
+-- and the view re-derives from it, so their effect is visible and coherent.)
+rtfDisabledActions :: [MenuAction]
+rtfDisabledActions =
+  [ MAFind, MAFindNext, MAFindPrev, MAReplace, MAGoToLine, MAGoToDef
+  , MAGoToBracket, MANextProblem
+  , MACut, MACopy, MAPaste, MADelete, MASelectAll ]
+
 -- Rewrite value-carrying menu labels to show the document's current setting.
 relabelEntry :: Editor -> MenuEntry -> MenuEntry
 relabelEntry ed e = case e of
@@ -481,17 +556,24 @@ tidySeps es = reverse (dropWhile isSep (reverse (collapse (dropWhile isSep es)))
     collapse (x : rest)                 = x : collapse rest
     collapse []                         = []
 
--- Remove the table-only View entries (Table View, Freeze Header) and the
--- separator after them. These actions only appear at the head of the View menu.
-dropTableView :: [MenuEntry] -> [MenuEntry]
-dropTableView es = case span isTableItem es of
-  ([], _)            -> es                 -- not the View menu; leave it alone
-  (_,  MESep : rest) -> rest               -- also drop the separator that followed
-  (_,  rest)         -> rest
+-- Remove the view-mode entries at the head of the View menu that do not apply
+-- to this file — the table group (Table View, Freeze Header, Sort) and the
+-- formatted-RTF entry — and, if that empties the group, the separator after
+-- it. These actions only appear at the head of the View menu.
+dropViewModes :: (MenuAction -> Bool) -> [MenuEntry] -> [MenuEntry]
+dropViewModes unwanted es = case span isModeItem es of
+  ([], _)   -> es                          -- not the View menu; leave it alone
+  (kept, rest) ->
+    let kept' = filter (\e -> case e of MEItem _ _ a -> not (unwanted a); _ -> True) kept
+    in case (kept', rest) of
+         ([], MESep : rest') -> rest'       -- nothing left: drop the separator too
+         _                   -> kept' ++ rest
   where
-    isTableItem (MEItem _ _ a) =
-      a == MAToggleCsv || a == MAToggleFreezeHeader || a == MASortColumn
-    isTableItem _              = False
+    isModeItem (MEItem _ _ a) = a `elem` viewModeActions
+    isModeItem _              = False
+
+viewModeActions :: [MenuAction]
+viewModeActions = [MAToggleCsv, MAToggleFreezeHeader, MASortColumn, MAToggleRtf]
 
 windowEntries :: Editor -> [MenuEntry]
 windowEntries ed =
@@ -525,6 +607,10 @@ runAction a ed0 =
        then noEff ed { edStatus = "Not available in the paged view of a large file" }
      else if isJust (edPager ed) && a `elem` [MASave, MASaveAll, MARevert]
        then noEff ed { edStatus = "This file is open read-only (too large to edit)" }
+     -- As above, this also makes the keyboard shortcuts (Ctrl+F/R/G/X/V, F3)
+     -- inert while the formatted view is showing, not just the pruned menu.
+     else if isJust (edRtf ed) && a `elem` rtfDisabledActions
+       then noEff ed { edStatus = "Not available in the formatted view \x2014 Alt+T edits the RTF markup" }
      else case a of
        MANew        -> noEff (newFileFlow ed)
        MAOpen       -> openBrowser ed
@@ -567,6 +653,7 @@ runAction a ed0 =
                                                       , edStatus = "" })
        MAToggleWhitespace  -> noEff ed { edShowWhitespace = not (edShowWhitespace ed) }
        MAToggleCsv  -> noEff (toggleCsv ed)
+       MAToggleRtf  -> noEff (toggleRtf ed)
        MAToggleFreezeHeader -> noEff (toggleFreezeHeader ed)
        MASortColumn -> noEff (sortCsvColumn ed)
        MACycleLineEnding -> noEff (cycleLineEnding ed)
@@ -709,12 +796,19 @@ update (KPasteTruncated t) ed =
   let (ed', effs) = update (KPaste t) ed
   in (setStatus "Paste was too large \x2014 only the first part was inserted" ed', effs)
 update key ed =
-  let (ed', effs) = dispatchKey key ed
+  -- The formatted RTF view is derived from the buffer, so it is re-derived
+  -- after every key rather than at the handful of sites that could move the
+  -- buffer under it (Undo/Redo fall through to 'handleEditKey', a staged
+  -- workspace replace lands from the driver, ...). Both checks inside
+  -- 'refreshRtf' are O(1) when nothing changed — a pointer comparison and an
+  -- Int comparison — and it is a no-op when the view is not showing.
+  let (ed', effs) = fmapEd refreshRtf (dispatchKey key ed)
   -- When a menu has just been opened, refresh the active file's stale-on-disk
   -- flag so the File menu can offer Revert if the file changed underneath us.
   in case edPath ed' of
        Just p | edFocus ed /= FMenu && edFocus ed' == FMenu -> (ed', effs ++ [EffStatFile p])
        _                                                    -> (ed', effs)
+  where fmapEd f (e, es) = (f e, es)
 
 dispatchKey :: Key -> Editor -> (Editor, [Effect])
 -- Terminal focus reports are the driver's cue to refresh disk state; they must
@@ -781,6 +875,7 @@ dispatchKey key ed = case edFocus ed of
   -- Image view is a separate mode (like CSV) and takes priority over text/CSV.
   FEdit | Just idoc <- edImage ed -> handleImageKey key idoc ed
   FEdit | Just pg <- edPager ed    -> handlePagerKey key pg ed
+        | Just rd <- edRtf ed      -> handleRtfKey key rd ed
   FEdit    -> case edCsv ed of
                 Just v  -> handleCsvKey key v ed
                 Nothing -> handleEditKey key ed
@@ -788,7 +883,7 @@ dispatchKey key ed = case edFocus ed of
 -- | Handle a terminal resize: record the new size and re-clamp scrolling. The
 -- image view re-scales to the new size (its render cache is keyed by size).
 resize :: (Int, Int) -> Editor -> Editor
-resize size ed = refreshImage (ensureVisible ed { edSize = size })
+resize size ed = refreshRtf (refreshImage (ensureVisible ed { edSize = size }))
 
 ------------------------------------------------------------------------------
 -- Edit-mode key handling
@@ -913,7 +1008,9 @@ handleAlt :: Char -> Editor -> (Editor, [Effect])
 handleAlt c ed = case c of
   'z' -> runAction MAToggleWordWrap ed
   'l' -> runAction MAToggleLineNumbers ed
-  't' -> runAction MAToggleCsv ed
+  -- Alt+T is "show this file as the thing it describes": the table for a CSV,
+  -- the document for an RTF. A file is at most one of those.
+  't' -> runAction (if isRtfFile ed then MAToggleRtf else MAToggleCsv) ed
   's' -> runAction MASortColumn ed
   'j' -> runAction MAJoinLines ed
   '.' -> noEff (nextFile ed)
@@ -1346,9 +1443,13 @@ scrollBarTo row ed = case scrollBarInfo ed of
                 Just ss -> ed { edSearch = Just ss { ssTop = target } }
                 Nothing -> ed
          else case edCsv ed of
-                Just v  -> csvPut (Csv.clearSel
-                             (Csv.setCursor (min (Csv.nRows v - 1) target) (csvCurCol v) v)) ed
-                Nothing -> scrollLine (target - edTop ed) ed
+           Just v  -> csvPut (Csv.clearSel
+                        (Csv.setCursor (min (Csv.nRows v - 1) target) (csvCurCol v) v)) ed
+           -- Mirror the view split in 'scrollBarInfo': the formatted RTF view
+           -- scrolls its own laid-out rows, not the buffer's lines.
+           Nothing -> case edRtf ed of
+             Just rd -> ed { edRtf = Just (Rtf.rtfClamp (rtfHeight ed) rd { rdTop = target }) }
+             Nothing -> scrollLine (target - edTop ed) ed
 
 -- A left press on the horizontal scrollbar row, while a bar is showing.
 hScrollBarPress :: Editor -> MouseEvent -> Bool

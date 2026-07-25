@@ -49,7 +49,7 @@ leftSections =
   , ("View",
       [ ("Alt+Z",       "Word wrap")
       , ("Alt+L",       "Line numbers")
-      , ("Alt+T",       "CSV table view")
+      , ("Alt+T",       "Table / RTF view")
       , ("F10",         "Open the menus")
       ])
   ]

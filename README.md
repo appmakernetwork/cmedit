@@ -85,6 +85,16 @@ escape sequences and the POSIX `termios` API.
   column** — numeric-aware, case-insensitive for text, empties last; press it
   again to flip descending. The frozen header row stays pinned, the cursor
   follows its row, and one undo restores the previous order.
+- **Formatted view for RTF**: `.rtf` files open as the document rather than as
+  `{\rtf1\ansi...`. Bold, italic, underline, strike-through and text colour map
+  onto the terminal's own attributes; paragraphs wrap to the window with their
+  real alignment, indents and hanging bullets; `\'hh` and `\uN` escapes, curly
+  quotes and dashes decode properly, and font tables, style sheets, embedded
+  pictures and every other `{\*\...}` destination are skipped rather than shown.
+  **Alt+T** toggles to the raw markup, which edits and saves like any other text
+  file (with the control words syntax-highlighted). The formatted view is
+  read-only by design: it is a projection of the buffer and is never written
+  back, so the parts of a document it does not model cannot be lost on save.
 - **Paged view for huge files**: a file too large to load as an editable buffer
   (over 100 MB) used to be refused outright. It now opens in a read-only paged
   viewer whose memory does not depend on the file's size — a 281 MB, 4-million
@@ -107,13 +117,15 @@ escape sequences and the POSIX `termios` API.
   from-scratch `inflate`, WebP — both lossless VP8L and lossy VP8, boolean
   arithmetic decoder, loop filter and all — and Netpbm) is written from first
   principles using only GHC boot libraries.
-- **Five themes plus auto**: `theme = light-terminal` in the config (or
+- **Six themes plus auto**: `theme = light-terminal` in the config (or
   View ▸ Theme to pick one live, with preview) swaps the syntax palette for one readable on
   light terminal backgrounds; dark-terminal and light-terminal keep your
-  terminal's own background, while the other three are 24-bit themes that
+  terminal's own background, while the other four are 24-bit themes that
   paint their own background on every cell, so they look the same whatever
   the terminal's colours: `cherry-blossom` is light pink (after GymMaster's),
-  `flashbang` is a blinding pure white, and `midnight` is a deep navy.
+  `flashbang` is a blinding pure white, `midnight` is a deep navy, and
+  `graphite` is a neutral near-black with orchid keywords and gold function
+  names.
 - **Syntax highlighting** for SQL (PostgreSQL), Python, JavaScript/TypeScript
   (`.js/.mjs/.jsx/.ts/.tsx`), CSS/SCSS/LESS, HTML/XML, FreeMarker (`.ftl`),
   Jinja, shell, Markdown, JSON, YAML, TOML, INI/conf and CSV — including
@@ -318,6 +330,7 @@ Run `cmedit --help` for the full key map and the list of config-file keys
 | Go back / forward (history) | Alt+← / Alt+→ |
 | Switch open files | Alt+. / Alt+, , Alt+1…9, or the Window menu (Alt+W) |
 | Word wrap / Line numbers | Alt+Z / Alt+L |
+| Table view (CSV) / formatted view (RTF) | Alt+T |
 | Sort CSV column (table view) | Alt+S |
 | Menu | F10, or Alt+letter, or click |
 | Move by word / to document ends | Ctrl+Left/Right / Ctrl+Home/End |
@@ -361,6 +374,7 @@ logic unit-testable without a terminal.
 | `Cmedit.Csv` | CSV parse/serialise + spreadsheet table model |
 | `Cmedit.Image` | From-scratch BMP/PNM/GIF/PNG/JPEG (baseline+progressive)/WebP (VP8L+VP8) decoders + image→cell scaler |
 | `Cmedit.Pager` | Read-only paged view of files too large to load: sparse line index + windowed reads |
+| `Cmedit.Rtf` | RTF parser + document layout for the read-only formatted view of `.rtf` files |
 | `Cmedit.About` | The About box's animated wordmark (pure frame→cells generation) |
 | `Cmedit.Render` | Model → cell grid, and the diff to escape codes |
 | `Cmedit.App` | IO driver: setup/teardown, reader thread, event loop |

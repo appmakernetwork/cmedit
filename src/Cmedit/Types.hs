@@ -31,6 +31,7 @@ module Cmedit.Types
   , attrItalic
   , attrDim
   , attrUndercurl
+  , attrStrike
   , hasAttr
   , Style(Style, StyleU, styleFg, styleBg, styleAttr, styleUl)
   , defaultStyle
@@ -166,6 +167,7 @@ data Color
 type Attr = Int
 
 attrNone, attrBold, attrUnderline, attrReverse, attrItalic, attrDim, attrUndercurl :: Attr
+attrStrike :: Attr
 attrNone      = 0
 attrBold      = 1
 attrUnderline = 2
@@ -176,6 +178,10 @@ attrDim       = 16
 -- form render a squiggle; elsewhere the renderer falls back to a plain
 -- underline, so styles carrying this attr degrade gracefully.
 attrUndercurl = 32
+-- | Crossed-out text (SGR 9), for RTF's @\\strike@. Needs no capability gate:
+-- an unrecognised /numeric/ SGR parameter is ignored by terminals that lack it,
+-- unlike the colon sub-parameter forms above or REP, which corrupt the stream.
+attrStrike    = 64
 
 hasAttr :: Attr -> Attr -> Bool
 hasAttr flag a = (a .&. flag) /= 0

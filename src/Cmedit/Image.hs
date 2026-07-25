@@ -821,6 +821,13 @@ pngChunks bs pos mihdr plte trns idats
 -- anything else needing zlib decompression).
 
 -- Canonical Huffman table built from per-symbol code lengths.
+-- Boxed arrays here, deliberately, and measured: switching these two tables to
+-- UArray made the decoder allocate MORE (504 MB against 485 MB on the same
+-- image and tree). The elements are already-evaluated Ints, so a boxed lookup
+-- hands back a pointer to a box that already exists, while an unboxed lookup
+-- has to build a fresh box to return the Int through the ST monad. Unboxing
+-- only pays where the read fuses into arithmetic — as in the IDCT's cosine
+-- table, which measured the other way.
 data Huff = Huff !(Array Int Int) !(Array Int Int) !Int  -- counts[len], symbols, maxLen
 
 buildHuff :: [Int] -> Huff
@@ -836,33 +843,46 @@ buildHuff lens =
 -- Huffman code or block type) yields @Left@ so corrupt input is reported up
 -- front rather than rendered as garbage; a merely-short stream is tolerated
 -- (zero-padded) so slightly-truncated-but-valid files still display.
+-- Slots of the inflate reader's unboxed state array.
+iBit, iOut :: Int
+iBit = 0   -- bit position in the compressed stream
+iOut = 1   -- next output byte index
+
 inflate :: BS.ByteString -> Int -> Int -> Either String (UArray Int Word8)
 inflate dat startByte outSize = runST $ do
   out    <- newArray (0, max 0 (outSize-1)) 0 :: ST s (STUArray s Int Word8)
-  bitRef <- newSTRef (startByte * 8)
-  outRef <- newSTRef 0
+  -- Bit position and output position share one unboxed array: they are read
+  -- and written on every bit and every output byte respectively, and an
+  -- 'STRef Int' allocates a fresh box on each write.
+  st     <- newArray (0, 1) 0 :: ST s (STUArray s Int Int)
+  writeArray st iBit (startByte * 8)
   doneRef <- newSTRef False
   errRef  <- newSTRef (Nothing :: Maybe String)
   let fail' msg = writeSTRef errRef (Just msg) >> writeSTRef doneRef True
+      -- Direct bounds check rather than 'atM': that returns a Maybe, and this
+      -- runs once per bit of the compressed stream (tens of millions of times
+      -- for a photo-sized PNG), so the Just was a heap allocation per bit.
+      datLen = BS.length dat
       getBit = do
-        p <- readSTRef bitRef
-        let byte = maybe 0 id (atM dat (p `shiftR` 3))
+        p <- readArray st iBit
+        let i    = p `shiftR` 3
+            byte = if i >= 0 && i < datLen then fromIntegral (BS.index dat i) else 0
             b    = (byte `shiftR` (p .&. 7)) .&. 1
-        writeSTRef bitRef (p+1)
+        writeArray st iBit (p+1)
         pure b
       getBits n = go 0 0
-        where go i acc | i >= n = pure acc
-                       | otherwise = do b <- getBit; go (i+1) (acc .|. (b `shiftL` i))
-      putByte w = do
-        o <- readSTRef outRef
+        where go !i !acc | i >= n = pure acc
+                         | otherwise = do b <- getBit; go (i+1) (acc .|. (b `shiftL` i))
+      putByte !w = do
+        !o <- readArray st iOut
         when (o < outSize) $ writeArray out o w
-        writeSTRef outRef (o+1)
-      copyBack dist len = forM_ [1..len] $ \_ -> do
-        o <- readSTRef outRef
-        v <- if o - dist >= 0 && o - dist < outSize then readArray out (o-dist) else pure 0
+        writeArray st iOut (o+1)
+      copyBack !dist !len = forLoop 1 len $ \_ -> do
+        !o <- readArray st iOut
+        !v <- if o - dist >= 0 && o - dist < outSize then readArray out (o-dist) else pure 0
         putByte v
       decodeSym (Huff counts syms maxLen) = go 1 0 0 0
-        where go len code first index
+        where go !len !code !first !index
                 | len > maxLen = pure (-1)
                 | otherwise = do
                     b <- getBit
@@ -873,7 +893,7 @@ inflate dat startByte outSize = runST $ do
                       else go (len+1) (code1 `shiftL` 1) ((first+cnt) `shiftL` 1) (index+cnt)
       huffBlock lit dist = loop
         where loop = do
-                o <- readSTRef outRef
+                o <- readArray st iOut
                 if o >= outSize then pure () else do
                   sym <- decodeSym lit
                   if sym < 0 then fail' "invalid Huffman code"
@@ -881,21 +901,21 @@ inflate dat startByte outSize = runST $ do
                   else if sym == 256 then pure ()
                   else do
                     let li = sym - 257
-                    if li >= length lenBase then fail' "invalid length code" else do
-                      extra <- getBits (lenExtra !! li)
-                      let len = lenBase !! li + extra
+                    if li >= nLenCodes then fail' "invalid length code" else do
+                      extra <- getBits (lenExtra ! li)
+                      let len = lenBase ! li + extra
                       dsym <- decodeSym dist
-                      if dsym < 0 || dsym >= length distBase then fail' "invalid distance code" else do
-                        dextra <- getBits (distExtra !! dsym)
-                        let d = distBase !! dsym + dextra
+                      if dsym < 0 || dsym >= nDistCodes then fail' "invalid distance code" else do
+                        dextra <- getBits (distExtra ! dsym)
+                        let d = distBase ! dsym + dextra
                         copyBack d len
                         loop
       storedBlock = do
-        p <- readSTRef bitRef
-        writeSTRef bitRef ((p + 7) .&. complement 7)   -- align to byte
+        p <- readArray st iBit
+        writeArray st iBit ((p + 7) .&. complement 7)   -- align to byte
         len <- getBits 16
         _nlen <- getBits 16
-        forM_ [1..len] $ \_ -> do v <- getBits 8; putByte (fromIntegral v)
+        forLoop 1 len $ \_ -> do v <- getBits 8; putByte (fromIntegral v)
       readDynamic = do
         hlit  <- getBits 5
         hdist <- getBits 5
@@ -926,7 +946,7 @@ inflate dat startByte outSize = runST $ do
                       r <- getBits 7; let k = r + 11 in go (replicate k 0 ++ acc) (n+k)
       blockLoop = do
         done <- readSTRef doneRef
-        o <- readSTRef outRef
+        o <- readArray st iOut
         if done || o >= outSize then pure () else do
           bfinal <- getBit
           btype  <- getBits 2
@@ -953,12 +973,24 @@ fixedDist = buildHuff (replicate 30 5)
 clOrder :: [Int]
 clOrder = [16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15]
 
-lenBase, lenExtra, distBase, distExtra :: [Int]
-lenBase   = [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258]
-lenExtra  = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0]
-distBase  = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769
-            ,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577]
-distExtra = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13]
+-- DEFLATE's length/distance tables. Unboxed arrays, not lists: these are
+-- indexed once per compressed match, and (!!) walks the list every time —
+-- the same "indexing a list in a hot loop" cost the JPEG work found, but on
+-- the path that runs for every match in the stream.
+lenBase, lenExtra, distBase, distExtra :: UArray Int Int
+lenBase   = U.listArray (0, nLenCodes - 1)
+  [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258]
+lenExtra  = U.listArray (0, nLenCodes - 1)
+  [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0]
+distBase  = U.listArray (0, nDistCodes - 1)
+  [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769
+  ,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577]
+distExtra = U.listArray (0, nDistCodes - 1)
+  [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13]
+
+nLenCodes, nDistCodes :: Int
+nLenCodes  = 29
+nDistCodes = 30
 
 ------------------------------------------------------------------------------
 -- JPEG: baseline AND progressive sequential DCT (Huffman). Arithmetic and
@@ -1011,6 +1043,13 @@ findFrame bs pos
                    in JComp (at bs o) (hv `shiftR` 4) (hv .&. 15) (at bs (o+2))
       in JFrame (be16 bs (seg+3)) (be16 bs (seg+1)) (map comp [0 .. nf-1])
 
+-- Slots of the entropy reader's unboxed state array (see 'decodeJpegImage').
+iPos, iBuf, iCnt, iMk :: Int
+iPos = 0   -- byte offset into the file
+iBuf = 1   -- current byte being consumed, bit by bit
+iCnt = 2   -- bits left in that byte
+iMk  = 3   -- marker that stopped the entropy stream (0 = none)
+
 -- The natural-order index for each zig-zag position.
 zigzag :: UArray Int Int
 zigzag = U.listArray (0,63)
@@ -1020,8 +1059,10 @@ zigzag = U.listArray (0,63)
   ,58,59,52,45,38,31,39,46,53,60,61,54,47,55,62,63]
 
 -- Precomputed IDCT cosine factors: ct[k*8+u] = C(u)*cos((2k+1)*u*pi/16).
-ct :: A.Array Int Double
-ct = A.listArray (0,63)
+-- Unboxed: this is read 1024 times per 8x8 block, and a boxed Array would
+-- hand back a heap object on every one of those reads.
+ct :: UArray Int Double
+ct = U.listArray (0,63)
   [ cu u * cos ((fromIntegral (2*k+1) * fromIntegral u * pi) / 16)
   | k <- [0..7], u <- [0..7] ]
   where cu u = if u == 0 then 1 / sqrt 2 else 1
@@ -1056,25 +1097,33 @@ decodeJpegImage bs w h comps =
     acT    <- newArray (0,3) emptyHuff :: ST s (STArray s Int Huff)
     driRef <- newSTRef 0
     -- Entropy bit reader.
-    posRef  <- newSTRef 2
-    bbufRef <- newSTRef 0; bcntRef <- newSTRef 0; mkRef <- newSTRef (0 :: Int)
+    --
+    -- The four hot state slots live in ONE unboxed array rather than four
+    -- 'STRef Int's. An STRef holds a boxed value, so every write allocates a
+    -- fresh Int on the heap — and this state is written several times per
+    -- *bit* of the entropy stream. Measured in isolation, the STRef shape
+    -- costs ~110 bytes per iteration (522 MB over 5M iterations) against zero
+    -- for the unboxed array; decoding a 603 KiB JPEG churned 830 MB, which at
+    -- GHC's allocation rate was most of its 679 ms.
+    st <- newArray (0, 3) 0 :: ST s (STUArray s Int Int)
+    writeArray st iPos 2
     let loadByte = do
-          mk <- readSTRef mkRef
+          mk <- readArray st iMk
           if mk /= 0 then pure () else do
-            p <- readSTRef posRef
+            p <- readArray st iPos
             case atM bs p of
-              Nothing -> writeSTRef mkRef 0xD9
+              Nothing -> writeArray st iMk 0xD9
               Just b
                 | b == 0xFF -> case atM bs (p+1) of
-                    Just 0  -> do writeSTRef posRef (p+2); writeSTRef bbufRef 0xFF; writeSTRef bcntRef 8
-                    Just nn -> writeSTRef mkRef nn
-                    Nothing -> writeSTRef mkRef 0xD9
-                | otherwise -> do writeSTRef posRef (p+1); writeSTRef bbufRef b; writeSTRef bcntRef 8
+                    Just 0  -> do writeArray st iPos (p+2); writeArray st iBuf 0xFF; writeArray st iCnt 8
+                    Just nn -> writeArray st iMk nn
+                    Nothing -> writeArray st iMk 0xD9
+                | otherwise -> do writeArray st iPos (p+1); writeArray st iBuf b; writeArray st iCnt 8
         nextBit = do
-          c0 <- readSTRef bcntRef
-          c  <- if c0 == 0 then loadByte >> readSTRef bcntRef else pure c0
+          c0 <- readArray st iCnt
+          c  <- if c0 == 0 then loadByte >> readArray st iCnt else pure c0
           if c == 0 then pure 0
-          else do buf <- readSTRef bbufRef; writeSTRef bcntRef (c-1); pure ((buf `shiftR` (c-1)) .&. 1)
+          else do buf <- readArray st iBuf; writeArray st iCnt (c-1); pure ((buf `shiftR` (c-1)) .&. 1)
         getBitsJ n = go 0 n where go acc 0 = pure acc
                                   go acc k = do b <- nextBit; go ((acc `shiftL` 1) .|. b) (k-1)
         recv s | s == 0 = pure 0
@@ -1088,15 +1137,15 @@ decodeJpegImage bs w h comps =
                       let code1 = (code `shiftL` 1) .|. b; cnt = counts A.! len
                       if code1 - first < cnt then pure (syms A.! (idx + (code1 - first)))
                       else go (len+1) code1 ((first+cnt) `shiftL` 1) (idx+cnt)
-        -- After a scan, advance posRef to the next real marker (skipping the
+        -- After a scan, advance the read position to the next real marker (skipping the
         -- entropy stream's stuffed 0xFF00 and any RST markers).
         syncToMarker = do
-          p0 <- readSTRef posRef
+          p0 <- readArray st iPos
           let go p | p+1 >= BS.length bs = BS.length bs
                    | at bs p == 0xFF && at bs (p+1) /= 0
                      && not (at bs (p+1) >= 0xD0 && at bs (p+1) <= 0xD7) = p
                    | otherwise = go (p+1)
-          writeSTRef posRef (go p0)
+          writeArray st iPos (go p0)
     -- DQT / DHT into the mutable tables.
     let applyDQT seg end = goD seg
           where goD p | p >= end = pure ()
@@ -1130,8 +1179,8 @@ decodeJpegImage bs w h comps =
               ah = ahal `shiftR` 4; al = ahal .&. 15
               scanComps = [ (ci, td, ta) | (cs,td,ta) <- ents
                                          , (ci,c) <- zip [0..] comps, jcId c == cs ]
-          writeSTRef posRef next
-          writeSTRef bbufRef 0; writeSTRef bcntRef 0; writeSTRef mkRef 0
+          writeArray st iPos next
+          writeArray st iBuf 0; writeArray st iCnt 0; writeArray st iMk 0
           preds  <- newArray (0, max 0 (ncomp-1)) 0 :: ST s (STUArray s Int Int)
           eobRef <- newSTRef 0
           ri <- readSTRef driRef
@@ -1232,8 +1281,8 @@ decodeJpegImage bs w h comps =
                              else acRefine coef boff actbl acStart
           cntRef <- newSTRef 0
           let doRestart = do
-                writeSTRef bcntRef 0; writeSTRef mkRef 0
-                p <- readSTRef posRef; writeSTRef posRef (findRST bs p)
+                writeArray st iCnt 0; writeArray st iMk 0
+                p <- readArray st iPos; writeArray st iPos (findRST bs p)
                 forM_ [0..ncomp-1] $ \i -> writeArray preds i 0
                 writeSTRef eobRef 0
               tick = when (ri > 0) $ do
@@ -1259,57 +1308,105 @@ decodeJpegImage bs w h comps =
           syncToMarker
     -- Marker walk: apply tables and decode every scan until EOI.
     let walk = do
-          p <- readSTRef posRef
+          p <- readArray st iPos
           if p + 1 >= BS.length bs then pure ()
-          else if at bs p /= 0xFF then writeSTRef posRef (p+1) >> walk
+          else if at bs p /= 0xFF then writeArray st iPos (p+1) >> walk
           else let m = at bs (p+1) in
-            if m == 0xFF then writeSTRef posRef (p+1) >> walk
+            if m == 0xFF then writeArray st iPos (p+1) >> walk
             else if m == 0xD9 then pure ()                            -- EOI
-            else if m == 0xD8 || (m >= 0xD0 && m <= 0xD7) then writeSTRef posRef (p+2) >> walk
+            else if m == 0xD8 || (m >= 0xD0 && m <= 0xD7) then writeArray st iPos (p+2) >> walk
             else do
               let len = be16 bs (p+2); seg = p+4; next = p+2+len
-              if      m == 0xDB then applyDQT seg next >> writeSTRef posRef next >> walk
-              else if m == 0xC4 then applyDHT seg next >> writeSTRef posRef next >> walk
-              else if m == 0xDD then writeSTRef driRef (be16 bs seg) >> writeSTRef posRef next >> walk
-              else if m == 0xDA then decodeScan seg next >> walk      -- leaves posRef at next marker
-              else writeSTRef posRef next >> walk                     -- APPn / COM / SOF (already parsed)
+              if      m == 0xDB then applyDQT seg next >> writeArray st iPos next >> walk
+              else if m == 0xC4 then applyDHT seg next >> writeArray st iPos next >> walk
+              else if m == 0xDD then writeSTRef driRef (be16 bs seg) >> writeArray st iPos next >> walk
+              else if m == 0xDA then decodeScan seg next >> walk      -- leaves iPos at the next marker
+              else writeArray st iPos next >> walk                     -- APPn / COM / SOF (already parsed)
     walk
     -- Reconstruct: dequantise + IDCT every block into its component plane.
+    --
+    -- The IDCT is separable: a 2-D transform is a pass over rows followed by a
+    -- pass over columns, 2x8x8 multiply-adds per block instead of the 8^4 the
+    -- direct double sum needs. The two scratch buffers are allocated once and
+    -- reused for every block — the previous code built a 64-element list and a
+    -- fresh UArray per block, which on a 1280x1014 photo is ~30 000 of each.
+    blk <- newArray (0, 63) 0 :: ST s (STUArray s Int Double)   -- dequantised coefficients
+    tmp <- newArray (0, 63) 0 :: ST s (STUArray s Int Double)   -- output of the row pass
     forM_ (zip3 [0..] comps compInfo) $ \(ci, c, (bpr,bpc,_,_)) -> do
       let coef = coefs !! ci
           (pw,ph,plane) = planes !! ci
       qtbl <- readArray quantT (jcTq c)
-      forM_ [0..bpc-1] $ \by -> forM_ [0..bpr-1] $ \bx -> do
+      forLoop 0 (bpc-1) $ \by -> forLoop 0 (bpr-1) $ \bx -> do
         let boff = (by*bpr+bx)*64
-        cf <- mapM (\k -> do v <- readArray coef (boff+k); pure (v * (qtbl ! k))) [0..63]
-        let cfA = U.listArray (0,63) cf :: UArray Int Int
-        forM_ [0..7] $ \yy -> forM_ [0..7] $ \xx -> do
-          let sm = 0.25 * sum [ (ct A.!(xx*8+u)) * (ct A.!(yy*8+v)) * fromIntegral (cfA ! (v*8+u))
-                              | u <- [0..7], v <- [0..7] ]
-              gx = bx*8+xx; gy = by*8+yy
-          when (gx < pw && gy < ph) $
-            writeArray plane (gy*pw+gx) (fromIntegral (clamp8 (round (sm+128))))
+        forLoop 0 63 $ \k -> do
+          v <- readArray coef (boff+k)
+          writeArray blk k (fromIntegral (v * (qtbl ! k)))
+        -- Rows: tmp[v*8+xx] = sum_u ct[xx*8+u] * blk[v*8+u]
+        forLoop 0 7 $ \v -> forLoop 0 7 $ \xx -> do
+          let goU !u !acc
+                | u > 7 = pure acc
+                | otherwise = do cv <- readArray blk (v*8+u)
+                                 goU (u+1) (acc + ct ! (xx*8+u) * cv)
+          sm <- goU 0 0
+          writeArray tmp (v*8+xx) sm
+        -- Columns: out[yy][xx] = 0.25 * sum_v ct[yy*8+v] * tmp[v*8+xx]
+        forLoop 0 7 $ \yy -> forLoop 0 7 $ \xx -> do
+          let gx = bx*8+xx; gy = by*8+yy
+          when (gx < pw && gy < ph) $ do
+            let goV !v !acc
+                  | v > 7 = pure acc
+                  | otherwise = do tv <- readArray tmp (v*8+xx)
+                                   goV (v+1) (acc + ct ! (yy*8+v) * tv)
+            sm <- goV 0 0
+            writeArray plane (gy*pw+gx) (fromIntegral (clamp8 (round (0.25 * sm + 128))))
     -- Upsample (centred bilinear) + YCbCr->RGB into the RGBA image.
-    let sampleAt ci x y = do
-          let (pw,ph,plane) = planes !! ci
-              c = comps !! ci
-              fx = (fromIntegral x + 0.5) * fromIntegral (jcH c) / fromIntegral hmax - 0.5 :: Double
-              fy = (fromIntegral y + 0.5) * fromIntegral (jcV c) / fromIntegral vmax - 0.5
-              x0 = clampI 0 (pw-1) (floor fx); x1 = clampI 0 (pw-1) (x0+1)
-              y0 = clampI 0 (ph-1) (floor fy); y1 = clampI 0 (ph-1) (y0+1)
-              dx = fx - fromIntegral (floor fx :: Int); dy = fy - fromIntegral (floor fy :: Int)
-          p00 <- rdD plane (y0*pw+x0); p10 <- rdD plane (y0*pw+x1)
-          p01 <- rdD plane (y1*pw+x0); p11 <- rdD plane (y1*pw+x1)
-          let top = p00 + (p10-p00)*dx; bot = p01 + (p11-p01)*dx
-          pure (top + (bot-top)*dy)
-    forM_ [0 .. h-1] $ \y -> forM_ [0 .. w-1] $ \x ->
+    --
+    -- The per-component data is resolved ONCE here, not per sample: this loop
+    -- runs w*h times and took `planes !! ci` and `comps !! ci` on every
+    -- component of every pixel, walking a list 3 times per pixel (4 million
+    -- traversals on a 1280x1014 photo) to fetch three values that never change.
+    let planeOf ci = planes !! ci
+        compOf ci  = comps !! ci
+        -- Arguments are unpacked and strict, and the whole thing is inlined:
+        -- this runs once per component per pixel (four million times on a
+        -- 1280x1014 photo), and every Double left un-forced there is a heap
+        -- allocation. Bilinear upsampling is also skipped outright for a
+        -- component that is already full resolution — which luma always is —
+        -- where it provably reduces to a single read (dx = dy = 0).
+        sampleAtF :: Int -> Int -> STUArray s Int Word8 -> Bool -> Int -> Int -> Int -> Int
+                  -> Int -> Int -> ST s Double
+        sampleAtF !pw !ph !plane !full !ch !cv !hm !vm !x !y
+          | full = rdD plane (min (ph-1) y * pw + min (pw-1) x)
+          | otherwise = do
+              let !fx = (fromIntegral x + 0.5) * fromIntegral ch / fromIntegral hm - 0.5 :: Double
+                  !fy = (fromIntegral y + 0.5) * fromIntegral cv / fromIntegral vm - 0.5
+                  !fxi = floor fx :: Int
+                  !fyi = floor fy :: Int
+                  -- NB: x1 clamps x0+1, not fxi+1. At the left edge fx is
+                  -- -0.5, so fxi is -1: clamping fxi+1 would give 0 and sample
+                  -- the same pixel twice instead of interpolating inward.
+                  !x0 = clampI 0 (pw-1) fxi; !x1 = clampI 0 (pw-1) (x0+1)
+                  !y0 = clampI 0 (ph-1) fyi; !y1 = clampI 0 (ph-1) (y0+1)
+                  !dx = fx - fromIntegral fxi; !dy = fy - fromIntegral fyi
+              !p00 <- rdD plane (y0*pw+x0); !p10 <- rdD plane (y0*pw+x1)
+              !p01 <- rdD plane (y1*pw+x0); !p11 <- rdD plane (y1*pw+x1)
+              let !top = p00 + (p10-p00)*dx; !bot = p01 + (p11-p01)*dx
+              pure (top + (bot-top)*dy)
+        {-# INLINE sampleAtF #-}
+        sampleWith (pw,ph,plane) c x y =
+          sampleAtF pw ph plane (jcH c == hmax && jcV c == vmax)
+                    (jcH c) (jcV c) hmax vmax x y
+        pl0 = planeOf 0; c0 = compOf 0
+        pl1 = planeOf (min 1 (ncomp-1)); c1 = compOf (min 1 (ncomp-1))
+        pl2 = planeOf (min 2 (ncomp-1)); c2 = compOf (min 2 (ncomp-1))
+    forLoop 0 (h-1) $ \y -> forLoop 0 (w-1) $ \x ->
       if ncomp == 1
-        then do yv <- sampleAt 0 x y
+        then do yv <- sampleWith pl0 c0 x y
                 let g = clamp8 (round yv) in putRGBA img w x y g g g 255
         else do
-          yf  <- sampleAt 0 x y
-          cbv <- sampleAt 1 x y
-          crv <- sampleAt 2 x y
+          yf  <- sampleWith pl0 c0 x y
+          cbv <- sampleWith pl1 c1 x y
+          crv <- sampleWith pl2 c2 x y
           let cb = cbv - 128; cr = crv - 128
               r = clamp8 (round (yf + 1.402*cr))
               g = clamp8 (round (yf - 0.344136*cb - 0.714136*cr))
@@ -1321,6 +1418,16 @@ clamp8 v = max 0 (min 255 v)
 
 clampI :: Int -> Int -> Int -> Int
 clampI lo hi v = max lo (min hi v)
+
+-- | A strict counted loop. @forM_ [lo..hi]@ builds a list and a closure per
+-- element; in the JPEG reconstruct path that runs ~200 times per 8x8 block
+-- over tens of thousands of blocks, which is real allocation. This compiles to
+-- a plain tail-recursive loop.
+forLoop :: Int -> Int -> (Int -> ST s ()) -> ST s ()
+forLoop lo hi act = go lo
+  where go !i | i > hi = pure ()
+              | otherwise = act i >> go (i + 1)
+{-# INLINE forLoop #-}
 
 rdD :: STUArray s Int Word8 -> Int -> ST s Double
 rdD a i = fromIntegral <$> readArray a i

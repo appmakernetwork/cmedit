@@ -7,7 +7,7 @@ module Cmedit.Help
 import Cmedit.ConfigFile (configKeysHelp)
 
 versionString :: String
-versionString = "CMeDit 0.4.1"
+versionString = "CMeDit 0.5.0"
 
 helpString :: String
 helpString = unlines $
@@ -78,6 +78,11 @@ helpString = unlines $
   , ".csv / .tsv files open in a spreadsheet table view (toggle with Alt+T):"
   , "arrows/Tab move, Enter edits a cell, Alt+arrows insert rows/columns,"
   , "Ctrl+Del deletes a row, Alt+Backspace deletes a column."
+  , ""
+  , ".rtf files open as the formatted document rather than as markup: bold,"
+  , "italic, underline, strike-through, colour, alignment, indents and lists"
+  , "are rendered, wrapped to the window. The view is read-only \x2014 Alt+T"
+  , "switches to the raw RTF, which edits and saves like any other text file."
   , ""
   , "Image files (bmp gif jpg png webp ppm/pgm) open in a read-only view,"
   , "scaled to fit in 24-bit colour half-blocks; press 'a' for an ASCII ramp."

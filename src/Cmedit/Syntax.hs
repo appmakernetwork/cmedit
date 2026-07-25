@@ -42,7 +42,7 @@ import System.FilePath (takeExtension)
 
 data Lang = SQL | Python | Markdown | HTML
           | JS | CSS | Shell | JSON | YAML | TOML | INI | FTL | Jinja | CSV
-          | Haskell
+          | Haskell | RTF
   deriving (Eq, Show)
 
 -- | A highlighting token class assigned to each character.
@@ -92,6 +92,7 @@ langComment lang = case lang of
   FTL      -> Just (BlockComment "<#--" "-->")
   Jinja    -> Just (BlockComment "{#" "#}")
   CSV      -> Nothing                   -- comments aren't a thing in CSV data
+  RTF      -> Nothing                   -- RTF has {\*\comment ...}, but commenting out markup is not an edit anyone wants
 
 -- | Choose a language from a file path's extension, if supported.
 langForPath :: Maybe FilePath -> Maybe Lang
@@ -127,6 +128,7 @@ langForPath (Just p) = case map toLower (takeExtension p) of
   ".jinja"  -> Just Jinja
   ".jinja2" -> Just Jinja
   ".j2"     -> Just Jinja
+  ".rtf"  -> Just RTF
   ".csv"  -> Just CSV
   ".tsv"  -> Just CSV
   ".hs"   -> Just Haskell
@@ -159,6 +161,7 @@ lexLine lang st line = case lang of
   Jinja    -> lexWith jinjaStep st line
   Haskell  -> lexWith hsStep st line
   CSV      -> lexCsv line
+  RTF      -> lexRtf line
 
 ------------------------------------------------------------------------------
 -- Cached lexer states
@@ -1008,6 +1011,38 @@ hsBuiltins = Set.fromList
   , "seq","fromIntegral","fromEnum","toEnum","show","read","print","putStr"
   , "putStrLn","getLine","return","pure","fmap","mapM","mapM_","forM","forM_"
   , "sequence","sequence_","when","unless","either","maybe" ]
+
+------------------------------------------------------------------------------
+-- Rich Text Format
+--
+-- The raw, editable view of an @.rtf@ file (Alt+T from the formatted view).
+-- RTF has no multi-line constructs to carry across lines, so this needs no
+-- state: control words are keywords, their numeric parameters numbers,
+-- @\'hh@ and the other control symbols escapes, and braces punctuation —
+-- which leaves the document's actual text as the only unstyled thing on
+-- screen, the whole point of highlighting markup.
+
+lexRtf :: Text -> ([Tok], HlState)
+lexRtf line = (go (T.unpack line), StNormal)
+  where
+    go [] = []
+    go ('{' : rest) = TkPunct : go rest
+    go ('}' : rest) = TkPunct : go rest
+    go ('\\' : rest) = case rest of
+      (c : more)
+        | isAlpha c ->
+            let (word, r1)   = span isAlpha (c : more)
+                (sign, r2)   = span (== '-') r1
+                (digits, r3) = span isDigit r2
+            in TkKeyword : map (const TkKeyword) word
+                 ++ map (const TkNumber) (sign ++ digits)
+                 ++ go r3
+        -- \'hh, and the one-character control symbols (\\ \{ \} \~ \- ...).
+        | c == '\'' -> let (hex, r) = splitAt 2 more
+                       in TkString : TkString : map (const TkString) hex ++ go r
+        | otherwise -> TkString : TkString : go more
+      [] -> [TkKeyword]
+    go (_ : rest) = TkText : go rest
 
 ------------------------------------------------------------------------------
 -- CSV / TSV

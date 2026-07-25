@@ -1914,12 +1914,14 @@ renderNow drv editorRef prevRef titleRef = do
   modifyIORef' (stFrameMax st) (max ms)
 
 -- A visible cursor for a dark theme, a dark one for light backgrounds
--- (cherry blossom gets its raspberry accent, midnight its periwinkle).
+-- (cherry blossom gets its raspberry accent, midnight its periwinkle,
+-- graphite its blue).
 themeCursorColor :: ThemeName -> (Word8, Word8, Word8)
 themeCursorColor ThemeLight         = (0x20, 0x20, 0x20)
 themeCursorColor ThemeFlashbang     = (0x1A, 0x1A, 0x1A)
 themeCursorColor ThemeCherryBlossom = (0xA3, 0x12, 0x5F)
 themeCursorColor ThemeMidnight      = (0x7A, 0xA2, 0xF7)
+themeCursorColor ThemeGraphite      = (0x4F, 0xA6, 0xF5)
 themeCursorColor _                  = (0xE8, 0xE8, 0xE8)
 
 -- | The pixel-graphics overlay for this frame, if any output is needed:

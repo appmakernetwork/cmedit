@@ -268,6 +268,58 @@ in `README.md`; the cross-cutting structure that matters when editing:
   of the view. Syntax highlighting lexes each visible line from `initialState`,
   since the state before it would mean reading from the top of a multi-gigabyte
   file. Switchable with `paged-view = off`.
+- **Formatted RTF view (`Cmedit.Rtf`, `edRtf`/`docRtf`).** A fifth view mode,
+  wired exactly like CSV's — same per-document field, same **Alt+T**
+  (`handleAlt` picks `MAToggleRtf` over `MAToggleCsv` by extension; a file is
+  at most one of the two, so the View menu's two mode groups are pruned
+  against each other by `dropViewModes`) — but the traffic is **one-way, and
+  that is the whole design**. The CSV table *is* the document while showing,
+  so it serialises back (`syncCsvToBuffer`); the RTF view must not, because it
+  models bold/italic/underline/strike/colour/alignment/indent and a real
+  document also carries style sheets, tables, pictures and revision marks that
+  it does not. So there is **no serialiser** — the buffer stays the document,
+  Save writes the buffer, leaving the view discards the projection, and the
+  fidelity problem that makes RTF editing hard simply cannot arise. Editing an
+  `.rtf` means editing its markup (Alt+T; `Syntax`'s `RTF` lexer highlights
+  it). Consequences of "derived, not owned": the view is read-only (editing
+  keys swallowed by `handleRtfKey`, `rtfDisabledActions` pruned from the menus
+  *and* guarded in `runAction` so the shortcuts are inert), it has **no
+  cursor** (`computeCursor` returns `Nothing` like the image view — the buffer
+  cursor is a point in the *markup*, so showing it would blink somewhere
+  arbitrary in the rendered text), it re-derives itself when the buffer moves
+  under it (`refreshRtf` from the `update` wrapper, so Undo/Redo and staged
+  replaces are covered without hunting the mutation sites), and an RTF doc
+  stays `isPlainDoc` (unlike CSV/image/pager) since its buffer is live and
+  authoritative. **`rtfStale` compares `edEditSeq`, an `Int` — not the
+  buffer.** The obvious version (keep the line `Seq`, check `ptrEq`, the
+  `HlCache` idiom) *silently fails here*: under `-O2` `ptrEq` on a lifted
+  value reported a mismatch even for an untouched buffer — immediately after
+  `mkRtfDoc` stored it — and unlike `Syntax.sameText` there is no cheap `==`
+  to fall back to on a whole document, so every keystroke re-parsed the file
+  (measured 169 ms per arrow key on a 1.6 MB RTF; 0.18 ms after). `ptrEq` is
+  only sound as a fast path in front of a real comparison; where there isn't
+  one, use a counter. A Spec *timing* test pins this, since nothing structural
+  can see it. Mouse-wise the view owns only the wheel; **every other mouse
+  event in the text area is swallowed** (there is no cursor to move, and
+  falling through to `handleEditKey` would drag a selection through the
+  invisible markup buffer *and* set `edMouseSelecting`, which gates the
+  scrollbar guard). Note the vertical scrollbar needs teaching **twice** —
+  `scrollBarInfo` (draw/measure) and the hub's `scrollBarTo` (act) are
+  separate view splits, and a mode added to only the first gets a bar that
+  tracks perfectly and does nothing when dragged.
+  Parsing is the ordinary RTF reader trick: group-scoped state, a colour
+  table, and `{\*\...}` plus `skipDestinations` skipped wholesale, so every
+  construct we do not model is *ignored* rather than mis-rendered. Layout
+  (`layoutRtf`) wraps/indents/aligns into `RtfLine`s keyed on width in
+  `rdCache` — recomputed on resize, never on scroll — and `Render.drawRtf`
+  feeds their formatting runs to the same `expandLineCellsFrom` the text view
+  uses as `baseAt`, so tabs and wide-glyph continuations behave identically.
+  Two rendering judgements worth keeping: a document colour is honoured only
+  when `legibleOn` says it reads against the theme (nearly every RTF specifies
+  *black* body text, invisible on a dark theme), and `\fs`-large runs render
+  bold since a terminal has one font size. `attrStrike` (SGR 9) was added for
+  `\strike` and needs no capability gate — an unrecognised *numeric* SGR
+  parameter is ignored, unlike the colon sub-parameter forms or REP.
 - **Two coordinate systems.** Buffer positions (`Pos`) count *characters*; the
   screen counts *display cells*. `Cmedit.Width` maps between them
   (`colToDisplay`/`displayToCol`) and supplies a compact `wcwidth` plus tab-stop
@@ -608,7 +660,8 @@ in `README.md`; the cross-cutting structure that matters when editing:
 - **Themes.** `Render.themeFor (resolvedTheme ed)` picks the palette per
   frame; `Theme` carries `thTokens :: Tok -> Style` so the syntax palette
   differs per theme (light swaps washed-out brights for dark hues). Config key
-  `theme = auto|dark-terminal|light-terminal|cherry-blossom|flashbang|midnight`
+  `theme =
+  auto|dark-terminal|light-terminal|cherry-blossom|flashbang|midnight|graphite`
   (default `auto`; the old `dark`/`light` spellings still parse):
   `resolvedTheme` maps `auto`
   through `edDetectedDark` — the driver's OSC 11 background query, re-run on
@@ -616,7 +669,7 @@ in `README.md`; the cross-cutting structure that matters when editing:
   dark when the terminal never answers. Paint with `resolvedTheme`, never
   `cfgTheme`, or `auto` breaks. View ▸ Theme… opens a picker dialog
   (`DKTheme`/`mkTheme`, one button per `themeChoices` entry, focus starting
-  on the current mode; its seven buttons are why dialog button rows wrap —
+  on the current mode; its eight buttons are why dialog button rows wrap —
   `EditorState.buttonRows` splits them at `buttonRowMaxW`, shared by the
   renderer, mouse hit-test and `dialogGeom`): moving the focus
   **live-previews** the theme —
@@ -624,10 +677,14 @@ in `README.md`; the cross-cutting structure that matters when editing:
   restores simply because nothing was written — and Enter commits via
   `applyTheme` (per-session; the config key persists it). Note the two
   terminal themes keep the terminal's default background, so a preview
-  restyles chrome/tokens only, while the forced-background three —
-  cherry-blossom (pink), flashbang (pure white) and midnight (deep navy) —
-  repaint every cell via `thRemap`, so the terminal palette never shows
-  through. `EditorEdit.themeLabel` doubles as the config word and the UI
+  restyles chrome/tokens only, while the forced-background four —
+  cherry-blossom (pink), flashbang (pure white), midnight (deep navy) and
+  graphite (neutral near-black) — repaint every cell via `thRemap`, so the
+  terminal palette never shows through. Graphite is the one whose chrome
+  sits *below* the page (`gpBar` darker than `gpBase`, IDE-style), so its
+  remap deliberately maps the hardcoded `White` panel grounds just above the
+  page instead of well above it.
+  `EditorEdit.themeLabel` doubles as the config word and the UI
   label — keep any new theme's label parseable by `applyKey`. The driver
   also matches the cursor colour to the theme (OSC 12, reset on exit) —
   previews included, since it reads `resolvedTheme` per frame.

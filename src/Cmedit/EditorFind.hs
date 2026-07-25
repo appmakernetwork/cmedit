@@ -784,7 +784,7 @@ stagedDoc path lr buf' = Document
   , docRedo = Seq.empty, docLastEdit = EKNone
   , docOverwrite = False, docDiscard = False
   , docCsv = Nothing, docCsvStash = Nothing, docImage = Nothing
-  , docPager = Nothing
+  , docPager = Nothing, docRtf = Nothing
   , docHlCache = Nothing
   , docDiags = []
   }

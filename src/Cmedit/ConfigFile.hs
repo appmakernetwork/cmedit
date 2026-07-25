@@ -56,11 +56,11 @@ import Text.Read (readMaybe)
 -- OSC 11 query), and falls back to dark where it doesn't. 'ThemeDark' and
 -- 'ThemeLight' keep the terminal's own background (hence \"dark terminal\" /
 -- \"light terminal\" in the UI); 'ThemeCherryBlossom' (light pink),
--- 'ThemeFlashbang' (blinding white) and 'ThemeMidnight' (deep navy) paint
--- their own background on every cell, so they never depend on the terminal's
--- palette.
+-- 'ThemeFlashbang' (blinding white), 'ThemeMidnight' (deep navy) and
+-- 'ThemeGraphite' (neutral near-black) paint their own background on every
+-- cell, so they never depend on the terminal's palette.
 data ThemeName = ThemeDark | ThemeLight | ThemeAuto | ThemeCherryBlossom
-               | ThemeFlashbang | ThemeMidnight
+               | ThemeFlashbang | ThemeMidnight | ThemeGraphite
   deriving (Eq, Show)
 
 data Config = Config
@@ -152,7 +152,8 @@ applyKey key val cfg = case key of
     "cherry"         -> Right cfg { cfgTheme = ThemeCherryBlossom }
     "flashbang"      -> Right cfg { cfgTheme = ThemeFlashbang }
     "midnight"       -> Right cfg { cfgTheme = ThemeMidnight }
-    _ -> Left "theme expects 'auto', 'dark-terminal', 'light-terminal', 'cherry-blossom', 'flashbang' or 'midnight'"
+    "graphite"       -> Right cfg { cfgTheme = ThemeGraphite }
+    _ -> Left "theme expects 'auto', 'dark-terminal', 'light-terminal', 'cherry-blossom', 'flashbang', 'midnight' or 'graphite'"
   "paged-view" -> boolKey (\b -> cfg { cfgPagedView = b })
   "debug-stats" -> boolKey (\b -> cfg { cfgDebugStats = b })
   "lint" -> boolKey (\b -> cfg { cfgLint = b })
@@ -195,12 +196,14 @@ configKeysHelp =
   , "                     (default false)."
   , "freeze-header = BOOL Pin a CSV table's first row while scrolling"
   , "                     (default true)."
-  , "theme = auto|dark-terminal|light-terminal|cherry-blossom|flashbang|midnight"
+  , "theme = auto|dark-terminal|light-terminal|cherry-blossom|flashbang|"
+  , "        midnight|graphite"
   , "                     Colour theme; 'auto' follows the terminal"
   , "                     background (default dark). The terminal themes keep"
   , "                     the terminal's own background; cherry-blossom (light"
-  , "                     pink), flashbang (bright white) and midnight (deep"
-  , "                     navy) paint their own background colours."
+  , "                     pink), flashbang (bright white), midnight (deep"
+  , "                     navy) and graphite (neutral near-black) paint their"
+  , "                     own background colours."
   , "lint = BOOL          Run external linters on the active file (default"
   , "                     true). Per-linter switches: lint-ruff, lint-flake8,"
   , "                     lint-eslint, lint-stylelint, lint-pyright,"
@@ -252,6 +255,7 @@ renderTheme t = case t of
   ThemeCherryBlossom -> "cherry-blossom"
   ThemeFlashbang     -> "flashbang"
   ThemeMidnight      -> "midnight"
+  ThemeGraphite      -> "graphite"
 
 -- | Produce config-file text setting every key to @desired@, editing the given
 -- current text as little as possible: a supported key already present has only

@@ -178,7 +178,7 @@ mkTheme :: Int -> Dialog
 mkTheme cur = Dialog DKTheme "Theme"
   [] [] []
   [ "Auto", "Dark Terminal", "Light Terminal"
-  , "Cherry Blossom", "Flashbang", "Midnight", "Cancel" ] cur
+  , "Cherry Blossom", "Flashbang", "Midnight", "Graphite", "Cancel" ] cur
   "Applies for this session; set theme = ... in the config to keep it."
   False
 
