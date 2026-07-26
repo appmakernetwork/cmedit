@@ -12,8 +12,8 @@ No TUI framework is used. Everything — raw-mode terminal control, the input
 parser, the diff renderer, the menus and dialogs — is built directly on VT/ANSI
 escape sequences and the POSIX `termios` API.
 
-**Website:** <https://arrrg.org/cmedit/> ·
-**Release white paper:** [*CMeDit: A Text Editor That Exists*](https://arrrg.org/cmedit/whitepaper.html)
+**Website:** <https://appmakernetwork.com/cmedit/> ·
+**Release white paper:** [*CMeDit: A Text Editor That Exists*](https://appmakernetwork.com/cmedit/whitepaper.html)
 
 ```
   File   Edit   Find   View   Help
