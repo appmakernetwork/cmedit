@@ -57,6 +57,8 @@ import Cmedit.Gfx
 import Cmedit.Image (Image, imgW, imgH, sniffImage, decodeFrames, scaleRGBA)
 import Cmedit.Pager (PagerDoc(..))
 import qualified Cmedit.Pager as Pg
+import Cmedit.Pdf (PdfDoc(..))
+import qualified Cmedit.Pdf as Pdf
 import Cmedit.Input
 import Cmedit.Lint
   ( LinterId, Linter(..), Diag(..), LintAvail
@@ -64,6 +66,7 @@ import Cmedit.Lint
 import Cmedit.Render
 import Cmedit.Search (SearchReq(..), FileResult(..))
 import qualified Cmedit.Search as S
+import qualified Cmedit.Zip as Z
 import qualified Cmedit.QuickOpen as Q
 import Cmedit.Term
 import Cmedit.TextBuffer
@@ -215,6 +218,7 @@ loadInitialFiles cfg recents size files readOnly = do
         OutText p lr  -> addDocument p lr e
         OutImage p im -> addImageDocument p im e
         OutPaged pg   -> addPagerDocument pg e
+        OutPdf p pd   -> addPdfDocument p pd e
         OutError _    -> e
 
 -- | Refresh the status bar's live counters when @debug-stats@ is on (and clear
@@ -592,6 +596,7 @@ eventLoop editorRef prevRef titleRef q drv _src = do
             OutText p _  -> notifyUnfocused drv ("Finished loading " ++ takeFileName p)
             OutImage p _ -> notifyUnfocused drv ("Finished loading " ++ takeFileName p)
             OutPaged pg  -> notifyUnfocused drv ("Finished indexing " ++ takeFileName (pgPath pg))
+            OutPdf p _   -> notifyUnfocused drv ("Finished reading " ++ takeFileName p)
             OutError _   -> pure ()
           renderNow drv editorRef prevRef titleRef
           -- A load installed a fresh buffer (fingerprint changed): (re-)arm lint.
@@ -988,8 +993,11 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
     -- matches files opened earlier by any route.
     cpath <- canonicalizeSafe path
     msz <- fileSizeSafe cpath
-    isImg <- looksLikeImage cpath
-    let asyncBar = if isImg then imageAsyncBytes else asyncThresholdBytes
+    -- Images and PDFs are *decoded* rather than read, so the work is out of
+    -- proportion to the byte count: both go to the background thread far
+    -- sooner than a text file does.
+    slow <- looksLikeDecoded cpath
+    let asyncBar = if slow then imageAsyncBytes else asyncThresholdBytes
     case msz of
       -- Big (but openable) files load on a background thread with a spinner, so
       -- the event loop keeps painting; small/new/oversized files resolve inline.
@@ -1465,6 +1473,7 @@ data LoadOutcome
   = OutText  !FilePath !LoadResult
   | OutImage !FilePath ![(Image, Int)]   -- ^ Frames + delays (ms); singleton for a still.
   | OutPaged !PagerDoc                   -- ^ Too large for a buffer: the read-only paged view.
+  | OutPdf   !FilePath !PdfDoc           -- ^ A PDF, already extracted into its reading view.
   | OutError !String
 
 -- Read and classify a path without touching the editor. Refuses files that are
@@ -1481,9 +1490,14 @@ classifyFile = classifyFileWith True
 classifyFileWith :: Bool -> FilePath -> IO LoadOutcome
 classifyFileWith pagedOK path = do
   exists <- doesFileExist path
+  hdr4 <- if exists then readHead path 4 else pure Nothing
   if not exists
     then pure (OutText path emptyLoadResult)  -- new file
-    else do
+    -- Archives are sniffed before anything else reads the file. They are
+    -- binary, so the refusal below would otherwise be the whole story, and
+    -- they can be arbitrarily large, so the size check must not see them
+    -- either: 'zipOutcome' never reads more than the table of contents.
+    else if maybe False Z.zipMagic hdr4 then zipOutcome path else do
       msz <- fileSizeSafe path
       case msz of
         -- Too large for a buffer. Rather than refusing outright, offer the
@@ -1509,6 +1523,12 @@ classifyFileWith pagedOK path = do
               Just _  -> pure (either (\err -> OutError (takeFileName path ++ ": " ++ err))
                                       (OutImage path) (decodeFrames bs))
               Nothing
+                -- Sniffed before the binary refusal, exactly like an image: a
+                -- PDF is binary by nature, so that refusal would otherwise be
+                -- the only thing that ever happened to one.
+                | Pdf.sniffPdf bs ->
+                    pure (either (\err -> OutError (takeFileName path ++ ": " ++ err))
+                                 (OutPdf path) (Pdf.parsePdf bs))
                 | looksBinary bs ->
                     pure (OutError (takeFileName path ++ ": binary file ("
                                     ++ humanSize (fromIntegral (BS.length bs))
@@ -1542,6 +1562,53 @@ readHead path n = do
          :: IO (Either SomeException BS.ByteString)
   pure (either (const Nothing) Just r)
 
+-- | Read at most @n@ bytes from an absolute offset. The ZIP reader needs the
+-- /end/ of a file whose front it must never touch, which is the one place a
+-- seek buys something a whole-file read cannot.
+readAt :: FilePath -> Integer -> Int -> IO (Maybe BS.ByteString)
+readAt _    _   n | n <= 0 = pure (Just BS.empty)
+readAt path off n = do
+  r <- try (withBinaryFile path ReadMode
+              (\h -> hSeek h AbsoluteSeek (max 0 off) >> BS.hGet h n))
+         :: IO (Either SomeException BS.ByteString)
+  pure (either (const Nothing) Just r)
+
+-- | Turn a ZIP archive into its read-only listing document ("Cmedit.Zip").
+--
+-- Two short reads whatever the archive's size: the tail, which holds the
+-- end-of-central-directory record, and the central directory that record
+-- points at. Nothing is decompressed, so an archive whose members are
+-- encrypted lists exactly like one whose members are not.
+--
+-- The result is an ordinary 'OutText' outcome, which is the point: from here
+-- on the listing is just a read-only buffer, and every installer, view and
+-- key handler downstream needs to know nothing about archives.
+zipOutcome :: FilePath -> IO LoadOutcome
+zipOutcome path = do
+  msz <- fileSizeSafe path
+  mt  <- fileMtime path
+  case msz of
+    Nothing -> pure (bad "cannot measure the archive")
+    Just sz -> do
+      let tlen = fromInteger (min (toInteger Z.eocdSearchBytes) sz)
+      mtl <- readAt path (sz - toInteger tlen) tlen
+      case mtl of
+        Nothing -> pure (bad "cannot read the end of the archive")
+        Just tl -> case Z.findEocd tl (sz - toInteger (BS.length tl)) of
+          Left err -> pure (bad err)
+          Right ec -> do
+            mcd <- readAt path (Z.ecCdOff ec)
+                     (fromInteger (min Z.maxCentralBytes (Z.ecCdSize ec)))
+            case mcd of
+              Nothing -> pure (bad "cannot read the archive's central directory")
+              Just cd -> pure $ case Z.parseCentral cd of
+                Left err -> bad err
+                Right es ->
+                  let txt = Z.zipListing (takeFileName path) sz es (Z.ecComment ec)
+                  in OutText path
+                       (LoadResult (fromText txt) Cmedit.TextBuffer.LF Utf8 True True mt)
+  where bad msg = OutError (takeFileName path ++ ": " ++ msg)
+
 -- Apply a load outcome to the editor via the matching pure installer.
 applyOutcome :: (FilePath -> LoadResult -> Editor -> Editor)
              -> (FilePath -> [(Image, Int)] -> Editor -> Editor)
@@ -1549,9 +1616,11 @@ applyOutcome :: (FilePath -> LoadResult -> Editor -> Editor)
 applyOutcome installText installImage o ed = case o of
   OutText p lr  -> installText p lr ed
   OutImage p im -> installImage p im ed
-  -- Paged documents have no "already open" subtlety worth a second installer:
-  -- they are read-only, so switching to an open copy is the only sane result.
+  -- Paged and PDF documents have no "already open" subtlety worth a second
+  -- installer: both are read-only, so switching to an open copy is the only
+  -- sane result.
   OutPaged pg   -> pagerLoadedNew pg ed
+  OutPdf p pd   -> pdfLoadedNew p pd ed
   OutError msg  -> setError msg ed
 
 -- Open a path synchronously (used at startup and for Revert). The interactive
@@ -1575,13 +1644,14 @@ asyncThresholdBytes = 2 * 1024 * 1024
 imageAsyncBytes :: Integer
 imageAsyncBytes = 64 * 1024
 
--- | Does this file start with an image magic number? One short read; used to
--- pick the async threshold, not to decide the format (that is 'classifyFile').
-looksLikeImage :: FilePath -> IO Bool
-looksLikeImage path = do
-  r <- try (withBinaryFile path ReadMode (\h -> BS.hGet h 16))
+-- | Does this file open into a view that has to *decode* it (an image, a PDF)
+-- rather than simply read it? Those pay for their content, not their size,
+-- so they cross to the background loader at a much lower threshold.
+looksLikeDecoded :: FilePath -> IO Bool
+looksLikeDecoded path = do
+  r <- try (withBinaryFile path ReadMode (\h -> BS.hGet h 1024))
          :: IO (Either SomeException BS.ByteString)
-  pure (either (const False) (isJust . sniffImage) r)
+  pure (either (const False) (\bs -> isJust (sniffImage bs) || Pdf.sniffPdf bs) r)
 
 -- List a directory for the file browser as (fullPath, isDirectory, size) tuples
 -- (size is Nothing for directories). Unreadable directories yield an empty

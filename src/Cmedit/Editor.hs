@@ -47,6 +47,15 @@ module Cmedit.Editor
   , rtfHeight
   , isRtfPath
   , isRtfFile
+    -- * PDF reading view
+  , PdfDoc(..)
+  , pdfLoaded
+  , pdfLoadedNew
+  , addPdfDocument
+  , refreshPdf
+  , pdfActive
+  , pdfHeight
+  , isArchivePath
   , refreshImage
   , imageCrop
   , imageAnim
@@ -238,6 +247,8 @@ import Cmedit.Pager (PagerDoc(..))
 import qualified Cmedit.Pager as Pg
 import Cmedit.Rtf (RtfDoc(..))
 import qualified Cmedit.Rtf as Rtf
+import Cmedit.Pdf (PdfDoc(..))
+import qualified Cmedit.Pdf as Pdf
 import Cmedit.TextBuffer
 import Cmedit.Width (colToDisplay, displayToCol, wrapLine)
 import Cmedit.ConfigFile
@@ -378,6 +389,98 @@ handleRtfKey key rd ed = case key of
     readOnlyNote =
       noEff ed { edStatus = "Formatted view is read-only \x2014 Alt+T edits the RTF markup" }
 
+-- | Keys in the PDF reading view. A reader's view like the formatted RTF one,
+-- with the addition PDF brings and no other view has: the document is divided
+-- into pages, so it can be navigated by them ('[' and ']', and Go To, which
+-- means \"page\" here rather than \"line\").
+handlePdfKey :: Key -> PdfDoc -> Editor -> (Editor, [Effect])
+handlePdfKey key pd ed = case key of
+  -- Plain movement scrolls the *window*, which is what this view is for; it
+  -- deliberately leaves any selection alone, so you can scroll to see the
+  -- rest of what you highlighted. Shift+movement moves the caret and extends
+  -- the selection, the way it does everywhere else.
+  KArrow d m | hasShift m -> extend (arrowMove d)
+  KArrow DDown _  -> scroll 1
+  KArrow DUp _    -> scroll (-1)
+  KArrow DLeft _  -> noEff ed
+  KArrow DRight _ -> noEff ed
+  KPageDown m | hasShift m -> extend (pageMove h)
+  KPageUp m   | hasShift m -> extend (pageMove (-h))
+  KPageDown _     -> scroll h
+  KPageUp _       -> scroll (-h)
+  KHome m | hasShift m, hasCtrl m -> extend Pdf.pdfCaretTop
+          | hasShift m            -> extend Pdf.pdfCaretHome
+  KEnd m  | hasShift m, hasCtrl m -> extend Pdf.pdfCaretBottom
+          | hasShift m            -> extend Pdf.pdfCaretEnd
+  KHome _         -> go (Pdf.pdfGoTop pd)
+  KEnd _          -> go (Pdf.pdfGoBottom h pd)
+  KChar ']'       -> go (Pdf.pdfNextPage h pd)
+  KChar '['       -> go (Pdf.pdfPrevPage h pd)
+  KChar 'n'       -> go (Pdf.pdfNextPage h pd)
+  KChar 'p'       -> go (Pdf.pdfPrevPage h pd)
+  -- Esc drops the selection (there is nothing else for it to cancel here).
+  KEsc | isJust (Pdf.pdfSelection pd) -> go (Pdf.pdfClearSel pd)
+  KMouse me
+    | meButton me == MBWheelDown -> scroll 3
+    | meButton me == MBWheelUp   -> scroll (-3)
+    | otherwise -> noEff (handlePdfMouse me pd ed)
+  -- Nothing here is editable: there is no buffer under this view at all.
+  KChar _     -> readOnlyNote
+  KEnter      -> readOnlyNote
+  KModEnter   -> readOnlyNote
+  KBackspace  -> readOnlyNote
+  KDelete _   -> readOnlyNote
+  KTab        -> readOnlyNote
+  KBackTab    -> readOnlyNote
+  KPaste _    -> readOnlyNote
+  _           -> handleEditKey key ed
+  where
+    h = max 1 (pdfHeight ed)
+    go pd' = noEff ed { edPdf = Just pd' }
+    scroll d = go (Pdf.pdfScroll h d pd)
+    -- A caret move brings the window with it, since the point of moving the
+    -- caret is to see where it went.
+    extend f = go (Pdf.pdfScrollToCaret h (Pdf.pdfExtendTo f pd))
+    arrowMove d = case d of
+      DUp    -> Pdf.pdfCaretUp
+      DDown  -> Pdf.pdfCaretDown
+      DLeft  -> Pdf.pdfCaretLeft
+      DRight -> Pdf.pdfCaretRight
+    pageMove n p = iterate (if n < 0 then Pdf.pdfCaretUp else Pdf.pdfCaretDown) p !! abs n
+    readOnlyNote = noEff ed { edStatus = "PDF view is read-only \x2014 [ and ] turn the page" }
+
+-- | Mouse in the PDF view: select text to copy out of it.
+--
+-- Press, drag and release are the text view's ('mouseText'), and for the same
+-- reasons — double-click takes a word, triple-click a line, and
+-- 'edMouseSelecting' is set for the duration so the chrome's mouse guards
+-- (\"not while a selection drag is in progress\") hold off. What is different
+-- is that a plain click does *not* leave a caret behind: with no selection
+-- this view shows no cursor, so a stray click should leave no trace.
+handlePdfMouse :: MouseEvent -> PdfDoc -> Editor -> Editor
+handlePdfMouse me pd ed
+  | mePressed me && not (meDrag me) =
+      case meClicks me of
+        n | n >= 3    -> put (uncurry Pdf.pdfSelectRange (Pdf.pdfLineRange pos pd) pd)
+          | n == 2    -> put (uncurry Pdf.pdfSelectRange (Pdf.pdfWordRange pos pd) pd)
+          -- Shift+click extends the selection that is already there.
+          | hasShift (meMods me), isJust (pdAnchor pd) ->
+              put (pd { pdCaret = Pdf.pdfClampPos pd pos })
+          | otherwise ->
+              (put (Pdf.pdfSelectRange pos pos pd)) { edMouseSelecting = True }
+  | meDrag me && edMouseSelecting ed = put pd { pdCaret = Pdf.pdfClampPos pd pos }
+  -- Release: a click that never moved leaves anchor == caret, which reads as
+  -- no selection; drop the anchor so no cursor is drawn for it.
+  | otherwise =
+      (put (if isJust (Pdf.pdfSelection pd) then pd else Pdf.pdfClearSel pd))
+        { edMouseSelecting = False }
+  where
+    lo = computeLayout ed
+    pos = Pdf.pdfPosAtCell (tabWidthOf ed)
+            (pdTop pd + (meRow me - loTextTop lo))
+            (meCol me - loTextLeft lo) pd
+    put pd' = ed { edPdf = Just pd' }
+
 -- | Attach a window-fill request to a paged-view result, if the viewport has
 -- moved off what is loaded. The read is a seek plus a few screens, so it
 -- resolves within the same event-loop iteration, before the frame is drawn.
@@ -444,9 +547,9 @@ pruneEntries ed = map (relabelEntry ed)
     dropNextProblem es
       | nextProblemAvailable ed = es
       | otherwise = filter (\e -> case e of MEItem _ _ MANextProblem -> False; _ -> True) es
-    -- Line ending / BOM are meaningless for a read-only image.
+    -- Line ending / BOM are meaningless for a read-only image or a PDF.
     dropFileProps es
-      | isJust (edImage ed) || isJust (edPager ed) = tidySeps (filter keep es)
+      | isJust (edImage ed) || isJust (edPager ed) || isJust (edPdf ed) = tidySeps (filter keep es)
       | otherwise = es
       where keep (MEItem _ _ a) = a `notElem` [MACycleLineEnding, MAToggleBom]
             keep MESep          = True
@@ -455,7 +558,7 @@ pruneEntries ed = map (relabelEntry ed)
     -- hide the whole group there.
     dropLineOps es
       | isJust (edCsv ed) || isJust (edImage ed) || isJust (edPager ed)
-        || isJust (edRtf ed) = tidySeps (filter keep es)
+        || isJust (edRtf ed) || isJust (edPdf ed) = tidySeps (filter keep es)
       | otherwise = es
       where keep (MEItem _ _ a) = a `notElem` lineOpActions
             keep MESep          = True
@@ -465,12 +568,14 @@ pruneEntries ed = map (relabelEntry ed)
     -- In the read-only image view there is no text to search: drop the in-file
     -- Find / Replace / Go to Line entries (workspace Find/Replace in Files stay).
     dropImageFind es
-      | isJust (edImage ed) || isJust (edPager ed) || isJust (edRtf ed) =
+      | isJust (edImage ed) || isJust (edPager ed) || isJust (edRtf ed)
+        || isJust (edPdf ed) =
           let es' = filter keep es
           in if length es' == length es then es else tidySeps es'
       | otherwise = es
       where disabled | isJust (edPager ed) = pagerDisabledFind
                      | isJust (edRtf ed)   = rtfDisabledActions
+                     | isJust (edPdf ed)   = pdfDisabledActions
                      | otherwise           = imageDisabledFind
             keep (MEItem _ _ a) = a `notElem` disabled
             keep MESep          = True
@@ -484,7 +589,8 @@ pruneEntries ed = map (relabelEntry ed)
       | otherwise = filter (\e -> case e of MEItem _ _ MACloseFolder -> False; _ -> True) es
     -- In the table view, and in the formatted RTF view (which does its own
     -- wrapping and has no gutter), the text-rendering toggles do nothing.
-    dropToggles es = if isJust (edCsv ed) || isJust (edRtf ed) then dropTextToggles es else es
+    dropToggles es = if isJust (edCsv ed) || isJust (edRtf ed) || isJust (edPdf ed)
+                       then dropTextToggles es else es
     dropDelete es
       | isJust (getSelection ed) = es
       | otherwise = filter (\e -> case e of MEItem _ _ MADelete -> False; _ -> True) es
@@ -516,6 +622,25 @@ imageDisabledFind = [MAFind, MAFindNext, MAFindPrev, MAReplace, MAGoToLine, MAGo
 pagerDisabledFind :: [MenuAction]
 pagerDisabledFind = [MAFind, MAFindNext, MAFindPrev, MAReplace, MAGoToDef, MAGoToBracket, MANextProblem]
 
+-- | Actions that make no sense in the PDF reading view.
+--
+-- Note what is /not/ here. Find, Find Next/Previous, Copy and Select All all
+-- work: the view has its own selection over the laid-out text and its own
+-- matcher over the same lines (`pdfFindWith`), because looking something up
+-- and pasting the answer elsewhere is most of what a PDF gets opened for.
+-- Go To is reinterpreted as \"go to page\" (see 'gotoLine'). What is left out
+-- is everything that would have to *write*: there is no buffer under this
+-- view, so Cut, Paste, Delete and Replace have nothing to act on. Go to
+-- Definition and the diagnostics jump want a source file, and bracket
+-- matching wants the file's own text rather than a reflow of it.
+pdfDisabledActions :: [MenuAction]
+pdfDisabledActions =
+  [ MAReplace, MAGoToDef, MAGoToBracket, MANextProblem
+  , MACut, MAPaste, MADelete
+  -- Undo and Redo stay for the RTF view, whose buffer is live and whose
+  -- edits are real; here there is no buffer for them to move at all.
+  , MAUndo, MARedo ]
+
 -- | Actions that make no sense while the formatted RTF view is showing.
 --
 -- Everything here addresses the /buffer/ — the markup — through a cursor and
@@ -533,6 +658,10 @@ rtfDisabledActions =
 -- Rewrite value-carrying menu labels to show the document's current setting.
 relabelEntry :: Editor -> MenuEntry -> MenuEntry
 relabelEntry ed e = case e of
+  -- One action, two meanings: in the PDF view Go To takes a page number (see
+  -- 'gotoLine'), so the menu has to say so — the dialog already does.
+  MEItem _ acc MAGoToLine | isJust (edPdf ed) ->
+    MEItem "&Go to Page\x2026" acc MAGoToLine
   MEItem _ acc MACycleLineEnding ->
     MEItem (T.pack ("Line E&ndings: " ++ eolName (edLineEnding ed))) acc MACycleLineEnding
   MEItem _ acc MAToggleBom ->
@@ -611,6 +740,10 @@ runAction a ed0 =
      -- inert while the formatted view is showing, not just the pruned menu.
      else if isJust (edRtf ed) && a `elem` rtfDisabledActions
        then noEff ed { edStatus = "Not available in the formatted view \x2014 Alt+T edits the RTF markup" }
+     else if isJust (edPdf ed) && a `elem` pdfDisabledActions
+       then noEff ed { edStatus = "Not available in the PDF view" }
+     else if isJust (edPdf ed) && a `elem` [MASave, MASaveAll, MARevert]
+       then noEff ed { edStatus = "A PDF is open read-only \x2014 this view cannot write one" }
      else case a of
        MANew        -> noEff (newFileFlow ed)
        MAOpen       -> openBrowser ed
@@ -802,7 +935,13 @@ update key ed =
   -- workspace replace lands from the driver, ...). Both checks inside
   -- 'refreshRtf' are O(1) when nothing changed — a pointer comparison and an
   -- Int comparison — and it is a no-op when the view is not showing.
-  let (ed', effs) = fmapEd refreshRtf (dispatchKey key ed)
+  --
+  -- 'refreshPdf' rides along for a narrower reason: nothing can edit a PDF, so
+  -- only the *width* it was laid out for can move under it — but that width
+  -- has more sources than the handful of sites that call 'relayout' (turning
+  -- the scrollbar off in Settings changes it by a column). Its cache key
+  -- comparison is as cheap, so it goes here rather than being chased.
+  let (ed', effs) = fmapEd (refreshPdf . refreshRtf) (dispatchKey key ed)
   -- When a menu has just been opened, refresh the active file's stale-on-disk
   -- flag so the File menu can offer Revert if the file changed underneath us.
   in case edPath ed' of
@@ -876,14 +1015,17 @@ dispatchKey key ed = case edFocus ed of
   FEdit | Just idoc <- edImage ed -> handleImageKey key idoc ed
   FEdit | Just pg <- edPager ed    -> handlePagerKey key pg ed
         | Just rd <- edRtf ed      -> handleRtfKey key rd ed
+        | Just pd <- edPdf ed      -> handlePdfKey key pd ed
   FEdit    -> case edCsv ed of
                 Just v  -> handleCsvKey key v ed
                 Nothing -> handleEditKey key ed
 
 -- | Handle a terminal resize: record the new size and re-clamp scrolling. The
--- image view re-scales to the new size (its render cache is keyed by size).
+-- image view re-scales to the new size, and the reflowing views (RTF, PDF)
+-- re-wrap to the new width — all three are keyed on the size, so this is a
+-- comparison when nothing moved.
 resize :: (Int, Int) -> Editor -> Editor
-resize size ed = refreshRtf (refreshImage (ensureVisible ed { edSize = size }))
+resize size ed = refreshPdf (refreshRtf (refreshImage (ensureVisible ed { edSize = size })))
 
 ------------------------------------------------------------------------------
 -- Edit-mode key handling
@@ -1449,7 +1591,9 @@ scrollBarTo row ed = case scrollBarInfo ed of
            -- scrolls its own laid-out rows, not the buffer's lines.
            Nothing -> case edRtf ed of
              Just rd -> ed { edRtf = Just (Rtf.rtfClamp (rtfHeight ed) rd { rdTop = target }) }
-             Nothing -> scrollLine (target - edTop ed) ed
+             Nothing -> case edPdf ed of
+               Just pd -> ed { edPdf = Just (Pdf.pdfClamp (pdfHeight ed) pd { pdTop = target }) }
+               Nothing -> scrollLine (target - edTop ed) ed
 
 -- A left press on the horizontal scrollbar row, while a bar is showing.
 hScrollBarPress :: Editor -> MouseEvent -> Bool

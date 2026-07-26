@@ -51,6 +51,8 @@ import Cmedit.Link (filePathUri, urlSpans, urlSpansIn)
 import Cmedit.Pager (PagerDoc(..))
 import qualified Cmedit.Pager as Pg
 import Cmedit.Rtf (RtfDoc(..), RtfLine(..), RtfFmt(..))
+import qualified Cmedit.Pdf as Pdf
+import Cmedit.Pdf (PdfDoc(..), PdfLine(..), PdfFmt(..))
 import qualified Cmedit.Rtf as Rtf
 import qualified Cmedit.Csv as Csv
 import Cmedit.ConfigFile (ThemeName(..))
@@ -828,7 +830,9 @@ renderEditor ed = runST $ do
         Just pg -> drawPager th ed pg lo arr
         Nothing -> case edRtf ed of
           Just rd -> drawRtf th ed rd lo arr
-          Nothing -> maybe (drawTextArea th ed lo arr) (\v -> drawCsvTable th ed v lo arr) (edCsv ed)
+          Nothing -> case edPdf ed of
+            Just pd -> drawPdf th ed pd lo arr
+            Nothing -> maybe (drawTextArea th ed lo arr) (\v -> drawCsvTable th ed v lo arr) (edCsv ed)
   maybe (pure ()) (drawVScroll th arr cols rows) (scrollBarInfo ed)
   maybe (pure ()) (drawHScroll th arr cols rows ed lo) (loHBarRow lo)
   when (isJust (edExplorer ed)) $ drawExplorer th ed lo arr
@@ -858,7 +862,8 @@ renderEditor ed = runST $ do
 -- 'scrollPlan' verifies content before scrolling, so the hint stays valid.
 scrollHintFor :: Editor -> Layout -> Maybe ScrollHint
 scrollHintFor ed lo
-  | edSearchMode ed || isJust (edImage ed) || isJust (edCsv ed) || edWordWrap ed = Nothing
+  | edSearchMode ed || isJust (edImage ed) || isJust (edCsv ed) || isJust (edPdf ed)
+      || edWordWrap ed = Nothing
   | loTextHeight lo < 4 = Nothing
   | otherwise = Just ScrollHint
       { shTop    = loTextTop lo
@@ -1167,6 +1172,64 @@ legibleOn dark col = case col of
                 `div` (1000 :: Int)
     in if dark then lum >= 60 else lum <= 205
   _ -> True
+
+-- | The PDF reading view. Identical in shape to 'drawRtf' — "Cmedit.Pdf" has
+-- already wrapped, indented and aligned every line for this width, so all
+-- that is left is to place styled cells through the same
+-- 'expandLineCellsFrom' the plain text view uses. Page boundaries draw as a
+-- rule, the way an RTF page break does.
+drawPdf :: Theme -> Editor -> PdfDoc -> Layout -> Surf s -> ST s ()
+drawPdf th ed pd lo arr = do
+  let cols = loCols lo; rows = loRows lo
+      tabw = tabWidthOf ed
+      ls   = Pdf.pdfLines pd
+      sel  = Pdf.pdfSelection pd
+  forM_ [0 .. loTextHeight lo - 1] $ \row -> do
+    let li = pdTop pd + row
+        sr = loTextTop lo + row
+    case Seq.lookup li ls of
+      Nothing -> pure ()
+      Just l
+        | plRule l ->
+            drawStr arr cols rows sr (loTextLeft lo) (thGutter th)
+              (replicate (loTextWidth lo) '\x2500')
+        | otherwise -> do
+            -- The selection and the live find highlights come from the same
+            -- two mechanisms the text view uses, over this view's own
+            -- coordinates: laid-out line and character index.
+            let baseAt = pdfBaseAt th (plSpans l)
+                (selRange, selEOL) = case lineSelInterval sel li (T.length (plText l)) of
+                  Just (a, b, eol) -> (Just (a, b), eol)
+                  Nothing          -> (Nothing, False)
+                overlays = [ (a, b, thFindMatch th) | (a, b) <- liveMatchSpans ed (plText l) ]
+                cells  = expandLineCells tabw False baseAt (thSelection th) (thWhitespace th)
+                           selRange selEOL overlays []
+                           (urlLinksIn 0 (T.length (plText l)) (plText l))
+                           (plText l)
+                x0 = loTextLeft lo + plPad l
+            forM_ (takeWhile (\(d, _) -> plPad l + d < loTextWidth lo) cells) $ \(d, cell) ->
+              putCell arr cols rows sr (x0 + d) cell
+
+-- A per-character base-style lookup over a laid-out PDF line's formatting
+-- runs; 'rtfBaseAt' for the PDF view, and linear for the same reason.
+pdfBaseAt :: Theme -> [(Int, Int, PdfFmt)] -> (Int -> Style)
+pdfBaseAt th spans = \i ->
+  case [ f | (s, e, f) <- spans, i >= s, i < e ] of
+    (f : _) -> pdfStyle th f
+    []      -> thText th
+
+-- Map PDF character formatting onto a terminal style. Colour is deliberately
+-- not carried across (see 'rtfStyle' for what honouring a document's own
+-- colours costs); weight and slope are, and a monospaced run is dimmed the
+-- way a code listing reads on a page.
+pdfStyle :: Theme -> PdfFmt -> Style
+pdfStyle th f = base { styleAttr = styleAttr base .|. attrs }
+  where
+    base = thText th
+    attrs = foldr (\(on, a) acc -> if on then a .|. acc else acc) attrNone
+      [ (pfBold f,   attrBold)
+      , (pfItalic f, attrItalic)
+      ]
 
 -- Does the resolved theme paint light text on a dark ground?
 isDarkTheme :: ThemeName -> Bool
@@ -1546,6 +1609,9 @@ drawHints th ed lo arr = do
          [ ("\x2191\x2193", "Move"), ("\x21b5", "Open"), ("Ins", "New")
          , ("F2", "Rename"), ("Del", "Delete"), (".", "Hidden")
          , ("^B", "Editor"), ("F10", "Menu") ]
+       | isJust (edPdf ed) =
+         [ ("[ ]", "Page"), ("^G", "GoToPage"), ("^F", "Find"), ("F3", "FindNext")
+         , ("^C", "Copy"), ("^O", "Open"), ("^Q", "Quit"), ("F10", "Menu") ]
        | otherwise = case edImage ed of
        Just _ ->
          [ ("a", "ASCII/Colour"), ("^O", "Open"), ("^W", "Close")
@@ -1914,6 +1980,8 @@ fileKind path
       TOML     -> FKData
       INI      -> FKData
       CSV      -> FKData
+      -- An archive is no longer a blob we refuse: it opens as its listing.
+      Archive  -> FKData
       _        -> FKCode
   | S.binaryExtension path                = FKBinary
   | otherwise                             = FKPlain
@@ -2463,6 +2531,19 @@ computeCursor ed lo = case edFocus ed of
   -- view ever grows a text selection to copy from, that selection — not the
   -- buffer's cursor — is what would want showing here.)
   FEdit | isJust (edRtf ed) -> Nothing
+  -- The PDF view has no buffer for a cursor to sit in — but it does have a
+  -- selection, and while one is being made the caret is the one thing on
+  -- screen worth pointing at. With no selection it goes back to having no
+  -- position at all, so no cursor is shown.
+  FEdit | Just pd <- edPdf ed ->
+    case pdAnchor pd of
+      Nothing -> Nothing
+      Just _ ->
+        let Pos l _ = pdCaret pd
+            sr = loTextTop lo + (l - pdTop pd)
+            sc = loTextLeft lo + Pdf.pdfCellOfPos (tabWidthOf ed) (pdCaret pd) pd
+        in if sr >= loTextTop lo && sr < loTextTop lo + loTextHeight lo && sc < loCols lo
+             then Just (sr, sc) else Nothing
   FEdit | Just v <- edCsv ed -> csvCursor ed v lo
   FEdit | edWordWrap ed ->
     let Pos l c = edCursor ed

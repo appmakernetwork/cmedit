@@ -49,17 +49,19 @@ import Cmedit.Syntax (HlCache, CommentSyntax(..), langComment, langForPath)
 import Cmedit.History (pushHist)
 import Cmedit.Pager (PagerDoc(..))
 import Cmedit.Rtf (RtfDoc(..))
+import Cmedit.Pdf (PdfDoc(..))
+import qualified Cmedit.Pdf as Pdf
 import qualified Cmedit.Rtf as Rtf
 import qualified Cmedit.Pager as Pg
 import Cmedit.EditorState
 import Cmedit.EditorEdit
 
 
--- Re-clamp scrolling / re-scale an image / re-wrap the formatted RTF view
--- after a layout change (e.g. the panel width or collapse state changed,
+-- Re-clamp scrolling / re-scale an image / re-wrap the formatted RTF and PDF
+-- views after a layout change (e.g. the panel width or collapse state changed,
 -- which shifts the text area).
 relayout :: Editor -> Editor
-relayout = refreshRtf . refreshImage . ensureVisible
+relayout = refreshPdf . refreshRtf . refreshImage . ensureVisible
 
 ------------------------------------------------------------------------------
 -- Files / lifecycle
@@ -91,7 +93,7 @@ setLoaded path lr ed =
         , edFocus = FEdit, edDialog = Nothing, edSearchMode = False
         , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
         , edCsv = Nothing, edCsvStash = Nothing
-        , edImage = Nothing, edRtf = Nothing
+        , edImage = Nothing, edRtf = Nothing, edPdf = Nothing
         , edDiags = []                        -- a reloaded file's stale diags must not survive
         , edEditSeq = edEditSeq ed + 1         -- fresh buffer: the driver must re-lint (also covers Revert)
         }
@@ -215,6 +217,92 @@ refreshRtf ed = case edRtf ed of
     in ed { edRtf = Just (Rtf.rtfRelayout (tabWidthOf ed) (loTextWidth lo)
                             (loTextHeight lo) rd1) }
 
+------------------------------------------------------------------------------
+-- PDF reading view (read-only). Structured like the image view, not like the
+-- RTF one: a PDF is binary, so there is no buffer under it to toggle to and
+-- nothing that Save could write. The extracted model arrives from the driver
+-- already parsed (it is the expensive part) and is laid out here, against the
+-- window width, the first time it is shown.
+
+-- | Install a parsed PDF as the active document.
+pdfLoaded :: FilePath -> PdfDoc -> Editor -> Editor
+pdfLoaded path pd ed = touchRecent path $ refreshPdf $ ensureVisible ed
+  { edBuffer = emptyBuffer, edSavedBuffer = emptyBuffer
+  , edCursor = origin, edSelAnchor = Nothing, edDesiredCol = 0
+  , edTop = 0, edLeft = 0
+  , edPath = Just path, edModified = False
+  , edDiskMtime = Nothing, edDiskChanged = False
+  , edLineEnding = LF, edSavedEol = LF, edEncoding = Utf8, edSavedEnc = Utf8
+  , edFinalNewline = True
+  , edReadOnly = True
+  , edUndo = Seq.empty, edRedo = Seq.empty, edLastEdit = EKNone
+  , edStatus = T.pack ("Viewing " ++ takeFileName path ++ "  "
+                ++ show (Pdf.pdfPageCount pd) ++ " page" ++ plural (Pdf.pdfPageCount pd)
+                ++ (if T.null (pdNote pd) then "" else "  \x2014 " ++ T.unpack (pdNote pd))
+                ++ "  \x2014 read-only")
+    -- Same rule as the image and paged views: an open from the explorer panel
+    -- keeps its focus, because a read-only view has no keystroke editing to
+    -- receive it.
+  , edFocus = if edFocus ed == FExplorer then FExplorer else FEdit
+  , edDialog = Nothing, edSearchMode = False
+  , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
+  , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edRtf = Nothing
+  , edPager = Nothing
+  , edPdf = Just pd
+  , edHlCache = Nothing, edDiags = []
+  }
+
+-- | Open a parsed PDF as a new document (reusing a pristine empty buffer if
+-- present), mirroring 'setLoadedNew' for text.
+pdfLoadedNew :: FilePath -> PdfDoc -> Editor -> Editor
+pdfLoadedNew path pd ed = case switchToOpen path ed of
+  Just ed'
+    | edFocus ed == FExplorer -> ed' { edFocus = FExplorer }
+    | otherwise               -> ed'
+  Nothing
+    | isPristine ed -> pdfLoaded path pd ed
+    | otherwise     -> pdfLoaded path pd ed { edBefore = edBefore ed ++ [captureDoc ed] }
+
+-- | Append a PDF to the open-files list (startup, 2nd+ file).
+addPdfDocument :: FilePath -> PdfDoc -> Editor -> Editor
+addPdfDocument path pd ed =
+  touchRecent path ed { edAfter = edAfter ed ++ [pdfDocSnapshot path pd] }
+
+pdfDocSnapshot :: FilePath -> PdfDoc -> Document
+pdfDocSnapshot path pd = Document
+  { docBuffer = emptyBuffer, docSavedBuffer = emptyBuffer, docCursor = origin
+  , docSelAnchor = Nothing, docDesiredCol = 0, docTop = 0, docLeft = 0
+  , docPath = Just path, docModified = False
+  , docDiskMtime = Nothing, docDiskChanged = False
+  , docLineEnding = LF, docSavedEol = LF, docEncoding = Utf8, docSavedEnc = Utf8
+  , docFinalNewline = True, docReadOnly = True
+  , docUndo = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone, docOverwrite = False
+  , docDiscard = False, docCsv = Nothing, docCsvStash = Nothing
+  , docImage = Nothing, docRtf = Nothing, docPager = Nothing
+  , docPdf = Just pd
+  , docHlCache = Nothing
+  , docDiags = []
+  }
+
+-- | Re-lay-out the PDF view when the width it was laid out for has moved (a
+-- resize, the explorer panel opening). Mirrors 'refreshRtf' and
+-- 'refreshImage': a comparison per keystroke, real work only when the cache
+-- key changes. There is no staleness check to make — nothing can edit a PDF
+-- document, so the extracted pages never move under the layout.
+refreshPdf :: Editor -> Editor
+refreshPdf ed = case edPdf ed of
+  Nothing -> ed
+  Just pd ->
+    let lo = computeLayout ed
+    in ed { edPdf = Just (Pdf.pdfRelayout (tabWidthOf ed) (loTextWidth lo)
+                            (loTextHeight lo) pd) }
+
+-- | Jump the reading view to a page (the Go To command in this mode).
+pdfGoToPageIn :: Int -> Editor -> Editor
+pdfGoToPageIn n ed = case edPdf ed of
+  Nothing -> ed
+  Just pd -> ed { edPdf = Just (Pdf.pdfGoToPage (pdfHeight ed) n pd), edStatus = "" }
+
 -- Capture the active document fields into a saveable 'Document'.
 captureDoc :: Editor -> Document
 captureDoc ed = Document
@@ -232,13 +320,14 @@ captureDoc ed = Document
   , docImage = edImage ed
   , docPager = edPager ed
   , docRtf = edRtf ed
+  , docPdf = edPdf ed
   , docHlCache = edHlCache ed
   , docDiags = edDiags ed
   }
 
 -- Make a saved 'Document' the active one.
 restoreDoc :: Document -> Editor -> Editor
-restoreDoc d ed = refreshRtf $ refreshImage $ ensureVisible ed
+restoreDoc d ed = refreshPdf $ refreshRtf $ refreshImage $ ensureVisible ed
   { edBuffer = docBuffer d, edSavedBuffer = docSavedBuffer d, edCursor = docCursor d, edSelAnchor = docSelAnchor d
   , edDesiredCol = docDesiredCol d, edTop = docTop d, edLeft = docLeft d
   , edPath = docPath d, edModified = docModified d
@@ -253,6 +342,7 @@ restoreDoc d ed = refreshRtf $ refreshImage $ ensureVisible ed
   , edImage = docImage d
   , edPager = docPager d
   , edRtf = docRtf d
+  , edPdf = docPdf d
   , edHlCache = docHlCache d
   , edDiags = docDiags d
   , edFocus = FEdit, edDialog = Nothing, edSearchMode = False
@@ -368,6 +458,7 @@ docFromLoad seqNow path lr = Document
   , docCsvStash = Nothing
   , docImage = Nothing
   , docPager = Nothing
+  , docPdf = Nothing
   , docHlCache = Nothing
   , docDiags = []
   , docCsv = if isCsvPath path
@@ -449,6 +540,7 @@ pagerLoaded pg ed = touchRecent (pgPath pg) ed
   , edDialog = Nothing, edSearchMode = False
   , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
   , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edRtf = Nothing
+  , edPdf = Nothing
   , edPager = Just pg
   , edHlCache = Nothing, edDiags = []
   }
@@ -498,7 +590,7 @@ imageDocSnapshot path frames = Document
   , docUndo = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone, docOverwrite = False
   , docDiscard = False, docCsv = Nothing, docCsvStash = Nothing
   , docImage = Just (mkImageDoc frames)
-  , docPager = Nothing, docRtf = Nothing
+  , docPager = Nothing, docRtf = Nothing, docPdf = Nothing
   , docHlCache = Nothing
   , docDiags = []
   }
@@ -517,7 +609,7 @@ pagerDocSnapshot pg = Document
   , docFinalNewline = True, docReadOnly = True
   , docUndo = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone, docOverwrite = False
   , docDiscard = False, docCsv = Nothing, docCsvStash = Nothing
-  , docImage = Nothing, docRtf = Nothing
+  , docImage = Nothing, docRtf = Nothing, docPdf = Nothing
   , docPager = Just pg
   , docHlCache = Nothing
   , docDiags = []
@@ -870,6 +962,7 @@ doNew ed = ensureVisible ed
   , edStatus = "New file", edFocus = FEdit, edDialog = Nothing, edSearchMode = False
   , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
   , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edRtf = Nothing
+  , edPdf = Nothing
   }
 
 -- | Open the built-in manual ("Cmedit.Manual") as a read-only Markdown
@@ -898,6 +991,7 @@ openManual ed0 = case findOpenIndex manualPath ed of
          , edFocus = FEdit, edDialog = Nothing, edSearchMode = False
          , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
          , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edRtf = Nothing
+         , edPdf = Nothing
          }
   where
     ed = pushNavIfFar (Just manualPath) origin ed0
@@ -930,11 +1024,23 @@ saveAsDialogFlow :: Editor -> Editor
 saveAsDialogFlow ed = openDialog (mkSaveAs (T.pack (seed (edPath ed)))) ed
   where
     -- The manual's pseudo-path is not writable; offer a plain filename instead.
-    seed (Just p) | p == manualPath = takeFileName manualPath
-                  | otherwise       = p
+    -- An archive's buffer is its listing, not its bytes ("Cmedit.Zip"), so
+    -- seeding its own path would offer to replace the archive with a
+    -- description of itself — and Save As does not ask before overwriting.
+    seed (Just p) | p == manualPath  = takeFileName manualPath
+                  | isArchivePath p  = p ++ ".txt"
+                  | otherwise        = p
     seed Nothing  = ""
 
 gotoLine :: Text -> Editor -> Editor
+-- A PDF is divided into pages, so this is where a reader wants to go: the
+-- dialog is titled "Go to Page" in this mode ('openGoTo') and the number is
+-- read as one. Laid-out row numbers move with the window width and would mean
+-- nothing to anyone.
+gotoLine t ed | isJust (edPdf ed) =
+  case reads (T.unpack (T.strip t)) :: [(Int, String)] of
+    ((n, _) : _) -> pdfGoToPageIn n ed
+    _ -> ed { edStatus = "Invalid page number" }
 -- In the paged view there is no buffer to move a cursor in: jump the viewer
 -- instead. This is the one in-file navigation the paged view does support, and
 -- the reason it exists — "show me line 4 million of this log".
@@ -961,7 +1067,7 @@ openPathsList = mapMaybe docPath . allOpenDocs
 -- pending action so it also works after an async (large-file) load completes.
 applyPendingJump :: Editor -> Editor
 applyPendingJump ed = case edPendingJump ed of
-  Just (p, l, c, len) | edPath ed == Just p, isNothing (edImage ed) ->
+  Just (p, l, c, len) | edPath ed == Just p, isNothing (edImage ed), isNothing (edPdf ed) ->
     let buf = edBuffer ed
         a = clampPos (Pos l c) buf
         b = clampPos (Pos l (c + len)) buf

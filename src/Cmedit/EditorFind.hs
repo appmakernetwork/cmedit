@@ -39,6 +39,8 @@ import Cmedit.QuickOpen (QuickOpen(..))
 import qualified Cmedit.QuickOpen as Q
 import qualified Cmedit.Regex as Rx
 import Cmedit.Csv (CsvView(..))
+import Cmedit.Pdf (PdfDoc(..))
+import qualified Cmedit.Pdf as Pdf
 import qualified Cmedit.Csv as Csv
 import Cmedit.About (aboutCanvasH, aboutCanvasMinW, aboutTotalFrames)
 import Cmedit.Clipboard (CopyOutcome(..))
@@ -86,6 +88,12 @@ openReplace ed = refreshFindCount (openDialog (mkReplace (findSeed ed) (edReplac
 -- outlive the document — an undetached slice would pin its whole file.
 findSeed :: Editor -> Text
 findSeed ed
+  -- The PDF view's selection is its own; seeding from it is what makes
+  -- "highlight a term, press Ctrl+F" work there too.
+  | Just pd <- edPdf ed
+  , let sel = detach (Pdf.pdfSelText pd)
+  , not (T.null sel), not (hasNewline sel) = sel
+  | isJust (edPdf ed) = edSearchTerm ed
   | Nothing <- edCsv ed
   , Just (a, b) <- getSelection ed = detach (textInRange a b (edBuffer ed))
   | otherwise = edSearchTerm ed
@@ -260,6 +268,12 @@ refreshFindCount ed = case edDialog ed of
 
 findCountMsg :: Editor -> Dialog -> Text
 findCountMsg ed d
+  | Just pd <- edPdf ed =
+      let ms = pdfAllMatches cs ww t pd
+      in if T.null t || hasNewline t then ""
+         else if null ms then "No matches"
+         else if length ms > matchCountCap then T.pack (show matchCountCap ++ "+ matches")
+         else T.pack (show (length ms) ++ " match" ++ (if length ms == 1 then "" else "es"))
   | isJust (edCsv ed) || T.null t || hasNewline t = ""
   | bufChars (edBuffer ed) > liveCountMaxChars = ""
   | n == 0 = "No matches"
@@ -292,6 +306,7 @@ matchOrdinalMsg a ed
 findAgain :: Bool -> Editor -> Editor
 findAgain forward ed
   | T.null (edSearchTerm ed) = openFind ed
+  | Just pd <- edPdf ed = pdfFindWith False forward ed pd
   | Just v <- edCsv ed = csvFindWith False forward ed v   -- search cells, advance
   | otherwise =
       let buf = edBuffer ed
@@ -304,9 +319,56 @@ findAgain forward ed
 -- Run a search and select the match (used when confirming the Find dialog).
 doFind :: Editor -> Editor
 doFind ed
+  | Just pd <- edPdf ed = pdfFindWith True True ed pd
   | Just v <- edCsv ed = csvFindWith True True ed v        -- search cells from current
   | otherwise = selectMatch
       (searchFrom (edSearchTerm ed) (edSearchCase ed) (edSearchWord ed) (edCursor ed) (edBuffer ed)) ed
+
+-- Search the laid-out PDF text and select the match.
+--
+-- The document being searched is the *reflowed* one on screen, which is the
+-- only text this view has and the only text a hit could be shown in — so a
+-- term that the original page broke across a line will not be found, exactly
+-- as it would not be in the wrapped text view. The scan is a linear walk of
+-- the laid-out lines from the caret, wrapping once, and the found range
+-- becomes the selection, so Find and copy-out compose: search for it, then
+-- Ctrl+C.
+pdfFindWith :: Bool -> Bool -> Editor -> PdfDoc -> Editor
+pdfFindWith inclusive forward ed pd =
+  case pick of
+    ((a, b) : _) ->
+      (ed { edPdf = Just (Pdf.pdfScrollToCaret (pdfHeight ed) (Pdf.pdfSelectRange a b pd)) })
+        { edStatus = pdfOrdinalMsg a matches }
+    [] -> ed { edStatus = "Not found: " <> flat1 (edSearchTerm ed) }
+  where
+    here = pdCaret pd
+    -- Searching backwards measures from the *start* of the current selection,
+    -- not the caret at its end — otherwise the first Shift+F3 after a find
+    -- just re-finds the match you are already sitting on.
+    back = maybe here fst (Pdf.pdfSelection pd)
+    matches = pdfAllMatches (edSearchCase ed) (edSearchWord ed) (edSearchTerm ed) pd
+    -- Confirming the dialog searches from the caret inclusively (so a fresh
+    -- search finds a match at the very start); Find Next searches past it, so
+    -- it advances. Both wrap once, by appending the whole list again.
+    started p = if inclusive then p >= here else p > here
+    pick | forward   = filter (started . fst) matches ++ matches
+         | otherwise = reverse (filter ((< back) . fst) matches) ++ reverse matches
+
+-- Every match in the laid-out document, in reading order, capped so that a
+-- one-letter term in a long document cannot cost more than a bounded scan.
+pdfAllMatches :: Bool -> Bool -> Text -> PdfDoc -> [(Pos, Pos)]
+pdfAllMatches cs ww term pd
+  | T.null term || hasNewline term = []
+  | otherwise = take (matchCountCap + 1)
+      [ (Pos li i, Pos li (i + T.length term))
+      | li <- [0 .. Pdf.pdfLineCount pd - 1]
+      , i <- matchIndices cs ww term (Pdf.pdfLineText pd li) ]
+
+pdfOrdinalMsg :: Pos -> [(Pos, Pos)] -> Text
+pdfOrdinalMsg a ms
+  | length ms > matchCountCap = ""
+  | otherwise = T.pack ("Match " ++ show k ++ " of " ++ show (length ms))
+  where k = length (takeWhile ((/= a) . fst) ms) + 1
 
 -- Search the table cells (row-major) for the search term and move the
 -- selection to the matching cell, which the renderer highlights.
@@ -784,7 +846,7 @@ stagedDoc path lr buf' = Document
   , docRedo = Seq.empty, docLastEdit = EKNone
   , docOverwrite = False, docDiscard = False
   , docCsv = Nothing, docCsvStash = Nothing, docImage = Nothing
-  , docPager = Nothing, docRtf = Nothing
+  , docPager = Nothing, docRtf = Nothing, docPdf = Nothing
   , docHlCache = Nothing
   , docDiags = []
   }

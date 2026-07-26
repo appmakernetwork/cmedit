@@ -51,6 +51,7 @@ import Cmedit.History (pushHist)
 import Cmedit.Pager (PagerDoc(..))
 import qualified Cmedit.Pager as Pg
 import qualified Cmedit.Rtf as Rtf
+import qualified Cmedit.Pdf as Pdf
 import Cmedit.EditorState
 
 
@@ -409,6 +410,16 @@ deleteWordRight ed0
 -- array for the rest of the session — see 'detach'. The whole-line cases below
 -- append a newline, which already builds a fresh array.
 copy :: Editor -> (Editor, [Effect])
+-- The PDF view has its own selection over the laid-out text (there is no
+-- buffer to select in), and copying out of it is most of the reason it can
+-- select at all. Detached like every other clipboard value: the slice would
+-- otherwise pin the whole laid-out page it came from.
+copy ed | Just pd <- edPdf ed =
+  case Pdf.pdfSelection pd of
+    Nothing -> (ed { edStatus = "Nothing selected \x2014 drag over the text to select it" }, [])
+    Just _  ->
+      let txt = detach (Pdf.pdfSelText pd)
+      in (ed { edClipboard = txt, edStatus = "Copied" }, [EffCopy txt])
 copy ed = case getSelection ed of
   Just (a, b) ->
     let txt = detach (textInRange a b (edBuffer ed))
@@ -439,6 +450,7 @@ cut ed0
         in (setDesired (afterEdit ed2) { edClipboard = txt, edStatus = "Cut line" }, [EffCopy txt])
 
 selectAll :: Editor -> Editor
+selectAll ed | Just pd <- edPdf ed = ed { edPdf = Just (Pdf.pdfSelectAll pd) }
 selectAll ed =
   ensureVisible ed { edSelAnchor = Just origin
                    , edCursor = endPos (edBuffer ed)
@@ -649,6 +661,9 @@ statusRightInfo ed = flatten segs
     -- opens Go To Line, which is the one in-file jump the view supports.
     segs = case edPager ed of
       Just pg -> [ zone SZGoTo (Pg.pagerStatus pg) ]
+      -- The PDF view has no cursor, no selection and nothing writable; what
+      -- matters is which page you are on, and clicking it opens Go To Page.
+      Nothing | Just pd <- edPdf ed -> [ zone SZGoTo (Pdf.pdfStatus pd) ]
       -- The formatted view has no cursor and no selection, and its line
       -- numbers are laid-out rows rather than file lines, so Go To Line does
       -- not apply. The line ending still does: the buffer underneath is a
@@ -727,7 +742,7 @@ statusClick col ed =
        _                  -> noEff ed
 
 openGoTo :: Editor -> Editor
-openGoTo ed = openDialog mkGoToLine ed
+openGoTo ed = openDialog (if isJust (edPdf ed) then mkGoToPage else mkGoToLine) ed
 
 -- | Jump to the next diagnostic after the cursor in (line, col) order, wrapping
 -- to the first; a no-op with a "No problems" note when there are none. The

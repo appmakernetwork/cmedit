@@ -60,7 +60,10 @@ library
                       Cmedit.Regex
                       Cmedit.Syntax
                       Cmedit.Csv
+                      Cmedit.Inflate
                       Cmedit.Image
+                      Cmedit.Pdf
+                      Cmedit.Zip
                       Cmedit.Render
                       Cmedit.App
                       Cmedit.Help

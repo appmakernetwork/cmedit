@@ -13,6 +13,7 @@ module Cmedit.Dialog
   , mkFind
   , mkReplace
   , mkGoToLine
+  , mkGoToPage
   , mkNewPath
   , mkRename
   , mkConfirm
@@ -140,6 +141,12 @@ mkReplace term repl caseSens = Dialog DKReplace "Replace"
 mkGoToLine :: Dialog
 mkGoToLine = Dialog DKGoToLine "Go to Line"
   [field "Line:" ""] [] [] ["Go", "Cancel"] 0 "" False
+
+-- | The same dialog, worded for a document divided into pages (the PDF view).
+-- One dialog kind either way, so the confirm path stays a single case.
+mkGoToPage :: Dialog
+mkGoToPage = Dialog DKGoToLine "Go to Page"
+  [field "Page:" ""] [] [] ["Go", "Cancel"] 0 "" False
 
 -- | Explorer "new file/folder" prompt. @where_@ names the directory it will
 -- be created in (display only; the caller re-derives it on confirm).

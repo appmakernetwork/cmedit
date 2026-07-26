@@ -23,6 +23,7 @@ import Cmedit.Types
 import Cmedit.TextBuffer
 import Cmedit.History (pushHist)
 import Cmedit.Width (colToDisplay, displayToCol, wrapLine)
+import qualified Cmedit.Zip as Zip
 import Cmedit.ConfigFile
   ( Config(..), ThemeName(..), defaultConfig, RecentEntry(..)
   , maxRecentEntries, maxHistoryEntries )
@@ -48,6 +49,8 @@ import Cmedit.Image (Image(..), ImgMode(..), renderImage, viewFit)
 import Cmedit.Pager (PagerDoc(..), pagerStatus)
 import Cmedit.Rtf (RtfDoc(..))
 import qualified Cmedit.Rtf as Rtf
+import Cmedit.Pdf (PdfDoc(..))
+import qualified Cmedit.Pdf as Pdf
 import qualified Cmedit.Pager as Pg
 import Cmedit.Syntax (HlCache, CommentSyntax(..), langComment, langForPath)
 import Cmedit.Lint
@@ -133,6 +136,7 @@ data Document = Document
   , docImage         :: !(Maybe ImageDoc) -- ^ Image-view model when this doc is an image.
   , docPager         :: !(Maybe PagerDoc) -- ^ Paged read-only view when this doc is too big to load.
   , docRtf           :: !(Maybe RtfDoc)   -- ^ Formatted read-only view when this doc is an RTF file being shown as a document.
+  , docPdf           :: !(Maybe PdfDoc)   -- ^ Reading view when this doc is a PDF.
   , docHlCache       :: !(Maybe HlCache)  -- ^ Cached syntax-highlight lexer states (perf only; self-validating).
   , docDiags         :: ![Diag]           -- ^ Latest linter diagnostics for this doc (sorted by line,col; @[]@ until a lint pass posts).
   } deriving (Show)
@@ -241,6 +245,7 @@ data Editor = Editor
   , edImage         :: !(Maybe ImageDoc) -- ^ Image view, when the active doc is an image (a separate mode to text/CSV).
   , edPager         :: !(Maybe PagerDoc) -- ^ Paged read-only view, when the active doc is too big to hold in a buffer (a fourth view mode; see "Cmedit.Pager").
   , edRtf           :: !(Maybe RtfDoc)  -- ^ Formatted RTF view, when the active doc is an @.rtf@ shown as a document rather than as its markup (a fifth view mode; see "Cmedit.Rtf"). Read-only and derived: the buffer stays the document and is the only thing saved.
+  , edPdf           :: !(Maybe PdfDoc)  -- ^ PDF reading view, when the active doc is a PDF (a sixth view mode; see "Cmedit.Pdf"). Like the image view and unlike the RTF one it has no buffer at all: the file is binary, so there is nothing to toggle to and nothing to save.
   , edHlCache       :: !(Maybe HlCache) -- ^ Cached syntax-highlight lexer states for the active doc (perf only; self-validating against the buffer).
   , edRecent        :: ![RecentEntry]   -- ^ Recently-opened files, most recent first (global; persisted by the driver).
   , edDetectedDark  :: !(Maybe Bool)    -- ^ OSC 11 verdict: the terminal background is dark (drives @theme = auto@; Nothing until the terminal answers).
@@ -335,6 +340,7 @@ newEditor size cfg = Editor
   , edImage         = Nothing
   , edPager         = Nothing
   , edRtf           = Nothing
+  , edPdf           = Nothing
   , edHlCache       = Nothing
   , edRecent        = []
   , edDetectedDark  = Nothing
@@ -412,6 +418,14 @@ rtfActive = isJust . edRtf
 -- | The viewport height available to the formatted RTF view.
 rtfHeight :: Editor -> Int
 rtfHeight = loTextHeight . computeLayout
+
+-- | Is the active document showing the PDF reading view?
+pdfActive :: Editor -> Bool
+pdfActive = isJust . edPdf
+
+-- | The viewport height available to the PDF view.
+pdfHeight :: Editor -> Int
+pdfHeight = loTextHeight . computeLayout
 
 -- | The viewport height available to the paged view (same text area as a
 -- normal document; the pager never word-wraps).
@@ -648,10 +662,10 @@ computeLayout ed =
                   Nothing -> lineCount (edBuffer ed)
       sideW   = sidebarWidth ed
       avail   = max 1 (cols - sideW)
-      -- The image and formatted-RTF views use the full width: neither has
-      -- buffer lines to number (an RTF line number would count laid-out rows,
-      -- which move with the window width and mean nothing in the file).
-      gutter  = if isJust (edImage ed) || isJust (edRtf ed) then 0
+      -- The image, formatted-RTF and PDF views use the full width: none has
+      -- buffer lines to number (a laid-out row number moves with the window
+      -- width and means nothing in the file).
+      gutter  = if isJust (edImage ed) || isJust (edRtf ed) || isJust (edPdf ed) then 0
                 else if edShowLineNumbers ed
                   then max 4 (length (show nLines) + 2)
                   else 0
@@ -664,12 +678,13 @@ computeLayout ed =
       -- row left after the reservation. Like the vertical bar's reserved
       -- column this is content-INdependent (mode + config only), so the wrap
       -- width can never oscillate with content.
-      -- The formatted RTF view wraps to the window, so it never scrolls
-      -- sideways and takes no horizontal bar (like an image, unlike the pager).
+      -- The formatted RTF and PDF views wrap to the window, so they never
+      -- scroll sideways and take no horizontal bar (like an image, unlike the
+      -- pager).
       wantHBar = cfgScrollBarH (edConfig ed)
                    && not (searchViewActive ed)
                    && (isJust (edCsv ed)
-                       || (isNothing (edImage ed) && isNothing (edRtf ed)
+                       || (isNothing (edImage ed) && isNothing (edRtf ed) && isNothing (edPdf ed)
                            && (isJust (edPager ed) || not (edWordWrap ed))))
                    && textH0 - 1 >= 1
       barH    = if wantHBar then 1 else 0
@@ -728,7 +743,9 @@ scrollBarInfo ed
                -- exactly what the bar measures here (no wrapped-line proxy
                -- needed: the layout already is the visual rows).
                Just rd -> bar (Rtf.rtfLineCount rd) (rdTop rd)
-               Nothing -> bar (lineCount (edBuffer ed)) (edTop ed)
+               Nothing -> case edPdf ed of
+                 Just pd -> bar (Pdf.pdfLineCount pd) (pdTop pd)
+                 Nothing -> bar (lineCount (edBuffer ed)) (edTop ed)
 
 -- | Thumb placement within a bar: @(thumbTop, thumbLen)@ for a @h@-row track
 -- showing a @total@-row document scrolled to @win@.
@@ -998,6 +1015,14 @@ isRtfPath p = map toLower (takeExtension p) == ".rtf"
 
 isRtfFile :: Editor -> Bool
 isRtfFile ed = maybe False isRtfPath (edPath ed)
+
+-- | Is this a ZIP-based archive (by extension)? Archives are /detected/ by
+-- magic bytes ("Cmedit.Zip"), so this is not what opens the listing view; it
+-- is the cheap by-name test for the places that only need a good guess — the
+-- explorer's colouring, the listing's syntax lexer, and the Save As seed,
+-- which must not offer to overwrite an archive with its own table of contents.
+isArchivePath :: FilePath -> Bool
+isArchivePath p = drop 1 (map toLower (takeExtension p)) `elem` Zip.archiveExtensions
 
 csvDelimForPath :: FilePath -> Char
 csvDelimForPath p = if map toLower (takeExtension p) == ".tsv" then '\t' else ','
@@ -1336,11 +1361,13 @@ docText = bufferToText LF False . docBuffer
 
 isPlainDoc :: Document -> Bool
 -- Note an RTF document counts as plain whichever view it is showing: unlike
--- CSV (whose buffer goes stale) and image/pager (which have no buffer), the
--- formatted view is derived from a buffer that stays live and authoritative,
--- so workspace replace and the other buffer consumers are correct on it. The
--- view re-derives itself when the buffer moves under it ('refreshRtf').
+-- CSV (whose buffer goes stale) and image/pager/PDF (which have no buffer),
+-- the formatted view is derived from a buffer that stays live and
+-- authoritative, so workspace replace and the other buffer consumers are
+-- correct on it. The view re-derives itself when the buffer moves under it
+-- ('refreshRtf').
 isPlainDoc d = isNothing (docCsv d) && isNothing (docImage d) && isNothing (docPager d)
+                 && isNothing (docPdf d)
 
 plural :: Int -> String
 plural n = if n == 1 then "" else "s"

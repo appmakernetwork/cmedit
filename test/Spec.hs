@@ -50,7 +50,10 @@ import qualified Cmedit.Regex as Rx
 import qualified Data.Sequence as Seq
 import Cmedit.Pager (PagerDoc(..))
 import qualified Cmedit.Pager as Pg
+import qualified Cmedit.Zip as Z
 import Cmedit.Rtf (RtfDoc(..))
+import Cmedit.Pdf (PdfDoc(..))
+import qualified Cmedit.Pdf as Pdf
 import qualified Cmedit.Rtf as Rtf
 import Cmedit.Csv
 import Cmedit.Image (Image(..), ImgMode(..), decodeImage, decodeFrames, decodeGIFFrames, sniffImage, renderImage, viewFit, scaleRGBA)
@@ -1357,6 +1360,546 @@ main = do
     checkEq "rtf scroll clamps at the top" (rdTop (Rtf.rtfScroll h (-99) rd)) 0
     check "rtf scroll clamps at the bottom"
       (rdTop (Rtf.rtfScroll h 999 rd) <= max 0 (Rtf.rtfLineCount rd - h))
+
+  -- PDF reading view -----------------------------------------------------------
+  -- The fixtures are built here rather than read from disk so the tests are
+  -- hermetic: a PDF is text markup around a handful of streams, and a stored
+  -- (uncompressed) DEFLATE block is a legal zlib stream, so even the
+  -- FlateDecode path can be exercised without a compressor.
+  do
+    let ascii = BS.pack . map (fromIntegral . fromEnum)
+        obj n body = ascii (show (n :: Int) ++ " 0 obj\n") <> body <> ascii "\nendobj\n"
+        mkPdf objs = ascii "%PDF-1.4\n" <> BS.concat [ obj n b | (n, b) <- objs ]
+                       <> ascii "trailer\n<< /Size 9 /Root 1 0 R >>\n%%EOF\n"
+        stream dict body =
+          ascii ("<< " ++ dict ++ " /Length " ++ show (BS.length body) ++ " >>\nstream\n")
+            <> body <> ascii "\nendstream"
+        -- A zlib stream whose single DEFLATE block is "stored": BFINAL=1,
+        -- BTYPE=00, then the length, its complement, and the bytes.
+        zlibStored raw =
+          let n = BS.length raw
+              lo v = fromIntegral (v .&. 0xff) :: Word8
+              hi v = fromIntegral ((v `shiftR` 8) .&. 0xff) :: Word8
+          in BS.pack [0x78, 0x01, 0x01, lo n, hi n, lo (65535 - n), hi (65535 - n)]
+               <> raw <> BS.pack [0, 0, 0, 1]
+        -- One page whose content stream is `body`, with `fontName` as /F1.
+        onePage fontName body = mkPdf
+          [ (1, ascii "<< /Type /Catalog /Pages 2 0 R >>")
+          , (2, ascii "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+          , (3, ascii ("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]"
+                       ++ " /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"))
+          , (4, stream "" (ascii body))
+          , (5, ascii ("<< /Type /Font /Subtype /Type1 /BaseFont /" ++ fontName
+                       ++ " /Encoding /WinAnsiEncoding >>"))
+          ]
+        textOf pd = T.intercalate (T.pack "\n")
+          [ T.concat (map Pdf.psText (Pdf.ppRuns par))
+          | pg <- toList (pdPages pd), par <- Pdf.pgPars pg ]
+        hex2 :: Char -> String
+        hex2 c = let n = fromEnum c
+                     d k = "0123456789ABCDEF" !! k
+                 in [d (n `div` 16), d (n `mod` 16)]
+        parse label bs = case Pdf.parsePdf bs of
+          Left e   -> Nothing <$ check ("pdf parses " ++ label ++ " (" ++ e ++ ")") False
+          Right pd -> pure (Just pd)
+
+    check "pdf sniffs its header" (Pdf.sniffPdf (ascii "%PDF-1.7\n..."))
+    -- Producers are allowed junk before the header, and a viewer that insisted
+    -- on offset zero would refuse files every other reader opens.
+    check "pdf sniffs a header after junk" (Pdf.sniffPdf (ascii (replicate 200 'x' ++ "%PDF-1.4")))
+    check "pdf does not sniff plain text" (not (Pdf.sniffPdf (ascii "hello, world")))
+    check "pdf does not sniff a late header"
+      (not (Pdf.sniffPdf (ascii (replicate 4000 'x' ++ "%PDF-1.4"))))
+
+    -- Text extraction, and the space that is not in the file. PDF records no
+    -- word breaks: "Hello" ends at x=99.3 (Helvetica's own metrics at 12pt)
+    -- and "world" starts at 110, and the gap is what has to become a space.
+    Just pd1 <- parse "a one-page document" (onePage "Helvetica"
+      "BT /F1 12 Tf 1 0 0 1 72 700 Tm (Hello) Tj 1 0 0 1 110 700 Tm (world) Tj ET")
+    checkEq "pdf page count" (Pdf.pdfPageCount pd1) 1
+    checkEq "pdf infers a space from the gap" (textOf pd1) (T.pack "Hello world")
+
+    -- ...but a kerning adjustment is not a word break. TJ moves the next glyph
+    -- by thousandths of an em; treating that as a gap would space out every
+    -- kerned pair in the document.
+    Just pd2 <- parse "a kerned string" (onePage "Helvetica"
+      "BT /F1 12 Tf 1 0 0 1 72 700 Tm [(Hel) -20 (lo) -15 (,) 0 ( there)] TJ ET")
+    checkEq "pdf kerning does not become a space" (textOf pd2) (T.pack "Hello, there")
+
+    -- WinAnsi is the encoding nearly every simple font declares, and its
+    -- 0x80..0x9F range is where the curly quotes and dashes live.
+    Just pd3 <- parse "cp1252 bytes" (onePage "Helvetica"
+      "BT /F1 12 Tf 1 0 0 1 72 700 Tm (\\223q\\224\\227\\351) Tj ET")
+    checkEq "pdf decodes WinAnsi" (textOf pd3) (T.pack "\8220q\8221\8212\233")
+
+    -- Weight and slope come from the font's name, since PDF has no way to say
+    -- "the bold version of this run".
+    Just pdB <- parse "a bold font" (onePage "Helvetica-BoldOblique"
+      "BT /F1 12 Tf 1 0 0 1 72 700 Tm (Heavy) Tj ET")
+    check "pdf reads bold and italic off the font name"
+      (all (\s -> Pdf.pfBold (Pdf.psFmt s) && Pdf.pfItalic (Pdf.psFmt s))
+           [ s | pg <- toList (pdPages pdB), par <- Pdf.pgPars pg, s <- Pdf.ppRuns par ])
+
+    -- Ligatures are what a font honestly reports and what no terminal font
+    -- has; spelling them out is the difference between "first" and a hole.
+    Just pdL <- parse "a ligature" (mkPdf
+      [ (1, ascii "<< /Type /Catalog /Pages 2 0 R >>")
+      , (2, ascii "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+      , (3, ascii ("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]"
+                   ++ " /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"))
+      , (4, stream "" (ascii "BT /F1 12 Tf 1 0 0 1 72 700 Tm (\\001rst) Tj ET"))
+      , (5, ascii ("<< /Type /Font /Subtype /Type1 /BaseFont /AAAAAA+Minion"
+                   ++ " /ToUnicode 6 0 R >>"))
+      , (6, stream "" (ascii ("begincodespacerange <00> <ff> endcodespacerange\n"
+                             ++ "1 beginbfchar <01> <FB01> endbfchar")))
+      ])
+    checkEq "pdf expands the fi ligature" (textOf pdL) (T.pack "first")
+
+    -- FlateDecode is how essentially every real content stream arrives.
+    let flatePdf = mkPdf
+          [ (1, ascii "<< /Type /Catalog /Pages 2 0 R >>")
+          , (2, ascii "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+          , (3, ascii ("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]"
+                       ++ " /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"))
+          , (4, stream "/Filter /FlateDecode"
+                  (zlibStored (ascii "BT /F1 12 Tf 1 0 0 1 72 700 Tm (Compressed) Tj ET")))
+          , (5, ascii "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+          ]
+    Just pdF <- parse "a compressed content stream" flatePdf
+    checkEq "pdf inflates a content stream" (textOf pdF) (T.pack "Compressed")
+
+    -- ASCIIHexDecode, and a filter chain, since /Filter may be an array.
+    Just pdH <- parse "a hex-encoded stream" (mkPdf
+      [ (1, ascii "<< /Type /Catalog /Pages 2 0 R >>")
+      , (2, ascii "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+      , (3, ascii ("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]"
+                   ++ " /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"))
+      , (4, stream "/Filter [/ASCIIHexDecode]"
+              (ascii (concatMap hex2 ("BT /F1 12 Tf 1 0 0 1 72 700 Tm (Hex) Tj ET" :: String) ++ ">")))
+      , (5, ascii "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+      ])
+    checkEq "pdf decodes an ASCIIHex stream" (textOf pdH) (T.pack "Hex")
+
+    -- Objects inside a compressed object stream are invisible to the scan that
+    -- finds every other object, so they are expanded separately — and every
+    -- PDF written since 1.5 puts its catalog there.
+    let objStmBody = ascii "1 0 " <> ascii "<< /Type /Catalog /Pages 2 0 R >>"
+    Just pdO <- parse "an object stream" (mkPdf
+      [ (7, stream "/Type /ObjStm /N 1 /First 4 /Filter /FlateDecode" (zlibStored objStmBody))
+      , (2, ascii "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+      , (3, ascii ("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]"
+                   ++ " /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"))
+      , (4, stream "" (ascii "BT /F1 12 Tf 1 0 0 1 72 700 Tm (Streamed) Tj ET"))
+      , (5, ascii "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+      ])
+    checkEq "pdf finds a catalog inside an object stream" (textOf pdO) (T.pack "Streamed")
+
+    -- A form XObject is a nested content stream with its own matrix; text
+    -- drawn inside one is document text like any other.
+    Just pdX <- parse "a form xobject" (mkPdf
+      [ (1, ascii "<< /Type /Catalog /Pages 2 0 R >>")
+      , (2, ascii "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+      , (3, ascii ("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]"
+                   ++ " /Resources << /Font << /F1 5 0 R >> /XObject << /X1 6 0 R >> >>"
+                   ++ " /Contents 4 0 R >>"))
+      , (4, stream "" (ascii "/X1 Do"))
+      , (5, ascii "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+      , (6, stream "/Type /XObject /Subtype /Form /BBox [0 0 612 792]"
+              (ascii "BT /F1 12 Tf 1 0 0 1 72 700 Tm (Inside) Tj ET"))
+      ])
+    checkEq "pdf runs a form xobject" (textOf pdX) (T.pack "Inside")
+
+    -- /Rotate turns the page for display, and a landscape page normally draws
+    -- its text rotated to match — so the two compose, and getting either the
+    -- direction or the endpoints wrong collapses every line of such a page
+    -- into one. The text matrix here advances along +y.
+    Just pdR <- parse "a rotated landscape page" (mkPdf
+      [ (1, ascii "<< /Type /Catalog /Pages 2 0 R >>")
+      , (2, ascii "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+      , (3, ascii ("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Rotate 90"
+                   ++ " /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"))
+      , (4, stream "" (ascii (concat
+              [ "BT /F1 12 Tf 0 1 -1 0 " ++ show (100 + 16 * i :: Int)
+                ++ " 100 Tm (Landscape " ++ show i ++ ") Tj ET\n"
+              | i <- [0 .. 3 :: Int] ])))
+      , (5, ascii "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+      ])
+    check "pdf reads a rotated page in order"
+      (T.pack "Landscape 0" `T.isInfixOf` textOf pdR
+         && T.pack "Landscape 3" `T.isInfixOf` textOf pdR
+         && T.count (T.pack "Landscape") (textOf pdR) == 4)
+    check "pdf keeps a rotated page's lines apart"
+      (not (T.pack "Landscape 0Landscape" `T.isInfixOf` textOf pdR))
+
+    -- An /Encrypt entry means the streams are ciphertext. Saying so beats
+    -- showing a document made of noise.
+    let encPdf = ascii "%PDF-1.4\n"
+          <> obj 1 (ascii "<< /Type /Catalog /Pages 2 0 R >>")
+          <> ascii "trailer\n<< /Size 9 /Root 1 0 R /Encrypt 8 0 R >>\n%%EOF\n"
+    check "pdf reports an encrypted file" $ case Pdf.parsePdf encPdf of
+      Left e  -> "encrypted" `isInfixOf` e
+      Right _ -> False
+
+    -- Malformed input must degrade, not diverge or throw.
+    forM_ [ "%PDF-1.4", "%PDF-1.4\n1 0 obj\n<< /Type", "%PDF-1.4\n1 0 obj\nstream\n"
+          , "%PDF-1.4\n<< >>\ntrailer", "%PDF-1.4\n0 0 obj\n(", "%PDF-1.4\n1 0 obj\n[[[[" ] $ \s -> do
+      r <- try (evaluate (either length (const 0) (Pdf.parsePdf (ascii s))))
+             :: IO (Either SomeException Int)
+      check ("pdf survives " ++ show s) (either (const False) (const True) r)
+
+    -- A multi-page document, which is what page navigation moves between.
+    -- Long enough that it overflows a terminal window, since the interactive
+    -- assertions below are about scrolling as well as paging.
+    let pageBody n = ascii (concat
+          [ "BT /F1 11 Tf 1 0 0 1 72 " ++ show (700 - 14 * i :: Int)
+            ++ " Tm (Page " ++ show (n :: Int) ++ " line " ++ show i
+            ++ " with several more words on it so that the line is a long one.) Tj ET\n"
+          | i <- [0 .. 19 :: Int] ])
+        nPages = 3 :: Int
+        manyPages = mkPdf $
+          [ (1, ascii "<< /Type /Catalog /Pages 2 0 R >>")
+          , (2, ascii ("<< /Type /Pages /Count " ++ show nPages ++ " /Kids ["
+                       ++ concat [ show (10 + k) ++ " 0 R " | k <- [0 .. nPages - 1] ] ++ "] >>"))
+          , (5, ascii "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+          ] ++ concat
+          [ [ (10 + k, ascii ("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]"
+                              ++ " /Resources << /Font << /F1 5 0 R >> >> /Contents "
+                              ++ show (20 + k) ++ " 0 R >>"))
+            , (20 + k, stream "" (pageBody (k + 1))) ]
+          | k <- [0 .. nPages - 1] ]
+    Just pdP <- parse "a multi-page document" manyPages
+    checkEq "pdf counts every page" (Pdf.pdfPageCount pdP) nPages
+
+    -- Layout: every laid-out line fits the width it was laid out for, and the
+    -- spans stay inside their line's text (the renderer indexes with them).
+    forM_ [20, 40, 80] $ \w -> do
+      let (ls, starts) = Pdf.layoutPdf 8 w (pdPages pdP)
+      check ("pdf layout fits width " ++ show w)
+        (all (\l -> Pdf.plPad l + lineDisplayWidth 8 (Pdf.plText l) <= w) (toList ls))
+      check ("pdf layout spans in range " ++ show w)
+        (all (\l -> all (\(s, e, _) -> s >= 0 && e <= T.length (Pdf.plText l) && s <= e)
+                        (Pdf.plSpans l)) (toList ls))
+      checkEq ("pdf layout records one start per page at width " ++ show w)
+        (Seq.length starts) nPages
+      check ("pdf page starts are ordered and in range at width " ++ show w)
+        (and [ a < b | (a, b) <- zip (toList starts) (drop 1 (toList starts)) ]
+           && all (< Seq.length ls) (toList starts))
+    -- Narrower wrapping can only produce more lines, never fewer.
+    check "pdf narrower wraps to more lines"
+      (Seq.length (fst (Pdf.layoutPdf 8 30 (pdPages pdP)))
+         >= Seq.length (fst (Pdf.layoutPdf 8 80 (pdPages pdP))))
+
+    -- Page navigation.
+    let laidOut = Pdf.pdfRelayout 8 60 10 pdP
+        h = 10
+    checkEq "pdf starts on page 1" (Pdf.pdfCurrentPage laidOut) 1
+    checkEq "pdf ] turns the page" (Pdf.pdfCurrentPage (Pdf.pdfNextPage h laidOut)) 2
+    checkEq "pdf [ turns back"
+      (Pdf.pdfCurrentPage (Pdf.pdfPrevPage h (Pdf.pdfNextPage h laidOut))) 1
+    checkEq "pdf go-to-page clamps above the last page"
+      (Pdf.pdfCurrentPage (Pdf.pdfGoToPage h 99 laidOut)) nPages
+    checkEq "pdf go-to-page clamps below the first"
+      (Pdf.pdfCurrentPage (Pdf.pdfGoToPage h (-3) laidOut)) 1
+    -- Scrolled into the middle of a page, "back" means the top of this one.
+    let onTwo = Pdf.pdfGoToPage h 2 laidOut
+        midway = Pdf.pdfScroll h 1 onTwo
+    check "pdf scrolling within a page stays on it" (Pdf.pdfCurrentPage midway == 2)
+    checkEq "pdf [ from mid-page returns to that page's top"
+      (pdTop (Pdf.pdfPrevPage h midway)) (pdTop onTwo)
+    checkEq "pdf scroll clamps at the top" (pdTop (Pdf.pdfScroll h (-99) laidOut)) 0
+    check "pdf scroll clamps at the bottom"
+      (pdTop (Pdf.pdfScroll h 999 laidOut) <= max 0 (Pdf.pdfLineCount laidOut - h))
+    -- Re-laying out at the same width must not rebuild: scrolling a long
+    -- document would otherwise re-wrap it on every keypress.
+    let scrolled = Pdf.pdfScroll h 3 laidOut
+    checkEq "pdf relayout at the same width is a no-op"
+      (pdTop (Pdf.pdfRelayout 8 60 h scrolled)) (pdTop scrolled)
+
+    -- The view in the editor: read-only, no cursor, and Go To means pages.
+    let edPdfDoc = pdfLoaded "paper.pdf" laidOut (newEditor (24, 80) defaultConfig)
+    check "pdf opens in the reading view" (isJust' (edPdf edPdfDoc))
+    check "pdf document is read-only" (edReadOnly edPdfDoc)
+    check "pdf view has no buffer" (lineCount (edBuffer edPdfDoc) <= 1)
+    check "pdf view shows no cursor" (not (isJust' (scrCursor (renderEditor edPdfDoc))))
+    let edTypedPdf = fst (update (KChar 'X') edPdfDoc)
+    check "pdf typing does not modify anything" (not (edModified edTypedPdf))
+    checkEq "pdf typing leaves the page where it was"
+      (fmap pdTop (edPdf edTypedPdf)) (fmap pdTop (edPdf edPdfDoc))
+    -- ] and [ are the page keys, and they must not fall through to the
+    -- read-only note that swallows every other printable character.
+    let edNext = feed edPdfDoc [KChar ']']
+        edBack = feed edNext [KChar '[']
+    checkEq "pdf ] turns to page 2 in the editor"
+      (fmap Pdf.pdfCurrentPage (edPdf edNext)) (Just 2)
+    checkEq "pdf [ turns back in the editor"
+      (fmap Pdf.pdfCurrentPage (edPdf edBack)) (Just 1)
+    -- Go To is worded and read as pages here, not lines.
+    let edGoTo = fst (update (KCtrlChar 'g') edPdfDoc)
+    checkEq "pdf Ctrl+G opens Go to Page"
+      (fmap dlgTitle (edDialog edGoTo)) (Just (T.pack "Go to Page"))
+    let edPage2 = feed edGoTo [KChar '2', KEnter]
+    checkEq "pdf go-to-page jumps"
+      (fmap Pdf.pdfCurrentPage (edPdf edPage2)) (Just 2)
+    -- Save would have to write a PDF, which this view cannot do.
+    let edSavePdf = feed edPdfDoc [KCtrlChar 's']
+    check "pdf refuses to save" (T.unpack (edStatus edSavePdf) /= "")
+    -- ...and neither can anything else that writes.
+    forM_ [KCtrlChar 'v', KCtrlChar 'x'] $ \k ->
+      check ("pdf refuses " ++ show k)
+        (fmap Pdf.pdfLineCount (edPdf (feed edPdfDoc [k]))
+           == fmap Pdf.pdfLineCount (edPdf edPdfDoc))
+
+    -- Selection, which exists so that a passage can be copied out.
+    let firstLine = maybe (T.pack "") (\p -> Pdf.pdfLineText p 0) (edPdf edPdfDoc)
+        selAll = feed edPdfDoc [KCtrlChar 'a']
+    check "pdf select all covers the document"
+      (case edPdf selAll >>= Pdf.pdfSelection of
+         Just (Pos 0 0, Pos l _) -> l == maybe 0 (subtract 1 . Pdf.pdfLineCount) (edPdf selAll)
+         _ -> False)
+    check "pdf select-all text starts with the first line"
+      (T.isPrefixOf firstLine (maybe (T.pack "") Pdf.pdfSelText (edPdf selAll)))
+    -- Copy puts the selected text on the clipboard and emits the effect the
+    -- driver turns into an OSC 52 / xclip write.
+    let (edCopied, copyEffs) = update (KCtrlChar 'c') selAll
+    check "pdf copy emits a clipboard effect" (not (null copyEffs))
+    check "pdf copy fills the clipboard with the selection"
+      (edClipboard edCopied == maybe (T.pack "") Pdf.pdfSelText (edPdf selAll))
+    check "pdf copy leaves the document alone" (not (edModified edCopied))
+    -- With nothing selected there is nothing to copy: the text view's
+    -- "copy the current line" fallback needs a cursor this view has not got.
+    let (edCopyNone, copyNoneEffs) = update (KCtrlChar 'c') edPdfDoc
+    check "pdf copy with no selection copies nothing" (null copyNoneEffs)
+    check "pdf copy with no selection says so" (T.unpack (edStatus edCopyNone) /= "")
+    -- No selection means no cursor; making one puts the cursor at its end.
+    check "pdf shows no cursor without a selection"
+      (not (isJust' (scrCursor (renderEditor edPdfDoc))))
+    check "pdf Esc drops the selection"
+      (not (isJust' (edPdf (feed selAll [KEsc]) >>= Pdf.pdfSelection)))
+    -- Shift+movement extends from the caret; plain movement scrolls the
+    -- window and must leave the selection alone (you scroll to see the rest
+    -- of what you highlighted).
+    let edShifted = feed edPdfDoc [KArrow DRight shiftMods, KArrow DRight shiftMods]
+    check "pdf shows a cursor while selecting"
+      (isJust' (scrCursor (renderEditor edShifted)))
+    -- Select All does not move the window, so its caret (the last line) is
+    -- off screen and there is nothing on screen to point at.
+    check "pdf shows no cursor for an off-screen caret"
+      (not (isJust' (scrCursor (renderEditor selAll))))
+    checkEq "pdf shift+right selects two characters"
+      (T.length (maybe (T.pack "") Pdf.pdfSelText (edPdf edShifted))) 2
+    let edScrolled = feed edShifted [KArrow DDown noMods, KArrow DDown noMods]
+    checkEq "pdf plain scrolling keeps the selection"
+      (fmap Pdf.pdfSelText (edPdf edScrolled)) (fmap Pdf.pdfSelText (edPdf edShifted))
+    check "pdf plain scrolling still scrolls"
+      (fmap pdTop (edPdf edScrolled) == Just 2)
+    -- Mouse: a drag across the first line selects it; a plain click leaves no
+    -- selection (and so no cursor) behind.
+    let mouseAt r c pressed dragging =
+          KMouse (MouseEvent MBLeft c r pressed dragging noMods 1)
+        edDragged = feed edPdfDoc [ mouseAt 1 0 True False, mouseAt 1 12 True True
+                                  , mouseAt 1 12 False False ]
+    checkEq "pdf mouse drag selects what it crossed"
+      (maybe (T.pack "") Pdf.pdfSelText (edPdf edDragged)) (T.take 12 firstLine)
+    let edClicked = feed edPdfDoc [ mouseAt 1 5 True False, mouseAt 1 5 False False ]
+    check "pdf a plain click selects nothing"
+      (not (isJust' (edPdf edClicked >>= Pdf.pdfSelection)))
+    let edDoubled = feed edPdfDoc [KMouse (MouseEvent MBLeft 2 1 True False noMods 2)]
+    check "pdf double-click takes a word"
+      (let t = maybe (T.pack "") Pdf.pdfSelText (edPdf edDoubled)
+       in not (T.null t) && T.all (\c -> c /= ' ') t)
+
+    -- Find, over the laid-out text: it is the only text this view has, and
+    -- the found range becomes the selection so Find and copy compose.
+    let edFound = feed edPdfDoc [KCtrlChar 'f', KChar 'P', KChar 'a'
+                                , KChar 'g', KChar 'e', KEnter]
+    check "pdf Ctrl+F opens the Find dialog"
+      (isJust' (edDialog (feed edPdfDoc [KCtrlChar 'f'])))
+    checkEq "pdf find selects the match"
+      (maybe (T.pack "") Pdf.pdfSelText (edPdf edFound)) (T.pack "Page")
+    check "pdf find reports which match it is"
+      ("Match 1 of " `isPrefixOf` T.unpack (edStatus edFound))
+    -- F3 advances, and the two hits are not the same one.
+    let edNext2 = feed edFound [KFn 3 noMods]
+    check "pdf find next advances"
+      (fmap pdCaret (edPdf edNext2) /= fmap pdCaret (edPdf edFound))
+    checkEq "pdf find next still selects the term"
+      (maybe (T.pack "") Pdf.pdfSelText (edPdf edNext2)) (T.pack "Page")
+    -- Searching backwards from there returns to the first hit.
+    let edPrev = feed edNext2 [KFn 3 shiftMods]
+    check "pdf find previous goes back"
+      (fmap pdCaret (edPdf edPrev) == fmap pdCaret (edPdf edFound))
+    -- A term that is not there says so and leaves the view where it was.
+    let edMiss = feed edPdfDoc [KCtrlChar 'f', KChar 'z', KChar 'q', KChar 'x', KEnter]
+    check "pdf find reports a miss" ("Not found" `isPrefixOf` T.unpack (edStatus edMiss))
+    check "pdf a missed find selects nothing"
+      (not (isJust' (edPdf edMiss >>= Pdf.pdfSelection)))
+    -- A find scrolls its hit into view rather than leaving it off screen.
+    let edFar = feed edPdfDoc [KCtrlChar 'f', KChar 'S', KChar 'e', KChar 'c'
+                              , KChar 'o', KChar 'n', KChar 'd', KEnter]
+    check "pdf find scrolls the hit into view"
+      (case edPdf edFar of
+         Just p -> let Pos l _ = pdCaret p
+                   in l >= pdTop p && l < pdTop p + pdfHeight edFar
+         Nothing -> False)
+    -- The selection has to be *painted*, not merely held: a highlight the
+    -- renderer does not draw is a selection nobody can see they have.
+    do
+      let scr = renderEditor edShifted
+          loSel = computeLayout edShifted
+          cellRC r c = scrCells scr A.! (r * scrW scr + c)
+          pad = maybe 0 Pdf.plPad (edPdf edShifted >>= \p -> Seq.lookup 0 (Pdf.pdfLines p))
+          row = loTextTop loSel
+          selSty = thSelection (themeFor (resolvedTheme edShifted))
+      check "pdf paints the selected cells"
+        (all (\c -> cellStyle (cellRC row (loTextLeft loSel + pad + c)) == selSty) [0, 1])
+      check "pdf leaves unselected cells alone"
+        (cellStyle (cellRC row (loTextLeft loSel + pad + 2)) /= selSty)
+    -- Every match highlights while the Find dialog is open, the way it does
+    -- in the text view.
+    do
+      let edLive = feed edPdfDoc [KCtrlChar 'f', KChar 'P', KChar 'a', KChar 'g', KChar 'e']
+          scr = renderEditor edLive
+          loLive = computeLayout edLive
+          cellRC r c = scrCells scr A.! (r * scrW scr + c)
+          matchSty = thFindMatch (themeFor (resolvedTheme edLive))
+          rowCells r = [ cellStyle (cellRC r c) | c <- [0 .. scrW scr - 1] ]
+      check "pdf highlights live find matches"
+        (any (\r -> matchSty `elem` rowCells r)
+             [loTextTop loLive .. loTextTop loLive + loTextHeight loLive - 1])
+
+    -- Re-wrapping invalidates line/character indices, so the selection goes
+    -- rather than pointing at whatever now sits there.
+    check "pdf a re-wrap drops the selection"
+      (not (isJust' (Pdf.pdfSelection (Pdf.pdfRelayout 8 41 10 (Pdf.pdfSelectAll laidOut)))))
+    -- The scrollbar must drive the view it is measuring.
+    let edWide = pdfLoaded "paper.pdf" (Pdf.pdfRelayout 8 79 20 pdP)
+                   (newEditor (24, 80) defaultConfig)
+    case scrollBarInfo edWide of
+      Nothing -> check "pdf scrollbar is showing for a long document" False
+      Just (bx, btop, bh, total, _) -> do
+        checkEq "pdf scrollbar measures laid-out rows"
+          total (maybe 0 Pdf.pdfLineCount (edPdf edWide))
+        let clickAt row = KMouse (MouseEvent MBLeft bx row True False noMods 1)
+            edMid = fst (update (clickAt (btop + bh - 1)) edWide)
+        check "pdf scrollbar click scrolls the view"
+          (maybe 0 pdTop (edPdf edMid) > 0)
+
+  -- ZIP archive listing -------------------------------------------------------
+  -- The archives are built here rather than read from disk so the tests are
+  -- hermetic and portable: a stored (uncompressed) archive is a handful of
+  -- fixed-layout records, which is exactly what the reader parses. Nothing is
+  -- decompressed by the reader, so stored members exercise all of it.
+  do
+    let le16, le32 :: Int -> BS.ByteString
+        le16 n = BS.pack [fromIntegral (n .&. 0xff), fromIntegral ((n `shiftR` 8) .&. 0xff)]
+        le32 n = le16 (n .&. 0xffff) <> le16 ((n `shiftR` 16) .&. 0xffff)
+        utf8 = TE.encodeUtf8 . T.pack
+        -- (name, contents, general-purpose flag word)
+        mkZip :: [(BS.ByteString, BS.ByteString, Int)] -> BS.ByteString -> BS.ByteString
+        mkZip items comment =
+          let local (nm, dat, fl) =
+                BS.concat [ le32 0x04034b50, le16 20, le16 fl, le16 0, le16 0, le16 0
+                          , le32 0, le32 (BS.length dat), le32 (BS.length dat)
+                          , le16 (BS.length nm), le16 0, nm, dat ]
+              locals  = map local items
+              offsets = scanl (+) 0 (map BS.length locals)
+              central (off, (nm, dat, fl)) =
+                BS.concat [ le32 0x02014b50, le16 20, le16 20, le16 fl, le16 0
+                          , le16 0, le16 0, le32 0
+                          , le32 (BS.length dat), le32 (BS.length dat)
+                          , le16 (BS.length nm), le16 0, le16 0, le16 0, le16 0
+                          , le32 0, le32 off, nm ]
+              cds   = map central (zip offsets items)
+              cdOff = sum (map BS.length locals)
+              cdSz  = sum (map BS.length cds)
+              eocd  = BS.concat [ le32 0x06054b50, le16 0, le16 0
+                                , le16 (length items), le16 (length items)
+                                , le32 cdSz, le32 cdOff
+                                , le16 (BS.length comment), comment ]
+          in BS.concat (locals ++ cds ++ [eocd])
+        -- What the driver does: find the end record in the tail, then read the
+        -- central directory it points at.
+        readZip bs =
+          case Z.findEocd bs 0 of
+            Left e   -> Left e
+            Right ec -> fmap ((,) ec) (Z.parseCentral
+              (BS.take (fromInteger (Z.ecCdSize ec)) (BS.drop (fromInteger (Z.ecCdOff ec)) bs)))
+
+        plain nm dat = (utf8 nm, utf8 dat, 0x800)   -- bit 11: the name is UTF-8
+        archive = mkZip [ plain "README.md" "hello"
+                        , plain "src/" ""
+                        , plain "src/main.c" "int main(void){}"
+                        , plain "src/util/str.h" "x"
+                        , (utf8 "secret.txt", utf8 "\0\0\0\0", 0x801)  -- bit 0: encrypted
+                        ] (utf8 "an archive comment")
+
+    check "zip magic recognises a local header" (Z.zipMagic archive)
+    check "zip magic rejects text" (not (Z.zipMagic (utf8 "PKZIP is not a zip")))
+    check "zip magic rejects a short file" (not (Z.zipMagic (BS.take 3 archive)))
+
+    case readZip archive of
+      Left e -> check ("zip parses the archive we built (" ++ e ++ ")") False
+      Right (ec, es) -> do
+        checkEq "zip entry count" (length es) 5
+        checkEq "zip comment" (Z.ecComment ec) (T.pack "an archive comment")
+        checkEq "zip member names"
+          (map Z.zeName es)
+          (map T.pack ["README.md", "src/", "src/main.c", "src/util/str.h", "secret.txt"])
+        checkEq "zip member size" (map Z.zeSize (take 1 es)) [5]
+        check "zip trailing slash is a directory" (Z.zeDir (es !! 1))
+        check "zip a file is not a directory" (not (Z.zeDir (head es)))
+        check "zip general-purpose bit 0 is encryption" (Z.zeEncrypted (last es))
+        check "zip an unflagged member is not encrypted" (not (any Z.zeEncrypted (init es)))
+
+        -- The listing is the whole user-visible surface, so assert on it.
+        let listing = Z.zipListing "demo.zip" (toInteger (BS.length archive))
+                        es (Z.ecComment ec)
+            lns = T.lines listing
+            has s = any (T.isInfixOf (T.pack s)) lns
+        check "zip listing names the archive" (has "demo.zip")
+        check "zip listing counts files and folders" (has "4 files in 2 folders")
+        check "zip listing reports the comment" (has "an archive comment")
+        check "zip listing flags encrypted members" (has "encrypted")
+        check "zip listing draws a tree" (has "\x251c\x2500\x2500 " && has "\x2514\x2500\x2500 ")
+        check "zip listing marks directories with a slash" (has "src/")
+        -- A directory only implied by its members still gets a row: plenty of
+        -- archivers write no entry for one.
+        check "zip listing synthesises an implied directory" (has "util/")
+        check "zip listing shows every member"
+          (all (\n -> has n) ["README.md", "main.c", "str.h", "secret.txt"])
+        -- The listing is a description, never the archive's bytes.
+        check "zip listing is not the archive" (not (has "PK"))
+
+    -- A self-extracting archive is a stub followed by an ordinary ZIP, whose
+    -- recorded offsets are relative to the ZIP rather than to the file.
+    case readZip (BS.replicate 5000 0x58 <> archive) of
+      Left e -> check ("zip reads past a self-extracting stub (" ++ e ++ ")") False
+      Right (_, es) -> checkEq "zip reads past a self-extracting stub" (length es) 5
+
+    -- An archive with no members is valid: the end record is the whole file.
+    case readZip (mkZip [] BS.empty) of
+      Left e -> check ("zip reads an empty archive (" ++ e ++ ")") False
+      Right (_, es) -> do
+        checkEq "zip empty archive has no members" (length es) 0
+        check "zip empty archive says so"
+          (T.isInfixOf (T.pack "empty") (Z.zipListing "e.zip" 22 [] T.empty))
+
+    -- Names are CP437 unless bit 11 says UTF-8; guessing wrong mangles them.
+    case readZip (mkZip [(BS.pack [0x63, 0x61, 0x66, 0x82], BS.empty, 0)] BS.empty) of
+      Left e -> check ("zip decodes a CP437 name (" ++ e ++ ")") False
+      Right (_, es) -> checkEq "zip decodes a CP437 name"
+        (map Z.zeName es) [T.pack "caf\233"]
+
+    -- Malformed input must be a Left, not a crash or a hang: these bytes come
+    -- from a file we did not write.
+    forM_ [ ("truncated", BS.take 40 archive)
+          , ("headless", BS.drop 40 archive)
+          , ("empty", BS.empty)
+          , ("tiny", utf8 "PK\3\4")
+          , ("no end record", BS.replicate 200 0x41)
+          ] $ \(what, bs) ->
+      check ("zip survives " ++ what)
+        (case readZip bs of Left _ -> True; Right (_, es) -> length es >= 0)
 
   -- Save/load round-trip matrix (plan 0013) ----------------------------------
   -- Saving is the one operation where a bug silently corrupts the user's file,

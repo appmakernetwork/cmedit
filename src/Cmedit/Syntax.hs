@@ -32,6 +32,7 @@ module Cmedit.Syntax
 import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace, isUpper, toLower)
 import Data.Foldable (toList)
 import Data.List (isPrefixOf)
+import qualified Cmedit.Zip as Zip
 import Data.Sequence (Seq)
 import qualified Data.Sequence as Seq
 import Data.Text (Text)
@@ -42,7 +43,7 @@ import System.FilePath (takeExtension)
 
 data Lang = SQL | Python | Markdown | HTML
           | JS | CSS | Shell | JSON | YAML | TOML | INI | FTL | Jinja | CSV
-          | Haskell | RTF
+          | Haskell | RTF | Archive
   deriving (Eq, Show)
 
 -- | A highlighting token class assigned to each character.
@@ -93,6 +94,7 @@ langComment lang = case lang of
   Jinja    -> Just (BlockComment "{#" "#}")
   CSV      -> Nothing                   -- comments aren't a thing in CSV data
   RTF      -> Nothing                   -- RTF has {\*\comment ...}, but commenting out markup is not an edit anyone wants
+  Archive  -> Nothing                   -- the listing is generated and read-only
 
 -- | Choose a language from a file path's extension, if supported.
 langForPath :: Maybe FilePath -> Maybe Lang
@@ -132,6 +134,9 @@ langForPath (Just p) = case map toLower (takeExtension p) of
   ".csv"  -> Just CSV
   ".tsv"  -> Just CSV
   ".hs"   -> Just Haskell
+  -- Not the file's own syntax: an archive is binary, and what the editor shows
+  -- for one is the listing "Cmedit.Zip" derives from its table of contents.
+  e | drop 1 e `elem` Zip.archiveExtensions -> Just Archive
   _       -> Nothing
 
 -- | Above this length a line is rendered unstyled: tokenising a
@@ -162,6 +167,7 @@ lexLine lang st line = case lang of
   Haskell  -> lexWith hsStep st line
   CSV      -> lexCsv line
   RTF      -> lexRtf line
+  Archive  -> lexArchive line
 
 ------------------------------------------------------------------------------
 -- Cached lexer states
@@ -1043,6 +1049,43 @@ lexRtf line = (go (T.unpack line), StNormal)
         | otherwise -> TkString : TkString : go more
       [] -> [TkKeyword]
     go (_ : rest) = TkText : go rest
+
+------------------------------------------------------------------------------
+-- Archive listings
+--
+-- Not a file format: this lexes the tree "Cmedit.Zip" renders for a @.zip@ and
+-- its relatives, which is the only thing the editor ever shows for one. The
+-- listing is generated, so its shape is known exactly and a positional lexer
+-- is enough — no state, and no guessing.
+--
+-- The one thing worth being careful about is where a member's name ends.
+-- Names contain spaces; the gap before the size column is two or more, which
+-- is what 'gapAt' looks for.
+
+lexArchive :: Text -> ([Tok], HlState)
+lexArchive line = (go (T.unpack line), StNormal)
+  where
+    go s
+      -- The rule under the column headings.
+      | not (null s) && all (== '\x2500') s = map (const TkComment) s
+      -- No tree prefix: one of the summary lines above the tree.
+      | null prefix = map (const TkHeading) name ++ map (const TkComment) rest
+      | otherwise   = map (const TkPunct) prefix
+                        ++ map (const (if last' name == '/' then TkType else TkText)) name
+                        ++ map meta rest
+      where
+        (prefix, s')   = span isTreeChar s
+        (name, rest)   = maybe (s', "") (`splitAt` s') (gapAt s')
+    isTreeChar c = c `elem` ("\x2502\x251c\x2514\x2500 " :: String)
+    last' xs = if null xs then ' ' else last xs
+    -- Offset of the first two-space run, i.e. where the name column ends.
+    gapAt = search (0 :: Int)
+      where search !i s@(_ : more) = case s of
+              (' ' : ' ' : _) -> Just i
+              _               -> search (i + 1) more
+            search _ [] = Nothing
+    meta c | isDigit c = TkNumber
+           | otherwise = TkComment
 
 ------------------------------------------------------------------------------
 -- CSV / TSV

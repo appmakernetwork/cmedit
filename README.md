@@ -2,11 +2,11 @@
 
 *A play on **CMD** and "**C Me Edit**".*
 
-A terminal text editor written **from first principles in Haskell**. It is a
-cross between Microsoft's [Edit](https://github.com/microsoft/edit) (`msedit`)
-and GNU **nano**: a modeless editor with a drop-down menu bar, real mouse
-support and system-clipboard integration, plus nano-style on-screen shortcut
-hints.
+A terminal text editor written **from first principles in Haskell**. It is
+modeless — you type and the characters appear — and everything else is where you
+would expect it: a drop-down menu bar across the top, a row of shortcut hints
+along the bottom, real mouse support (click, drag-select, scroll, resize) and
+the system clipboard behind Ctrl+C/X/V.
 
 No TUI framework is used. Everything — raw-mode terminal control, the input
 parser, the diff renderer, the menus and dialogs — is built directly on VT/ANSI
@@ -30,7 +30,7 @@ escape sequences and the POSIX `termios` API.
 
 - **Drop-down menu bar** (File / Edit / Find / View / Help) with keyboard
   (F10, Alt+letter, arrows) and mouse navigation, accelerator hints, and
-  separators — in the spirit of `msedit`.
+  separators.
 - **Text selection** with Shift + any cursor key, Ctrl+A (select all), mouse
   drag, and double-click (word) / triple-click (line), shown with a highlight.
 - **Real system clipboard**: Ctrl+C / Ctrl+X / Ctrl+V go through `xclip`,
@@ -50,7 +50,7 @@ escape sequences and the POSIX `termios` API.
   (Ctrl+Shift+P opens it that way directly): fuzzy-search every menu command —
   context-pruned, with live labels like "View: Line Endings: LF" — and Enter
   runs it.
-- **File explorer panel** (VS Code / Sublime style): open a folder
+- **File explorer panel**: open a folder
   (`cmedit DIR`, **File ▸ Open Folder**, or **Ctrl+B**) to dock a persistent
   tree on the left. Click a file to open it, or navigate with the arrow keys
   and Enter; directories expand/collapse in place. Open files are highlighted,
@@ -95,6 +95,24 @@ escape sequences and the POSIX `termios` API.
   file (with the control words syntax-highlighted). The formatted view is
   read-only by design: it is a projection of the buffer and is never written
   back, so the parts of a document it does not model cannot be lost on save.
+- **PDF reading view**: opening a `.pdf` (detected by magic bytes, so the
+  extension does not matter) shows the *document* — the text, reflowed to the
+  window, with headings and bold/italic runs picked out — rather than refusing
+  it as binary. Columns are detected and read in order, paragraphs are put back
+  together and re-wrapped to your terminal's width (hyphens introduced by the
+  original line breaks are undone), tables and other positioned lines keep their
+  columns, and `[` / `]` turn the page, with **Ctrl+G** jumping straight to a
+  page number. It reads compressed streams and object streams, simple and CID
+  fonts, `/ToUnicode` maps, the standard-14 fonts' built-in metrics and Type3
+  fonts, all from scratch on GHC's boot libraries — no Poppler, no rasteriser.
+  You can **select text with the mouse** (double-click for a word, triple for a
+  line, or Shift+arrows) and **Ctrl+C** copies it — looking something up and
+  pasting the answer elsewhere is most of what a PDF gets opened for. **Ctrl+F**
+  searches the document you are reading, with F3 / Shift+F3 stepping through the
+  hits and every match highlighted while the dialog is open; the hit becomes the
+  selection, so finding something and copying it are one gesture.
+  The view is read-only: there is no serialiser back to PDF and there could not
+  be. Encrypted files say so rather than showing noise.
 - **Paged view for huge files**: a file too large to load as an editable buffer
   (over 100 MB) used to be refused outright. It now opens in a read-only paged
   viewer whose memory does not depend on the file's size — a 281 MB, 4-million
@@ -117,6 +135,15 @@ escape sequences and the POSIX `termios` API.
   from-scratch `inflate`, WebP — both lossless VP8L and lossy VP8, boolean
   arithmetic decoder, loop filter and all — and Netpbm) is written from first
   principles using only GHC boot libraries.
+- **Archive listings**: opening a `.zip` — or anything built on it, a `.jar`,
+  `.whl`, `.docx`, `.epub`, `.apk` (detected by magic bytes, not by name) —
+  shows its contents as a read-only file tree with sizes, compression savings
+  and timestamps, instead of refusing it as binary. Only the archive's table of
+  contents is read, never its members, so this costs two short reads however
+  large the file is, and encrypted archives list fine — names and sizes are not
+  the part that is encrypted, and members that are get flagged. The listing is
+  an ordinary read-only buffer, so Find, word wrap, Go To Line and copying all
+  work on it as usual; the archive itself can never be written to.
 - **Six themes plus auto**: `theme = light-terminal` in the config (or
   View ▸ Theme to pick one live, with preview) swaps the syntax palette for one readable on
   light terminal backgrounds; dark-terminal and light-terminal keep your
@@ -139,7 +166,7 @@ escape sequences and the POSIX `termios` API.
   (kept across sessions in `~/.config/cmedit/history`), and a seeded term is
   replaced by the first character you type — press an arrow first to edit it
   in place instead.
-- **Workspace-wide Find in Files** (VS Code / Sublime style): **F4**
+- **Workspace-wide Find in Files**: **F4**
   opens a search panel over the whole open folder; **F6** adds the
   replace field. Results are grouped by file with match counts and snippet lines
   you can select with the keyboard or **click** to jump straight to that spot in
@@ -326,11 +353,13 @@ Run `cmedit --help` for the full key map and the list of config-file keys
 | Find / Find next / prev / Replace | Ctrl+F / F3 / Shift+F3 / Ctrl+R |
 | Find in Files / Replace in Files | F4 / F6 |
 | Search toggles (in the panel) | Alt+C case, Alt+W word, Alt+X regex, Alt+R replace-all |
-| Go to line / Go to bracket | Ctrl+G / Ctrl+] |
+| Go to line (page, in the PDF view) / Go to bracket | Ctrl+G / Ctrl+] |
 | Go back / forward (history) | Alt+← / Alt+→ |
 | Switch open files | Alt+. / Alt+, , Alt+1…9, or the Window menu (Alt+W) |
 | Word wrap / Line numbers | Alt+Z / Alt+L |
 | Table view (CSV) / formatted view (RTF) | Alt+T |
+| Previous / next page (PDF view) | `[` / `]` |
+| Select / copy in the PDF view | drag, double/triple-click, Shift+arrows / Ctrl+C |
 | Sort CSV column (table view) | Alt+S |
 | Menu | F10, or Alt+letter, or click |
 | Move by word / to document ends | Ctrl+Left/Right / Ctrl+Home/End |
@@ -372,9 +401,12 @@ logic unit-testable without a terminal.
 | `Cmedit.Regex` | From-scratch linear-time regex engine — Thompson NFA / Pike VM (for regex search) |
 | `Cmedit.Syntax` | Per-language lexers (one token per character) |
 | `Cmedit.Csv` | CSV parse/serialise + spreadsheet table model |
+| `Cmedit.Inflate` | Hand-rolled DEFLATE (RFC 1951), shared by PNG and PDF's compressed streams |
 | `Cmedit.Image` | From-scratch BMP/PNM/GIF/PNG/JPEG (baseline+progressive)/WebP (VP8L+VP8) decoders + image→cell scaler |
+| `Cmedit.Pdf` | From-scratch PDF reader: object scan, filters, content-stream interpreter, fonts, and page→document reconstruction |
 | `Cmedit.Pager` | Read-only paged view of files too large to load: sparse line index + windowed reads |
 | `Cmedit.Rtf` | RTF parser + document layout for the read-only formatted view of `.rtf` files |
+| `Cmedit.Zip` | ZIP central-directory reader + the file-tree listing shown for an archive |
 | `Cmedit.About` | The About box's animated wordmark (pure frame→cells generation) |
 | `Cmedit.Render` | Model → cell grid, and the diff to escape codes |
 | `Cmedit.App` | IO driver: setup/teardown, reader thread, event loop |

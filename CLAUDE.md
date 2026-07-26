@@ -320,6 +320,145 @@ in `README.md`; the cross-cutting structure that matters when editing:
   bold since a terminal has one font size. `attrStrike` (SGR 9) was added for
   `\strike` and needs no capability gate — an unrecognised *numeric* SGR
   parameter is ignored, unlike the colon sub-parameter forms or REP.
+- **PDF reading view (`Cmedit.Pdf`, `edPdf`/`docPdf`).** A sixth view mode.
+  Structurally it is the **image** view, not the RTF one, and the reason is
+  worth stating: a PDF is binary, so there is no buffer under it to toggle to
+  (no Alt+T), nothing Save could write, and the file is sniffed
+  (`Pdf.sniffPdf`, `%PDF-` anywhere in the first KiB — producers are allowed
+  junk in front of it) *before* the binary refusal in `classifyFileWith`,
+  exactly like `sniffImage` and `zipMagic`. It arrives as its own
+  `LoadOutcome` (`OutPdf`), installed by `pdfLoaded`/`pdfLoadedNew`/
+  `addPdfDocument`. Like the pager it needs no second installer for the
+  already-open case — it is read-only, so switching to the open copy is the
+  only sane result. Parsing is the expensive part, so a PDF crosses to the
+  background loader at `imageAsyncBytes` rather than `asyncThresholdBytes`
+  (`looksLikeDecoded` covers both: these views pay for their *content*, not
+  their byte count).
+  Three things make a text view of PDF tractable without a rasteriser, and
+  they are the load-bearing decisions in the module:
+  **(1) Objects are found without the cross-reference table.** `scanObjects`
+  sweeps the file for `N G obj` and parses each, resuming *after* the object
+  it just read so an `obj` inside a compressed stream's bytes is never
+  mistaken for a definition. This is deliberately not "parse `startxref` and
+  walk the chain": broken, patched and linearised-then-appended files are
+  everywhere, and a scan reads them all — incremental updates fall out for
+  free, since a later definition of an object number wins, which is exactly
+  what an appended update means. The one thing a scan cannot see is objects
+  inside compressed object streams (`/ObjStm`, universal since PDF 1.5), so
+  `expandObjStms` inflates those afterwards and folds them in under the same
+  later-wins rule. The trailer is found by keyword, by `/Type /XRef`, or
+  failing both by any object calling itself a `/Catalog`.
+  **(2) The content stream is a small stack machine.** Of its ~70 operators
+  only the text ones and the two matrix ones carry position, so `runContent`
+  implements those and clears operands for everything else — an unmodelled
+  operator is *ignored*, the same bargain `Cmedit.Rtf` strikes with markup.
+  Form XObjects recurse (depth-capped); inline images (`BI … ID …binary… EI`)
+  are the one construct that cannot be tokenised as objects and are skipped
+  whole.
+  **(3) Reading order is recovered, heuristically, in one place.**
+  `assemblePage` is where a bag of positioned glyph runs becomes a document:
+  columns from a vertical band in the x-occupancy (runs wider than 60% of the
+  page are excluded from that test and placed by their centre, or a
+  full-width title would fill the gutter and hide it), lines from y-clustering
+  at ±0.5 em (superscripts and separately-drawn accents belong to their line),
+  spaces from the gap between one run's end and the next one's start measured
+  in ems, and paragraphs from lines that both sit at the column's ordinary
+  leading *and* reach its right margin. Two statistics there are load-bearing
+  and were both wrong first: the leading is the **mode** of consecutive
+  baseline steps, not the median (a page with several headings has enough wide
+  steps to drag a median past the body leading, and then every paragraph on it
+  merges into one), and the right margin is a **high percentile** of where
+  lines end, not the maximum (a page number sits at the true page edge, and
+  against that no body line ever "reaches the margin", so every ragged-right
+  paragraph breaks at its first short line). Both signals must agree before
+  two lines join, which is what lets each cover the other's blind spot.
+  Everything downstream is the RTF view's shape: `layoutPdf` wraps/indents/
+  aligns into `PdfLine`s cached against the width in `pdCache`, `Render.drawPdf`
+  feeds their formatting runs to the same `expandLineCellsFrom` the text view
+  uses, there is **no cursor** (`computeCursor` returns `Nothing`), mouse in
+  the text area is swallowed apart from the wheel, `pdfDisabledActions` are
+  pruned from the menus *and* guarded in `runAction`, and the vertical
+  scrollbar is taught **twice** (`scrollBarInfo` to measure, `scrollBarTo` to
+  act). `refreshPdf` rides the `update` wrapper next to `refreshRtf` — not
+  because anything can edit a PDF (nothing can) but because the *width* it was
+  laid out for has more sources than the `relayout` sites (turning the
+  scrollbar off in Settings moves it by a column).
+  **It selects, and that is the point of it.** `pdCaret`/`pdAnchor` are the
+  text view's cursor-and-anchor model over laid-out (line, character)
+  coordinates, minus everything that writes — mouse press/drag/release with
+  double-click-word and triple-click-line, Shift+movement, Ctrl+A, and Ctrl+C
+  copying `pdfSelText` (detached, like every clipboard value). Three
+  decisions there are deliberate: **plain arrows scroll the window and leave
+  the selection alone** (in a reader, scrolling to see the rest of what you
+  highlighted must not destroy it — Esc is what clears it); a **plain click
+  leaves nothing behind**, since with no selection this view shows no cursor
+  and a stray click should not conjure one; and the caret is drawn *only*
+  while an anchor is set, so `computeCursor` still returns `Nothing` for an
+  untouched document. A re-wrap drops the selection outright (`pdfRelayout`)
+  — the indices address the old layout, and pointing at whatever now sits
+  there would be a lie. **In-file Find** (`pdfFindWith`, `pdfAllMatches` in
+  `EditorFind`) searches the same laid-out lines, so a term the original page
+  broke across a line is not found, exactly as in the wrapped text view; the
+  hit becomes the selection, which is what makes Find and copy compose —
+  search for it, then Ctrl+C. Find Next measures from the caret, Find
+  Previous from the *start* of the current selection (otherwise the first
+  Shift+F3 after a find re-finds the match you are sitting on), and the
+  live-highlight and match-count paths are the text view's own
+  (`liveMatchSpans` works on any `Text`; `findCountMsg` grew a PDF branch).
+  Workspace search still skips PDFs — they are binary on disk, and the
+  reflowed text only exists once the file is open.
+  What the view adds that no other has is **pages**: `pdCache` carries the
+  first line index of each one, `[`/`]` turn them, and `MAGoToLine` is
+  reinterpreted — `gotoLine` reads a page number, `openGoTo` opens
+  `mkGoToPage`, and `relabelEntry` retitles the menu item, because a laid-out
+  row number moves with the window width and would mean nothing to anyone.
+  Fonts are where extraction quality actually lives: a glyph code means
+  nothing without the font's `/ToUnicode` CMap or its encoding
+  (WinAnsi/MacRoman plus `/Differences`, resolved through a Latin glyph-name
+  table), and its *width* decides where words break — which is why the
+  standard-14 metrics are built in for files that ship no `/Widths` at all,
+  and why Type3 fonts get their `/FontMatrix` applied (`fiWScale`): miss that
+  and every advance is out by three orders of magnitude, which reads on screen
+  as a document with all its spaces missing. Ligatures are spelled out
+  (`expandLigatures`) because U+FB01 is what the font honestly reports and
+  what no terminal font has. Encrypted files are *reported*, not guessed at;
+  every other limit in the module (`maxPdfPages`, `maxPdfChars`,
+  `maxStreamBytes`, `maxOpsPerPage`, `maxFormDepth`) bounds work that only a
+  malformed or hostile file could make unbounded. Extraction is at parity with
+  `pdftotext`'s word count across the test corpus, which is the bar to hold if
+  the heuristics are ever retuned.
+- **Archive listings (`Cmedit.Zip`).** A `.zip` — and everything built on it
+  (`.jar`, `.whl`, `.docx`, `.epub`, `.apk`; sniffed by `zipMagic` in
+  `classifyFileWith`, *before* the size check and the binary refusal, exactly
+  like `sniffImage`) — opens as a read-only file tree of its contents. The
+  deliberate choice here is that **it is not a view mode**: `App.zipOutcome`
+  returns an ordinary `OutText` whose buffer is the listing and whose
+  `lrReadOnly` is `True`, the trick `Cmedit.Manual` plays with its pseudo-path.
+  Nothing downstream — installers, key handlers, renderer, scroll bars, find,
+  wrap — learns a new mode, and there is no serialiser back to ZIP (nor could
+  there be), so the archive can never be overwritten by its own table of
+  contents. The one hole that leaves is `Save As`, which seeds `edPath` and
+  does **not** confirm before overwriting (`DKConfirmOverwrite` exists but is
+  never constructed), so `saveAsDialogFlow` seeds `<name>.txt` for an
+  `isArchivePath`; if you ever wire up the overwrite confirmation, that
+  special case can go.
+  Reading is **size-independent and decompresses nothing**: the central
+  directory is at the end of the file and is proportional to the entry count,
+  so `findEocd` works on a 128 KiB tail (via the driver's `readAt`, the one
+  seeking read in `App`) and `parseCentral` on the directory block alone — a
+  10 GB archive costs the same two reads as a 10 KB one, and `maxOpenBytes`
+  never applies. Because no member is ever read, **entry encryption is
+  irrelevant**: an encrypted archive lists normally and flagged members just
+  say so. The parser handles ZIP64 (the locator/end-record pair supersedes the
+  32-bit fields wholesale), the self-extracting-stub offset correction (the
+  directory ends where the end record begins, so subtraction finds the real
+  start — 32-bit only; ZIP64's offsets are already absolute), and CP437 names
+  (general-purpose bit 11 selects UTF-8; guessing wrong mangles accented
+  names). `Cmedit.Zip` is a leaf (`Cmedit.Width` only) and `Syntax`'s `Archive`
+  lexer colours the *generated* listing, not any file format — which is why
+  it is positional and stateless, and why `archiveExtensions` feeding
+  `langForPath` also (harmlessly) recolours those extensions in the explorer
+  via `Render.fileKind`.
 - **Two coordinate systems.** Buffer positions (`Pos`) count *characters*; the
   screen counts *display cells*. `Cmedit.Width` maps between them
   (`colToDisplay`/`displayToCol`) and supplies a compact `wcwidth` plus tab-stop
@@ -540,9 +679,13 @@ in `README.md`; the cross-cutting structure that matters when editing:
   a self-contained, IO-free module that decodes BMP, Netpbm, GIF, PNG, JPEG
   (baseline **and** progressive) and WebP (lossless VP8L **and** lossy VP8,
   incl. the ALPH alpha chunk and an animation's first frame) from raw bytes
-  using only boot libraries — the DEFLATE `inflate`, GIF LZW, JPEG
-  Huffman/IDCT, VP8L prefix codes/transforms, and the VP8 boolean decoder /
-  intra prediction / loop filter are all hand-rolled — into
+  using only boot libraries — GIF LZW, JPEG Huffman/IDCT, VP8L prefix
+  codes/transforms, and the VP8 boolean decoder / intra prediction / loop
+  filter are all hand-rolled, and DEFLATE lives next door in the leaf module
+  `Cmedit.Inflate` (`inflate` for a known output size, which PNG has;
+  `inflateDyn`, which grows its buffer, for PDF content streams, which declare
+  only their *compressed* length; `Huff`/`buildHuff` are shared with JPEG's
+  own canonical tables) — into
   an RGBA `Image`, and `renderImage` area-averages it down to a grid of half-block
   (`▀`, fg=top pixel / bg=bottom pixel, 24-bit colour) or ASCII-ramp `Cell`s.
   Detection is by **magic bytes** in `App.openPath` (not extension): it sniffs
