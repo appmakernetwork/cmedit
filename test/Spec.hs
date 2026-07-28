@@ -4,6 +4,7 @@
 module Main (main) where
 
 import Control.Monad (forM_, unless, void)
+import Text.Read (readMaybe)
 import Data.Bits (shiftR, (.&.))
 import Data.Foldable (toList)
 import Data.IORef
@@ -36,11 +37,13 @@ import Cmedit.Editor
 import Cmedit.ConfigFile
   ( parseConfigText, updateConfigText, RecentEntry(..), parseRecentText
   , renderRecentText, parseHistoryText, renderHistoryText
-  , Session(..), parseSessionText, renderSessionText
+  , Session(..), SessionFile(..), SessionSummary(..), parseSessionText
+  , renderSessionText, summarizeSession, newestSession, splitLeadingFields
+  , sessionVersion
   , RestorePlan(..), planRestore )
 import Cmedit.QuickOpen (QuickOpen(..))
 import qualified Cmedit.QuickOpen as Q
-import Cmedit.Menu (MenuAction(..), MenuEntry(..), MenuState(..))
+import Cmedit.Menu (MenuAction(..), MenuEntry(..), MenuState(..), mnemonicChar, parseMnemonic)
 import Cmedit.Dialog (fieldValue, Field(..), Choice(..), Dialog(..), DialogKind(..), mkFind, mkTheme, fieldSetCursorLineCol, focusedButton, focusedChoice, focusedField, focusIsButton, focusNext, focusPrev, cycleChoice, setChoiceIx, focusCount)
 import Cmedit.Browser (Browser(..), FileNode(..))
 import qualified Cmedit.Browser as Br
@@ -62,7 +65,7 @@ import qualified Cmedit.Epub as Epub
 import qualified Cmedit.Xlsx as Xlsx
 import qualified Cmedit.Formula as Fm
 import qualified Cmedit.Odf as Odf
-import Cmedit.App (convertPath)
+import Cmedit.App (convertPath, abbreviateHome)
 import Cmedit.Rtf (RtfDoc(..))
 import Cmedit.Pdf (PdfDoc(..))
 import qualified Cmedit.Pdf as Pdf
@@ -5531,6 +5534,40 @@ main = do
     checkEq "recent parse entry" (head rs) (RecentEntry "/tmp/a.txt" 11 4)
     checkEq "recent path may contain colons" (rePath (rs !! 2)) "/tmp/with:colon.txt"
     checkEq "recent roundtrip" (parseRecentText (renderRecentText rs)) rs
+
+    -- The pre-0030 line parser, kept as the oracle for the shared
+    -- 'splitLeadingFields' that replaced it — the 'csvParsePrev' idiom, and for
+    -- the same reason. Every existing user's recents file goes through the new
+    -- one on the next start, and the property that must not be lost is
+    -- byte-level: only the first two colons separate, everything after them is
+    -- the path, and a line that fails any of that is dropped rather than
+    -- half-read. The corpus puts a colon at every position of every string up
+    -- to length four over an alphabet of the characters that decide the answer
+    -- (colons, digits, a sign, a separator, a letter and both blanks, since
+    -- 'parseRecentText' strips), plus the hand-picked shapes too long to
+    -- enumerate.
+    let parseRecentPrev line
+          | T.null line = Nothing
+          | otherwise =
+              let (lt, rest1) = T.breakOn (T.pack ":") line
+                  (ct, rest2) = T.breakOn (T.pack ":") (T.drop 1 rest1)
+                  path        = T.unpack (T.drop 1 rest2)
+              in do l <- readMaybe (T.unpack lt)
+                    c <- readMaybe (T.unpack ct)
+                    if null path || T.null rest1 || T.null rest2
+                      then Nothing
+                      else Just (RecentEntry path (max 0 (l - 1)) (max 0 (c - 1)))
+        recentCorpus =
+          [ T.pack s | n <- [0 .. 4 :: Int], s <- sequence (replicate n ":019-/a \t") ]
+            ++ map T.pack
+                 [ "1:1:/a", "-1:-1:/a", "+3:4:/x", "999999999999999999:1:/a"
+                 , "0x10:2:/a", " 1: 1:/a", "1 :1 :/a", "1:1:", "::", ":::"
+                 , "1::/a", "1:1:/a:b:c", "3:4:5:/x", "1:1:/a\r", "01:01:/a"
+                 , "(1):1:/a", "1:(1):/a", "1:1:/a/b/c.txt", "1:1: " ]
+    check ("the recents parser is byte-identical to the pre-0030 one ("
+             ++ show (length recentCorpus) ++ " inputs)")
+      (all (\t -> parseRecentText t == maybe [] (: []) (parseRecentPrev (T.strip t)))
+           recentCorpus)
     check "recent list is capped"
       (length (parseRecentText (T.unlines
         [ T.pack ("1:1:/f" ++ show i) | i <- [1 .. 200 :: Int] ])) == 50)
@@ -7650,49 +7687,99 @@ main = do
   -- once the files that have since vanished are dropped, and which documents
   -- are worth recording at all.
   do
-    let sess = Session (Just "/home/ben/my work")
-                 [ RecentEntry "/w/a.txt" 0 0
-                 , RecentEntry "/w/b:c:d.txt" 11 4        -- colons belong to the path
-                 , RecentEntry "/w/spaced name.md" 3 7 ] 1
+    let sf p l c = SessionFile p l c Nothing
+        sess = Session (Just "/home/ben/my work")
+                 [ SessionFile "/w/a.txt" 0 0 (Just 1753659000000000000000)
+                 , SessionFile "/w/b:c:d.txt" 11 4 Nothing   -- colons belong to the path
+                 , SessionFile "/w/spaced name.md" 3 7 (Just 1) ] 1
+                 (Just 1753660000000000000000)
         roundTrips lbl s = checkEq ("session round-trip: " ++ lbl)
                              (parseSessionText (renderSessionText s)) (Just s)
-    roundTrips "folder, files, active" sess
+    roundTrips "folder, files, active, mtimes, closed" sess
     roundTrips "no folder" sess { seFolder = Nothing }
-    roundTrips "no files" (Session (Just "/w") [] 0)
-    roundTrips "nothing at all" (Session Nothing [] 0)
+    roundTrips "no closed stamp" sess { seClosed = Nothing }
+    roundTrips "every mtime absent"
+      sess { seFiles = [ f { sfMtime = Nothing } | f <- seFiles sess ] }
+    roundTrips "no files" (Session (Just "/w") [] 0 (Just 7))
+    roundTrips "nothing at all" (Session Nothing [] 0 Nothing)
+
+    -- v2 is what is written; the version line says so.
+    check "the rendered version line is v2"
+      (T.isPrefixOf (T.pack "cmedit-session 2\n") (renderSessionText sess))
+    checkEq "the format version written is 2" sessionVersion 2
 
     -- A version we do not know is "no session", not a guess: a later format's
     -- lines would arrive here looking exactly like malformed ones.
-    check "an unknown session version is no session"
-      (parseSessionText (T.pack "cmedit-session 2\nactive: 0\n1:1:/w/a.txt\n") == Nothing)
+    check "a version from the future is no session"
+      (parseSessionText (T.pack "cmedit-session 3\nactive: 0\n1:1:-:/w/a.txt\n") == Nothing)
     check "a file that is not a session is rejected"
       (parseSessionText (T.pack "1:1:/w/a.txt\n") == Nothing)
     check "an empty session file is no session"
       (parseSessionText T.empty == Nothing)
+    check "garbage is no session"
+      (parseSessionText (T.pack "\x00\x01 not a session at all\n") == Nothing)
+    -- A truncated final line is skipped, not fatal: the file is user-visible
+    -- state on disk, not a format we can assume intact.
+    checkEq "a truncated final entry line is skipped"
+      (fmap (map sfPath . seFiles)
+        (parseSessionText (T.pack "cmedit-session 2\n1:1:-:/w/a.txt\n12:3")))
+      (Just ["/w/a.txt"])
+    check "an active index out of range still parses (planRestore clamps it)"
+      (fmap seActive (parseSessionText
+        (T.pack "cmedit-session 2\nactive: 99\n1:1:-:/w/a.txt\n")) == Just 99)
+
+    -- The case that catches a mis-generalised line parser: only the first *k*
+    -- colons separate, so a v2 path may contain as many as it likes even with a
+    -- third leading field in front of it.
+    checkEq "v2 keeps colons in the path after three leading fields"
+      (fmap seFiles (parseSessionText
+        (T.pack "cmedit-session 2\n3:9:42:/w/a:b:c.txt\n")))
+      (Just [SessionFile "/w/a:b:c.txt" 2 8 (Just 42)])
+    checkEq "v1 keeps colons in the path after two leading fields"
+      (fmap seFiles (parseSessionText (T.pack "cmedit-session 1\n3:9:/w/a:b:c.txt\n")))
+      (Just [SessionFile "/w/a:b:c.txt" 2 8 Nothing])
+    -- The shared splitter itself, since two encodings now depend on it.
+    checkEq "splitLeadingFields takes exactly k fields"
+      (splitLeadingFields 3 (T.pack "1:2:3:/a:b"))
+      (Just ([T.pack "1", T.pack "2", T.pack "3"], "/a:b"))
+    check "splitLeadingFields fails when there are too few separators"
+      (splitLeadingFields 3 (T.pack "1:2:/a") == Nothing
+       && splitLeadingFields 2 (T.pack "1:2:") == Nothing)
+
+    -- Back-compat: a byte-exact 0025 session file parses to what it always did,
+    -- with every mtime Nothing -- so no file is ever reported changed and a
+    -- first restore after the upgrade behaves precisely like a 0025 restore.
+    checkEq "a v1 session file parses, with no mtimes"
+      (parseSessionText (T.pack ("cmedit-session 1\nfolder: /home/ben/work/cmedit\n"
+                                 ++ "active: 2\n"
+                                 ++ "12:4:/w/App.hs\n1:1:/w/new.md\n340:18:/w/Editor.hs\n")))
+      (Just (Session (Just "/home/ben/work/cmedit")
+               [ sf "/w/App.hs" 11 3, sf "/w/new.md" 0 0, sf "/w/Editor.hs" 339 17 ]
+               2 Nothing))
+    check "a v1 session records no closed stamp"
+      (fmap seClosed (parseSessionText (T.pack "cmedit-session 1\n1:1:/w/a\n"))
+         == Just Nothing)
 
     -- Tolerance: CRLF line endings, blank lines and lines from a future
     -- version are all skipped rather than taking the session down with them.
     checkEq "CRLF, blanks and unknown keys are tolerated"
       (parseSessionText (T.pack ("cmedit-session 1\r\nfolder: /w\r\nactive: 1\r\n"
                                  ++ "1:1:/w/a.txt\r\n\r\nlayout: split\r\n12:5:/w/b.txt\r\n")))
-      (Just (Session (Just "/w")
-               [RecentEntry "/w/a.txt" 0 0, RecentEntry "/w/b.txt" 11 4] 1))
+      (Just (Session (Just "/w") [sf "/w/a.txt" 0 0, sf "/w/b.txt" 11 4] 1 Nothing))
     checkEq "an absent active line reads as the first file"
       (fmap seActive (parseSessionText (T.pack "cmedit-session 1\n1:1:/w/a.txt\n"))) (Just 0)
     checkEq "an empty folder value is no folder"
       (fmap seFolder (parseSessionText (T.pack "cmedit-session 1\nfolder:\n"))) (Just Nothing)
 
     -- planRestore: the index arithmetic, which is the whole of the risk.
-    let s3 = Session Nothing [ RecentEntry "/w/a" 0 0
-                             , RecentEntry "/w/b" 1 0
-                             , RecentEntry "/w/c" 2 0 ] 2
+    let s3 = Session Nothing [ sf "/w/a" 0 0, sf "/w/b" 1 0, sf "/w/c" 2 0 ] 2 Nothing
         plan fs s = planRestore fs s
     checkEq "restore keeps the session's order"
-      (map rePath (rpFiles (plan [True, True, True] s3))) ["/w/a", "/w/b", "/w/c"]
+      (map sfPath (rpFiles (plan [True, True, True] s3))) ["/w/a", "/w/b", "/w/c"]
     checkEq "restore keeps the recorded active file"
       (rpActive (plan [True, True, True] s3)) 2
     checkEq "restore skips the files that are gone"
-      (map rePath (rpFiles (plan [True, False, True] s3))) ["/w/a", "/w/c"]
+      (map sfPath (rpFiles (plan [True, False, True] s3))) ["/w/a", "/w/c"]
     checkEq "a missing file ahead of the active one shifts it down"
       (rpActive (plan [True, False, True] s3)) 1
     checkEq "two missing files ahead of it shift it twice"
@@ -7709,7 +7796,7 @@ main = do
       (null (rpFiles (plan [False, False, False] s3))
        && rpActive (plan [False, False, False] s3) == 0)
     check "a short existence list means the rest are gone"
-      (map rePath (rpFiles (plan [True] s3)) == ["/w/a"])
+      (map sfPath (rpFiles (plan [True] s3)) == ["/w/a"])
 
     -- What the editor records. Untitled buffers are absent by construction:
     -- there is no path to reopen, and their content is the journal's job.
@@ -7719,21 +7806,29 @@ main = do
         edSab = setLoadedNew "/w/b.txt" (mkLRs "bbb\nbbb") edSa   -- a backgrounded, b active
         edSabU = fst (update (KCtrlChar 'n') edSab)               -- + an untitled buffer, active
     checkEq "the session records open files in order"
-      (map rePath (seFiles (sessionForPersist edSab))) ["/w/a.txt", "/w/b.txt"]
+      (map sfPath (seFiles (sessionForPersist edSab))) ["/w/a.txt", "/w/b.txt"]
     checkEq "the session records which file is active"
       (seActive (sessionForPersist edSab)) 1
     checkEq "an untitled buffer is not recorded"
-      (map rePath (seFiles (sessionForPersist edSabU))) ["/w/a.txt", "/w/b.txt"]
+      (map sfPath (seFiles (sessionForPersist edSabU))) ["/w/a.txt", "/w/b.txt"]
     checkEq "an untitled active buffer records the nearest recorded document"
       (seActive (sessionForPersist edSabU)) 1
     checkEq "the manual's pseudo-path is not recorded"
-      (map rePath (seFiles (sessionForPersist (openManual edSab)))) ["/w/a.txt", "/w/b.txt"]
+      (map sfPath (seFiles (sessionForPersist (openManual edSab)))) ["/w/a.txt", "/w/b.txt"]
+    -- The driver fills the stamp in (it is the only side that can read a clock).
+    checkEq "the pure session carries no closed stamp"
+      (seClosed (sessionForPersist edSab)) Nothing
+    -- No baseline in these test documents, so the mtime fields are absent --
+    -- which is exactly a "named but never created" file, and means no change
+    -- detection rather than "unchanged".
+    checkEq "a document with no disk baseline records no mtime"
+      (map sfMtime (seFiles (sessionForPersist edSab))) [Nothing, Nothing]
     checkEq "the session records the open folder"
       (seFolder (sessionForPersist (explorerStart "/w" [("/w/a.txt", False, Just 3)] edSab)))
       (Just "/w")
     checkEq "the session records live cursor positions"
       (seFiles (sessionForPersist edSab { edCursor = Pos 1 2 }))
-      [RecentEntry "/w/a.txt" 0 0, RecentEntry "/w/b.txt" 1 2]
+      [sf "/w/a.txt" 0 0, sf "/w/b.txt" 1 2]
     -- ...but a cursor move is not a change of *shape*, so it must not make the
     -- driver rewrite the file (the recents' rule, for the recents' reason).
     checkEq "a cursor move is not a session change"
@@ -7748,7 +7843,7 @@ main = do
     checkEq "the shape is the persisted session's folder, paths and active index"
       (sessionShape (explorerStart "/w" [("/w/a.txt", False, Just 3)] edSab))
       (let s = sessionForPersist (explorerStart "/w" [("/w/a.txt", False, Just 3)] edSab)
-       in (seFolder s, map rePath (seFiles s), seActive s))
+       in (seFolder s, map sfPath (seFiles s), seActive s))
 
     -- 0029: the driver evaluates 'sessionShape' after *every* key batch, so it
     -- must never ask a document where its cursor is. For a table document that
@@ -7772,7 +7867,7 @@ main = do
                  :: IO (Either SomeException Int)
     check "0029: sessionShape does not force a table document's cursor position"
       (either (const False) (> 0) shapeOk)
-    posBoom <- try (evaluate (length (concatMap rePath
+    posBoom <- try (evaluate (length (concatMap sfPath
                                 (seFiles (sessionForPersist edBomb)))))
                  :: IO (Either SomeException Int)
     check "0029: ...and the bomb is armed (sessionForPersist does force it)"
@@ -7805,6 +7900,311 @@ main = do
     checkEq "restore-session round-trips through updateConfigText"
       (fst (parseConfigText (updateConfigText cR T.empty) defaultConfig)) cR
     checkEq "restore-session is off by default" (cfgRestoreSession defaultConfig) False
+
+  -- Per-workspace sessions (plan 0030) ========================================
+  --
+  -- Everything below is a pure function: how a folder maps to a session file,
+  -- which past sessions the File menu offers and how it labels them, which
+  -- letter each of those rows may claim, the §2.8 precedence table as a decision
+  -- function, and which open documents a clean exit snapshots. The IO around
+  -- them (the directories, the stat pass, the wholesale snapshot replace) is
+  -- pinned by docs/plans/bench/pty_session.py.
+  do
+    -- Naming a session file: 'Journal.pathHash' + 'sanitizeBase', reused
+    -- verbatim, which is what makes the cwd lookup a filename computation
+    -- instead of a directory scan.
+    checkEq "a session file is named <hash>-<basename>.session"
+      (J.sessionFileName "/home/ben/work/cmedit")
+      (J.pathHash "/home/ben/work/cmedit" ++ "-cmedit.session")
+    check "two folders sharing a basename get different session files"
+      (J.sessionFileName "/home/ben/work/api"
+         /= J.sessionFileName "/home/ben/other/api")
+    check "the same folder always gets the same session file"
+      (J.sessionFileName "/w/x" == J.sessionFileName "/w/x")
+    checkEq "the folderless session has its own key"
+      (J.sessionKeyName Nothing) "no-folder"
+    checkEq "a folder's snapshot directory is its session file minus the extension"
+      (J.sessionKeyName (Just "/w/x") ++ J.sessionExtension)
+      (J.sessionFileName "/w/x")
+    check "only .session names are ours"
+      (J.isSessionFileName "abc.session" && not (J.isSessionFileName "abc.txt")
+       && not (J.isSessionFileName ".session"))
+
+    -- The --restore fallback: the greatest 'closed:' wins, and the answer
+    -- carries the folder the status line will name.
+    let sumOf f c n = SessionSummary ("/cfg/" ++ show n) f n c
+        sA = sumOf (Just "/w/api")     (Just 200) 3
+        sB = sumOf (Just "/w/website") (Just 900) 6
+        sC = sumOf Nothing             (Just 100) 1
+        sV1 = sumOf (Just "/w/old")    Nothing    2      -- a v1 file: no stamp
+    checkEq "the fallback picks the most recently written session"
+      (fmap sumFolder (newestSession [sA, sB, sC])) (Just (Just "/w/website"))
+    checkEq "an unstamped v1 session loses to anything stamped"
+      (fmap sumFolder (newestSession [sV1, sC])) (Just Nothing)
+    checkEq "an unstamped session still wins when it is all there is"
+      (fmap sumFolder (newestSession [sV1])) (Just (Just "/w/old"))
+    checkEq "no sessions is no fallback" (newestSession []) Nothing
+    -- The fallback's status note names the folder it came from, which is the
+    -- whole of what makes it non-astonishing — so the abbreviation must not
+    -- name a folder nobody has. A plain prefix test makes "/home/ben" a prefix
+    -- of "/home/benjamin", and "~jamin/site" is a worse answer than the path.
+    checkEq "a folder under home is abbreviated"
+      (abbreviateHome "/home/ben" "/home/ben/work/website") "~/work/website"
+    checkEq "the home directory itself is just ~"
+      (abbreviateHome "/home/ben" "/home/ben") "~"
+    checkEq "a trailing separator on $HOME does not eat the one after it"
+      (abbreviateHome "/home/ben/" "/home/ben/work") "~/work"
+    checkEq "a sibling that merely starts with home's name is left alone"
+      (abbreviateHome "/home/ben" "/home/benjamin/site") "/home/benjamin/site"
+    checkEq "a path outside home is left alone"
+      (abbreviateHome "/home/ben" "/srv/data") "/srv/data"
+    checkEq "an empty home abbreviates nothing"
+      (abbreviateHome "" "/srv/data") "/srv/data"
+    checkEq "summarizing keeps folder, count and stamp"
+      (summarizeSession "/cfg/x"
+         (Session (Just "/w") [SessionFile "/w/a" 0 0 Nothing] 0 (Just 5)))
+      (SessionSummary "/cfg/x" (Just "/w") 1 (Just 5))
+
+    -- The File menu's section: ordering, the cap, the live-key exclusion,
+    -- de-duplication by folder, the labels, and MARestoreSession k addressing
+    -- the same entry the label names.
+    let edMs0 = (newEditor (24, 80) defaultConfig) { edSessions = [sA, sB, sC] }
+    -- With no folder open, the *folderless* session is the live one, so it is
+    -- the one excluded.
+    checkEq "sessions are offered newest first"
+      (map sumFolder (sessionMenuList edMs0)) [Just "/w/website", Just "/w/api"]
+    checkEq "at most sessionMenuMax sessions are offered"
+      (length (sessionMenuList edMs0 { edSessions =
+                 [ sumOf (Just ("/w/" ++ show k)) (Just (fromIntegral k)) k
+                 | k <- [1 .. 9 :: Int] ] }))
+      sessionMenuMax
+    -- The live session's own key is excluded: offering to restore what is
+    -- already open is noise, and the key is a function of the folder.
+    let edMsOpen = explorerStart "/w/website" [] edMs0
+    checkEq "the live session's own folder is not offered"
+      (map sumFolder (sessionMenuList edMsOpen)) [Just "/w/api", Nothing]
+    checkEq "with a folder open, the folderless session is offered"
+      (map sumFolder (sessionMenuList (explorerStart "/w/elsewhere" [] edMs0)))
+      [Just "/w/website", Just "/w/api", Nothing]
+    -- A legacy folderless session that names a folder now owning its own file
+    -- must not appear twice; the newer 'closed:' wins.
+    let dupOld = sumOf (Just "/w/api") (Just 50)  9
+        dupNew = sumOf (Just "/w/api") (Just 800) 4
+    checkEq "sessions are de-duplicated by folder, newest kept"
+      (map sumCount (sessionMenuList edMs0 { edSessions = [dupOld, dupNew] })) [4]
+    checkEq "a session's label is its folder's basename and file count"
+      (sessionMenuLabel sB) (T.pack "website (6 files)")
+    checkEq "one file is not pluralised"
+      (sessionMenuLabel (sumOf (Just "/w/api") (Just 1) 1)) (T.pack "api (1 file)")
+    checkEq "the folderless session says so"
+      (sessionMenuLabel sC) (T.pack "(no folder) (1 file)")
+    check "a very long basename is elided from the left"
+      (let lbl = sessionMenuLabel (sumOf (Just ("/w/" ++ replicate 90 'x')) (Just 1) 2)
+       in T.length lbl <= 44 && T.isPrefixOf (T.pack "\x2026") lbl)
+    checkEq "MARestoreSession addresses the entry its label names"
+      [ (lbl, a) | MEItem lbl _ a <- sessionMenuEntries edMs0 ]
+      [ (sessionMenuLabel s, MARestoreSession k)
+      | (k, s) <- zip [0 ..] (sessionMenuList edMs0) ]
+
+    -- Where the section lands: above the recents, both above Settings…/Exit.
+    let fileMenu ed = entriesFor ed 0
+        actsOf ed = [ a | MEItem _ _ a <- fileMenu ed ]
+        ixOf p ed = length (takeWhile (not . p) (actsOf ed))
+        isSessAct a = case a of MARestoreSession _ -> True; _ -> False
+        isRecAct  a = case a of MARecentFile _      -> True; _ -> False
+    check "sessions sit above the recents, and both above the tail"
+      (let ed = edMs0 { edRecent = [RecentEntry "/w/r1.txt" 0 0] }
+       in ixOf isSessAct ed < ixOf isRecAct ed
+          && ixOf isRecAct ed < ixOf (== MASettings) ed)
+    check "no sessions means no session section"
+      (null [ () | MEItem _ _ (MARestoreSession _) <- fileMenu (newEditor (24, 80) defaultConfig) ])
+
+    -- Mnemonics. A free initial is claimed; a taken one, a digit and a
+    -- non-letter get none -- and no dropdown may ever hold two entries with the
+    -- same mnemonic, which also guards future static items.
+    let mnemonicsOf es = [ c | MEItem lbl _ _ <- es, Just c <- [mnemonicChar lbl] ]
+        noDupes es = let ms = mnemonicsOf es in length ms == length (nub ms)
+        edMn ss = (newEditor (24, 80) defaultConfig)
+                    { edSessions = ss
+                    , edRecent = [ RecentEntry ("/w/r" ++ show k ++ ".txt") 0 0
+                                 | k <- [1 .. 6 :: Int] ] }
+        labelledMnemonic ed folder =
+          [ mnemonicChar lbl | MEItem lbl _ (MARestoreSession _) <- fileMenu ed
+          , T.isInfixOf (T.pack folder) (fst (parseMnemonic lbl)) ]
+    -- 'w' is free in the File menu, so ~/work/website takes it.
+    checkEq "a session whose initial is free claims it"
+      (labelledMnemonic (edMn [sB]) "website") [Just 'w']
+    -- 'c' is Close File's; a session in ~/work/cmedit gets no underline.
+    checkEq "a session whose initial is taken gets none"
+      (labelledMnemonic (edMn [sumOf (Just "/w/cmedit") (Just 1) 2]) "cmedit") [Nothing]
+    checkEq "a session whose initial is a digit gets none"
+      (labelledMnemonic (edMn [sumOf (Just "/w/2024-notes") (Just 1) 2]) "2024") [Nothing]
+    checkEq "the folderless session's '(' is no mnemonic"
+      (labelledMnemonic (explorerStart "/w/elsewhere" [] (edMn [sC])) "no folder")
+      [Nothing]
+    -- Two sessions with the same initial: the first takes it, the second does
+    -- not, so the dropdown never offers the same key twice.
+    check "two sessions cannot claim the same letter"
+      (noDupes (fileMenu (edMn [ sumOf (Just "/w/wombat") (Just 9) 1
+                               , sumOf (Just "/w/walrus") (Just 8) 1 ])))
+    check "every File-menu mnemonic is unique with sessions and recents present"
+      (noDupes (fileMenu (edMn [sA, sB, sC, sumOf (Just "/w/zebra") (Just 5) 1])))
+    check "every dropdown's mnemonics stay unique"
+      (all (\mi -> noDupes (entriesFor (edMn [sA, sB]) mi)) [0 .. 5])
+    -- The allocator is a pure post-pass and must leave non-session rows alone.
+    checkEq "assignSessionMnemonics touches nothing but session rows"
+      (assignSessionMnemonics [MEItem (T.pack "&New") T.empty MANew, MESep])
+      [MEItem (T.pack "&New") T.empty MANew, MESep]
+    checkEq "assignSessionMnemonics marks a free initial"
+      (assignSessionMnemonics [MEItem (T.pack "zebra (2 files)") T.empty (MARestoreSession 0)])
+      [MEItem (T.pack "&zebra (2 files)") T.empty (MARestoreSession 0)]
+
+    -- The §2.8 precedence table, one row per line of it. The decision takes
+    -- (recorded mtime, current mtime, snapshot availability) and nothing else.
+    checkEq "v1: no recorded mtime means no change detection"
+      (sessionChangeVerdict Nothing (Just 5) True) CVUnchanged
+    checkEq "recorded == disk: not listed"
+      (sessionChangeVerdict (Just 5) (Just 5) True) CVUnchanged
+    checkEq "recorded /= disk with a snapshot: offered"
+      (sessionChangeVerdict (Just 4) (Just 5) True) CVOffer
+    checkEq "recorded /= disk with no snapshot: listed and annotated"
+      (sessionChangeVerdict (Just 4) (Just 5) False) CVDiskOnly
+    checkEq "the file is gone: skipped and counted by planRestore, never listed"
+      (sessionChangeVerdict (Just 4) Nothing True) CVUnchanged
+    -- A stale snapshot set (the stamp mismatch) and an over-cap file both reach
+    -- the decision as "no snapshot available", which is the whole point of
+    -- funnelling them through one flag.
+    checkEq "a stamp mismatch degrades to the disk-only row"
+      (sessionChangeVerdict (Just 4) (Just 5) False) CVDiskOnly
+    -- A backwards clock is still a difference, and still honest.
+    checkEq "a file older than the record is a change too"
+      (sessionChangeVerdict (Just 9) (Just 5) True) CVOffer
+
+    -- Which open documents a clean exit snapshots, and that a snapshot
+    -- round-trips through the *unmodified* Journal serialiser.
+    let mkLRx t = LoadResult (fromText (T.pack t)) LF Utf8 True False Nothing
+        edSn0 = newEditor (24, 80) defaultConfig
+        edSnA = setLoaded "/w/a.txt" (mkLRx "alpha\n") edSn0
+        edSnB = setLoadedNew "/w/t.csv" (mkLRx "a,b\nc,d\n") edSnA
+    checkEq "a plain text document is snapshotted"
+      (map fst (snapshotRequests edSnA)) [J.journalFileName (Just "/w/a.txt") 0]
+    check "an unmodified document is snapshotted too (unlike a journal)"
+      (not (docModified (captureDoc edSnA)) && length (snapshotRequests edSnA) == 1)
+    checkEq "a CSV is snapshotted through its table, not its stale buffer"
+      (fmap jText (lookup (J.journalFileName (Just "/w/t.csv") 0)
+                          (snapshotRequests edSnB)))
+      (Just (T.pack "a,b\nc,d"))
+    check "an untitled buffer is not snapshotted"
+      (null (snapshotRequests edSn0))
+    check "the manual's pseudo-path is not snapshotted"
+      (map fst (snapshotRequests (openManual edSnA))
+         == [J.journalFileName (Just "/w/a.txt") 0])
+    check "a read-only view with no buffer is not snapshotted"
+      (not (snapshotableDoc (captureDoc edSnA)
+              { docPager = Just (Pg.mkPagerDoc "/w/big.log" 0 0 [] LF Utf8) }))
+    check "a document over the cap gets no snapshot"
+      (null (snapshotRequests
+               (setLoaded "/w/huge.txt"
+                  (mkLRx (replicate (maxSnapshotBytes + 10) 'x')) edSn0)))
+    check "a snapshot round-trips through the unmodified Journal serialiser"
+      (case snapshotRequests edSnA of
+         [(_, j)] -> J.parseJournal (J.serializeJournal j) == Just j
+         _        -> False)
+
+    -- Installing "As You Left Them": a modified unsaved buffer whose saved
+    -- baseline is what is on disk *now* and whose mtime baseline is the
+    -- session's, so it reads as modified and carries ◆ from the first frame.
+    let snapJ = Journal (Just "/w/a.txt") (Just (J.picosToDiskTime 1000))
+                        LF Utf8 True False (Pos 0 2) (T.pack "alpha EDITED")
+        edInst = installSessionSnapshots
+                   edSnA { edSessionChanged = [ChangedFile "/w/a.txt" (Just snapJ)] }
+    checkEq "the snapshot's text replaces the buffer"
+      (bufferToText LF True (edBuffer edInst)) (T.pack "alpha EDITED\n")
+    check "the installed document is modified"
+      (edModified edInst)
+    check "and carries the changed-on-disk marker"
+      (edDiskChanged edInst)
+    checkEq "its disk baseline is the session's, not the file's now"
+      (edDiskMtime edInst) (Just (J.picosToDiskTime 1000))
+    checkEq "its saved baseline is what was loaded from disk"
+      (bufferToText LF True (edSavedBuffer edInst)) (T.pack "alpha\n")
+    check "the offer list is emptied by the answer" (null (edSessionChanged edInst))
+    -- The restore reopens through the ordinary guards, so a path that is now a
+    -- view with no buffer under it must keep its disk version rather than have
+    -- a buffer written into it.
+    check "a document now in a buffer-less view is not patched"
+      (let edPg = edSnA { edPager = Just (Pg.mkPagerDoc "/w/a.txt" 0 0 [] LF Utf8)
+                        , edSessionChanged = [ChangedFile "/w/a.txt" (Just snapJ)] }
+           ed  = installSessionSnapshots edPg
+       in not (edModified ed)
+          && bufferToText LF True (edBuffer ed) == T.pack "alpha\n")
+    check "a file with no snapshot is left exactly as loaded"
+      (let ed = installSessionSnapshots
+                  edSnA { edSessionChanged = [ChangedFile "/w/a.txt" Nothing] }
+       in not (edModified ed)
+          && bufferToText LF True (edBuffer ed) == T.pack "alpha\n")
+    -- A *menu* restore runs on a live editor, where a recorded path may already
+    -- be open with unsaved work in it. The patch replaces the buffer outright
+    -- and clears the undo history, so a dirty document gets the same floor a
+    -- buffer-less view gets: 0030 §2.5's "it adds; it never closes" would be a
+    -- lie if one click on "As You Left Them" could destroy edits it never
+    -- offered to save. At startup this cannot fire — every restored document
+    -- was loaded from disk moments ago — which is why only the menu route can
+    -- see it and why nothing structural does.
+    check "a document with unsaved edits is never overwritten by a snapshot"
+      (let edDirty = fst (update (KChar '!') edSnA)
+           ed = installSessionSnapshots
+                  edDirty { edSessionChanged = [ChangedFile "/w/a.txt" (Just snapJ)] }
+       in edModified ed
+          && bufferToText LF True (edBuffer ed) == T.pack "!alpha\n"
+          && null (edSessionChanged ed))
+    check "...and a backgrounded dirty document is protected too"
+      (let edDirty = fst (update (KChar '!')
+                            (setLoadedNew "/w/b.txt" (mkLRx "beta\n") edSnA))
+           edBack = switchToFile 0 edDirty      -- /w/a.txt is active again
+           ed = installSessionSnapshots
+                  edBack { edSessionChanged = [ChangedFile "/w/b.txt" (Just snapB)] }
+           snapB = Journal (Just "/w/b.txt") (Just (J.picosToDiskTime 1000))
+                           LF Utf8 True False (Pos 0 0) (T.pack "beta SNAPSHOT")
+       in [ bufferToText LF True (docBuffer d) | d <- edAfter ed ] == [T.pack "!beta\n"])
+
+    -- The dialog itself: wording, buttons, and the single-OK degradation.
+    let dlgOf ed = edDialog (openSessionChangedDialog ed)
+        offered  = edSnA { edSessionChanged = [ChangedFile "/w/a.txt" (Just snapJ)] }
+        bare     = edSnA { edSessionChanged = [ChangedFile "/w/a.txt" Nothing] }
+    checkEq "the changed-files dialog is titled as the plan pins it"
+      (fmap dlgTitle (dlgOf offered)) (Just (T.pack "Files Changed Since This Session"))
+    checkEq "with a snapshot it offers both answers"
+      (fmap dlgButtons (dlgOf offered))
+      (Just [T.pack "Latest on Disk", T.pack "As You Left Them"])
+    checkEq "with nothing to offer it degrades to a single OK"
+      (fmap dlgButtons (dlgOf bare)) (Just [T.pack "OK"])
+    check "a file with no usable snapshot is annotated per file"
+      (maybe False (T.isInfixOf (T.pack "no saved copy from that session") . dlgMessage)
+             (dlgOf bare))
+    check "each listed file carries the stale marker"
+      (maybe False (T.isInfixOf (T.pack "\x25c6 a.txt") . dlgMessage) (dlgOf offered))
+    check "nothing changed means no dialog"
+      (dlgOf edSnA == Nothing)
+    -- Esc is the no-op answer, which is why this dialog needs no Cancel.
+    let answerWith ks = foldl (\e k -> fst (update k e))
+                              (openSessionChangedDialog offered) ks
+    check "Esc out of the changed-files prompt leaves the buffer alone"
+      (let ed = answerWith [KEsc]
+       in edDialog ed == Nothing && not (edModified ed)
+          && null (edSessionChanged ed))
+    check "Enter on the default answer (Latest on Disk) changes nothing"
+      (let ed = answerWith [KEnter]
+       in edDialog ed == Nothing && not (edModified ed)
+          && null (edSessionChanged ed))
+    check "Tab then Enter (As You Left Them) installs the snapshot"
+      (let ed = answerWith [KTab, KEnter]
+       in edDialog ed == Nothing && edModified ed && edDiskChanged ed
+          && bufferToText LF True (edBuffer ed) == T.pack "alpha EDITED\n")
+    check "the single-OK form has nothing but the no-op"
+      (let ed = foldl (\e k -> fst (update k e))
+                      (openSessionChangedDialog bare) [KTab, KEnter]
+       in edDialog ed == Nothing && not (edModified ed))
 
   -- Report -------------------------------------------------------------------
   (passed, failed) <- readIORef results

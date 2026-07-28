@@ -291,19 +291,47 @@ escape sequences and the POSIX `termios` API.
   **Discard** or **Keep for later**; recovered files come back as unsaved
   buffers, so nothing is written over your file until you save it. A journal is
   deleted as soon as its document is saved or closed, and on a clean exit. The
-  journal holds file *content* in your cache directory — if you edit secrets,
-  put `journal = off` in the config (or turn the row off in File ▸ Settings) and
-  none is ever written.
-- **Session restore**: `cmedit --restore` reopens the files you had open last
-  time — in the same order, with the same cursor positions, the same workspace
-  folder and the same file in front. Put `restore-session = true` in the config
-  (or turn on "Restore session on start" in File ▸ Settings) to have a bare
+  journal holds file *content* in your cache directory — and, so a restored
+  session can offer your files back as you left them (below), a clean exit also
+  writes a copy of every open document (up to 4 MB each) to
+  `~/.cache/cmedit/snapshots`. One switch covers both: `journal = off` in the
+  config (or the row turned off in File ▸ Settings) and cmedit caches no file
+  content anywhere — no journals while you work, no snapshots when you quit.
+  That is the setting to reach for if you edit secrets.
+- **Session restore, per workspace folder**: `cmedit --restore` reopens the
+  files you had open in *this* folder last time — in the same order, with the
+  same cursor positions, the same workspace folder and the same file in front.
+  Each folder gets its own session file under `~/.config/cmedit/sessions`, so
+  alternating between two projects in two terminals no longer has the second
+  one overwrite the first one's list; `--restore` takes the session for the
+  directory you start in, or — if that folder has none — the most recently
+  written session of any folder, with the status line naming the folder it
+  came from (a folderless session has none to name).
+  A run with no folder open keeps using `~/.config/cmedit/session`, and older
+  session files still restore. Put `restore-session = true` in the config (or
+  turn on "Restore session on start" in File ▸ Settings) to have a bare
   `cmedit` do it; naming files on the command line still just opens those, and
-  files named alongside `--restore` open on top of the restored session. The
-  list lives in `~/.config/cmedit/session` and holds paths and cursors only,
-  never file content. Files that have since been deleted are skipped with a note
-  ("Restored 4 of 5 files"), and it composes with crash recovery: restore runs
-  first, so unsaved changes from a crash come back *in* the restored files.
+  files named alongside `--restore` open on top of the restored session.
+  Session files hold paths, cursors and the times the files were last seen —
+  never file content. The **File menu also lists your last few sessions**
+  ("website (6 files)", up to four): choosing one restores it into the running
+  editor, adding its folder and files to what you already have open — an
+  already-open file is switched to, not duplicated — and closing nothing.
+- **Files that moved while you were away**: if a restored file changed on disk
+  since the session ended, a **"Files Changed Since This Session"** dialog
+  lists them (◆) and offers **Latest on Disk** (the default; Esc means it too,
+  and it is a no-op since the files are already open at that version) or
+  **As You Left Them**, which brings back the contents from the session's clean
+  exit as *unsaved*, modified buffers marked ◆ — nothing is written over the
+  newer file until you save it yourself. One answer covers the whole list.
+  Files over 4 MB, and sessions that ended in a crash (or ran with
+  `journal = off`), have no saved copy: those are annotated in the list, stay
+  at their newest version, and if none of the listed files has a copy the
+  dialog just reports what changed with a single button. Files deleted since
+  the session are skipped with a note ("Restored 4 of 5 files"). Restore
+  composes with crash recovery: restore runs first and the journal is applied
+  last, so unsaved changes from a crash come back *in* the restored files and
+  always have the final word.
 - **Undo / redo** with sensible coalescing of typing runs.
 - **A settings page and config file**: File ▸ Settings (`Ctrl+,`) lists every
   option — tab width, indent style, auto-indent, theme, word wrap, line
@@ -411,7 +439,7 @@ cmedit [OPTIONS] [FILE|DIR...]
       --line-numbers / --no-line-numbers   (default: hidden)
       --no-auto-indent
       --readonly
-      --restore           Reopen last session's files, folder and cursors.
+      --restore           Restore this folder's session (or the newest one).
 ```
 
 Run `cmedit --help` for the full key map and the list of config-file keys

@@ -162,6 +162,7 @@ the pure-core architecture directly.
 | [0023](incomplete/0023-macro-recording-and-repeat.md) | Macro recording, playback, repeat-last-edit | capability | 2–3 days (+1) | Near-free because `Key` is pure data and `update` is deterministic; warm-up for `0024` |
 | [0024](incomplete/0024-input-journal-and-deterministic-replay.md) | Input-stream journal and deterministic replay | capability + testing | 4–6 days | Bug repro, replay testing, behavioural diffing. Complements `0011` (now shipped — see its §2); build after `0023` |
 | [0025](completed/0025-session-restore.md) | Full session restore (`--restore`, `restore-session`) | capability | ✅ **DONE** | `0011` §6 cashed in: a `session` file of folder + open paths + cursors, restored *before* journal recovery so crash content lands in the restored documents |
+| [0030](completed/0030-per-workspace-sessions.md) | Per-workspace sessions, File-menu recent sessions, changed-files dialog | capability | ✅ **DONE** | Sessions keyed by workspace folder (`~/.config/cmedit/sessions/`), `--restore` cwd-scoped with a most-recent fallback; up to 4 restorable sessions in the File menu; "Files Changed Since This Session" offers *Latest on Disk* / *As You Left Them* via clean-exit snapshots (journal format, stamped against the session's `closed:` so a crashed or torn set is never offered, gated on `journal`) |
 
 `0025` joined this table later: it is not one of the four, but `0011` §6's
 follow-on, kept here so the capability work reads in one place.

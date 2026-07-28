@@ -85,6 +85,12 @@ module Cmedit.Journal
   , isJournalFileName
   , untitledIndexOf
   , pathHash
+  , sanitizeBase
+    -- * Naming a session file / snapshot directory
+  , sessionExtension
+  , sessionKeyName
+  , sessionFileName
+  , isSessionFileName
     -- * The recovery decision
   , RecoveryCase(..)
   , classifyJournal
@@ -419,6 +425,48 @@ sanitizeBase name =
     keep c | isAlphaNum c && ord c < 128 = c
            | c `elem` (".-_" :: String)  = c
            | otherwise                   = '-'
+
+------------------------------------------------------------------------------
+-- Naming a session file and its snapshot directory
+--
+-- The same argument 'journalFileName' makes, made once more rather than
+-- differently: the hash is the identity (a folder path is long, contains
+-- separators and may contain anything a filename cannot) and the sanitised
+-- basename is there purely so a human looking in ~/.config or ~/.cache can tell
+-- which is which.
+--
+-- Naming it this way is what makes the cwd lookup O(1) and listing-free: given
+-- a canonical $PWD the session file's *name* is computable, so @--restore@ is
+-- one 'doesFileExist' and one read. Only the File menu, which genuinely wants
+-- all of them, lists the directory.
+
+-- | The per-workspace session file extension.
+sessionExtension :: String
+sessionExtension = ".session"
+
+-- | The key identifying one session: a workspace folder, or 'Nothing' for the
+-- folderless session. It names both @~\/.config\/cmedit\/sessions\/\<key\>.session@
+-- and @~\/.cache\/cmedit\/snapshots\/\<key\>\/@, so the snapshot directory for a
+-- session can be found from the session and vice versa without a parse.
+sessionKeyName :: Maybe FilePath -> FilePath
+sessionKeyName Nothing  = "no-folder"
+sessionKeyName (Just p) = pathHash p ++ "-" ++ sanitizeBase (takeFileName p)
+
+-- | The basename of the session file for a workspace folder — never a
+-- directory, so the driver owns where the sessions directory is.
+--
+-- A folder that is renamed therefore loses its session, which is the honest
+-- answer: the paths inside it are stale too, and it ages out under the
+-- directory cap.
+sessionFileName :: FilePath -> FilePath
+sessionFileName p = sessionKeyName (Just p) ++ sessionExtension
+
+-- | Does this directory entry look like one of ours? Used by the sessions
+-- directory's listing and cap so an unrelated file is left alone.
+isSessionFileName :: FilePath -> Bool
+isSessionFileName n =
+  length n > length sessionExtension
+    && drop (length n - length sessionExtension) n == sessionExtension
 
 ------------------------------------------------------------------------------
 -- The recovery decision

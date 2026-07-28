@@ -627,10 +627,10 @@ settingsSpec =
     , "Keep a table's first row pinned while scrolling." )
   , ( Nothing, "Crash-recovery journal", offOn
     , boolIx cfgJournal
-    , "Journal unsaved changes to ~/.cache/cmedit; off when editing secrets." )
+    , "Cache buffer contents under ~/.cache/cmedit for crash recovery and session snapshots; off when editing secrets." )
   , ( Nothing, "Restore session on start", offOn
     , boolIx cfgRestoreSession
-    , "Reopen the last session's files and folder when started with no arguments." )
+    , "Reopen this directory's session (files and folder) when started with no arguments." )
   -- Linting rows (row 'nEditingSettings' onward). The master switch first, then
   -- one row per 'linters' entry in table order. Per-linter hints and the
   -- availability notes are filled in by 'mkSettings' from 'edLintAvail'.

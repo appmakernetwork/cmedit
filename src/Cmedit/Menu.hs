@@ -56,6 +56,7 @@ data MenuAction
   | MAToggleTheme              -- ^ Open the theme picker dialog (auto / dark-terminal / light-terminal / cherry-blossom / flashbang / midnight / graphite, live-previewed).
   | MASwitchFile !Int          -- ^ Switch to the open file at this index.
   | MARecentFile !Int          -- ^ Open the k-th entry of the File menu's recent-files list.
+  | MARestoreSession !Int      -- ^ Restore the k-th entry of the File menu's recent-sessions list (a driver round trip: restoring is file IO by definition). Adds to what is open; it never closes anything.
   | MANextFile | MAPrevFile
   | MAAbout | MAHelp
   | MAManual                   -- ^ Open the built-in manual as a read-only document.

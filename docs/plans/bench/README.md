@@ -145,6 +145,53 @@ session is on disk, correct, before any shape change), then makes a real shape
 change (a second file, closed with Ctrl+W) before the `SIGKILL` so the
 change-driven persist is exercised too.
 
+## The per-workspace session integration test
+
+`pty_workspace.py` is the PTY half of 0030, and it imports the same machinery
+one level further along: the VT emulator, the `Session` helper and the
+throwaway-`HOME` isolation from `pty_journal.py`, and the config writer and
+clean-quit helper from `pty_session.py`. Where `pty_session.py` is the v1→v2
+regression net — its five scenarios open files but never a *folder*, so they
+all still land in the folderless `~/.config/cmedit/session` — this one is
+about what happens once there is more than one workspace.
+
+```sh
+python3 docs/plans/bench/pty_workspace.py   # ~2 s, exit 1 if a scenario fails
+```
+
+Seven scenarios, each in its own throwaway `HOME`, so the developer's own
+`~/.config/cmedit/sessions` and `~/.cache/cmedit/snapshots` are never read or
+written and the script is safe to run concurrently with itself:
+
+| Scenario | Asserts |
+|---|---|
+| two workspaces, two sessions | a clean exit in folder A and one in folder B leave **two** files under `sessions/` (and no folderless `session` file at all), each recording its own folder and its own paths with v2 mtimes; `--restore` from A's directory gives A and from B's gives B, with no origin note either time; two restores and two more exits later the two files still have not merged |
+| fallback names the folder | from a third directory with no session of its own, `--restore` picks the most recently written session and says `Session restored from ~/zsbravo` — the note that makes the fallback non-astonishing |
+| File menu restores a session | with A's file already open and no folder, the File menu lists `zsbravo (2 files)` and `wsalpha (1 file)`; pressing `w` (the mnemonic `assignSessionMnemonics` can give it, since the static File menu claims `n o f i s a l v c d t x` and the recents take digits) restores A onto the live editor — the folder opens, the already-open file is switched to rather than duplicated, and neither the journal-recovery nor the changed-files prompt appears |
+| changed: Latest on Disk | a clean exit writes one `.cmj` per open document plus a `stamp` equal to the session's `closed:`; after the file is rewritten underneath it, `--restore` raises `Files Changed Since This Session` listing `◆ a.txt` with both answers; Esc (= button 0) leaves the newest bytes in an unmodified buffer that quits without a confirmation |
+| changed: As You Left Them | the same setup answered the other way installs the snapshot as a **modified, unsaved** buffer carrying ● and ◆, with the *newer* bytes still on disk — until an explicit Ctrl+S writes the session's version over them |
+| crashed session, stale stamp | a clean exit at T1, then a second session under the same key re-stamped by a shape change and `SIGKILL`ed at T2, leaves T1's snapshot set intact and unusable: the prompt still reports the changed file but in its single-button form (`— no saved copy from that session`, no *As You Left Them*), and the content comes from disk |
+| journal = off, no snapshots | a clean exit writes no snapshots and never creates `~/.cache/cmedit` at all, the session file is unaffected (it holds paths, cursors and mtimes, never content), and the changed-files prompt degrades to the same single-button form |
+
+Two things about the harness are worth knowing before adding a scenario.
+`pty_journal.Session` chdirs its child to `$HOME`, and 0030 §2.3 made
+`--restore` **cwd-scoped**, so the starting directory is an input to almost
+every scenario here — `start(home, args, cwd=…)` patches that one call for the
+duration of the fork rather than forking a second copy of the helper. And
+every path handed to the editor is absolute, for the reason `pty_session.py`
+records: a relative path resolved against the wrong one of the four
+directories these scenarios start in opens a new empty buffer instead of
+failing.
+
+The session file is parsed by a third independent parser (`pty_session.py`'s,
+generalised over *where* the file is, which is the whole of 0030) and the
+session file's *name* is deliberately never recomputed here — listing the
+directory is what proves the two workspaces got two files, where recomputing
+the hash would only assert that two copies of the same formula agree.
+`rewrite()` re-writes a file until its mtime actually moves: the feature turns
+on `recorded != current`, so a rewrite the filesystem gave the same timestamp
+would silently make the scenario assert the opposite of what it says.
+
 ## Diagnosing without a profiling build
 
 The profiling libraries are not installed in this environment (`ghc -prof`

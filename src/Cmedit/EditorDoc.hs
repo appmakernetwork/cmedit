@@ -7,7 +7,7 @@ module Cmedit.EditorDoc where
 import Data.Char (isAlpha, isAlphaNum, isSpace, isDigit)
 import Data.Foldable (toList)
 import Data.List (findIndex, intercalate, isPrefixOf, isSuffixOf, sortBy)
-import Data.Ord (comparing)
+import Data.Ord (Down(..), comparing)
 import Data.Sequence (Seq, (|>))
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
@@ -24,7 +24,8 @@ import Cmedit.TextBuffer
 import Cmedit.Width (colToDisplay, displayToCol, wrapLine)
 import Cmedit.ConfigFile
   ( Config(..), ThemeName(..), defaultConfig, RecentEntry(..)
-  , maxRecentEntries, maxHistoryEntries, Session(..), maxSessionFiles )
+  , maxRecentEntries, maxHistoryEntries, Session(..), SessionFile(..)
+  , SessionSummary(..), maxSessionFiles )
 import Cmedit.Menu
 import Cmedit.Dialog
 import Cmedit.Browser (Browser(..), FileNode(..), Entry)
@@ -992,15 +993,22 @@ sessionActiveIx ed recorded =
   where here = length (edBefore ed)
 
 -- | The session as it should be persisted: the open folder, every open
--- document that has a real path (in open order, with live cursor positions),
--- and which of them is active.
+-- document that has a real path (in open order, with live cursor positions and
+-- the on-disk baseline each was loaded\/saved at), and which of them is active.
+--
+-- The per-file mtime costs __no extra stats__: every document already carries
+-- 'docDiskMtime', recorded by @loadFile@\/@saveFile@ and refreshed by the
+-- driver's existing freshness pass. @closed:@ is filled in by the driver, which
+-- is the only side that can read a clock.
 sessionForPersist :: Editor -> Session
 sessionForPersist ed = Session
   { seFolder = explorerRoot ed
   , seFiles  = take maxSessionFiles
-                 [ RecentEntry p (posLine pos) (posCol pos)
+                 [ SessionFile p (posLine pos) (posCol pos)
+                     (J.diskTimeToPicos <$> docDiskMtime d)
                  | (_, p, d) <- recorded, let pos = docCursorPos d ]
   , seActive = sessionActiveIx ed recorded
+  , seClosed = Nothing
   }
   where recorded = sessionDocs ed
 
@@ -1072,11 +1080,17 @@ recentMenuEntries ed =
 -- Settings…/Exit block at the bottom (dropping a duplicate separator when
 -- the static menu already ends its upper section with one).
 addRecentEntries :: Editor -> [MenuEntry] -> [MenuEntry]
-addRecentEntries ed es = case recentMenuEntries ed of
-  [] -> es
-  rs -> case break isTail es of
-    (pre, tl@(_ : _)) -> dropTrailingSep pre ++ [MESep] ++ rs ++ [MESep] ++ tl
-    (_, [])           -> es ++ [MESep] ++ rs
+addRecentEntries ed es = spliceAboveTail (recentMenuEntries ed) es
+
+-- The splice both dynamic File-menu sections use: insert above the
+-- Settings…/Exit tail, separated. Applying it twice (sessions, then recents)
+-- leaves the second section /below/ the first, which is why 'entriesFor' adds
+-- the sessions first.
+spliceAboveTail :: [MenuEntry] -> [MenuEntry] -> [MenuEntry]
+spliceAboveTail [] es = es
+spliceAboveTail rs es = case break isTail es of
+  (pre, tl@(_ : _)) -> dropTrailingSep pre ++ [MESep] ++ rs ++ [MESep] ++ tl
+  (_, [])           -> es ++ [MESep] ++ rs
   where
     isTail (MEItem _ _ MAExit)     = True
     isTail (MEItem _ _ MASettings) = True
@@ -1084,6 +1098,106 @@ addRecentEntries ed es = case recentMenuEntries ed of
     dropTrailingSep xs = case reverse xs of
       (MESep : r) -> reverse r
       _           -> xs
+
+------------------------------------------------------------------------------
+-- The File menu's recent sessions (plan 0030 §2.4)
+
+-- | How many past sessions the File menu offers.
+sessionMenuMax :: Int
+sessionMenuMax = 4
+
+-- | Driver callback for 'EffListSessions'.
+sessionsListed :: [SessionSummary] -> Editor -> Editor
+sessionsListed sums ed = ed { edSessions = sums }
+
+-- | The sessions the File menu offers, in the order it offers them —
+-- newest-'sumClosed' first, at most 'sessionMenuMax'.
+--
+-- Two filters, both deliberate. The __live session's own key is excluded__
+-- (offering to restore what is already open is noise), and the key is a
+-- function of the folder, so comparing folders /is/ comparing keys. And the
+-- list is __de-duplicated by folder__ so a legacy folderless session that names
+-- a folder now owning its own file does not appear twice — sorted first, so the
+-- newer @closed:@ is the one kept.
+--
+-- 'MARestoreSession' addresses this list by index, so the label and the action
+-- cannot disagree.
+sessionMenuList :: Editor -> [SessionSummary]
+sessionMenuList ed =
+  take sessionMenuMax (dedup [] (sortBy newestFirst others))
+  where
+    others = [ s | s <- edSessions ed, sumFolder s /= explorerRoot ed ]
+    -- Descending, so an unstamped v1 file (Nothing, which sorts first
+    -- ascending) lands last, which is what it deserves.
+    newestFirst = comparing (Down . sumClosed)
+    dedup _ [] = []
+    dedup seen (s : rest)
+      | sumFolder s `elem` seen = dedup seen rest
+      | otherwise               = s : dedup (sumFolder s : seen) rest
+
+-- | One session's menu label: the folder's __basename__ and the recorded file
+-- count, elided from the left past @maxW@ exactly as 'recentMenuEntries' elides
+-- paths. The path is what disambiguates two sessions, but two simultaneously
+-- listed sessions with the same basename is rare enough to answer with the
+-- status line after the fact rather than with 44 columns of menu.
+--
+-- @&@ is stripped from the basename because it is this menu's mnemonic markup:
+-- a folder called @a&b@ must not silently claim @b@ as an accelerator.
+sessionMenuLabel :: SessionSummary -> Text
+sessionMenuLabel s = T.pack (elide (name ++ " (" ++ show n ++ " file" ++ plural n ++ ")"))
+  where
+    n = sumCount s
+    name = case sumFolder s of
+      Nothing -> "(no folder)"
+      Just f  -> case filter (/= '&') (takeFileName f) of
+        "" -> filter (/= '&') f      -- a root path: "/" has no basename
+        b  -> b
+    maxW = 44
+    elide p | length p <= maxW = p
+            | otherwise        = "\x2026" ++ drop (length p - maxW + 1) p
+
+sessionMenuEntries :: Editor -> [MenuEntry]
+sessionMenuEntries ed =
+  [ MEItem (sessionMenuLabel s) "" (MARestoreSession k)
+  | (k, s) <- zip [0 ..] (sessionMenuList ed) ]
+
+-- | Splice the recent-sessions section into the File menu. Files and sessions
+-- are both \"things I had open\"; sessions are the coarser unit, so they read
+-- better first — which 'entriesFor' arranges by adding them before the recents.
+addSessionEntries :: Editor -> [MenuEntry] -> [MenuEntry]
+addSessionEntries ed es = spliceAboveTail (sessionMenuEntries ed) es
+
+-- | Give each session row the first letter of its label as a mnemonic, when no
+-- other entry in the same dropdown has claimed it.
+--
+-- A post-pass over the /finished/ entry list, which is exactly where it can see
+-- what is taken. Sessions cannot take digits: 'recentMenuEntries' numbers
+-- @&1@..@&6@ and 'mnemonicItemIn' returns the __first__ match, so a second
+-- numbered list would give the user two @1@s; continuing the sequence is worse,
+-- because 'recentMenuPaths' filters out already-open files and every session's
+-- digit would move as files are opened.
+--
+-- A session whose initial is taken, a digit or a non-letter simply renders
+-- without an underline and stays reachable by arrows and mouse. That is a
+-- graceful floor rather than a hole: nothing else in the menu depends on a
+-- mnemonic existing.
+assignSessionMnemonics :: [MenuEntry] -> [MenuEntry]
+assignSessionMnemonics es = go taken0 es
+  where
+    taken0 = [ c | MEItem lbl _ a <- es, not (isSessionEntry a)
+                 , Just c <- [mnemonicChar lbl] ]
+    isSessionEntry (MARestoreSession _) = True
+    isSessionEntry _                    = False
+    go _ [] = []
+    go taken (e@(MEItem lbl acc a) : rest)
+      | isSessionEntry a = case initialOf lbl of
+          Just c | c `notElem` taken ->
+            MEItem ("&" <> lbl) acc a : go (c : taken) rest
+          _ -> e : go taken rest
+    go taken (e : rest) = e : go taken rest
+    initialOf lbl = case T.uncons lbl of
+      Just (c, _) | isAlpha c && fromEnum c < 128 -> Just (toLower c)
+      _                                          -> Nothing
 
 save :: Editor -> (Editor, [Effect])
 save ed
@@ -1590,8 +1704,18 @@ seedJournalIds used ed =
 -- | Open the startup recovery prompt for the journals the driver found.
 -- Nothing to offer ⇒ the editor is returned untouched, so this is safe to
 -- call unconditionally.
+--
+-- When a dialog is /already/ open — which at startup means the changed-files
+-- prompt (plan 0030 §2.8: restore, then changed files, then the journal) — the
+-- items are stashed and nothing is shown. 'afterSessionChanged' opens this once
+-- that question has been answered, so the journal's answer is asked about the
+-- state the first answer produced. Two stacked modal dialogs at startup is the
+-- accepted design: each is independently conditional and rare, and merging them
+-- would fuse two questions with different answers and different consequences.
 openRecoverDialog :: [RecoverItem] -> Editor -> Editor
 openRecoverDialog [] ed = ed
+openRecoverDialog items ed
+  | isJust (edDialog ed) = ed { edRecover = items }
 openRecoverDialog items ed =
   openDialog (mkConfirm DKRecover "Unsaved Changes Recovered" msg
                 ["Recover", "Discard", "Keep for later"])
@@ -1707,6 +1831,165 @@ recoveredDoc it = Document
   where
     j   = riJournal it
     buf = J.journalBuffer j
+
+------------------------------------------------------------------------------
+-- The changed-files dialog (plan 0030 §2.6)
+--
+-- A session restored on Monday describes files as they were on Friday, and
+-- @git pull@ happened in between. The ◆ machinery cannot show that: it compares
+-- against a baseline taken /at load/, and the load just happened. A session that
+-- records what it saw can say so instead — and, when a clean-exit snapshot
+-- exists (§2.7), can offer the version the user actually had.
+
+-- | Open the changed-files prompt for whatever the driver's comparison found.
+-- Nothing changed ⇒ the editor is returned untouched, so this is safe to call
+-- unconditionally after any restore.
+--
+-- __There is no Cancel, and Esc is safe.__ By the time this appears the files
+-- are open at their newest state, so @Latest on Disk@ is a no-op and
+-- 'Cmedit.Editor.cancelDialog' maps to it. __When there is nothing to offer__ —
+-- a crashed session (no snapshots), every file over the cap, or
+-- @journal = off@ — the second choice would do nothing, and offering it anyway
+-- would be a lie, so the dialog degrades to a single @OK@ and the informational
+-- wording, joining the single-button family that dismisses on a click off the
+-- box.
+openSessionChangedDialog :: Editor -> Editor
+openSessionChangedDialog ed = case edSessionChanged ed of
+  []    -> ed
+  items -> openDialog (mkConfirm DKSessionChanged "Files Changed Since This Session"
+                         (msg items) (buttons items)) ed
+  where
+    buttons items
+      | any (isJust . cfSnapshot) items = ["Latest on Disk", "As You Left Them"]
+      | otherwise                       = ["OK"]
+    msg items = T.unlines $
+      [ T.pack (show n ++ " file" ++ plural n ++ " ha" ++ (if n == 1 then "s" else "ve")
+                ++ " changed on disk since this session ended.")
+      , "" ]
+        ++ [ "  " <> describeChanged it | it <- take maxRecoverListed items ]
+        ++ [ T.pack ("  \x2026 and " ++ show (n - maxRecoverListed) ++ " more")
+           | n > maxRecoverListed ]
+        ++ (if any (isJust . cfSnapshot) items
+              then [ "", "Open the newest version, or the files as you left them?" ]
+              else [])
+      where n = length items
+
+-- One line of the changed-files listing. The ◆ is the marker the editor already
+-- uses for "this file changed underneath you", so it needs no explaining; a file
+-- with no usable snapshot says so and stays at its disk version either way.
+describeChanged :: ChangedFile -> Text
+describeChanged cf =
+  "\x25c6 " <> T.pack (takeFileName (cfPath cf))
+    <> (case cfSnapshot cf of
+          Just _  -> ""
+          Nothing -> " \x2014 no saved copy from that session")
+
+-- | The @As You Left Them@ answer: replace each offered document's buffer with
+-- the session's snapshot of it, as a __modified, unsaved buffer__.
+--
+-- The shape is 'recoveredDoc'\'s, with the two differences the situation
+-- demands. 'docSavedBuffer' is the file's /current on-disk content/ — which the
+-- document is holding right now, because it was loaded from disk moments ago —
+-- so the modified flag is computed against what is really there and Ctrl+S has
+-- something honest to compare with; and 'docDiskMtime' is left at the
+-- __session's recorded baseline__ (already installed by the restore) so the
+-- document carries ◆ from the first frame. Nothing here writes: saving over the
+-- newer file is then a deliberate Ctrl+S by a user who has been told twice.
+--
+-- Documents whose snapshot is missing are left exactly as loaded.
+installSessionSnapshots :: Editor -> Editor
+installSessionSnapshots ed0
+  | n == 0    = ed0 { edSessionChanged = [] }
+  | otherwise = (restoreDoc (docs !! here) ed1 { edBefore = take here docs
+                                               , edAfter  = drop (here + 1) docs })
+                  { edStatus = T.pack ("Restored " ++ show n ++ " file" ++ plural n
+                                       ++ " as the session left them \x2014 unsaved, "
+                                       ++ "nothing has been written to disk") }
+  where
+    offered = [ (cfPath cf, j) | cf <- edSessionChanged ed0, Just j <- [cfSnapshot cf] ]
+    ed1     = ed0 { edSessionChanged = [] }
+    here    = min (length (edBefore ed1)) (max 0 (length docs - 1))
+    (docs, n) = let ps = map patch (allOpenDocs ed1)
+                in (map fst ps, length (filter snd ps))
+    -- 'snapshotableDoc' guards the patch, not just the write: the restore
+    -- reopened every path through the ordinary guards, so a file that has since
+    -- grown past 'maxOpenBytes' or been replaced by a PDF is now a view with no
+    -- buffer under it, and writing a buffer into one would be nonsense. Such a
+    -- document keeps its disk version, which is the same floor a missing
+    -- snapshot gets.
+    --
+    -- __An unsaved document keeps its edits__, and gets that same floor. At
+    -- startup this never fires (every restored document was loaded from disk
+    -- moments ago), but a /menu/ restore runs on a live editor, where a
+    -- recorded path may already be open with work in it — and this patch
+    -- replaces the buffer and clears the undo history, so without the guard one
+    -- click on @As You Left Them@ would silently destroy it. Plan 0030 §2.5's
+    -- rule for the menu route is that it adds and never closes, which is why it
+    -- needs no unsaved-changes prompt of its own; overwriting a dirty buffer
+    -- would be strictly worse than closing one.
+    patch d = case [ j | (p, j) <- offered, Just p == docPath d
+                       , snapshotableDoc d, not (docModified d) ] of
+      (j : _) -> (snapshotDoc j d, True)
+      []      -> (d, False)
+
+-- One document rebuilt around its snapshot. The identity fields (the document
+-- id, the read-only flag, the diagnostics) stay the document's own; the content,
+-- cursor and file-shape metadata come from the snapshot, and the /saved/
+-- baselines stay the disk file's, so a difference in either reads as modified.
+--
+-- 'docDocSeq' is advanced past 'docJournalSeq' deliberately: this is unsaved
+-- content now, and the write-behind must journal it.
+snapshotDoc :: Journal -> Document -> Document
+snapshotDoc j d = d
+  { docBuffer      = buf
+  , docSavedBuffer = docBuffer d          -- what is on disk right now
+  , docCursor      = clampPos (jCursor j) buf
+  , docSelAnchor   = Nothing, docDesiredCol = 0, docTop = 0, docLeft = 0
+  , docModified    = True
+    -- The snapshot's own baseline *is* the session's recorded one (both come
+    -- from 'docDiskMtime' at the moment the session ended), so the document
+    -- arrives already carrying the ◆ the stale-file machinery would have shown
+    -- — which it could not, because ◆ compares against a baseline taken at load
+    -- and the load just happened. 'noteDiskMtimes' never rewrites a baseline, so
+    -- the freshness poll confirms this rather than clobbering it.
+  , docDiskMtime   = jMtime j
+  , docDiskChanged = True                 -- ◆ from the first frame
+  , docLineEnding  = jEol j, docEncoding = jEnc j, docFinalNewline = jFinalNewline j
+  , docUndo        = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone
+  , docHlCache     = Nothing
+  , docCsv = case docPath d of
+      -- 'Csv.markUnsaved' for exactly the reason 'docSavedBuffer' is the disk
+      -- text above: 'mkCsvLines' would adopt the snapshot grid as the saved one,
+      -- and a single Ctrl+Z would then declare the document clean.
+      Just p | isCsvPath p, isNothing (docSheets d) ->
+        Just (Csv.markUnsaved (Csv.mkCsvLines (csvDelimForPath p) (bufLines buf)))
+      _ -> docCsv d
+  , docRtf = case docPath d of
+      Just p | isRtfPath p, not (maybe False Rtf.rtfDerived (docRtf d)) ->
+        Just (Rtf.mkRtfDoc 0 (bufLines buf))
+      _ -> docRtf d
+  , docDocSeq = docDocSeq d + 1
+  }
+  where buf = J.journalBuffer j
+
+-- | What happens when the changed-files prompt is answered, whichever way: the
+-- queued journal-recovery prompt (if the startup scan found one) takes the
+-- screen. Plan 0030 §2.8's \"journal last\" — a journal is unsaved content from a
+-- session that died, a snapshot is saved content from one that ended tidily, and
+-- when both speak for a file the unsaved edits must win.
+--
+-- After startup 'edRecover' is always empty (the prompt is answered once per
+-- process), so a menu-driven restore's answer opens nothing, which is §2.5's
+-- rule that journal recovery does not re-run.
+afterSessionChanged :: Editor -> Editor
+afterSessionChanged ed = openRecoverDialog (edRecover ed) ed { edSessionChanged = [] }
+
+-- | The snapshots a clean exit should write: one journal record per open
+-- document worth snapshotting ('snapshotOf'), keyed by the file name it goes
+-- under. Pure, so \"which documents get snapshotted\" is a unit test rather than
+-- a property of the driver.
+snapshotRequests :: Editor -> [(FilePath, Journal)]
+snapshotRequests ed = mapMaybe snapshotOf (allOpenDocs ed)
 
 -- | Alt+Left: go back to the previous location (pushing the current one onto
 -- the forward trail). Stops in untitled buffers are only reachable while that

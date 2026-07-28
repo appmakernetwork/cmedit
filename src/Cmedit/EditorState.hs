@@ -26,7 +26,7 @@ import Cmedit.Width (colToDisplay, displayToCol, wrapLine)
 import qualified Cmedit.Zip as Zip
 import Cmedit.ConfigFile
   ( Config(..), ThemeName(..), defaultConfig, RecentEntry(..)
-  , maxRecentEntries, maxHistoryEntries )
+  , maxRecentEntries, maxHistoryEntries, SessionSummary(..) )
 import Cmedit.Menu
 import Cmedit.Dialog
 import Cmedit.Browser (Browser(..), FileNode(..), Entry)
@@ -292,8 +292,54 @@ data Editor = Editor
     -- twin 'docDocId'.
   , edNextDocId     :: !Int              -- ^ Next 'edDocId' to hand out (global). Seeded past every recovered/kept untitled journal at startup so a fresh untitled buffer cannot clobber one.
   , edRecover       :: ![RecoverItem]    -- ^ Journals found at startup and offered by the 'DKRecover' dialog; emptied when the user answers it. Global, like 'edSearch'.
+  , edSessions      :: ![SessionSummary]
+    -- ^ The past sessions the File menu offers ('MARestoreSession'). Filled by
+    -- a driver round trip ('EffListSessions' → 'sessionsListed'), fired once at
+    -- startup and again whenever the File menu opens — the same hook that
+    -- already emits 'EffStatFile' there, and for the same reason: another
+    -- instance may have exited since. Global state like 'edRecent', /not/ in
+    -- 'Document'.
+  , edSessionChanged :: ![ChangedFile]
+    -- ^ Files a just-restored session recorded at an mtime the disk no longer
+    -- has ('DKSessionChanged'). Global, like 'edRecover', and emptied when the
+    -- dialog is answered.
   , edStats         :: !(Maybe Text)     -- ^ Live session counters for the status bar (@debug-stats@). Pre-rendered by the driver so the pure side stays IO-free; 'Nothing' when the key is off.
   } deriving (Show)
+
+-- | One restored file that moved on disk while its session was closed, with
+-- the session's own copy of it if there is a usable one.
+--
+-- The driver does the IO (stat the path, read and parse the snapshot under the
+-- stamp check); this is what it hands the pure layer, exactly as 'RecoverItem'
+-- is for the journal. A 'Nothing' snapshot is annotated in the dialog and stays
+-- at its disk version under either answer — a crashed session (no snapshots at
+-- all), a file over 'maxSnapshotBytes', or @journal = off@.
+data ChangedFile = ChangedFile
+  { cfPath     :: !FilePath          -- ^ The restored document's path.
+  , cfSnapshot :: !(Maybe Journal)   -- ^ The session's saved copy, in the journal format.
+  } deriving (Show)
+
+-- | What to do about one restored path, from the three facts that decide it and
+-- nothing else: the mtime the session recorded, the mtime on disk now, and
+-- whether a usable snapshot exists. Plan 0030 §2.8's table, as a function.
+--
+-- Both times are exact picoseconds ('Cmedit.Journal.diskTimeToPicos'), because
+-- the question is @recorded == current@ and a lossy comparison answers
+-- \"changed\" for a file nobody touched.
+data ChangeVerdict
+  = CVUnchanged  -- ^ Nothing to say: no baseline (v1 or never created), the file is gone (the restore already skipped and counted it), or it is byte-for-byte the session's.
+  | CVOffer      -- ^ Listed, and /As You Left Them/ can install the session's copy.
+  | CVDiskOnly   -- ^ Listed and annotated: it changed, but there is no copy to offer, so disk wins under either answer.
+  deriving (Eq, Show)
+
+sessionChangeVerdict :: Maybe Integer -> Maybe Integer -> Bool -> ChangeVerdict
+sessionChangeVerdict recorded now hasSnapshot = case (recorded, now) of
+  (Nothing, _)                -> CVUnchanged
+  (_, Nothing)                -> CVUnchanged
+  (Just r, Just c)
+    | r == c                  -> CVUnchanged
+    | hasSnapshot             -> CVOffer
+    | otherwise               -> CVDiskOnly
 
 -- | One journal found by the startup scan, with the verdict the recovery
 -- dialog reports for it. The driver does the IO (list, parse, stat the
@@ -403,6 +449,8 @@ newEditor size cfg = Editor
   , edDocId         = 1
   , edNextDocId     = 2
   , edRecover       = []
+  , edSessions      = []
+  , edSessionChanged = []
   , edStats         = Nothing
   }
 
@@ -1090,6 +1138,18 @@ data Effect
     -- dialog's Recover button, whose documents are now open and modified.
     -- Until a journal is adopted the driver will not delete it, which is
     -- exactly what "Keep for later" means — it emits nothing at all.
+  | EffListSessions
+    -- ^ Re-read the session directory for the File menu's recent-sessions
+    -- section (driver replies via 'sessionsListed'). One @listDirectory@ and at
+    -- most 'sessionDirMax' small parses; the summaries carry no file list, so
+    -- the restore re-reads the session at the moment it acts.
+  | EffRestoreSession !FilePath
+    -- ^ Restore the session in this file /onto the live editor/: open its
+    -- folder, open its files (already-open paths switch rather than duplicate),
+    -- seat the recorded cursors, then run the changed-files comparison. A
+    -- driver round trip rather than a pure toggle, because restoring is file IO
+    -- by definition — and it runs the same code path as the startup restore.
+    -- It adds; it never closes, so it needs no unsaved-changes prompt.
   | EffContainerView !FilePath !Bool
     -- ^ Re-read a ZIP container into the other of its two views and install it
     -- over the active document: 'True' for the archive listing, 'False' for
@@ -1704,6 +1764,55 @@ journalTextOf d = case docCsv d of
 -- | The journal file /name/ for a document. The directory is the driver's.
 journalKeyOf :: Document -> FilePath
 journalKeyOf d = J.journalFileName (docPath d) (docDocId d)
+
+------------------------------------------------------------------------------
+-- Clean-exit snapshots (plan 0030 §2.7)
+--
+-- What makes "As You Left Them" possible. The /session/ file still never holds
+-- content — 0025's privacy claim is unchanged: the session files are paths,
+-- cursors, mtimes and counts. The content lives where content already lives,
+-- @~\/.cache@ behind the @journal@ key, in the /existing journal format/, which
+-- already carries exactly the fields a restore needs (path, baseline mtime,
+-- EOL, BOM, final newline, read-only, cursor, text) and already has a parser, a
+-- serialiser, a naming function and a test suite.
+
+-- | Per-document snapshot cap. Measured in characters, like
+-- 'journalPendingBytes' — a snapshot is written for /every/ open document
+-- rather than only the modified ones, so it needs a tighter bound than the
+-- journal's. A document over it gets no snapshot, the changed-files dialog says
+-- so per file, and that file restores from disk.
+maxSnapshotBytes :: Int
+maxSnapshotBytes = 4 * 1024 * 1024
+
+-- | Does this document get a clean-exit snapshot?
+--
+-- 'journalableDoc' minus its @docModified@ requirement (a snapshot records what
+-- was open, not what was unsaved) and plus a real path (a snapshot is addressed
+-- by the path a restore reopens; an untitled buffer has none, and its content
+-- is the journal's business). The exclusions are the journal's, one for one:
+-- a view with no buffer under it — image, pager, PDF, workbook,
+-- container-derived DOCX\/EPUB — has nothing a user could have \"left\"
+-- differently, and the manual's @cmedit:\/\/@ pseudo-path is not a file.
+snapshotableDoc :: Document -> Bool
+snapshotableDoc d =
+  isJust (docPath d)
+    && isNothing (docImage d) && isNothing (docPager d) && isNothing (docPdf d)
+    && isNothing (docSheets d)
+    && not (maybe False Rtf.rtfDerived (docRtf d))
+    && maybe True (not . ("cmedit://" `isPrefixOf`)) (docPath d)
+
+-- | The snapshot for one document, if it is worth taking and fits the cap:
+-- the file name it goes under ('Cmedit.Journal.journalFileName', verbatim — the
+-- snapshot /is/ a journal, so it is named like one) and the record.
+--
+-- A CSV is serialised through 'journalTextOf', exactly as its journal is: in
+-- table view the grid is the document and the line buffer beneath it is stale.
+snapshotOf :: Document -> Maybe (FilePath, Journal)
+snapshotOf d
+  | not (snapshotableDoc d)            = Nothing
+  | T.length (jText j) > maxSnapshotBytes = Nothing
+  | otherwise                          = Just (journalKeyOf d, j)
+  where j = journalOf d
 
 -- | The journal record for a document. 'docDiskMtime' is the baseline
 -- recovery compares against, which is why it is the load\/save mtime and not

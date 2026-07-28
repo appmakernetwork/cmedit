@@ -1354,7 +1354,17 @@ in `README.md`; the cross-cutting structure that matters when editing:
   status-line note (`drvJournalWarned` stops it nagging), never a dialog and
   never a block. The directory is created `0700` via `Term.setPrivateMode`
   — a platform-layer function precisely because `src/` must stay portable
-  (the Windows twin is a documented no-op).
+  (the Windows twin is a documented no-op). **The `journal` key is the one
+  privacy switch for all cached content**, and since plan 0030 it governs two
+  things: the write-behind journal of *modified* buffers here, and the
+  clean-exit snapshot of *every* open document under
+  `~/.cache/cmedit/snapshots` (see the changed-since-session bullet). Two
+  switches would make the sentence "content is cached in `~/.cache` only when
+  `journal = on`" conditional, and a user who turned journalling off to edit
+  secrets would be entitled to be angry about the second one. Anything new
+  that caches document content goes behind this key too — and says so in
+  `configKeysHelp`, the Settings hint and the manual, because a clean exit
+  used to leave nothing behind and now does not.
   **(2) Removal is derived, never announced.** `journalLiveKeys` answers
   "which documents would a crash still lose", and `sweepJournals` deletes
   anything in `drvJournals` (the journals *this session* wrote or adopted)
@@ -1435,14 +1445,16 @@ in `README.md`; the cross-cutting structure that matters when editing:
   `edQuit`** (`dropJournalsOnExit`): the `finally` block also runs on
   SIGTERM/SIGHUP, and deleting journals on a SIGHUP would defeat the feature
   in its headline scenario — an SSH drop.
-- **Session restore (`~/.config/cmedit/session`, `--restore` /
+- **Session restore (`~/.config/cmedit/sessions/`, `--restore` /
   `restore-session`).** The journal brings back unsaved *content*; this brings
   back the *arrangement* — the open folder, the open files in order with their
   cursors, and which one was active. The file is `Cmedit.ConfigFile`'s
-  (`Session`, `parseSessionText`/`renderSessionText`, next to the recents,
-  reusing their `line:col:path` encoding under a `cmedit-session 1` version
-  line; an unknown version means "no session", since a later format's lines
-  would arrive looking exactly like malformed ones). Four invariants:
+  (`Session`/`SessionFile`, `parseSessionText`/`renderSessionText`, next to the
+  recents, reusing their `line:col:path` encoding under a `cmedit-session 2`
+  version line; an unknown version means "no session", since a later format's
+  lines would arrive looking exactly like malformed ones — but **v1 still
+  parses**, with every mtime `Nothing`, so a first restore after an upgrade
+  behaves exactly like a 0025 one). Four invariants:
   **persistence is the recents' discipline, plus one startup write** —
   `maybePersistSession` rewrites when `sessionShape` (folder, ordered paths,
   active index) moves and the exit `finally` writes once more with live
@@ -1473,6 +1485,96 @@ in `README.md`; the cross-cutting structure that matters when editing:
   alongside it open *on top* and end up active; the config key applies only to
   a start with no arguments, and only `--restore` says so when there was
   nothing to restore.
+  **Sessions are per workspace, and the key is a computation, not a search**
+  (plan 0030). One file per open folder at
+  `~/.config/cmedit/sessions/<pathHash>-<basename>.session` —
+  `Journal.sessionFileName`/`sessionKeyName`, reusing `pathHash`/`sanitizeBase`
+  verbatim — so given a canonical `$PWD` the filename is *computable* and
+  `--restore` is one `doesFileExist` plus one read (`findRestoreSession`); only
+  the File menu lists the directory. `~/.config/cmedit/session` (singular)
+  **stays**, as the session for a run with no folder open and as the read
+  fallback for v1. The live session persists to the key of its *current* folder,
+  re-evaluated on every write (`persistSession`), so opening a folder mid-session
+  sends the next write to the new key and leaves the old key's file as a
+  restorable past session — the photograph invariant working, not a leak.
+  `--restore` falls back to the **most recently written session of any kind**
+  (`ConfigFile.newestSession`, by the new `closed:` field — *recorded*, not
+  stat'd, so the ordering survives an `rsync` of `~/.config`) and then says
+  where it came from ("Session restored from `~/work/website`"); an exact cwd
+  match says nothing extra, and the folderless session has no folder to name. A
+  cwd *inside* a workspace deliberately does not match — an ancestor walk would
+  guess wrongly on nested repos. The entry line grew a **third leading field**,
+  the per-file mtime in exact picoseconds (`-` for none), which costs no extra
+  stats (`docDiskMtime` already exists) and *must* go before the path:
+  `ConfigFile.splitLeadingFields k` generalises "k colon-separated leading
+  fields, the rest is the path" with the recents and v1 at `k = 2` and v2 at
+  `k = 3`, which is the only shape that keeps colons legal in filenames.
+  The File menu offers up to `sessionMenuMax` (4) past sessions
+  (`edSessions` ← `EffListSessions`/`sessionsListed`, fired at startup and on
+  every File-menu open beside the existing `EffStatFile`), spliced by
+  `addSessionEntries` *above* the recents (both use `spliceAboveTail`, so adding
+  sessions first puts them first), labelled `basename (N files)`, ordered by
+  `closed:`, de-duplicated by folder and excluding the live key. **Sessions do
+  not take digits**: the recents own `&1`..`&6` and `mnemonicItemIn` returns the
+  first match, so `assignSessionMnemonics` runs as a pure post-pass over the
+  *finished* entry list and gives each session row its label's initial only when
+  no other entry has claimed it — no underline otherwise, which is a graceful
+  floor because nothing depends on a mnemonic existing. `MARestoreSession k` →
+  `EffRestoreSession <file>` → the driver's `applySession`, **the same code path
+  as startup**, on the live editor: it *adds* and never closes (so no
+  unsaved-changes prompt), an already-open path switches rather than duplicates,
+  and the recorded active file is found **by path** in the merged list, not by
+  the session's own index — those are different numbers in a union.
+  **Journal recovery does not re-run** on a menu restore: it is a startup
+  question whose premise is "a previous run died".
+- **Changed-since-session recovery (`DKSessionChanged`, `~/.cache/cmedit/snapshots/`).**
+  A session restored on Monday describes Friday's files, and ◆ cannot show the
+  difference because its baseline is taken *at load* and the load just happened.
+  So after any restore the driver stats the restored paths (`sessionChangedPass`,
+  nearly free and cache-warm) and the pure `sessionChangeVerdict recorded now
+  hasSnapshot` decides per file — plan 0030 §2.8's table as a function taking
+  those three facts and nothing else. Anything not `CVUnchanged` becomes a
+  `ChangedFile` in `edSessionChanged`, and `openSessionChangedDialog` asks
+  once: **"Latest on Disk" / "As You Left Them"**, or a single **OK** when no
+  snapshot is usable (offering a choice that would do nothing is a lie). Button
+  0 is always the no-op — the files are already open at their newest state —
+  which is exactly why **Esc maps to it** and why the dialog needs no Cancel.
+  "As You Left Them" is `installSessionSnapshots`: `snapshotDoc` rebuilds each
+  document around its snapshot as a **modified, unsaved buffer**, with
+  `docSavedBuffer` = the content that is on disk *now* (which the document is
+  holding, having just loaded it) and `docDiskMtime` = the snapshot's own
+  baseline, so ◆ shows from the first frame. `noteDiskMtimes` never rewrites a
+  baseline, so the freshness poll *confirms* that rather than clobbering it.
+  Nothing here writes; saving over the newer file is a deliberate Ctrl+S by a
+  user told twice. **The content lives in the journal format, behind the
+  `journal` key** — `~/.cache/cmedit/snapshots/<session-key>/<pathHash>-<base>.cmj`
+  plus a `stamp`, written by `writeSnapshots` in the exit `finally` *after*
+  `persistSession` (so the stamp is the `closed:` that landed) and gated on
+  `edQuit`. `snapshotableDoc`/`snapshotOf`/`snapshotRequests` are
+  `journalableDoc` minus its modified requirement and plus a real path — every
+  open plain-text and CSV document (CSV through `journalTextOf`), capped at
+  `maxSnapshotBytes` (4 MB) each. The directory is replaced wholesale
+  (`.new` → remove old → rename); POSIX `rename()` cannot replace a non-empty
+  directory, so that pair is **not** atomic, and it does not need to be:
+  **`stamp` is written last inside `.new`** and the restore only trusts a set
+  whose stamp equals the session's `closed:`. That check also closes the real
+  hole — a clean exit at T1 followed by a SIGKILLed session at T2 under the same
+  key would otherwise offer T1's *older* content against T2's record — and makes
+  "a crashed session has no snapshots" a consequence rather than a rule.
+  `gcSnapshotDirs` (startup, **unconditional**, unlike the journal scan: cleanup
+  must not depend on the key that fills the cache) drops stray `.new` dirs, any
+  key whose session file is gone (a filename computation, not a parse), the
+  128 MB cap oldest-first and 30-day-old sets. `capSessionsDir` holds
+  `~/.config/cmedit/sessions` to 50 by `closed:`, and cannot touch the
+  folderless file, which is not in it. **Startup order is restore →
+  changed-files → journal**: `openRecoverDialog` *queues* itself when a dialog
+  is already open, and `afterSessionChanged` (both buttons and Esc) lets it
+  through — two stacked modals, deliberately, because they are different
+  questions with different answers. `journal = on` therefore now means "cache
+  buffer contents under `~/.cache/cmedit` for crash recovery **and session
+  snapshots**", which is why the key's help text and its Settings hint say so:
+  a clean exit used to leave no cached content and now leaves a copy of
+  everything that was open.
 - **Syntax highlighting (`Cmedit.Syntax`).** Per-language lexers return one
   `Tok` per character plus a trailing `HlState`, threaded across lines so
   multi-line constructs (block comments, Python docstrings, Markdown fences,

@@ -8,7 +8,9 @@
 -- @XDG_CONFIG_HOME@) and holds @key = value@ lines; the recent-files list at
 -- @~\/.config\/cmedit\/recent@ holds one @line:col:path@ entry per line
 -- (1-based, most recent first) so re-opening a file restores the cursor; the
--- session at @~\/.config\/cmedit\/session@ records what was open last time.
+-- sessions under @~\/.config\/cmedit\/sessions\/@ (one file per workspace
+-- folder, plus the folderless @~\/.config\/cmedit\/session@) record what was
+-- open last time.
 module Cmedit.ConfigFile
   ( -- * Configuration
     Config(..)
@@ -29,14 +31,24 @@ module Cmedit.ConfigFile
   , saveRecentFile
     -- * Session (what @--restore@ reopens)
   , Session(..)
+  , SessionFile(..)
+  , SessionSummary(..)
   , maxSessionFiles
+  , sessionDirMax
+  , sessionVersion
+  , splitLeadingFields
   , parseSessionText
   , renderSessionText
+  , summarizeSession
+  , newestSession
   , RestorePlan(..)
   , planRestore
   , sessionFilePath
+  , sessionsDirPath
   , loadSessionFile
   , saveSessionFile
+  , loadSessionFrom
+  , saveSessionTo
     -- * Find/replace input history
   , maxHistoryEntries
   , parseHistoryText
@@ -213,14 +225,18 @@ configKeysHelp =
   , "                     (default false)."
   , "freeze-header = BOOL Pin a CSV table's first row while scrolling"
   , "                     (default true)."
-  , "journal = BOOL       Keep a crash-recovery journal of unsaved changes"
-  , "                     under ~/.cache/cmedit/journal, offered back the"
-  , "                     next time cmedit starts (default true). Journals"
+  , "journal = BOOL       Cache buffer contents under ~/.cache/cmedit for"
+  , "                     crash recovery and session snapshots (default true)."
+  , "                     Unsaved changes are journalled as you type and"
+  , "                     offered back the next time cmedit starts; a clean"
+  , "                     exit also snapshots every open document, so a"
+  , "                     restored session can offer the files as you left"
+  , "                     them when they have changed on disk since. Both"
   , "                     hold file content, so set it to off when editing"
   , "                     secrets."
   , "restore-session = BOOL"
-  , "                     Reopen the last session's folder and files when"
-  , "                     cmedit is started with no arguments (default"
+  , "                     Reopen this directory's session (folder and files)"
+  , "                     when cmedit is started with no arguments (default"
   , "                     false). --restore does the same on demand."
   , "theme = auto|dark-terminal|light-terminal|cherry-blossom|flashbang|"
   , "        midnight|graphite"
@@ -355,21 +371,33 @@ parseRecentText txt =
   take maxRecentEntries
     [ e | raw <- T.lines txt, Just e <- [parseRecentLine (T.strip raw)] ]
 
--- | One @line:col:path@ entry. Only the first two colons separate, so a path
--- may contain as many as it likes. Shared with the session file, which reuses
--- this encoding rather than inventing a second one.
+-- | Split a @f1:f2:\@\<k fields\>:path@ line: exactly @k@ colon-separated
+-- leading fields, and /everything/ after the k-th colon is the path.
+--
+-- This is the one property the recents encoding has that must not be lost — a
+-- POSIX filename may contain colons, so only the first @k@ of them separate.
+-- Two callers: the recents and v1 sessions pass @k = 2@ (@line:col:path@), v2
+-- sessions pass @k = 3@ (@line:col:mtime:path@). A third fixed field before the
+-- path keeps the property; appending one after the path would destroy it.
+splitLeadingFields :: Int -> Text -> Maybe ([Text], FilePath)
+splitLeadingFields k0 line0 = go k0 line0 []
+  where
+    go 0 rest acc =
+      let p = T.unpack rest
+      in if null p then Nothing else Just (reverse acc, p)
+    go n t acc = case T.breakOn ":" t of
+      (_, r) | T.null r -> Nothing              -- fewer than k colons
+      (f, r)            -> go (n - 1 :: Int) (T.drop 1 r) (f : acc)
+
+-- | One @line:col:path@ entry (1-based on disk, 0-based in the record).
 parseRecentLine :: Text -> Maybe RecentEntry
 parseRecentLine line
   | T.null line = Nothing
-  | otherwise =
-      let (lt, rest1) = T.breakOn ":" line
-          (ct, rest2) = T.breakOn ":" (T.drop 1 rest1)
-          path        = T.unpack (T.drop 1 rest2)
-      in do l <- readMaybe (T.unpack lt)
-            c <- readMaybe (T.unpack ct)
-            if null path || T.null rest1 || T.null rest2
-              then Nothing
-              else Just (RecentEntry path (max 0 (l - 1)) (max 0 (c - 1)))
+  | otherwise = do
+      ([lt, ct], path) <- splitLeadingFields 2 line
+      l <- readMaybe (T.unpack lt)
+      c <- readMaybe (T.unpack ct)
+      pure (RecentEntry path (max 0 (l - 1)) (max 0 (c - 1)))
 
 renderRecentLine :: RecentEntry -> Text
 renderRecentLine e =
@@ -391,12 +419,39 @@ renderRecentText entries =
 -- It records paths, not content. Untitled buffers are deliberately absent:
 -- there is nothing to reopen, and their content is the journal's business.
 
+-- | One open document as a session records it: its path, the cursor it had,
+-- and the on-disk timestamp the session last saw for it.
+--
+-- The timestamp is exact picoseconds since the Unix epoch
+-- ('Cmedit.Journal.diskTimeToPicos'), not a decimal, because the question it
+-- exists to answer is @recorded == current@ — and a lossy rendering makes that
+-- answer \"changed\" for a file nobody touched on any filesystem with
+-- sub-second timestamps. 'Nothing' (written @-@) is a file with no baseline:
+-- named but never created, or recorded by a v1 session that had no such field.
+-- It means \"no change detection for this one\", never \"unchanged\".
+data SessionFile = SessionFile
+  { sfPath  :: !FilePath
+  , sfLine  :: !Int                -- ^ 0-based, like 'RecentEntry'.
+  , sfCol   :: !Int                -- ^ 0-based.
+  , sfMtime :: !(Maybe Integer)    -- ^ Picoseconds since the epoch, or 'Nothing'.
+  } deriving (Eq, Show)
+
 -- | The open documents (in zipper order, with their cursors), which of them
--- was active, and the workspace folder if one was open.
+-- was active, the workspace folder if one was open, and when the file was
+-- last written.
 data Session = Session
   { seFolder :: !(Maybe FilePath)  -- ^ The open workspace folder, if any.
-  , seFiles  :: ![RecentEntry]     -- ^ Open documents in order, with cursor positions.
+  , seFiles  :: ![SessionFile]     -- ^ Open documents in order, with cursor positions.
   , seActive :: !Int               -- ^ Index into 'seFiles' of the active document.
+  , seClosed :: !(Maybe Integer)
+    -- ^ When this file was last written, in picoseconds since the epoch
+    -- ('Nothing' for a v1 file, which had no such field). Written on /every/
+    -- write, not only at exit: for a session that ended, the exit write is the
+    -- last one and it reads as \"closed at\"; for one that was killed it is the
+    -- last shape change, which is the honest answer and the same thing every
+    -- other field in the file is saying. It is /recorded/ rather than read back
+    -- off the filesystem, so the menu's ordering survives an @rsync@ or a
+    -- restore of @~\/.config@, which would flatten every mtime into one instant.
   } deriving (Eq, Show)
 
 -- | How many open files a session records. A session larger than this is a
@@ -405,48 +460,125 @@ data Session = Session
 maxSessionFiles :: Int
 maxSessionFiles = 50
 
-sessionVersion :: Int
-sessionVersion = 1
+-- | How many per-workspace session files @~\/.config\/cmedit\/sessions@ keeps
+-- ('maxRecentEntries'' number, for the same reason). Evicted oldest-'seClosed'
+-- first on write; the folderless @session@ file is not in that directory and is
+-- therefore never touched by the cap.
+sessionDirMax :: Int
+sessionDirMax = 50
 
--- | Render a session. The first line is the version, so a future format can be
--- told from this one instead of being half-understood.
+-- | The format version written. v1 (plan 0025) is still /read/ — see
+-- 'parseSessionText'.
+sessionVersion :: Int
+sessionVersion = 2
+
+-- | Render a session (always at 'sessionVersion'). The first line is the
+-- version, so a past or future format can be told from this one instead of
+-- being half-understood.
 renderSessionText :: Session -> Text
 renderSessionText s = T.unlines $
   [ T.pack ("cmedit-session " ++ show sessionVersion) ]
     ++ [ T.pack ("folder: " ++ f) | Just f <- [seFolder s] ]
+    ++ [ T.pack ("closed: " ++ show c) | Just c <- [seClosed s] ]
     ++ [ T.pack ("active: " ++ show (seActive s)) ]
-    ++ map renderRecentLine (take maxSessionFiles (seFiles s))
+    ++ map renderSessionLine (take maxSessionFiles (seFiles s))
+
+renderSessionLine :: SessionFile -> Text
+renderSessionLine f =
+  T.pack (show (sfLine f + 1) ++ ":" ++ show (sfCol f + 1) ++ ":"
+          ++ maybe "-" show (sfMtime f) ++ ":" ++ sfPath f)
+
+-- | Parse a session entry line at the given format version: @k = 2@ for v1
+-- (@line:col:path@) and @k = 3@ for v2 (@line:col:mtime:path@), through the one
+-- 'splitLeadingFields'.
+parseSessionLine :: Int -> Text -> Maybe SessionFile
+parseSessionLine 1 line = do
+  ([lt, ct], path) <- splitLeadingFields 2 line
+  l <- readMaybe (T.unpack lt)
+  c <- readMaybe (T.unpack ct)
+  pure (SessionFile path (max 0 (l - 1)) (max 0 (c - 1)) Nothing)
+parseSessionLine _ line = do
+  ([lt, ct, mt], path) <- splitLeadingFields 3 line
+  l <- readMaybe (T.unpack lt)
+  c <- readMaybe (T.unpack ct)
+  m <- if mt == T.pack "-" then Just Nothing
+                           else Just <$> readMaybe (T.unpack mt)
+  pure (SessionFile path (max 0 (l - 1)) (max 0 (c - 1)) m)
 
 -- | Parse the session file. Unknown lines are skipped the way the config
 -- parser skips them (this is user-visible state on disk, not a format we can
 -- assume intact); an unknown version means \"no session\" rather than a
 -- guess, since a later format's lines would only look like malformed ones.
+--
+-- The version line governs, as it always has. A v1 file parses exactly as it
+-- did before with every 'sfMtime' 'Nothing' — so no file is ever reported
+-- changed and a first restore after the upgrade behaves precisely like a 0025
+-- restore, which is the right outcome for a session recorded by a binary that
+-- did not know what to record.
 parseSessionText :: Text -> Maybe Session
 parseSessionText txt = case dropWhile (T.null . T.strip) rawLines of
-  (v : rest) | versionOK v -> Just (finish (foldl step (Nothing, [], 0) rest))
+  (v : rest) | Just ver <- versionOf v, ver `elem` supportedVersions ->
+      Just (finish (foldl (step ver) (Nothing, [], 0, Nothing) rest))
   _ -> Nothing
   where
+    supportedVersions = [1, sessionVersion]
     rawLines = map (T.strip . T.dropWhileEnd (== '\r')) (T.lines txt)
-    versionOK line = case T.words line of
-      ["cmedit-session", n] -> readMaybe (T.unpack n) == Just sessionVersion
-      _                     -> False
-    step acc@(folder, files, active) line
+    versionOf line = case T.words line of
+      ["cmedit-session", n] -> readMaybe (T.unpack n) :: Maybe Int
+      _                     -> Nothing
+    step ver acc@(folder, files, active, closed) line
       | T.null line = acc
       | Just f <- T.stripPrefix "folder:" line =
           -- An empty value is no folder, not a folder named "".
-          (if T.null (T.strip f) then Nothing else Just (T.unpack (T.strip f)), files, active)
+          ( if T.null (T.strip f) then Nothing else Just (T.unpack (T.strip f))
+          , files, active, closed )
       | Just a <- T.stripPrefix "active:" line =
-          (folder, files, maybe active id (readMaybe (T.unpack (T.strip a))))
-      | Just e <- parseRecentLine line = (folder, e : files, active)
+          (folder, files, maybe active id (readMaybe (T.unpack (T.strip a))), closed)
+      | Just c <- T.stripPrefix "closed:" line =
+          (folder, files, active, readMaybe (T.unpack (T.strip c)) `orElse` closed)
+      | Just e <- parseSessionLine ver line = (folder, e : files, active, closed)
       | otherwise = acc
-    finish (folder, files, active) =
-      Session folder (take maxSessionFiles (reverse files)) active
+    orElse (Just x) _ = Just x
+    orElse Nothing  y = y
+    finish (folder, files, active, closed) =
+      Session folder (take maxSessionFiles (reverse files)) active closed
+
+-- | What the File menu needs to know about one session file without reading
+-- its contents twice: which file it is, whose folder it describes, how many
+-- documents it recorded, and when it was written.
+--
+-- Deliberately not the file list: the menu shows a label, and the /restore/
+-- re-reads the file at the moment it acts, so a session another instance has
+-- rewritten since the listing is honoured rather than remembered.
+data SessionSummary = SessionSummary
+  { sumFile   :: !FilePath          -- ^ The session file's path (what a restore reads).
+  , sumFolder :: !(Maybe FilePath)  -- ^ Its workspace folder; 'Nothing' is the folderless session.
+  , sumCount  :: !Int               -- ^ How many documents it recorded.
+  , sumClosed :: !(Maybe Integer)   -- ^ Its 'seClosed' stamp (orders the menu).
+  } deriving (Eq, Show)
+
+summarizeSession :: FilePath -> Session -> SessionSummary
+summarizeSession path s =
+  SessionSummary path (seFolder s) (length (seFiles s)) (seClosed s)
+
+-- | The most recently written session of any kind — what @--restore@ falls back
+-- to when the current directory has no session of its own (plan 0030 §2.3 step
+-- 2). That fallback is what preserves the muscle memory 0025 built: a user who
+-- has always typed @cmedit --restore@ from their home directory keeps getting
+-- their last session, and the status line names which folder it came from.
+--
+-- An unstamped v1 file ('Nothing') loses to anything that knows when it was
+-- written, and only wins when it is all there is.
+newestSession :: [SessionSummary] -> Maybe SessionSummary
+newestSession [] = Nothing
+newestSession xs = Just (foldr1 newer xs)
+  where newer a b = if sumClosed b > sumClosed a then b else a
 
 -- | What a restore should actually do, given which recorded files are still
 -- there. Separated from the IO so the index arithmetic — the only part that
 -- can be wrong — is a pure function with a test.
 data RestorePlan = RestorePlan
-  { rpFiles    :: ![RecentEntry]  -- ^ The files to open, in session order.
+  { rpFiles    :: ![SessionFile]  -- ^ The files to open, in session order.
   , rpActive   :: !Int            -- ^ Index into 'rpFiles' of the one to make active.
   , rpRecorded :: !Int            -- ^ How many files the session recorded (for \"4 of 5\").
   } deriving (Eq, Show)
@@ -466,30 +598,47 @@ planRestore exists s = RestorePlan kept active (length files)
     want   = max 0 (min (length files - 1) (seActive s))
     active = max 0 (min (length kept - 1) (length (filter snd (take want tagged))))
 
--- | @~\/.config\/cmedit\/session@.
+-- | @~\/.config\/cmedit\/session@ — the session for a run with /no workspace
+-- folder open/, and the read fallback for anything written before plan 0030.
+-- Deliberately unmoved: a folderless session is a real session, it needs a key,
+-- and the file 0025 already writes is the obvious key for it.
 sessionFilePath :: IO FilePath
 sessionFilePath = (</> "session") <$> configDir
 
--- | Load the last session, if there is a readable one.
+-- | @~\/.config\/cmedit\/sessions@ — one file per workspace folder, named by
+-- 'Cmedit.Journal.sessionFileName' so a given folder's session file can be
+-- /computed/ rather than searched for.
+sessionsDirPath :: IO FilePath
+sessionsDirPath = (</> "sessions") <$> configDir
+
+-- | Load the folderless session, if there is a readable one.
 loadSessionFile :: IO (Maybe Session)
-loadSessionFile = do
+loadSessionFile = sessionFilePath >>= loadSessionFrom
+
+-- | Persist the folderless session.
+saveSessionFile :: Session -> IO ()
+saveSessionFile s = sessionFilePath >>= \p -> saveSessionTo p s
+
+-- | Load a session from a named file (missing, unreadable or unparsable ⇒
+-- 'Nothing' — never an exception, because this runs on the startup path).
+loadSessionFrom :: FilePath -> IO (Maybe Session)
+loadSessionFrom path = do
   r <- try readIt :: IO (Either SomeException (Maybe Session))
   pure (either (const Nothing) id r)
   where
     readIt = do
-      path <- sessionFilePath
       exists <- doesFileExist path
       if exists then parseSessionText <$> TIO.readFile path else pure Nothing
 
--- | Persist the session (atomically, via a temp file). Failures are swallowed,
--- like the recents: losing the session must never take the editor down.
-saveSessionFile :: Session -> IO ()
-saveSessionFile s = do
+-- | Persist a session to a named file (atomically, via a temp file). Failures
+-- are swallowed, like the recents: losing the session must never take the
+-- editor down.
+saveSessionTo :: FilePath -> Session -> IO ()
+saveSessionTo path s = do
   _ <- try writeIt :: IO (Either SomeException ())
   pure ()
   where
     writeIt = do
-      path <- sessionFilePath
       createDirectoryIfMissing True (takeDirectory path)
       let tmp = path ++ ".tmp"
       TIO.writeFile tmp (renderSessionText s)

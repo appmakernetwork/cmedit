@@ -18,6 +18,7 @@ module Cmedit.Editor
   , fileCount
   , fileIndex
   , switchToFile
+  , findOpenIndex
   , entriesFor
     -- * Recent files
   , touchRecent
@@ -253,6 +254,26 @@ module Cmedit.Editor
   , seedJournalIds
   , openRecoverDialog
   , recoverJournals
+    -- * Clean-exit snapshots and the changed-files prompt (plan 0030)
+  , ChangedFile(..)
+  , ChangeVerdict(..)
+  , sessionChangeVerdict
+  , maxSnapshotBytes
+  , snapshotableDoc
+  , snapshotOf
+  , snapshotRequests
+  , openSessionChangedDialog
+  , installSessionSnapshots
+  , afterSessionChanged
+    -- * Sessions (the pure spine; the files live in "Cmedit.App")
+  , SessionSummary(..)
+  , sessionMenuMax
+  , sessionMenuList
+  , sessionMenuLabel
+  , sessionMenuEntries
+  , addSessionEntries
+  , assignSessionMnemonics
+  , sessionsListed
   , applySaveFixups
   , applySaveFixupsAll
   , tabWidthOf
@@ -310,7 +331,7 @@ import Cmedit.TextBuffer
 import Cmedit.Width (colToDisplay, displayToCol, wrapLine)
 import Cmedit.ConfigFile
   ( Config(..), ThemeName(..), defaultConfig, RecentEntry(..)
-  , maxRecentEntries, maxHistoryEntries )
+  , maxRecentEntries, maxHistoryEntries, SessionSummary(..) )
 import Cmedit.Menu
 import Cmedit.Dialog
 import Cmedit.Browser (Browser(..), FileNode(..), Entry)
@@ -650,7 +671,13 @@ finishImageDrag idoc ed =
 entriesFor :: Editor -> Int -> [MenuEntry]
 entriesFor ed mi
   | isWindowMenu mi = windowEntries ed
-  | isFileMenu mi   = addRecentEntries ed (pruneEntries ed (entriesOf mi))
+  -- Sessions are spliced first so the recents land *below* them (both splices
+  -- insert immediately above the Settings…/Exit tail), and the mnemonic
+  -- allocator runs last, over the finished list, which is the only place it can
+  -- see which letters the static items and the numbered recents have claimed.
+  | isFileMenu mi   = assignSessionMnemonics
+                        (addRecentEntries ed
+                          (addSessionEntries ed (pruneEntries ed (entriesOf mi))))
   | otherwise       = pruneEntries ed (entriesOf mi)
 
 -- Hide context-dependent items: the File menu's "Revert" unless the active file
@@ -1024,6 +1051,11 @@ runAction a ed0 =
        MARecentFile k -> case drop k (recentMenuPaths ed) of
                            (p : _) -> (pushNavIfFar (Just p) origin ed, [EffOpen p])
                            []      -> noEff ed
+       -- A driver round trip, not a pure toggle: restoring is file IO by
+       -- definition, and it runs the same code path the startup restore does.
+       MARestoreSession k -> case drop k (sessionMenuList ed) of
+                               (s : _) -> (ed, [EffRestoreSession (sumFile s)])
+                               []      -> noEff ed
        MANextFile   -> noEff (nextFile ed)
        MAPrevFile   -> noEff (prevFile ed)
        MAAbout      -> noEff (openAbout ed)
@@ -1168,10 +1200,14 @@ update key ed =
   -- comparison is as cheap, so it goes here rather than being chased.
   let (ed', effs) = fmapEd (refreshPdf . refreshRtf) (dispatchKey key ed)
   -- When a menu has just been opened, refresh the active file's stale-on-disk
-  -- flag so the File menu can offer Revert if the file changed underneath us.
-  in case edPath ed' of
-       Just p | edFocus ed /= FMenu && edFocus ed' == FMenu -> (ed', effs ++ [EffStatFile p])
-       _                                                    -> (ed', effs)
+  -- flag so the File menu can offer Revert if the file changed underneath us —
+  -- and, for the File menu specifically, re-read the sessions directory, for the
+  -- same reason: another instance may have exited since we last looked.
+      menuOpened = edFocus ed /= FMenu && edFocus ed' == FMenu
+      opened     = [ EffStatFile p | menuOpened, Just p <- [edPath ed'] ]
+                     ++ [ EffListSessions | menuOpened
+                                          , isFileMenu (msMenuIx (edMenu ed')) ]
+  in (ed', effs ++ opened)
   where fmapEd f (e, es) = (f e, es)
 
 dispatchKey :: Key -> Editor -> (Editor, [Effect])
@@ -1656,6 +1692,11 @@ cancelDialog ed =
        -- untouched (nothing has adopted them), and the offer is dropped so the
        -- buffers it was holding are not retained for the whole session.
        Just DKRecover -> base { edRecover = [] }
+       -- Esc out of the changed-files prompt is "Latest on Disk": the files are
+       -- already open at their newest state, so the default answer *is* the
+       -- no-op — which is the correct property for a prompt that appears rarely
+       -- and unpredictably. Any queued journal recovery then takes the screen.
+       Just DKSessionChanged -> afterSessionChanged base
        _ -> base
 
 -- Enter pressed: pick the focused button (or the primary one).
@@ -1750,6 +1791,15 @@ dispatchDialog kind btn d ed = case kind of
     where
       keys = map riKey (edRecover ed)
       answered s = (closeDialog ed { edRecover = [] }) { edStatus = s }
+  -- Files moved on disk while this session was closed. Button 0 is always the
+  -- no-op — "Latest on Disk", or the single "OK" when no snapshot is usable —
+  -- because the files are already open at their newest state. Button 1, when it
+  -- exists, installs the session's own copies as modified, unsaved buffers.
+  -- Either answer then lets the queued journal-recovery prompt through.
+  DKSessionChanged -> case btn of
+    1 | length (dlgButtons d) > 1 ->
+        noEff (afterSessionChanged (installSessionSnapshots (closeDialog ed)))
+    _ -> noEff (afterSessionChanged (closeDialog ed))
   DKAbout   -> noEff (closeDialog ed)
   DKHelp
     | btn == 0  -> noEff (openManual (closeDialog ed))

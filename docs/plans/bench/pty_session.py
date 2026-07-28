@@ -59,9 +59,21 @@ ROWS, COLS = 40, 140
 # ---------------------------------------------------------------------------
 # The session file
 #
-# ~/.config/cmedit/session, beside `recent` and `history`. A version line, an
-# optional `folder:`, an `active:` index, then one 1-based `line:col:path` per
-# open document in tab order — the recents encoding, reused deliberately.
+# A version line, an optional `folder:`, an optional `closed:` stamp, an
+# `active:` index, then one entry per open document in tab order.
+#
+# Plan 0030 made this per-workspace: `~/.config/cmedit/sessions/<key>.session`
+# for a run with a workspace folder open, and the original singular
+# `~/.config/cmedit/session` for a run with none. Every scenario here opens
+# files but never a folder, so they all still land in the folderless file —
+# which is exactly the property that lets these five scenarios stay the v1→v2
+# regression net.
+#
+# Two format changes: the version is now 2, and the entry line grew a third
+# leading field (the on-disk mtime the session saw, in picoseconds, or `-`) in
+# front of the path. Only the first k colons separate, so a path may still
+# contain as many as it likes — which is why the field went *before* the path
+# and not after it.
 
 def session_path(home):
     return os.path.join(home, ".config", "cmedit", "session")
@@ -71,12 +83,15 @@ def read_session(home):
     """Parse the session file into (folder, [(line, col, path)], active).
 
     Deliberately a second, independent parser: asserting against the same code
-    the editor writes with would assert nothing about the format.
+    the editor writes with would assert nothing about the format. Reads v1 and
+    v2, so a downgrade or a stale binary shows up as a format failure rather
+    than as a silently different answer.
     """
     with open(session_path(home), "r", encoding="utf-8") as f:
         lines = [l.rstrip("\r\n") for l in f]
-    check(bool(lines) and lines[0].strip() == "cmedit-session 1",
+    check(bool(lines) and lines[0].strip() in ("cmedit-session 1", "cmedit-session 2"),
           "session file has no version line: %r" % (lines[:1],))
+    version = int(lines[0].strip().split()[1])
     folder, files, active = None, [], 0
     for line in lines[1:]:
         line = line.strip()
@@ -86,9 +101,17 @@ def read_session(home):
             folder = line[len("folder:"):].strip() or None
         elif line.startswith("active:"):
             active = int(line[len("active:"):].strip())
+        elif line.startswith("closed:"):
+            int(line[len("closed:"):].strip())      # must be an integer
         else:
             ln, _, rest = line.partition(":")
-            col, _, path = rest.partition(":")
+            col, _, rest = rest.partition(":")
+            if version >= 2:
+                mtime, _, path = rest.partition(":")
+                check(mtime == "-" or mtime.isdigit(),
+                      "v2 entry has no mtime field: %r" % (line,))
+            else:
+                path = rest
             files.append((int(ln), int(col), path))
     return folder, files, active
 

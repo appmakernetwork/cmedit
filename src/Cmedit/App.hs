@@ -7,6 +7,7 @@ module Cmedit.App
   , convertFiles
     -- * Exposed for testing
   , convertPath
+  , abbreviateHome
   ) where
 
 import Control.Concurrent (ThreadId, forkIO, getNumCapabilities, killThread, myThreadId)
@@ -19,7 +20,8 @@ import qualified Data.ByteString as BS
 import Data.ByteString.Builder (Builder, char7, hPutBuilder)
 import Data.Foldable (toList)
 import Data.IORef
-import Data.List (isPrefixOf, isSuffixOf, sort, sortOn)
+import Data.List (dropWhileEnd, isPrefixOf, isSuffixOf, sort, sortOn)
+import Data.Ord (Down(..))
 import qualified Data.Map.Strict as M
 import qualified Data.Sequence as Seq
 import qualified Data.Sequence as Seq
@@ -34,13 +36,15 @@ import qualified Data.Text.IO as TIO
 import GHC.Clock (getMonotonicTime)
 import GHC.Stats
 import Text.Printf (printf)
+import Text.Read (readMaybe)
 import System.Directory
   ( XdgDirectory(XdgCache)
   , canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, doesFileExist
-  , findExecutable, getCurrentDirectory, getFileSize, getModificationTime
+  , findExecutable, getCurrentDirectory, getFileSize, getHomeDirectory
+  , getModificationTime
   , getXdgDirectory, listDirectory
-  , removeDirectoryRecursive, removeFile, renameFile, renamePath )
-import System.FilePath ((</>), makeRelative, splitDirectories, takeDirectory, takeFileName)
+  , removeDirectoryRecursive, removeFile, renameDirectory, renameFile, renamePath )
+import System.FilePath ((</>), isPathSeparator, makeRelative, splitDirectories, takeDirectory, takeFileName)
 import System.IO
 import System.Process
   ( CreateProcess(..), StdStream(CreatePipe), proc
@@ -57,7 +61,9 @@ import Cmedit.Clipboard
 import Cmedit.ConfigFile
   ( RecentEntry(..), ThemeName(..), loadRecentFile, saveRecentFile
   , loadHistoryFile, saveHistoryFile, configFilePath, updateConfigText
-  , Session(..), RestorePlan(..), planRestore, loadSessionFile, saveSessionFile )
+  , Session(..), SessionFile(..), SessionSummary(..), RestorePlan(..), planRestore
+  , loadSessionFrom, saveSessionTo, sessionFilePath, sessionsDirPath
+  , summarizeSession, newestSession, sessionDirMax, maxSessionFiles )
 import Cmedit.Definition (DefReq(..))
 import qualified Cmedit.Definition as D
 import Cmedit.Editor
@@ -139,12 +145,21 @@ runTui cfg cfgWarns files readOnly statsOnExit restoreFlag = do
                                     1 -> ""
                                     n -> " (+" ++ show (n - 1) ++ " more)"))) ed0'
                 _ -> ed0'
-    -- Before the first frame: collect the journal directory and, if a previous
-    -- session left unsaved work behind, open the recovery prompt over the
-    -- welcome status. Skipped entirely when the key is off — nothing is read
-    -- and nothing is offered.
+    -- Before the first frame, in plan 0030 §2.8's precedence order: the restore
+    -- has already happened (inside 'buildInitialEditor'), so first the
+    -- changed-files prompt for whatever moved on disk while the session was
+    -- closed, and then — last — the journal recovery prompt, which
+    -- 'openRecoverDialog' queues behind it when both apply. A journal is unsaved
+    -- content from a session that died; a snapshot is saved content from one
+    -- that ended tidily, and when both speak for a file the unsaved edits win.
+    --
+    -- The snapshot GC runs unconditionally, unlike the journal scan: cleaning up
+    -- @~/.cache@ must not depend on the key that fills it.
+    gcSnapshotDirs
     journalDir <- journalDirPath
-    ed0J <- if cfgJournal cfg then startupJournals journalDir ed0 else pure ed0
+    sessions0 <- listSessions
+    let ed0C = openSessionChangedDialog (sessionsListed sessions0 ed0)
+    ed0J <- if cfgJournal cfg then startupJournals journalDir ed0C else pure ed0C
     -- The kernel often knows the terminal's pixel size (ws_xpixel/ws_ypixel);
     -- when it does, the image view gets the true cell aspect ratio from the
     -- first frame. The XTWINOPS replies refine or supply it later.
@@ -166,7 +181,7 @@ runTui cfg cfgWarns files readOnly statsOnExit restoreFlag = do
     -- session whose shape never moves after startup would otherwise write
     -- nothing at all — and a SIGKILL would then leave the /previous/ session's
     -- file for @--restore@ to trust.
-    saveSessionFile (sessionForPersist ed0Px)
+    _ <- persistSession ed0Px
     quickGen  <- newTVarIO 0
     capsRef   <- newIORef defaultCaps
     pointerRef <- newIORef "default"
@@ -215,9 +230,15 @@ runTui cfg cfgWarns files readOnly statsOnExit restoreFlag = do
         -- SIGTERM/SIGHUP.
         `finally` (do edF <- readIORef editorRef
                       saveRecentFile (recentsForPersist edF)
-                      saveSessionFile (sessionForPersist edF)
+                      stamp <- persistSession edF
                       saveHistoryFile (toList (edFindHist edF))
                                       (toList (edReplHist edF))
+                      -- After the session write, so the stamp the snapshot set
+                      -- carries is the value that landed in the session file.
+                      -- Gated on 'edQuit' like the journal drop: this block also
+                      -- runs on SIGTERM/SIGHUP, and only a real quit is the
+                      -- clean exit a snapshot claims to be.
+                      when (edQuit edF) (writeSnapshots edF stamp)
                       dropJournalsOnExit drv edF))
     when statsOnExit (reportStats drv)
 
@@ -294,34 +315,105 @@ addOne cfg e f0 = do
 -- Runs before the journal scan, deliberately: recovery patches documents that
 -- are already open ('recoverJournals'), so restoring first is what makes a
 -- crashed session come back whole rather than as two copies of each file.
+-- @--restore@ (and @restore-session@) are __cwd-scoped__ (plan 0030 §2.3): the
+-- session for @$PWD@ if there is one, otherwise the most recently written
+-- session of any kind, which is what preserves the muscle memory 0025 built for
+-- anyone who has always typed @cmedit --restore@ from their home directory. A
+-- cwd that is /inside/ a workspace but not its root deliberately does not match:
+-- an ancestor walk would guess, and would guess wrongly on nested repositories.
 restoreSession :: Bool -> Editor -> IO Editor
 restoreSession explicit ed0 = do
-  msess <- loadSessionFile
-  case msess of
+  found <- findRestoreSession
+  case found of
     Nothing -> pure (nothingToRestore ed0)
-    Just s -> do
-      flags <- mapM (doesFileExist . rePath) (seFiles s)
-      let plan = planRestore flags s
-      (edF, folderOK) <- restoreFolder (seFolder s) ed0
-      edD <- foldM openRestored edF (rpFiles plan)
-      let n     = length (rpFiles plan)
-          total = rpRecorded plan
-          ed1   = switchToFile (rpActive plan) edD
-          -- The folder alone is a session worth having restored.
-          ed2 | n == 0 && not folderOK = nothingToRestore ed0
-              | n == total             = ed1 { edStatus = "Session restored" }
-              | otherwise = ed1 { edStatus = T.pack ("Restored " ++ show n ++ " of "
-                                                     ++ show total ++ " file"
-                                                     ++ (if total == 1 then "" else "s")) }
-      -- Restored files mean there is something to edit; the panel is context.
-      pure (if n > 0 then ed2 { edFocus = FEdit } else ed2)
+    Just (_, s, exact) -> do
+      (ed1, n, total, folderOK) <- applySession s ed0
+      if n == 0 && not folderOK
+        then pure (nothingToRestore ed0)
+        else do
+          -- Naming the folder is what makes the fallback non-astonishing — a
+          -- restore that silently produced another project's files is the bug
+          -- this plan opened with. An exact cwd match needs no such note (it is
+          -- the directory you are standing in), and the folderless session has
+          -- no folder to name.
+          note <- if exact then pure "" else sessionOriginNote (seFolder s)
+          edC <- sessionChangedPass s ed1 { edStatus = restoredMsg n total <> note }
+          -- Restored files mean there is something to edit; the panel is context.
+          pure (if n > 0 then edC { edFocus = FEdit } else edC)
   where
     nothingToRestore ed
       | explicit  = ed { edStatus = "No previous session to restore" }
       | otherwise = ed        -- the config key asked quietly; leave the welcome
+
+-- | The wording every restore shares: a full one says so, a partial one counts.
+restoredMsg :: Int -> Int -> T.Text
+restoredMsg n total
+  | n == total = "Session restored"
+  | otherwise  = T.pack ("Restored " ++ show n ++ " of " ++ show total ++ " file"
+                         ++ (if total == 1 then "" else "s"))
+
+-- | \" from ~\/work\/website\" for a session that was found by the fallback
+-- rather than by the cwd. Empty for the folderless session, which has no folder
+-- to name.
+sessionOriginNote :: Maybe FilePath -> IO T.Text
+sessionOriginNote Nothing  = pure ""
+sessionOriginNote (Just f) = do
+  home <- try getHomeDirectory :: IO (Either SomeException FilePath)
+  pure (T.pack (" from " ++ either (const f) (`abbreviateHome` f)
+                              (home :: Either SomeException FilePath)))
+
+-- | @~\/work\/website@ for a folder under the home directory, and the path
+-- unchanged for anything else.
+--
+-- The remainder has to begin at a path separator. A plain prefix test makes
+-- @\/home\/ben@ a prefix of @\/home\/benjamin\/site@ and abbreviates it to
+-- @~jamin\/site@ — a folder nobody has, in the one message whose whole job is
+-- to say which folder the session came from. Pure, so it is a unit test rather
+-- than a property of whoever's @$HOME@ the suite runs under.
+abbreviateHome :: FilePath -> FilePath -> FilePath
+abbreviateHome home f
+  | null h    = f
+  | otherwise = case splitAt (length h) f of
+      (pre, rest) | pre == h, null rest || isPathSeparator (head rest) -> '~' : rest
+      _                                                               -> f
+  where h = dropWhileEnd isPathSeparator home
+
+-- | Install a session onto an editor: the workspace folder if it is still a
+-- directory, then every recorded file that still exists, each through the
+-- ordinary 'classifyFile' guards — so an image, a workbook, a PDF or a file that
+-- grew past 'maxOpenBytes' lands in the view it would land in /today/, not the
+-- one it was in last week. Files that are gone are skipped and counted; nothing
+-- here is ever an error, because a session is a convenience and its absence must
+-- not stand between the user and an editor.
+--
+-- Shared by the startup restore and the File menu's ('EffRestoreSession'), which
+-- is the point: the menu route must not be a second, subtly different restore.
+-- It __adds; it never closes__ — files already open stay open and an already-open
+-- path switches to the open copy rather than duplicating it — so it needs no
+-- unsaved-changes prompt of its own.
+--
+-- Returns (editor, files opened, files recorded, folder was restored).
+applySession :: Session -> Editor -> IO (Editor, Int, Int, Bool)
+applySession s ed0 = do
+  flags <- mapM (doesFileExist . sfPath) (seFiles s)
+  let plan = planRestore flags s
+  (edF, folderOK) <- restoreFolder (seFolder s) ed0
+  edD <- foldM openRestored edF (rpFiles plan)
+  -- 'planRestore' decides *which* recorded file is active, as an index into the
+  -- session's own surviving list. Translating that to a path before switching is
+  -- load-bearing for the menu route: a restore onto a live editor is a union, so
+  -- the session's index and the merged open-files list's index are different
+  -- numbers, and switching by the raw index would land on whatever happened to
+  -- be open at that position.
+  let wanted = case drop (rpActive plan) (rpFiles plan) of
+                 (f : _) -> findOpenIndex (sfPath f) edD
+                 []      -> Nothing
+  pure ( maybe edD (`switchToFile` edD) wanted
+       , length (rpFiles plan), rpRecorded plan, folderOK )
+  where
     openRestored ed e = do
-      ed' <- openPath setLoadedNew imageLoadedNew (rePath e) ed
-      pure (seedSessionPos (rePath e) (Pos (reLine e) (reCol e)) ed')
+      ed' <- openPath setLoadedNew imageLoadedNew (sfPath e) ed
+      pure (seedSessionPos (sfPath e) (Pos (sfLine e) (sfCol e)) ed')
 
 -- The recorded workspace folder, if it is still a directory. Same installation
 -- path as File ▸ Open Folder, so the panel comes back in the same state.
@@ -333,6 +425,306 @@ restoreFolder (Just dir) ed = do
     cpath   <- canonicalizeSafe dir
     entries <- listEntries cpath
     pure (explorerStart cpath entries ed, True)
+
+------------------------------------------------------------------------------
+-- Per-workspace sessions: where the files are, and which one a restore finds
+-- (plan 0030 §§2.1–2.3)
+--
+-- One session file per workspace folder, named by 'J.sessionFileName' — so
+-- given a canonical $PWD the file's /name/ is computable and the cwd lookup is
+-- one 'doesFileExist' and one read. Only the File menu, which genuinely wants
+-- all of them, lists the directory.
+--
+-- The invariant everything below reasons from is 0025's, unchanged: __a session
+-- file describes what is actually open, at the moment it was written.__ Nothing
+-- derives, merges or reconciles; the file is a photograph. The live session
+-- persists to the key of its /current/ folder, re-evaluated on every write, so
+-- opening a folder mid-session sends the next write to the new key and leaves
+-- the previous key's file exactly as its last write left it — a restorable past
+-- session, which is a feature: closing a folder is the most common way a session
+-- ends without the process ending.
+
+-- | Where a session with this workspace folder lives. 'Nothing' is the
+-- folderless session, which stays at 0025's @~\/.config\/cmedit\/session@ — not
+-- migrated, not duplicated, not deleted: a folderless session is a real session,
+-- it needs a key, and the file 0025 already writes is the obvious key for it.
+sessionPathFor :: Maybe FilePath -> IO FilePath
+sessionPathFor Nothing  = sessionFilePath
+sessionPathFor (Just f) = (\d -> d </> J.sessionFileName f) <$> sessionsDirPath
+
+-- | Persist the editor's session under its /current/ folder's key, stamped now,
+-- and hold the sessions directory to its cap. Returns the @closed:@ value
+-- written, which is what a snapshot set's @stamp@ has to equal to be usable.
+--
+-- @closed:@ is written on every write, not only at exit, so its exact meaning is
+-- \"when this file was last written\". For a session that ended, the exit write
+-- is the last one and it reads as \"closed at\"; for one that was killed it is
+-- the last shape change, which is the honest answer and the same thing every
+-- other field is saying. Writing it only on exit would leave a crashed session
+-- undated, and dating it would then need the stat the field exists to avoid.
+persistSession :: Editor -> IO Integer
+persistSession ed = do
+  now <- getCurrentTime
+  let stamp = J.diskTimeToPicos now
+      s     = (sessionForPersist ed) { seClosed = Just stamp }
+  path <- sessionPathFor (seFolder s)
+  saveSessionTo path s
+  capSessionsDir
+  pure stamp
+
+-- | Hold @~\/.config\/cmedit\/sessions@ to 'sessionDirMax' files, evicting by
+-- @closed:@ oldest-first. This one is in @~\/.config@ rather than @~\/.cache@,
+-- so the eviction is conservative and silent — and it can never touch the
+-- folderless @session@ file, which is not in this directory at all.
+--
+-- The listing is cheap and happens on every session write; the parses happen
+-- only when the directory is actually over the cap.
+capSessionsDir :: IO ()
+capSessionsDir = void (try go :: IO (Either SomeException ()))
+  where
+    go = do
+      dir <- sessionsDirPath
+      exists <- doesDirectoryExist dir
+      when exists $ do
+        names <- filter J.isSessionFileName <$> listDirectory dir
+        when (length names > sessionDirMax) $ do
+          stamped <- forM names $ \n -> do
+            ms <- loadSessionFrom (dir </> n)
+            pure (n, ms >>= seClosed)
+          -- Oldest first; an unstamped v1 file (Nothing) sorts first and is
+          -- therefore evicted before anything that knows when it was written.
+          let ordered = sortOn snd stamped
+          mapM_ (\(n, _) -> void (try (removeFile (dir </> n))
+                                    :: IO (Either SomeException ())))
+                (take (length names - sessionDirMax) ordered)
+
+-- | Every readable session, summarised for the File menu. One listing and at
+-- most 'sessionDirMax' small parses; the summaries carry no file list, so a
+-- restore re-reads the session at the moment it acts.
+listSessions :: IO [SessionSummary]
+listSessions = either (const []) id <$> (try go :: IO (Either SomeException [SessionSummary]))
+  where
+    go = do
+      legacy <- sessionFilePath
+      dir    <- sessionsDirPath
+      names  <- do e <- doesDirectoryExist dir
+                   if e then listDirectory dir else pure []
+      let paths = legacy : [ dir </> n
+                           | n <- take sessionDirMax (sort (filter J.isSessionFileName names)) ]
+      mapMaybe id <$> forM paths (\p -> fmap (summarizeSession p) <$> loadSessionFrom p)
+
+-- | The session a @--restore@ should reopen: the cwd's own if there is one,
+-- otherwise the most recently written of any kind (including the folderless
+-- one). The 'Bool' says which of the two happened, because only the fallback
+-- needs to say where its answer came from.
+findRestoreSession :: IO (Maybe (FilePath, Session, Bool))
+findRestoreSession = do
+  cwd  <- canonicalizeSafe =<< getCurrentDirectory
+  own  <- sessionPathFor (Just cwd)
+  mine <- loadSessionFrom own
+  case mine of
+    Just s  -> pure (Just (own, s, True))
+    Nothing -> do
+      sums <- listSessions
+      case newestSession sums of
+        Just best -> fmap (\s -> (sumFile best, s, False))
+                       <$> loadSessionFrom (sumFile best)
+        Nothing   -> pure Nothing
+
+------------------------------------------------------------------------------
+-- Clean-exit snapshots and the changed-files comparison (plan 0030 §§2.6–2.7)
+--
+-- __The session file still never holds content.__ 0025's privacy claim is
+-- unchanged and unqualified: @~\/.config\/cmedit\/sessions\/*@ are paths,
+-- cursors, mtimes and counts. The content lives where content already lives —
+-- @~\/.cache@, 0700, behind the @journal@ key — in the /existing journal
+-- format/, which already carries exactly the fields needed and already has a
+-- parser, a serialiser, a naming function and a test suite.
+
+-- | @~\/.cache\/cmedit\/snapshots@.
+snapshotsDirPath :: IO FilePath
+snapshotsDirPath = (</> "snapshots") <$> getXdgDirectory XdgCache "cmedit"
+
+-- | The snapshot directory for one session key.
+snapshotDirFor :: Maybe FilePath -> IO FilePath
+snapshotDirFor mf = (</> J.sessionKeyName mf) <$> snapshotsDirPath
+
+-- | The one-line file inside a snapshot directory holding the @closed:@ value
+-- of the session it belongs to.
+stampFileName :: FilePath
+stampFileName = "stamp"
+
+-- Ceiling on the whole snapshots directory, evicting oldest-first. Half the
+-- journal's, because snapshots are written for every open document rather than
+-- only the modified ones and the loss when one is evicted is smaller — the file
+-- on disk is still there.
+snapshotDirCapBytes :: Integer
+snapshotDirCapBytes = 128 * 1024 * 1024
+
+-- | Write this session's snapshot set. Clean exit only, and only behind the
+-- @journal@ key: there is exactly one privacy story, and it is that content is
+-- cached in @~\/.cache@ when @journal = on@.
+--
+-- The directory is replaced wholesale so a snapshot set is always internally
+-- consistent and never half-updated. POSIX @rename()@ cannot replace a
+-- non-empty directory, so the replace is write-@.new@ / remove-old /
+-- rename-into-place rather than one atomic step — and that is fine __because
+-- the stamp check already invalidates any partial state__: the @stamp@ file is
+-- written __last__ inside @.new@, so a set that never got one, or got an older
+-- one, is simply not offered. A crash between the remove and the rename leaves
+-- the key with no snapshots at all, which degrades exactly as a crashed session
+-- does.
+writeSnapshots :: Editor -> Integer -> IO ()
+writeSnapshots ed stamp
+  | not (cfgJournal (edConfig ed)) = pure ()
+  | otherwise = void (try go :: IO (Either SomeException ()))
+  where
+    go = do
+      base <- snapshotsDirPath
+      ensureJournalDir base            -- same 0700 discipline; same reason
+      let dir = base </> J.sessionKeyName (explorerRoot ed)
+          new = dir ++ ".new"
+      removeDirIfPresent new           -- a stale one from a crash mid-write
+      createDirectoryIfMissing True new
+      forM_ (snapshotRequests ed) $ \(name, j) ->
+        BS.writeFile (new </> name) (J.serializeJournal j)
+      writeFile (new </> stampFileName) (show stamp ++ "\n")
+      removeDirIfPresent dir
+      renameDirectory new dir
+
+removeDirIfPresent :: FilePath -> IO ()
+removeDirIfPresent d = do
+  e <- doesDirectoryExist d
+  when e (void (try (removeDirectoryRecursive d) :: IO (Either SomeException ())))
+
+-- | Does this snapshot directory belong to the session that is being restored?
+--
+-- __The stamp is what stops a stale snapshot set being offered, and it closes a
+-- real hole.__ \"Crash sessions have no snapshots\" is not automatically true:
+-- a clean exit at T1 writes snapshots stamped T1, and a second session under the
+-- same key that is SIGKILLed at T2 leaves the session file saying @closed: T2@
+-- with no snapshots written. Without this check every mtime comparison would be
+-- made against T2's record while the offered content came from T1 — silently
+-- restoring /older/ content than the session describes. Requiring
+-- @stamp == closed:@ makes \"a crashed session has no snapshots\" fall out as a
+-- consequence rather than as a rule someone has to remember to enforce.
+--
+-- A v1 session has no @closed:@ at all, so it can never match: correct, since it
+-- also predates snapshots entirely.
+snapshotStampOK :: FilePath -> Maybe Integer -> IO Bool
+snapshotStampOK _ Nothing = pure False
+snapshotStampOK dir (Just want) = do
+  r <- try (readFile (dir </> stampFileName))
+  pure $ case r :: Either SomeException String of
+    Right txt -> readMaybe (takeWhile (/= '\n') txt) == Just want
+    Left _    -> False
+
+-- | One file's snapshot from a (stamp-verified) snapshot directory.
+--
+-- The @path:@ header is checked against the path we asked for, not just the
+-- file name: the name is a hash, and the identity that matters is what the
+-- record says about itself — the same rule journal recovery follows.
+readSnapshot :: FilePath -> FilePath -> IO (Maybe Journal)
+readSnapshot dir path = do
+  let f = dir </> J.journalFileName (Just path) 0
+  r <- try $ do
+    ok <- doesFileExist f
+    if not ok then pure Nothing else do
+      sz <- getFileSize f
+      if sz > maxOpenBytes then pure Nothing else do
+        bs <- BS.readFile f
+        pure $ case J.parseJournal bs of
+          Just j | jPath j == Just path -> Just j
+          _                             -> Nothing
+  pure (either (const Nothing) id (r :: Either SomeException (Maybe Journal)))
+
+-- | After a restore: stat the restored paths and compare each against the mtime
+-- the session recorded. It has just opened them, so this is nearly free and
+-- mostly cache-warm.
+--
+-- Files that differ moved __while the session was closed__ — which the ◆
+-- machinery cannot show, because ◆ compares against a baseline taken at load and
+-- the load just happened. The verdict itself is the pure
+-- 'sessionChangeVerdict'; this only supplies its three inputs.
+sessionChangedPass :: Session -> Editor -> IO Editor
+sessionChangedPass s ed = do
+  dir <- snapshotDirFor (seFolder s)
+  ok  <- if cfgJournal (edConfig ed) then snapshotStampOK dir (seClosed s)
+                                     else pure False
+  items <- fmap (mapMaybe id) $ forM (seFiles s) $ \f -> do
+    now <- fileMtime (sfPath f)
+    let nowP = J.diskTimeToPicos <$> now
+    -- Only read a snapshot for a file that actually moved: the whole set is
+    -- bounded, but there is no reason to read what nobody will be offered.
+    snap <- if ok && isJust (sfMtime f) && isJust nowP && sfMtime f /= nowP
+              then readSnapshot dir (sfPath f)
+              else pure Nothing
+    pure $ case sessionChangeVerdict (sfMtime f) nowP (isJust snap) of
+      CVUnchanged -> Nothing
+      _           -> Just (ChangedFile (sfPath f) snap)
+  pure ed { edSessionChanged = items }
+
+-- | Startup housekeeping for @~\/.cache\/cmedit\/snapshots@, beside
+-- 'gcJournalDir' and with the same discipline: one listing, bounded stats,
+-- delete before read.
+--
+--   * stray @.new@ directories (a crash between write and rename) go
+--     unconditionally;
+--   * a snapshot directory whose __session file no longer exists__ is
+--     unreachable and goes — the twin of 'journalIsOrphan', and cheaper, because
+--     the test is a filename computation rather than a parse;
+--   * anything over the directory cap goes, oldest first;
+--   * anything older than 'journalMaxAgeSecs' goes, matching the journal so
+--     there is one number to remember.
+--
+-- Run unconditionally, /not/ behind @journal@: housekeeping that only happens
+-- when caching is switched on would leave a user who switched it off with the
+-- cache they switched it off to avoid.
+gcSnapshotDirs :: IO ()
+gcSnapshotDirs = void (try go :: IO (Either SomeException ()))
+  where
+    go = do
+      base <- snapshotsDirPath
+      exists <- doesDirectoryExist base
+      when exists $ do
+        names <- listDirectory base
+        forM_ (filter (".new" `isSuffixOf`) names) (removeDirIfPresent . (base </>))
+        legacy   <- sessionFilePath
+        sessDir  <- sessionsDirPath
+        let keys = [ n | n <- names, not (".new" `isSuffixOf` n) ]
+        stats <- fmap (mapMaybe id) $ forM keys $ \n -> do
+          r <- try $ do
+            isDir <- doesDirectoryExist (base </> n)
+            if not isDir then pure Nothing else do
+              live <- doesFileExist (if n == J.sessionKeyName Nothing
+                                       then legacy
+                                       else sessDir </> (n ++ J.sessionExtension))
+              sz <- dirSizeBounded (base </> n)
+              mt <- getModificationTime (base </> n)
+              pure (Just (n, live, sz, mt))
+          pure (either (const Nothing) id
+                  (r :: Either SomeException (Maybe (FilePath, Bool, Integer, UTCTime))))
+        -- Unreachable first: no session file can ever address these again.
+        forM_ [ n | (n, False, _, _) <- stats ] (removeDirIfPresent . (base </>))
+        now <- getCurrentTime
+        let live0   = [ x | x@(_, True, _, _) <- stats ]
+            byAge   = sortOn (\(_, _, _, mt) -> mt) live0
+            overCap = evict (sum [ sz | (_, _, sz, _) <- byAge ]) byAge
+            evict total ((n, _, sz, _) : rest)
+              | total > snapshotDirCapBytes = n : evict (total - sz) rest
+            evict _ _ = []
+            tooOld  = [ n | (n, _, _, mt) <- byAge
+                          , realToFrac (diffUTCTime now mt) > journalMaxAgeSecs ]
+        forM_ (overCap ++ tooOld) (removeDirIfPresent . (base </>))
+
+-- One snapshot directory's size. Bounded by construction: a set holds at most
+-- 'maxSessionFiles' entries plus the stamp.
+dirSizeBounded :: FilePath -> IO Integer
+dirSizeBounded d = do
+  names <- listDirectory d
+  sum <$> forM (take (maxSessionFiles + 1) names) (\n ->
+    either (const 0) id <$> (try (getFileSize (d </> n))
+                               :: IO (Either SomeException Integer)))
 
 -- | Refresh the status bar's live counters when @debug-stats@ is on (and clear
 -- them if it was just turned off). Returns whether anything changed, so the
@@ -609,7 +1001,10 @@ maybePersistSession drv editorRef = do
   let shape = sessionShape ed
   old <- readIORef (drvSession drv)
   when (shape /= old) $ do
-    saveSessionFile (sessionForPersist ed)
+    -- The key is re-evaluated here, from the folder in the shape that just
+    -- changed: opening a folder mid-session sends this write to the new key and
+    -- leaves the old key's file as its last write left it.
+    _ <- persistSession ed
     writeIORef (drvSession drv) shape
 
 -- | Collapse a run of consecutive drag events (same button) to its last one.
@@ -1284,6 +1679,31 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
   EffStatFile path -> do
     mt <- fileMtime path
     pure (noteDiskMtime mt ed)
+
+  EffListSessions -> flip sessionsListed ed <$> listSessions
+
+  -- File ▸ a past session. The same code path as the startup restore, on the
+  -- live editor: the folder opens (so the explorer follows), each recorded path
+  -- goes through 'openPath', so an already-open one switches to the open copy
+  -- rather than duplicating it, the recorded cursors are seated, and the
+  -- changed-files comparison then runs. __Journal recovery does not re-run__ —
+  -- it is a startup scan whose whole premise is "a previous run of this editor
+  -- died", and re-running it mid-session would offer journals this session wrote.
+  EffRestoreSession path -> do
+    ms <- loadSessionFrom path
+    case ms of
+      Nothing -> pure ed { edStatus = "That session could not be read" }
+      Just s -> do
+        (ed1, n, total, folderOK) <- applySession s ed
+        -- A menu restore always says whose session it was: it is a union with
+        -- whatever was already open, so naming what arrived is the whole of the
+        -- feedback.
+        note <- sessionOriginNote (seFolder s)
+        let msg | n > 0     = restoredMsg n total <> note
+                | folderOK  = "Opened that session's folder" <> note
+                | otherwise = "Nothing left to restore from that session"
+        edC <- sessionChangedPass s ed1 { edStatus = msg }
+        pure (openSessionChangedDialog (if n > 0 then edC { edFocus = FEdit } else edC))
 
   EffBrowse mhint -> do
     dir0 <- case mhint of

@@ -75,6 +75,12 @@ data DialogKind
   | DKConfirmOverwrite
   | DKConfirmReplaceAll
   | DKRecover        -- ^ Startup: journals from a previous session were found (Recover / Discard / Keep for later).
+  | DKSessionChanged
+    -- ^ Restore: files moved on disk since the session ended (Latest on Disk /
+    -- As You Left Them). Button 0 is the no-op — the files are already open at
+    -- their newest state by the time this appears — so Esc maps to it safely,
+    -- and the whole dialog degrades to a single @OK@ when no snapshot of the
+    -- session's own version is usable.
   | DKAbout
   | DKHelp           -- ^ The F1 keyboard card (Manual button + styled overlay).
   | DKTheme          -- ^ View ▸ Theme: one button per colour theme, live-previewed.
