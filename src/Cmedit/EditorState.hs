@@ -49,6 +49,8 @@ import Cmedit.Image (Image(..), ImgMode(..), renderImage, viewFit)
 import Cmedit.Pager (PagerDoc(..), pagerStatus)
 import Cmedit.Rtf (RtfDoc(..))
 import qualified Cmedit.Rtf as Rtf
+import Cmedit.Xlsx (Workbook(..))
+import qualified Cmedit.Xlsx as Xlsx
 import Cmedit.Pdf (PdfDoc(..))
 import qualified Cmedit.Pdf as Pdf
 import qualified Cmedit.Pager as Pg
@@ -57,6 +59,8 @@ import Cmedit.Lint
   ( Diag(..), Severity(..), LintAvail, LinterId, Linter(..), linters, linterById
   , lintersForPath, diagAt )
 import qualified Cmedit.Lint as Lint
+import Cmedit.Journal (Journal(..), RecoveryCase(..))
+import qualified Cmedit.Journal as J
 
 
 ------------------------------------------------------------------------------
@@ -137,8 +141,12 @@ data Document = Document
   , docPager         :: !(Maybe PagerDoc) -- ^ Paged read-only view when this doc is too big to load.
   , docRtf           :: !(Maybe RtfDoc)   -- ^ Formatted read-only view when this doc is an RTF file being shown as a document.
   , docPdf           :: !(Maybe PdfDoc)   -- ^ Reading view when this doc is a PDF.
+  , docSheets        :: !(Maybe Workbook) -- ^ Workbook when this doc is an @.xlsx@ (the sheets; the showing one lives in 'docCsv').
   , docHlCache       :: !(Maybe HlCache)  -- ^ Cached syntax-highlight lexer states (perf only; self-validating).
   , docDiags         :: ![Diag]           -- ^ Latest linter diagnostics for this doc (sorted by line,col; @[]@ until a lint pass posts).
+  , docDocId         :: !Int              -- ^ Stable per-document id; names this document's journal while it is untitled ('Cmedit.Journal.journalFileName'). See 'edDocId'.
+  , docDocSeq        :: !Int              -- ^ This document's own edit counter (see 'edDocSeq').
+  , docJournalSeq    :: !Int              -- ^ The 'docDocSeq' value its on-disk journal holds (see 'edJournalSeq').
   } deriving (Show)
 
 -- | A read-only image-view document: the decoded image, the current paint mode,
@@ -229,6 +237,12 @@ data Editor = Editor
   , edSearch        :: !(Maybe SearchState) -- ^ Workspace-wide find/replace panel state (global, not per-document).
   , edSearchMode    :: !Bool                 -- ^ The search view occupies the main content area (drawn instead of the document); stays set while a menu/dialog overlays it.
   , edPendingJump   :: !(Maybe (FilePath, Int, Int, Int)) -- ^ After opening a search result: (path, line, col, len) to move the cursor to once loaded.
+  , edPendingDoc    :: !(Maybe (FilePath, Int, Text))
+    -- ^ After opening a workspace-search result that was found /inside a
+    -- document/: @(path, unit, term)@ to land on once loaded. Separate from
+    -- 'edPendingJump' because it addresses a reading view rather than a
+    -- buffer — a page\/chapter\/paragraph\/sheet plus the term to re-find
+    -- there, since these views have no stable line numbers to store.
   , edDefPick       :: !(Maybe DefPick) -- ^ The go-to-definition picker dialog, when open.
   , edDefGen        :: !Int             -- ^ Monotonic id of the newest definition scan (stale results are dropped).
   , edQuickOpen     :: !(Maybe QuickOpen) -- ^ The Ctrl+P go-to-file picker, when open.
@@ -245,6 +259,7 @@ data Editor = Editor
   , edImage         :: !(Maybe ImageDoc) -- ^ Image view, when the active doc is an image (a separate mode to text/CSV).
   , edPager         :: !(Maybe PagerDoc) -- ^ Paged read-only view, when the active doc is too big to hold in a buffer (a fourth view mode; see "Cmedit.Pager").
   , edRtf           :: !(Maybe RtfDoc)  -- ^ Formatted RTF view, when the active doc is an @.rtf@ shown as a document rather than as its markup (a fifth view mode; see "Cmedit.Rtf"). Read-only and derived: the buffer stays the document and is the only thing saved.
+  , edSheets        :: !(Maybe Workbook) -- ^ Open workbook, when the active doc is an @.xlsx@ (see "Cmedit.Xlsx"). The showing sheet is an ordinary 'edCsv' table view, so the renderer, key handler and scroll bars need to know nothing about workbooks; this holds the other sheets and marks the view read-only.
   , edPdf           :: !(Maybe PdfDoc)  -- ^ PDF reading view, when the active doc is a PDF (a sixth view mode; see "Cmedit.Pdf"). Like the image view and unlike the RTF one it has no buffer at all: the file is binary, so there is nothing to toggle to and nothing to save.
   , edHlCache       :: !(Maybe HlCache) -- ^ Cached syntax-highlight lexer states for the active doc (perf only; self-validating against the buffer).
   , edRecent        :: ![RecentEntry]   -- ^ Recently-opened files, most recent first (global; persisted by the driver).
@@ -258,7 +273,35 @@ data Editor = Editor
   , edDiags         :: ![Diag]           -- ^ Linter diagnostics for the active document (sorted by line,col; the renderer draws squiggles/counts from these; per-doc twin 'docDiags').
   , edLintAvail     :: !LintAvail         -- ^ Which linters the driver has detected as installed (drives the run list and the Settings availability notes); global, refreshed by 'EffDetectLinters'.
   , edEditSeq       :: !Int              -- ^ Monotonic edit counter bumped at every buffer edit/undo/redo/load; the driver fingerprints it to debounce lint passes.
+  , edDocSeq        :: !Int
+    -- ^ The /active document's own/ edit counter, bumped in lockstep with
+    -- 'edEditSeq' (and by table edits, which 'edEditSeq' ignores). It exists
+    -- because 'edEditSeq' is global: an edit in one file advances it for
+    -- every file, so a journal-staleness test built on it would rewrite the
+    -- journal of every modified document each time any one of them was
+    -- touched. Per-document twin 'docDocSeq'.
+  , edJournalSeq    :: !Int
+    -- ^ The 'edDocSeq' value the active document's on-disk journal holds.
+    -- Equal ⇒ the journal is current and the write-behind skips it; different
+    -- ⇒ stale. Per-document twin 'docJournalSeq'.
+  , edDocId         :: !Int
+    -- ^ Stable identity of the active document, from 'edNextDocId'. Only
+    -- untitled buffers need it — they have no path to hash, so their journal
+    -- is named @untitled-\<id\>@ — but zipper positions shift as files open
+    -- and close, so the number cannot come from the position. Per-document
+    -- twin 'docDocId'.
+  , edNextDocId     :: !Int              -- ^ Next 'edDocId' to hand out (global). Seeded past every recovered/kept untitled journal at startup so a fresh untitled buffer cannot clobber one.
+  , edRecover       :: ![RecoverItem]    -- ^ Journals found at startup and offered by the 'DKRecover' dialog; emptied when the user answers it. Global, like 'edSearch'.
   , edStats         :: !(Maybe Text)     -- ^ Live session counters for the status bar (@debug-stats@). Pre-rendered by the driver so the pure side stays IO-free; 'Nothing' when the key is off.
+  } deriving (Show)
+
+-- | One journal found by the startup scan, with the verdict the recovery
+-- dialog reports for it. The driver does the IO (list, parse, stat the
+-- journalled path); this is what it hands the pure layer.
+data RecoverItem = RecoverItem
+  { riKey     :: !FilePath      -- ^ The journal's file /name/ (no directory) — what the driver deletes or adopts.
+  , riCase    :: !RecoveryCase  -- ^ 'Cmedit.Journal.classifyJournal' against the path's current state.
+  , riJournal :: !Journal
   } deriving (Show)
 
 -- | A fresh editor for the given terminal size and config.
@@ -324,6 +367,7 @@ newEditor size cfg = Editor
   , edSearch        = Nothing
   , edSearchMode    = False
   , edPendingJump   = Nothing
+  , edPendingDoc    = Nothing
   , edDefPick       = Nothing
   , edDefGen        = 0
   , edQuickOpen     = Nothing
@@ -340,6 +384,7 @@ newEditor size cfg = Editor
   , edImage         = Nothing
   , edPager         = Nothing
   , edRtf           = Nothing
+  , edSheets        = Nothing
   , edPdf           = Nothing
   , edHlCache       = Nothing
   , edRecent        = []
@@ -353,6 +398,11 @@ newEditor size cfg = Editor
   , edDiags         = []
   , edLintAvail     = [ (linId l, Nothing) | l <- linters ]
   , edEditSeq       = 0
+  , edDocSeq        = 0
+  , edJournalSeq    = 0
+  , edDocId         = 1
+  , edNextDocId     = 2
+  , edRecover       = []
   , edStats         = Nothing
   }
 
@@ -422,6 +472,41 @@ rtfHeight = loTextHeight . computeLayout
 -- | Is the active document showing the PDF reading view?
 pdfActive :: Editor -> Bool
 pdfActive = isJust . edPdf
+
+-- | Is the active document one of the ZIP-container reading views — a DOCX or
+-- EPUB rendered through the formatted view, or an XLSX rendered through the
+-- table view?
+--
+-- This is the question behind \"can Save write this?\", \"is there a buffer
+-- underneath?\" and \"does Alt+T show markup or the archive listing?\", and
+-- it is derived from the view state rather than from the file extension so
+-- that a container renamed to @.zip@ behaves like what it is.
+containerViewActive :: Editor -> Bool
+containerViewActive ed = maybe False Rtf.rtfDerived (edRtf ed) || isJust (edSheets ed)
+
+-- | Is the active document the archive /listing/ of a file that also has a
+-- reading view — so Alt+T can go back to it?
+--
+-- Deliberately by extension. Nothing about a listing records what it was
+-- listed from (it is an ordinary read-only text buffer, which is the whole
+-- point of "Cmedit.Zip"'s design), and re-deriving the view is a driver round
+-- trip that will re-sniff the file properly anyway. A wrong guess here costs
+-- one status-line message.
+containerListing :: Editor -> Bool
+containerListing ed =
+  not (containerViewActive ed) && edReadOnly ed
+    && isNothing (edImage ed) && isNothing (edPdf ed) && isNothing (edPager ed)
+    && maybe False isContainerPath (edPath ed)
+
+-- | Extensions of the ZIP containers that have a reading view.
+isContainerPath :: FilePath -> Bool
+isContainerPath p =
+  map toLower (takeExtension p)
+    -- Flat OpenDocument (.fodt/.fods) is deliberately absent: it is a single
+    -- XML file rather than a ZIP, so it has no archive to toggle to — it opens
+    -- as its own markup, like any other XML.
+    `elem` [".docx", ".docm", ".xlsx", ".xlsm", ".epub", ".odt", ".ods"]
+
 
 -- | The viewport height available to the PDF view.
 pdfHeight :: Editor -> Int
@@ -857,6 +942,10 @@ explorerCloseCol lo = loContentLeft lo - 2
 explorerCollapseCol :: Layout -> Int
 explorerCollapseCol lo = loContentLeft lo - 4
 
+-- | The open workspace folder, if there is one.
+explorerRoot :: Editor -> Maybe FilePath
+explorerRoot ed = fnPath . brRoot <$> edExplorer ed
+
 -- Display name for the open folder (its base name, or the path for the FS root).
 explorerRootName :: Editor -> String
 explorerRootName ed = case edExplorer ed of
@@ -982,6 +1071,32 @@ data Effect
       --   'pagerFilled'). Bounded by construction — a few screens — so this is
       --   a seek and a short read, not a file slurp.
   | EffLintNow               -- ^ Run an immediate lint pass of the active document, save-time tools included (driver runs 'lintRequest' True and replies via 'lintResults'); emitted on save completion / settings change.
+  | EffExportTo !FilePath !Text
+    -- ^ Write this text to this path: what Save As means in a view that has no
+    -- buffer to save. Distinct from 'EffSaveTo' on purpose — that one writes
+    -- /the document/ and marks it saved at the path it wrote, and neither is
+    -- right here. An export is a copy of what is on screen; the workbook (or
+    -- PDF, or e-book) it came from stays exactly where it was, unmodified and
+    -- still the open document.
+  | EffDropJournals ![FilePath]
+    -- ^ Delete these journal files (names, not paths — the directory is the
+    -- driver's). Emitted by the recovery dialog's Discard button. Routine
+    -- removal — a save, a close, a document edited back to unmodified — needs
+    -- no effect: the driver derives the set of journals that /should/ exist
+    -- from the editor after every batch ('journalableDoc') and deletes the
+    -- rest, so no save or close path can forget to say so.
+  | EffAdoptJournals ![FilePath]
+    -- ^ Take responsibility for these existing journal files: the recovery
+    -- dialog's Recover button, whose documents are now open and modified.
+    -- Until a journal is adopted the driver will not delete it, which is
+    -- exactly what "Keep for later" means — it emits nothing at all.
+  | EffContainerView !FilePath !Bool
+    -- ^ Re-read a ZIP container into the other of its two views and install it
+    -- over the active document: 'True' for the archive listing, 'False' for
+    -- the rendered document. Reading is IO and the file is on disk either way,
+    -- so this is a round trip rather than a pure toggle — which also means the
+    -- driver re-sniffs, and a container that has since become unreadable
+    -- lands on the listing by the usual fallback rather than by a special case.
   deriving (Show)
 
 -- | The closed-file part of a workspace Replace All: which files to rewrite on
@@ -1012,6 +1127,11 @@ isCsvFile ed = maybe False isCsvPath (edPath ed)
 -- whether the formatted view is offered for it.
 isRtfPath :: FilePath -> Bool
 isRtfPath p = map toLower (takeExtension p) == ".rtf"
+
+-- | Is this an e-book? Used to pick the /unit/ a workspace search reports a
+-- match in: a spine chapter rather than a paragraph number.
+isEpubPath :: FilePath -> Bool
+isEpubPath p = map toLower (takeExtension p) == ".epub"
 
 isRtfFile :: Editor -> Bool
 isRtfFile ed = maybe False isRtfPath (edPath ed)
@@ -1366,8 +1486,11 @@ isPlainDoc :: Document -> Bool
 -- authoritative, so workspace replace and the other buffer consumers are
 -- correct on it. The view re-derives itself when the buffer moves under it
 -- ('refreshRtf').
+-- A container-derived formatted view (DOCX, EPUB) is /not/ plain, for the
+-- opposite reason: it has no buffer at all.
 isPlainDoc d = isNothing (docCsv d) && isNothing (docImage d) && isNothing (docPager d)
-                 && isNothing (docPdf d)
+                 && isNothing (docPdf d) && isNothing (docSheets d)
+                 && not (maybe False Rtf.rtfDerived (docRtf d))
 
 plural :: Int -> String
 plural n = if n == 1 then "" else "s"
@@ -1409,7 +1532,7 @@ pushNavIfFar tpath tpos ed
 -- "Linting" switch and rows @nEditingSettings+1 ..@ are one per 'linters'
 -- entry, in table order. A Spec test keeps this constant in step with the spec.
 nEditingSettings :: Int
-nEditingSettings = 12
+nEditingSettings = 14
 
 -- | The 'linters' entry a Settings dialog choice row maps to, if it is a
 -- per-linter row (the master switch and the editing rows return 'Nothing').
@@ -1534,6 +1657,70 @@ lintResults path ds ed
   | edPath ed == Just path = ed { edDiags = ds }
   | otherwise = ed { edBefore = map upd (edBefore ed), edAfter = map upd (edAfter ed) }
   where upd doc = if docPath doc == Just path then doc { docDiags = ds } else doc
+
+------------------------------------------------------------------------------
+-- Crash-recovery journal (the pure spine; see "Cmedit.Journal" for the format)
+--
+-- The whole subsystem is one question asked per document — "is there unsaved
+-- content here that a crash would lose, and is the copy on disk still the one
+-- it holds?" — answered by 'journalableDoc' and the 'docJournalSeq' \/
+-- 'docDocSeq' comparison. Everything else (when to ask, where to write) is the
+-- driver's, exactly as it is for linting.
+
+-- | Does this document have content a crash would lose? True only for a
+-- document with a /live, writable, authoritative/ buffer that is modified.
+--
+-- The exclusions are all the same shape: a view with no buffer under it
+-- (image, pager, PDF, workbook, container-derived DOCX\/EPUB) has nothing to
+-- journal, and journalling the empty buffer beneath one would offer to
+-- "recover" a document into nothing. A @cmedit:\/\/@ pseudo-path (the built-in
+-- manual) is not a file, and a ZIP listing is read-only so it can never be
+-- modified in the first place.
+--
+-- A CSV document /is/ journalled: its table is the live model and the line
+-- buffer under it is stale, which is what 'journalTextOf' is for.
+journalableDoc :: Document -> Bool
+journalableDoc d =
+  docModified d
+    && isNothing (docImage d) && isNothing (docPager d) && isNothing (docPdf d)
+    && isNothing (docSheets d)
+    && not (maybe False Rtf.rtfDerived (docRtf d))
+    && maybe True (not . ("cmedit://" `isPrefixOf`)) (docPath d)
+
+-- | The body of this document's journal.
+--
+-- The one subtlety is CSV: in table view the grid is the document and
+-- 'docBuffer' has not been re-serialised since the last save, so journalling
+-- the buffer would journal stale text. This is 'Cmedit.EditorDoc.syncCsvToBuffer'\'s
+-- rule applied per document — including the /inactive/ ones, which that
+-- function (which only sees the active fields) cannot reach. Workbook grids
+-- are exempt there and excluded here, for the same reason: an @.xlsx@ has no
+-- buffer and no serialiser back to its own format.
+journalTextOf :: Document -> Text
+journalTextOf d = case docCsv d of
+  Just v | isNothing (docSheets d) -> J.bufferJournalText (fromText (Csv.csvToText v))
+  _                                -> J.bufferJournalText (docBuffer d)
+
+-- | The journal file /name/ for a document. The directory is the driver's.
+journalKeyOf :: Document -> FilePath
+journalKeyOf d = J.journalFileName (docPath d) (docDocId d)
+
+-- | The journal record for a document. 'docDiskMtime' is the baseline
+-- recovery compares against, which is why it is the load\/save mtime and not
+-- the file's mtime now.
+journalOf :: Document -> Journal
+journalOf d = Journal
+  { jPath         = docPath d
+  , jMtime        = docDiskMtime d
+  , jEol          = docLineEnding d
+  , jEnc          = docEncoding d
+  , jFinalNewline = docFinalNewline d
+  -- Recorded so recovery will not offer to write back somewhere the session
+  -- itself could not; see 'Cmedit.Journal.canWriteBack'.
+  , jReadOnly     = docReadOnly d
+  , jCursor       = docCursorPos d
+  , jText         = journalTextOf d
+  }
 
 ------------------------------------------------------------------------------
 -- IO-callback used after a system copy attempt

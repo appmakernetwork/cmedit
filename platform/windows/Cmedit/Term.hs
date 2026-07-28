@@ -31,6 +31,8 @@ module Cmedit.Term
     -- * Directory-walk stat
   , EntryStat(..)
   , statEntry
+    -- * Private files
+  , setPrivateMode
   ) where
 
 import Control.Concurrent (ThreadId, forkIO, threadDelay)
@@ -259,3 +261,12 @@ statEntry path = handle (\(_ :: SomeException) -> pure Nothing) $ do
           if isFile
             then Just . EntryFile <$> getFileSize path
             else pure (Just EntryOther)
+
+-- | Restrict a path to its owner. A no-op here: Windows has no POSIX mode
+-- bits, and the equivalent — editing the path's ACL — needs advapi32 and a
+-- SID lookup for a directory that already lives inside the per-user profile
+-- (@%LOCALAPPDATA%@), which other users cannot traverse by default. The
+-- POSIX twin does the real work; keeping the export means "Cmedit.App" needs
+-- no @#ifdef@ around the journal directory.
+setPrivateMode :: FilePath -> IO ()
+setPrivateMode _ = pure ()

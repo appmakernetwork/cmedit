@@ -17,6 +17,11 @@ module Cmedit.Search
     -- * Matches and results
   , Match(..)
   , FileResult(..)
+  , DocKind(..)
+  , docKindName
+  , plainMatch
+  , plainResult
+  , replaceable
   , matchCount
   , fileMatchCount
     -- * Panel state
@@ -38,6 +43,7 @@ module Cmedit.Search
   , maxTotalMatches
   , maxResultFiles
   , maxFileBytesToSearch
+  , maxDocBytesToSearch
     -- * Globs / scope
   , parseGlobs
   , globMatch
@@ -45,6 +51,7 @@ module Cmedit.Search
   , dirPruned
   , defaultExcludes
   , binaryExtension
+  , documentExtension
     -- * Field editing
   , fieldInsert
   , fieldBackspace
@@ -75,6 +82,8 @@ module Cmedit.Search
   , scrollInto
   , toggleFileCollapsed
   , resultPaths
+  , replaceablePaths
+  , docResultCount
   ) where
 
 import Data.Array (Array, listArray, (!))
@@ -147,6 +156,10 @@ data SearchReq = SearchReq
   , sqInclude :: ![String]
   , sqExclude :: ![String]
   , sqSkip    :: ![FilePath]
+  , sqDocs    :: !Bool
+    -- ^ Also look inside PDFs, Word/OpenDocument files, workbooks and e-books
+    -- by decoding them to text first. Opt-in because decoding one file costs
+    -- what grepping a hundred source files costs.
   } deriving (Show)
 
 ------------------------------------------------------------------------------
@@ -159,15 +172,67 @@ data Match = Match
   { mLine :: !Int            -- ^ 0-based line number in the file.
   , mCols :: ![(Int, Int)]   -- ^ (startColumn, length) of each occurrence, in char columns.
   , mText :: !Text           -- ^ The line text for the snippet (clipped).
+  , mUnit :: !(Maybe (Int, Text))
+    -- ^ For a document result, where this match lives in terms the /view/ can
+    -- navigate to: @(1-based unit index, short label)@ — a page, chapter,
+    -- paragraph or sheet. 'Nothing' for an ordinary file, where 'mLine' is the
+    -- address and means something on its own.
+    --
+    -- It rides on the match rather than on the 'FileResult' because a
+    -- workbook's unit is a /cell/, which changes line by line; a per-file map
+    -- would need an entry per extracted line, and a 100 000-cell sheet has
+    -- 100 000 of those against at most 'maxMatchesPerFile' matches.
   } deriving (Eq, Show)
 
+-- | A match in an ordinary file, addressed by line number.
+plainMatch :: Int -> [(Int, Int)] -> Text -> Match
+plainMatch ln cols txt = Match ln cols txt Nothing
+
+-- | Which kind of document a result's text was extracted from, for results
+-- that did not come from a file's own bytes.
+--
+-- This is deliberately an enum /here/ rather than a re-export from
+-- "Cmedit.DocText": that module has to import every format reader
+-- (PDF, RTF, workbook, container), and this one is a low-level leaf that the
+-- walker and the renderer both depend on. The enum is all either of them
+-- needs — the label, and the knowledge that the file cannot be replaced in.
+data DocKind = DKPdf | DKWord | DKBook | DKSheet
+  deriving (Eq, Show)
+
+-- | What to call a document kind in the results panel.
+docKindName :: DocKind -> String
+docKindName k = case k of
+  DKPdf   -> "PDF"
+  DKWord  -> "document"
+  DKBook  -> "e-book"
+  DKSheet -> "workbook"
+
 -- | All matches for one file, plus display state.
+--
+-- @frDoc@ is 'Nothing' for an ordinary text file — the overwhelmingly common
+-- case — and 'Just' when the matches came from text /extracted/ from a
+-- document (see "Cmedit.DocText"). Two things follow from it, and both are
+-- load-bearing rather than cosmetic: the match rows are addressed by
+-- @frUnits@ instead of by line number, and the file is excluded from every
+-- replace path, because there is no serialiser back to any of these formats
+-- and there is not going to be one.
 data FileResult = FileResult
   { frPath      :: !FilePath
   , frMatches   :: ![Match]
   , frCollapsed :: !Bool
   , frTruncated :: !Bool     -- ^ matches for this file were capped.
+  , frDoc       :: !(Maybe DocKind)   -- ^ extracted from a document, not read as text.
   } deriving (Eq, Show)
+
+-- | A result from a file that was searched as its own bytes.
+plainResult :: FilePath -> [Match] -> Bool -> Bool -> FileResult
+plainResult p ms c t = FileResult p ms c t Nothing
+
+-- | Can this result's file be written back to? False for every document
+-- result: none of these formats has a serialiser, so a replace has nothing to
+-- write and must not pretend otherwise.
+replaceable :: FileResult -> Bool
+replaceable = (== Nothing) . frDoc
 
 matchCount :: Match -> Int
 matchCount = length . mCols
@@ -188,6 +253,7 @@ data SearchState = SearchState
   , ssCase        :: !Bool
   , ssWord        :: !Bool
   , ssRegex       :: !Bool       -- ^ interpret the Find term as a regular expression.
+  , ssDocs        :: !Bool       -- ^ also search inside documents (Alt+D / the [Doc] chip).
   , ssShowReplace :: !Bool       -- ^ the Replace row is shown (F6).
   , ssResults     :: !(Seq FileResult)   -- ^ a Seq for O(1) streaming append + length.
   , ssCursor      :: !Int        -- ^ index into 'focusItems' (fields then result rows).
@@ -207,7 +273,7 @@ data SearchState = SearchState
 newSearchState :: FilePath -> SearchState
 newSearchState root = SearchState
   { ssFind = mkField "", ssReplace = mkField "", ssInclude = mkField "", ssExclude = mkField ""
-  , ssCase = False, ssWord = False, ssRegex = False, ssShowReplace = False
+  , ssCase = False, ssWord = False, ssRegex = False, ssDocs = False, ssShowReplace = False
   , ssResults = Seq.empty, ssCursor = 0, ssTop = 0, ssLeft = 0
   , ssRunning = False, ssTotal = 0, ssGen = 0, ssSpin = 0, ssScanned = 0
   , ssTruncated = False, ssMessage = "", ssRoot = root, ssSearched = False }
@@ -355,7 +421,7 @@ collectMatches perLine txt = go 0 (T.lines txt) [] 0
       | length acc >= maxMatchesPerFile = (reverse acc, True, cnt)
       | otherwise = case perLine l of
           []   -> go (ln + 1) ls acc cnt
-          cols -> go (ln + 1) ls (Match ln cols (clip l) : acc) (cnt + length cols)
+          cols -> go (ln + 1) ls (plainMatch ln cols (clip l) : acc) (cnt + length cols)
     -- Keep snippets bounded, and 'T.copy' them: a Text slice shares its source
     -- array, so an uncopied snippet would pin the whole decoded file (up to
     -- megabytes) in memory for as long as its result row is on screen.
@@ -483,7 +549,42 @@ binaryExtensions =
   , "deb", "rpm", "dmg", "iso", "img"
     -- compiled objects and other opaque blobs
   , "so", "o", "a", "dylib", "dll", "exe", "obj", "class", "pyc", "pyo", "wasm"
-  , "pdf", "sqlite", "sqlite3", "hi", "rlib" ]
+  , "pdf", "sqlite", "sqlite3", "hi", "rlib"
+    -- Documents. Without "search in documents" these are skipped like any
+    -- other blob; naming them here rather than leaving them to the NUL sniff
+    -- saves an open and an 8 KiB read per file on every ordinary search.
+    -- Note @rtf@ is deliberately absent: it is genuinely text, and with the
+    -- option off it should be searched as the markup it is.
+  , "docx", "xlsx", "epub", "odt", "ods" ]
+
+-- | Extensions that "search in documents" decodes rather than skips.
+--
+-- Note that almost all of these are also in 'binaryExtensions' (a @.pdf@ is a
+-- binary blob; a @.docx@ is a ZIP full of them), and that is the correct
+-- relationship: without the option they must stay excluded, and the walker
+-- consults this list /instead of/ the binary one only when the option is on.
+--
+-- Matched by extension and not by magic bytes, unlike everything the editor
+-- opens interactively — a sniff means opening every file in the tree, which is
+-- exactly the cost this option is trying to keep opt-in.
+documentExtension :: FilePath -> Bool
+documentExtension name = case break (== '.') (reverse name) of
+  (revExt, '.' : _ : _) -> map toLower (reverse revExt) `elem` documentExtensions
+  _                     -> False
+
+documentExtensions :: [String]
+documentExtensions =
+  [ "pdf"                    -- reflowed page text
+  , "docx", "odt", "rtf"     -- formatted documents
+  , "xlsx", "ods"            -- workbooks (searched cell by cell)
+  , "epub" ]                 -- e-books
+
+-- | Size cap for a file the walker will decode. Deliberately larger than
+-- 'maxFileBytesToSearch': that cap exists because a source file over 8 MB is
+-- almost certainly not one, while a 20 MB PDF is an ordinary PDF. The work is
+-- still bounded — every reader has its own caps on pages, cells and chapters.
+maxDocBytesToSearch :: Integer
+maxDocBytesToSearch = 64 * 1024 * 1024
 
 ------------------------------------------------------------------------------
 -- Header + result rows (shared layout for rendering and mouse hit-testing)
@@ -597,3 +698,19 @@ toggleFileCollapsed fi ss =
 -- | Distinct file paths that currently have results.
 resultPaths :: SearchState -> [FilePath]
 resultPaths = map frPath . toList . ssResults
+
+-- | The result paths a replace can actually act on.
+--
+-- Document results are excluded, and this is the single place that happens:
+-- every replace path funnels through here, so a PDF or a workbook cannot be
+-- staged, rewritten on disk, or counted into the confirmation prompt. None of
+-- these formats has a serialiser and none is going to get one — the reading
+-- views exist precisely because writing them back is the hard part — so the
+-- only honest thing a replace can do with a document hit is leave it alone and
+-- say so.
+replaceablePaths :: SearchState -> [FilePath]
+replaceablePaths = map frPath . filter replaceable . toList . ssResults
+
+-- | How many result files were documents (and so cannot be replaced in).
+docResultCount :: SearchState -> Int
+docResultCount = length . filter (not . replaceable) . toList . ssResults

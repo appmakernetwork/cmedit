@@ -4,6 +4,7 @@ module Main (main) where
 
 import Control.Monad (forM_, when)
 import Data.List (foldl')
+import Data.Foldable (toList)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Encoding.Error as TEE
@@ -367,6 +368,31 @@ benchWrap = forM_ [(120::Int), 600, 3000] $ \len -> forM_ [False, True] $ \wrap 
                     in go e1 (i+1)
     _ <- (go ed 1 >>= forceEd); pure ()
 
+-- What an open CSV document actually costs to hold: the buffer *and* the grid,
+-- one construction path per process so the other cannot inflate the figure
+-- (0026). "text" is the pre-0026 route — re-join the buffer into one Text and
+-- parse that, which leaves the cells pointing into a second whole copy of the
+-- file; "lines" is the shipped one. RSS is read from /proc, since the point of
+-- the exercise is what `top` shows.
+benchCsvLive :: FilePath -> String -> IO ()
+benchCsvLive path how = do
+  bs <- BS.readFile path
+  let buf = lrBuffer (loadFromBytes False Nothing bs)
+      v | how == "text" = Csv.mkCsvView ',' (bufferToText LF False buf)
+        | otherwise     = Csv.mkCsvLines ',' (bufLines buf)
+      !n = Csv.nRows v * Csv.nCols v
+  n `seq` length (Csv.columnWidths v) `seq` pure ()
+  r <- resid
+  st <- readFile "/proc/self/status"
+  let field k = case [ w | l <- lines st, (k' : w : _) <- [words l], k' == k ] of
+                  (w : _) -> (read w :: Double) / 1024
+                  _       -> 0
+  -- Both must still be reachable past 'resid' (trap 1, in reverse).
+  putStrLn ("  " ++ how ++ ": live " ++ show (round r :: Int) ++ " MB, RSS "
+            ++ show (round (field "VmRSS:") :: Int) ++ " MB, peak "
+            ++ show (round (field "VmHWM:") :: Int) ++ " MB ["
+            ++ show (Csv.nRows v) ++ " rows, " ++ show (lineCount buf) ++ " lines]")
+
 -- CSV table mode at scale: parse, per-keystroke edit, per-frame render.
 benchCsv :: FilePath -> IO ()
 benchCsv path = do
@@ -382,6 +408,29 @@ benchCsv path = do
   putStrLn ("    live after parse: " ++ show (round r1 :: Int) ++ " MB (was "
             ++ show (round r0 :: Int) ++ "), " ++ show (Csv.nRows v0) ++ " rows x "
             ++ show (Csv.nCols v0) ++ " cols")
+  -- 0026: the load path as the editor actually runs it — the buffer's lines,
+  -- not a whole-file Text. The pieces are timed separately because the width
+  -- cache, not the parse, was the expensive half (2 697 MB of 3 719 MB).
+  buf <- timed "  loadFromBytes (decode + split lines)" $ do
+    let b = lrBuffer (loadFromBytes False Nothing bs)
+        !n = lineCount b
+    n `seq` pure b
+  timed "  bufferToText (the re-join 0026 removed)" $ do
+    let !n = T.length (bufferToText LF False buf)
+    n `seq` pure ()
+  timed "  csvParseLines (buffer lines) alone" $ do
+    -- Deep-forced: a Seq is element-lazy, so WHNF parses nothing (trap 2).
+    let g = Csv.csvParseLines ',' (bufLines buf)
+        !n = foldl' (\ !a row -> foldl' (\ !b c -> b + T.length c) a row) (0 :: Int) g
+    n `seq` pure ()
+  vL <- timed "  mkCsvLines (parse + width cache)" $ do
+    let v = Csv.mkCsvLines ',' (bufLines buf)
+        !n = Csv.nRows v * Csv.nCols v
+    n `seq` length (Csv.columnWidths v) `seq` pure v
+  -- (No live-heap figure here: the text-parsed grid above is still reachable,
+  -- so it would measure both. `bench csvlive FILE lines|text` retains exactly
+  -- one path, which is what 0026's live/RSS numbers came from.)
+  Csv.nRows vL `seq` pure ()
   -- Typing into a cell: begin edit then 100 inserts + commits (each commit
   -- goes through withRows/syncWidths and the modified check).
   timed "  100 cell edits (begin/insert/commit) at row 0" $ do
@@ -412,12 +461,111 @@ benchCsv path = do
     let step !v _ = Csv.commitEdit (Csv.editInsert 'x' (Csv.beginEdit v))
         vN = foldl' step (Csv.setCursor (Csv.nRows v0 - 1) 3 v0) [1 :: Int .. 100]
     Csv.nRows vN `seq` pure ()
-  timed "  100 isModified calls alone" $ do
-    let !k = length [ () | i <- [1 :: Int .. 100], Csv.isModified v0 == (i < 0) ]
-    k `seq` pure ()
+  -- 0028: 'Csv.isModified v' is loop-invariant, and full laziness floats it out
+  -- of a repeat loop — the probe would time one call and 99 comparisons. Moving
+  -- the cursor first makes each iteration a distinct view (an O(1) record
+  -- update that touches neither grid), which is enough to keep the call inside.
+  let modProbe lbl v = timed lbl $ do
+        let !k = length [ () | i <- [1 :: Int .. 100]
+                             , Csv.isModified (Csv.setCursor 0 (i `mod` 3) v) ]
+        k `seq` pure ()
+  modProbe "  100 isModified calls alone (UNMODIFIED grid)" v0
+  -- The same call once the grid has actually been edited. 0016 measured only
+  -- the line above, where the top-level pointer test short-circuits; after one
+  -- edit the saved grid is no longer the same object and the comparison had to
+  -- walk every row, on every keystroke.
+  let vMod = Csv.commitEdit (Csv.editInsert 'x' (Csv.beginEdit
+               (Csv.setCursor (Csv.nRows v0 - 1) 3 v0)))
+  modProbe "  100 isModified calls alone (MODIFIED grid)" vMod
+  -- ...and with the edit at the *first* row, where the old comparison found its
+  -- difference immediately and stopped. Same edit, 3 000x the cost, depending
+  -- only on where in the file it was: the shape of the defect.
+  let vMod0 = Csv.commitEdit (Csv.editInsert 'x' (Csv.beginEdit (Csv.setCursor 0 3 v0)))
+  modProbe "  100 isModified calls alone (MODIFIED at row 0)" vMod0
+  -- The comparison 0028 replaced, kept here so its cost is still measurable —
+  -- once with the pointer shortcuts it was designed around and once without,
+  -- because whether they fire under -O2 is the difference between 2 ms and
+  -- 400 ms and is not something the source can be read to decide. Also run on
+  -- the grid built from the *buffer's lines*, which is what the editor opens.
+  let sameGridRef fast a b =
+        ptrEq a b
+          || (Seq.length a == Seq.length b && and (zipWith sameRow (toList a) (toList b)))
+        where
+          sameRow r s = (fast && ptrEq r s)
+                        || (Seq.length r == Seq.length s
+                            && and (zipWith sameCell (toList r) (toList s)))
+          sameCell x y = (fast && ptrEq x y) || x == y
+      refProbe lbl fast v = timed lbl $ do
+        let !k = length [ () | i <- [1 :: Int .. 100]
+                             , sameGridRef fast (Csv.csvRows v)
+                                 (Csv.csvSaved (Csv.setCursor 0 (i `mod` 3) v)) ]
+        k `seq` pure ()
+  refProbe "  100 pre-0028 comparisons, pointer shortcuts on " True vMod
+  refProbe "  100 pre-0028 comparisons, pointer shortcuts off" False vMod
+  let vLMod = Csv.commitEdit (Csv.editInsert 'x' (Csv.beginEdit
+                (Csv.setCursor (Csv.nRows vL - 1) 3 vL)))
+  refProbe "  100 pre-0028 comparisons, grid from buffer lines" True vLMod
+  modProbe "  100 isModified calls alone (grid from buffer lines)" vLMod
+  timed "  100 undo/redo pairs (with the isModified check)" $ do
+    let step !v _ = let u = Csv.undo v
+                        r = Csv.redo u
+                    in Csv.isModified u `seq` Csv.isModified r `seq` r
+        vN = foldl' step vMod [1 :: Int .. 100]
+    Csv.nRows vN `seq` pure ()
+  timed "  100 undo/redo pairs WITHOUT the isModified check" $ do
+    let step !v _ = Csv.redo (Csv.undo v)
+        vN = foldl' step vMod [1 :: Int .. 100]
+    Csv.nRows vN `seq` pure ()
   timed "  100 columnWidths calls alone" $ do
     let !k = sum [ sum (Csv.columnWidths v0) | _ <- [1 :: Int .. 100] ]
     k `seq` pure ()
+  -- 0029: "which line of the serialised file does this cell start on?" — asked
+  -- by the recents, the session file, the crash journal and the nav history,
+  -- and (before 0029) reached from every keystroke via 'sessionShape'.
+  --
+  -- Both traps apply here at once. The result is a *tuple*, so `pure $!` forces
+  -- the constructor and computes neither component (trap 2 — this is exactly
+  -- how the driver-vs-in-process discrepancy in 0028 came about); and the call
+  -- is loop-invariant, so it floats out of a repeat loop (trap 3). Hence
+  -- 'force2' and the varying row.
+  let force2 (a, b) = a + b
+      posProbe lbl r = timed lbl $ do
+        let !k = foldl' (\ !acc i -> acc + force2 (Csv.cellTextPos v0 (r - i `mod` 3) 3))
+                        (0 :: Int) [1 :: Int .. 10]
+        k `seq` pure ()
+  posProbe "  10 cellTextPos at row 0     " 3
+  posProbe "  10 cellTextPos at the middle" (Csv.nRows v0 `div` 2)
+  posProbe "  10 cellTextPos at the LAST row" (Csv.nRows v0 - 1)
+  let cellProbe lbl ln = timed lbl $ do
+        let !k = foldl' (\ !acc i -> acc + force2 (Csv.textPosCell v0 (ln - i `mod` 3) 3))
+                        (0 :: Int) [1 :: Int .. 10]
+        k `seq` pure ()
+  cellProbe "  10 textPosCell at line 0    " 3
+  cellProbe "  10 textPosCell at the middle" (Csv.nRows v0 `div` 2)
+  cellProbe "  10 textPosCell at the LAST line" (Csv.nRows v0 - 1)
+  -- The cache that makes those cheap, built from scratch (the load-path cost).
+  timed "  computeNl over the whole grid (load path)" $ do
+    let !k = length (show (Csv.computeNl ',' (Csv.csvRows v0)))
+    k `seq` pure ()
+  -- The whole reason 0029 exists: the driver evaluates this after every key
+  -- batch, and it must not depend on where the cursor is.
+  let edCsvDoc = setLoaded path (loadFromBytes False Nothing bs)
+                           (newEditor (50, 200) defaultConfig)
+      atRow r e = case edCsv e of
+        Nothing -> e
+        Just vv -> e { edCsv = Just (Csv.setCursor r 0 vv) }
+      -- Forced the way the driver forces it: it *compares* the shape with the
+      -- last one, which walks the paths character by character. `length ps`
+      -- alone would force only the list spine and leave every path a thunk,
+      -- and the whole defect is one level further in (trap 2 again).
+      shapeProbe lbl r = timed lbl $ do
+        let one i = case sessionShape (atRow (max 0 (r - i `mod` 3)) edCsvDoc) of
+                      (f, ps, a) -> length (show f) + sum (map length ps) + a
+            !k = foldl' (\ !acc i -> acc + one i) (0 :: Int) [1 :: Int .. 100]
+        k `seq` pure ()
+  _ <- pure $! (case sessionShape edCsvDoc of (_, ps, a) -> sum (map length ps) + a)
+  shapeProbe "  100 sessionShape at row 0     " 0
+  shapeProbe "  100 sessionShape at the LAST row" (Csv.nRows v0 - 1)
   r2 <- resid
   putStrLn ("    live after edits: " ++ show (round r2 :: Int) ++ " MB")
   putStrLn ("    [keepalive " ++ show (Csv.nRows v0) ++ "]")
@@ -562,6 +710,7 @@ main = do
     ["share", f] -> benchShare f
     ["wrap"]    -> benchWrap
     ["csv", f]  -> benchCsv f
+    ["csvlive", f, how] -> benchCsvLive f how
     ["paste"]   -> benchPastes >> benchKeys 200000
     ["image", f] -> benchImage f
     ["search", f] -> benchSearch f

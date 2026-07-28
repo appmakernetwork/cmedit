@@ -10,6 +10,21 @@ framework** (no `brick`/`vty`): raw-mode terminal control, the input parser, the
 renderer, menus and dialogs are all built directly on `termios` and ANSI/VT
 escape sequences. Preserve this constraint when adding features.
 
+## Marketing & documentation website
+
+The CMeDit marketing and documentation site lives in a **separate repository at
+`~/work/appmakernetwork`** (GitHub `appmakernetwork/appmakernetwork.com`, served
+at https://appmakernetwork.com — the domain the in-app Help links point to). Its
+`cmedit/` directory holds the product page (`index.html`), the online manual
+(`manual.html`) and the whitepaper (`whitepaper.html`). When a request from this
+project involves updating the website — announcing a feature, syncing the online
+manual with `Cmedit.Manual`, refreshing release links — step sideways into that
+repo and work there directly, keeping this project open as the source of truth
+for what the editor actually does. Read `~/work/appmakernetwork/CLAUDE.md` first:
+it has its own conventions and hard constraints (plain static HTML with no build
+step, Cloudflare Pages auto-deploy on push to `main`, pretty-URL linking rules,
+pages that must not be restyled as a side effect).
+
 ## Build / test / run
 
 ```sh
@@ -290,7 +305,22 @@ in `README.md`; the cross-cutting structure that matters when editing:
   under it (`refreshRtf` from the `update` wrapper, so Undo/Redo and staged
   replaces are covered without hunting the mutation sites), and an RTF doc
   stays `isPlainDoc` (unlike CSV/image/pager) since its buffer is live and
-  authoritative. **`rtfStale` compares `edEditSeq`, an `Int` — not the
+  authoritative.
+  **It selects, and that is what makes it worth reading in.** `rdCaret`/
+  `rdAnchor` are the PDF view's model, ported: a caret and an optional anchor
+  over laid-out (line, character) coordinates, with mouse press/drag/release
+  (`handleRtfMouse`), double-click-word and triple-click-line, Shift+movement,
+  Ctrl+A and Ctrl+C copying `rtfSelText` (detached, like every clipboard
+  value). The same three judgements hold as there: **plain arrows scroll the
+  window and leave the selection alone** (Esc is what clears it), a **plain
+  click leaves nothing behind** (with no selection the view shows no cursor,
+  so a stray click must not conjure one), and the caret is drawn *only* while
+  an anchor is set — so `computeCursor` still returns `Nothing` for an
+  untouched document. A re-wrap drops the selection outright (`rtfRelayout`):
+  the indices address the old layout, and pointing at whatever now sits there
+  would be a lie. Note that the mouse handler sets `edMouseSelecting`, which
+  gates the chrome's mouse guards, so its *release* branch must always clear
+  it — a drag that never ends jams the scroll bars. **`rtfStale` compares `edEditSeq`, an `Int` — not the
   buffer.** The obvious version (keep the line `Seq`, check `ptrEq`, the
   `HlCache` idiom) *silently fails here*: under `-O2` `ptrEq` on a lifted
   value reported a mismatch even for an untouched buffer — immediately after
@@ -459,6 +489,167 @@ in `README.md`; the cross-cutting structure that matters when editing:
   it is positional and stateless, and why `archiveExtensions` feeding
   `langForPath` also (harmlessly) recolours those extensions in the explorer
   via `Render.fileKind`.
+  **Single-member extraction** (`localDataOffset`/`memberBytes`/`maxMemberBytes`)
+  was added for the container reading views below and is the one thing here
+  that decompresses. It keeps the size-independence — only named members are
+  ever read — and costs a second seek per member, because a local header's
+  name and extra lengths are *its own* and not the central directory's
+  (archivers routinely write a timestamp extra in one and not the other; assume
+  they match and you land in the middle of the data). Everything it cannot do
+  (encrypted, a method other than stored/deflate, over the cap) is a typed
+  `Left`, and every `Left` becomes the listing plus a note.
+- **Office and e-book reading views (`Cmedit.Docx`, `Cmedit.Xlsx`,
+  `Cmedit.Epub`, over `Cmedit.Xml`).** A `.docx`, `.xlsx` and `.epub` are ZIP
+  containers full of XML, and the editor already owned everything needed to
+  *read* them — so all three are **mappings, not view modes**. That is the
+  whole design, and the thing to preserve:
+  * a **DOCX** and an **EPUB** are `Cmedit.Rtf`'s paragraph model
+    (`docxPars` / `htmlPars` → `Seq RtfPar` → `mkRtfDocFrom`), so `layoutRtf`,
+    `rdCache`, `Render.drawRtf`, `handleRtfKey`, `scrollBarInfo`/`scrollBarTo`
+    and the status zone all work unchanged;
+  * an **XLSX** is `Cmedit.Csv`'s grid (`sheetGrid` → `Csv.mkCsvGrid`), so the
+    table view's navigation, selection, copy, column drags and both scroll
+    bars work unchanged.
+  What distinguishes them from the `.rtf` and `.csv` cases is
+  `Rtf.RtfOrigin` (`rtfDerived`) and `edSheets`: the file is **binary**, so
+  there is no buffer under the view — nothing to Alt+T to except the archive
+  listing, nothing `refreshRtf` could re-parse (`rtfStale` returns `False` for
+  a container origin), nothing Save could write, and `isPlainDoc` is `False`.
+  They arrive as their own `LoadOutcome`s (`OutDoc`, `OutBook`), install via
+  `containerDocLoaded`/`workbookLoaded` (over the shared `blankReadOnly`, which
+  `pdfLoaded` also uses — a field added to `Editor` and set in three of four
+  installers is how a view mode survives into a document that is not it), and
+  cross to the background loader at `imageAsyncBytes` like a PDF
+  (`looksLikeDecoded` now includes `zipMagic`: these pay for their *content*).
+  **The graceful floor is the listing.** `App.archiveOutcome` reads the central
+  directory, picks the format from the *member names* (`docxBodyMember`,
+  `isXlsx`, `isEpub` — zero extra reads, and more honest than the extension),
+  and any failure anywhere returns `Left note` which `listingOutcome` turns
+  into the listing with a `⚠` line. `View ▸ Archive Contents` / **Alt+T**
+  (`MAArchiveView` → `EffContainerView path listing`) swaps between the two
+  deliberately as a *driver round trip*, not a pure toggle: neither view is
+  derived from the other (one is the directory, one is a decompressed member),
+  and the round trip re-sniffs, so a file replaced on disk lands wherever it
+  now belongs. `containerViewActive`/`containerListing` decide which direction
+  is offered; the second is by extension, since a listing is an ordinary
+  read-only text buffer that records nothing about its origin.
+  **Formulas are the one place this reader computes anything, and the rule is
+  narrow on purpose: the file's own answer always wins.** Excel writes every
+  formula's result into the file beside it (`<v>`), so for a workbook a
+  spreadsheet program saved, the grid already holds that program's answers and
+  nothing recomputes them. A workbook written by a *library* (`openpyxl`,
+  `xlsxwriter`, `pandas`) carries the formula and no value, and those cells
+  used to show blank — which is the one answer that is certainly wrong. So
+  `sheetGrid` records **only** formulas with no cached value, `Xlsx.resolveFormulas`
+  runs `Cmedit.Formula.evalWorkbook` over the whole workbook (whole-workbook
+  purely so `=Summary!B2` resolves), and the status note reports how many were
+  computed and how many could not be. There is no path by which a computed
+  number displaces a supplied one, which is what makes the feature safe to
+  have at all — a Spec test pins it with a deliberately *stale* cached value.
+  `Cmedit.Formula` is a leaf: lexer, recursive-descent parser over Excel's
+  precedence, and an evaluator with a `Value` type, Excel's coercions and ~50
+  functions. Four things there are load-bearing. **An unknown function makes
+  the whole formula unsupported up front** (`parseFormula` walks the tree
+  before evaluation), so a cell is never half-computed — and an unsupported
+  formula leaves its cell exactly as it was and is *counted*, because showing
+  nothing is the honest answer to "I do not understand this" and showing a
+  number is not. **A genuine Excel error is an answer, not a failure**, so
+  `#DIV/0!` is shown while an unparseable formula is not. **The cycle guard is
+  a `Set`, not the recursion stack**: a running-total column is a chain
+  thousands deep, and a linear membership test down it per cell read is
+  quadratic in the chain — `maxDepth` is a separate, much larger stack guard
+  reported as `#NUM!`, precisely so a long chain is never mislabelled circular
+  (measured: a 3 000-deep upward chain resolves; before the split it did not).
+  **`maxSteps` counts cell *reads*, not formulas**, because the cost lives
+  inside range scans — a sheet of `SUM(A:A)` does millions of reads and only
+  thousands of evaluations. `TODAY`/`NOW`/`RAND` are deliberately absent: this
+  module is pure, and a wrong date is worse than a blank.
+  **Save As is an /export/ in every buffer-less view, and that distinction is
+  load-bearing.** `EffExportTo` writes a copy of what is on screen — a
+  workbook's showing sheet as CSV, a DOCX/EPUB/PDF as plain text
+  (`exportSuggestion`) — and, unlike `EffSaveTo`, does *not* set `edPath` or
+  mark anything saved: the open document is still the workbook, and a later
+  Ctrl+S must not aim at the CSV. The views with no text to export (image,
+  pager) refuse (`saveAsRefusal`). This is not a nicety: `MASaveAs` is in
+  neither `containerDisabledActions` nor `pdfDisabledActions`, so before it
+  existed Save As on a workbook, PDF, DOCX or EPUB wrote the *empty* buffer
+  underneath the view and then re-pointed the document at the file it had just
+  emptied. Exporting over the source archive is refused outright, since Save As
+  does not confirm before overwriting. `rtfPlainText`/`pdfPlainText` export the
+  **paragraphs**, not the laid-out lines — the opposite choice from
+  `rtfSelText`, deliberately: a selection is a piece of the screen, but a file
+  wrapped to whatever width the terminal happened to be is a poor artifact.
+  Read-only is enforced **twice**, as everywhere else: `containerDisabledActions`
+  is pruned from the menus *and* guarded in `runAction` (so the shortcuts are
+  inert), `handleSheetKey` swallows every grid-editing key, and
+  `syncCsvToBuffer` refuses a workbook outright as the backstop under all of
+  it — without that, any future save path would write one sheet of someone's
+  workbook over their workbook as CSV. `MAGoToLine` is reinterpreted a third
+  and fourth time (`goToUnitOK`, `mkGoToUnit`, `relabelEntry`): a *chapter*
+  for an EPUB, a *sheet* for a workbook, exactly as PDF reinterprets it as a
+  page, and for the same reason — a laid-out row number moves with the window
+  width and would mean nothing.
+  Two smaller judgements worth keeping. `rpSpace` (blank line after a
+  paragraph) exists because a `.docx` and an XHTML chapter carry their
+  paragraph spacing in a style sheet these readers do not resolve, so honouring
+  only their *manual* blank paragraphs gives a document with gaps in some
+  places and none in others; both mappers therefore drop empty paragraphs and
+  set `rpSpace` on every real one, and RTF (which spaces itself with empty
+  paragraphs) never sets it. And a **table row is one paragraph** whose cells
+  are tab stops in both mappers — a `<w:p>` inside a `<w:tc>` must not start a
+  paragraph, or every cell lands on its own line and the table's shape is gone.
+  **`Cmedit.Odf` (`.odt`/`.ods`) is the same shape a third time**, and the
+  cheapest of the three because it adds no target: a text body is the formatted
+  view, a spreadsheet is the grid, and `odfKind` picks between them from the
+  element inside `<office:body>` rather than from the extension or the
+  `mimetype` member (repackaging tools drop it). `.odp`/`.odg` are positioned
+  shapes, are deliberately not modelled, and fall back to the listing. Three
+  things differ from OOXML and are the whole of the work. **Formatting lives in
+  named styles, not on the run** — `<text:span text:style-name="T1">` with `T1`
+  defined in `<office:automatic-styles>` — so a reader matching on elements
+  alone sees *no* formatting at all; `odfStyles` builds that table in the same
+  pass (the styles are required to precede the body) and `resolveFmt`/
+  `resolvePar` walk the `style:parent-style-name` chain. **Lengths are CSS
+  lengths** (`0.5in`, `1.27cm`, `12pt`), hence `lengthToTwips`, where OOXML
+  writes bare twips. And **an `.ods` row is padded to the sheet width** with one
+  cell carrying `table:number-columns-repeated="1024"`, plus trailing rows at
+  `1048576` — expanding those literally turns every one-cell sheet into a
+  million-row grid, so a repeated run of *empty* cells or rows at the end of its
+  line is dropped rather than materialised. The exception that bites: a cell
+  with a **formula and no value looks empty and must survive the trim**, since
+  it is exactly the cell `Cmedit.Formula` is about to fill in.
+  ODF is also the one format that reads *better* than its OOXML cousin: a cell
+  carries its **displayed** text as well as its raw value, so the number formats
+  `Cmedit.Xlsx` declines to apply are already applied. `odfFormula` translates
+  the rare uncalculated formula (`of:=SUM([.A1:.B9])` → `SUM(A1:B9)`,
+  `[Sheet2.A1]` → `Sheet2!A1`) into the syntax `Cmedit.Formula` reads.
+  `Cmedit.Xml` is the shared leaf: a non-validating pull parser that matches on
+  **local names** (OOXML producers disagree about prefixes) and never fails,
+  bounded on nesting depth and text-node length. Its event list is lazy on
+  purpose, so a consumer that stops (a cell budget, a character budget) stops
+  the parser too. Element-*stack* matching in the mappers is load-bearing, not
+  fussiness: `w:jc` inside `w:pPr` is a paragraph's alignment and `w:jc` inside
+  `w:tblPr` is a table's, and matching on the element name alone lets one table
+  centre every paragraph in the document.
+- **Command-line conversion (`App.convertFiles`, `app/Main.hs`).** Every
+  reading view turns an awkward format into text, so the same work makes the
+  binary a converter: `cmedit paper.pdf > paper.txt`. **The trigger is
+  `hIsTerminalDevice stdout`** (in `base`, so `app/Main.hs` stays portable) and
+  needs no flag, because the editor draws on stdout — a redirected stdout
+  cannot mean "open the editor". `--convert` forces it at a terminal;
+  `--sheet N` picks a workbook's sheet, since a CSV holds one table and
+  emitting all of them would produce something that is not a CSV.
+  **Content to stdout, the description to stderr**, which is the only
+  arrangement a redirect survives; stderr is explicitly set to UTF-8 first,
+  since its encoding otherwise follows the locale and the arrows in the
+  description would make writing one an *exception* under `LANG=C`. `convertPath`
+  reuses `classifyFileWith` and matches on the `LoadOutcome`, so a format is
+  convertible exactly when it is openable — with two deliberate refusals
+  (an image has no text; a file over `maxOpenBytes` is already plain text, so
+  `cat` is the answer) and two special cases: a missing path is a *new buffer*
+  to the editor and an error here, and an `.rtf` arrives as a buffer of markup,
+  which is the one thing nobody redirecting this wants (it is re-parsed through
+  `rtfPlainText`).
 - **Two coordinate systems.** Buffer positions (`Pos`) count *characters*; the
   screen counts *display cells*. `Cmedit.Width` maps between them
   (`colToDisplay`/`displayToCol`) and supplies a compact `wcwidth` plus tab-stop
@@ -634,6 +825,22 @@ in `README.md`; the cross-cutting structure that matters when editing:
   on toggling back to text. The table carries its own undo. Mode is per-document
   (`docCsv` in the zipper). When adding save paths, they go through `EffSaveTo`,
   which already syncs — don't read `edBuffer` directly for CSV docs.
+  **Every route in builds the grid from the buffer's *lines*** — `mkCsvLines` /
+  `csvParseLines`, never `mkCsvView (bufferToText …)`, which is now only the
+  clipboard's and the tests' entry point. The parser is a cursor into a list of
+  lines (the remainder of the current line plus the lines after it) with the
+  newline between them implicit; `csvParse` is a `T.split (== '\n')` in front of
+  the same engine, so there is one parser and not two that could drift. Two
+  things follow. Re-joining the buffer to parse it cost a second whole copy of
+  the file, live for as long as the document stayed open (the cells were slices
+  of *it*, not of the buffer's array) — 32 MB of live heap and 134 MB of RSS on
+  a 32 MB table; parsing the lines makes both models share one array. And a
+  line with no quote and no CR takes a fast path that never enters the field
+  machinery at all. Cell text is `Text` slices throughout, so `0014`'s
+  copy-at-escape-boundaries rule applies (CSV copy/cut detaches). `cellWidth`
+  runs on every cell of the grid on load, so it is a strict fold with no
+  `T.unpack` and no `T.splitOn` — 2.7 GB of the 3.7 GB it used to cost to open
+  a 32 MB table was that one function (`0026`).
   Cells may contain newlines (Shift/Ctrl+Enter): a row's on-screen height is its
   tallest cell capped at `Csv.maxCellLines` (3), so rows have *variable height*.
   `Csv.rowHeight`/`csvRowLayout` (Render) and `Csv.rowAtLineOffset` (mouse) must
@@ -659,11 +866,91 @@ in `README.md`; the cross-cutting structure that matters when editing:
   `csvWidths` too or a fuzz test in `Spec.hs` will fail. `Csv.sortByColumn`
   (Alt+S, toggling asc/desc via `sortedAscBy`) follows that discipline:
   snapshot → `withRows`, numeric-aware keys, frozen header pinned, cursor
-  re-anchored to its row. The modified flag
-  (`Csv.isModified`, run per keystroke by `csvMod`) is exact at any table
-  size: `sameGrid` compares against `csvSaved` with per-row/per-cell pointer
-  shortcuts, so don't reintroduce a plain `==` on grids (or a big-table
-  cutoff) — content-comparing shared rows made large tables freeze per key.
+  re-anchored to its row. **The modified flag is maintained state, not a
+  comparison** (`csvDirty`, read per keystroke by `Csv.isModified` via
+  `csvMod`), under the same discipline as `csvWidths` and for the same
+  reason — comparing the grid against `csvSaved` cost 2.5 ms and 14 MB per
+  keystroke on a 223 000-row table. `CsvDirty` is `DirtyShape` **exactly
+  when** the two grids' shapes differ (row count, or any row's length) and
+  `DirtyCells n` **exactly when** the shapes match and `n` cells differ;
+  both directions of that biconditional are load-bearing, since `withCell`
+  keeps `DirtyShape` across a cell write without looking at the grid, and
+  every producer of `DirtyCells` relies on the converse. Three producers and
+  no others: `dirtyCell` (O(log rows) — a cell write knows its old, new and
+  saved text, so the count moves by ±1, which is *why* editing a cell back
+  to its saved value clears the flag by construction), `syncDirty`
+  (`withRows`/undo/redo, pointer-diff like `syncWidths`; a shape change is
+  the cheap case, and a shape *restored* pays one recompute because indices
+  cannot be trusted across it) and `dirtyFrom` (from scratch, for
+  `rebaseHistory`). Set `csvDirty` only where `csvWidths` is set, plus
+  `markSaved`/`markUnsaved`/`mkCsvGrid`; the `Spec.hs` fuzz test runs every mutating
+  operation in the module and checks the count against an independent
+  recomputation after each one. It must stay **exact** at any size — no
+  big-table cutoff, no approximation — because the flag drives the title
+  bar, the quit confirmation, Save All, `edDocSeq` and the crash journal's
+  sweep. Note `ptrEq` did *not* save the old design: measured under `-O2`,
+  `ptrEq (csvRows v) (csvSaved v)` returns `False` even for a freshly built
+  view, so the unmodified case walked the whole grid too (0028).
+  **A table carries its own saved baseline, so a `Document` that is dirty for
+  a reason the buffer knows about has to say so twice.** `mkCsvGrid` adopts the
+  grid it is handed as `csvSaved`, which is right for a file read off disk and
+  wrong for one recovered from a crash journal — there, `docSavedBuffer` is
+  deliberately `emptyBuffer` (the recovered text differs from disk by
+  definition) and the table needs `Csv.markUnsaved` for the same reason, or
+  `csvMod` recomputes the flag off the recovered grid, calls the document
+  clean, and the journal sweep deletes the only copy of the work. The same
+  guard is why `plainToCsv`'s *no-stash* branch is gated on `bufModified` — a
+  staged workspace replace opens a `.csv` with no table and no stash, so Alt+T
+  would otherwise parse its dirtiness away. (The stash branch never needed it:
+  `rebaseHistory` keeps the old saved point.) `markUnsaved`
+  sets `csvSaved` to the *empty* grid, which is an exact baseline rather than a
+  sentinel: `mkCsvGrid` guarantees at least one row, so `DirtyShape` is the
+  biconditional's own answer and no cell write can restore a zero-row shape.
+  **A third cache rides the same discipline: `csvNl`, the sparse map of rows
+  that contain embedded newlines and how many each contributes** to the
+  serialised CSV (absent = zero). It exists because `cellTextPos` — "which
+  line of the serialised file does this cell begin on?" — used to answer by
+  re-serialising *every row above the cursor*, and that question is asked by
+  the recents, the session file, the crash journal and the nav history. Set it
+  in exactly the places `csvWidths` is set (`mkCsvGrid`, `withCell`,
+  `withRows`, `undo`, `redo` — and nowhere else; `rebaseHistory` keeps `new`'s
+  grid, so `new`'s own map is already right), via `computeNl` (from scratch),
+  `syncNl` (the pointer-diff twin of `syncWidths`/`syncDirty`) and, on the
+  typing path, a ±delta in `withCell` that looks at nothing outside the row.
+  `linesBefore` prefix-sums it in O(log rows + multi-line rows above), and
+  **both** mappings read it: `cellTextPos` for the forward direction and
+  `textPosCell` for the inverse (a binary search over `i + linesBefore i`,
+  which is strictly increasing — it no longer serialises the file down to the
+  target line). The `Spec.hs` fuzz test checks the map against an oracle built
+  only out of `csvToText`, and both mappings against the from-scratch versions
+  they replaced. The vertical *display* geometry family — `rowHeight`,
+  `csvRowLayout`, `rowAtLineOffset`, `scrollTop`/`ensureVisible` — is
+  unrelated and already O(screen): it measures from `csvTop`, never from row
+  0, and must stay that way.
+  **Nothing on the per-batch driver path may ask a table document where its
+  cursor is.** `EditorDoc.sessionShape` is evaluated by the driver after every
+  key batch and deliberately records no positions — but it used to *project*
+  them out of a whole `sessionForPersist`, and `RecentEntry`'s fields are
+  strict, so building one forced the `docCursorPos` the projection then
+  dropped: 390 ms per keystroke typed into the last row of a 223 209-row CSV
+  (0029). It now derives folder/paths/active index from `sessionDocs` without
+  touching a `Document`'s cursor, and a `Spec.hs` test pins that with a grid
+  whose rows are `error` (a `Seq` is spine-strict but element-*lazy*, so
+  nothing structural can see this property).
+  **In-file find searches cells, not the buffer** (`csvFindWith`,
+  `csvSearchOrder` in `EditorFind`): the line buffer is stale in table mode, so
+  a character range would have nowhere to go — the unit a grid can show you is
+  a *cell*, and the hit becomes the cell cursor. `csvMatchingCells` feeds both
+  the dialog's live count and `csvOrdinalMsg`'s "Match 2 of 3 in B4", and
+  `liveCellMatch` (the grid's answer to `liveMatchSpans`) lights every matching
+  cell in `drawCsvTable`, below the cursor and above the selection. Both
+  counting paths are bounded by `liveCountMaxCells`, the grid's
+  `liveCountMaxChars`: the count is a full scan whenever matches are sparse and
+  it runs on every dialog keystroke — measured at 58 ms per keystroke on a
+  100 000-cell sheet, 6 ms once bounded. *Finding* is never bounded, because it
+  stops at the first match. Note `liveFindTerm` used to opt out of CSV
+  entirely; it no longer does, and anything new that consumes it must cope with
+  the table view being live.
   **User column widths**: dragging a column's border on the header row (like
   the explorer divider: press starts `edCsvColDrag`, which swallows the mouse
   until release; double-click re-fits) sets a sparse per-column override
@@ -925,6 +1212,49 @@ in `README.md`; the cross-cutting structure that matters when editing:
   `Search.compileMatcher`): matching is linear-time in the line, so
   pathological patterns like `(a+)+b` cannot hang the search and no match is
   dropped to a step budget; keep lexers/matchers cheap since they run per line.
+- **Searching inside documents (`Cmedit.DocText`, `ssDocs`/`sqDocs`/`scDocs`).**
+  The same panel, opt-in with **Alt+D** or the `[Doc]` chip, also greps PDFs,
+  Word/OpenDocument files, workbooks and e-books. Three decisions carry it.
+  **(1) The text comes from `classifyFileWith`, not from a lighter path.** The
+  walker's document branch (`App.extractDocFile` → `grepDoc`) builds the very
+  same `LoadOutcome` opening the file would, then flattens it
+  (`extractPdf`/`extractRtf`/`extractBook`). A cheaper bespoke extractor would
+  be faster and would eventually disagree with the view — and a search that
+  finds a phrase the reader then cannot is worse than one that never looked.
+  It costs what it costs (measured ~100 ms for a 171 KB PDF or a 57 KB DOCX,
+  ~250–500 ms for a workbook, against ~1 ms for a source file), which is the
+  whole reason the option is off by default; `documentExtension` gates
+  admission and `maxDocBytesToSearch` (64 MB, deliberately larger than
+  `maxFileBytesToSearch`) sizes it, since a 20 MB PDF is an ordinary PDF where
+  a 20 MB source file is not. The document extensions are also *in*
+  `binaryExtensions`, which is the correct relationship: with the option off
+  they must stay excluded, and the walker consults one list or the other.
+  **(2) A hit is addressed by a unit, never by a line.** These views lay out
+  against the terminal width (`rdCache`/`pdCache`), so a stored row points
+  elsewhere in a wider window. Every one of them does have an intrinsic unit
+  its view can already navigate to — page, chapter, paragraph, sheet — because
+  `MAGoToLine` is reinterpreted as exactly that in each; so `DocUnit` carries
+  `(duIndex, duLabel)` and `docMatches` stamps it onto `Match.mUnit` (on the
+  *match*, not the `FileResult`: a workbook's unit is a **cell**, which changes
+  line by line, and a per-file map would need an entry per extracted line where
+  a sheet has millions). Landing is `applyPendingDoc` (`edPendingDoc`, a
+  separate field from `edPendingJump` because it addresses a view rather than a
+  buffer): relayout, go to the unit, seed the caret at **the unit's own first
+  line** — `rtfSectionLine`/`rtfParLineRange`/`pdfPageLine`, *not* `rdTop`,
+  which `rtfClamp`/`pdfClamp` pull back on a short document or a last page —
+  then run the view's own in-file find there. That last step is why
+  `rtfFindWith` exists (an exact mirror of `pdfFindWith`) and why `MAFind` left
+  `rtfDisabledActions`: Ctrl+F in a DOCX/EPUB/RTF view is the same machinery.
+  **(3) Replace can never reach one.** `Search.replaceablePaths` is the single
+  funnel — every replace path goes through it, `runReplaceFile` guards
+  separately, and `docResultCount` feeds both the confirmation prompt's skip
+  note and `stageReplaceDone`'s, since below `replaceConfirmThreshold` there is
+  no dialog to carry it and a silently-untouched PDF reads as a bug. There is
+  no serialiser for any of these formats and there is not going to be one — the
+  reading views exist precisely because writing them back is the hard part.
+  `Cmedit.DocText` is pure and imports only the format readers, so it is unit
+  testable and runs on a grep worker; `DocKind` lives in `Cmedit.Search`
+  instead so that low-level module needs no dependency on the readers.
 - **Go to Definition (`Cmedit.Definition`, `edDefPick`/`FDefPick`).** F12 /
   Ctrl+Click / Find ▸ Go to Definition looks up the identifier at the cursor
   (via `wordRangeAt`) across the workspace and pops a modal, scrollable picker
@@ -1008,6 +1338,141 @@ in `README.md`; the cross-cutting structure that matters when editing:
   <install hint>", and the dialog scrolls when it doesn't fit:
   `dialogScroll` derives the top row purely from focus + height and is
   shared by `drawDialog` and mouse hit-testing (▲/▼ markers when clipped).
+- **Crash-recovery journal (`Cmedit.Journal`, `edDocSeq`/`edJournalSeq`).**
+  Unsaved buffers are mirrored to `~/.cache/cmedit/journal` so an SSH drop, a
+  closed window or an OOM kill doesn't take the session's work with it. The
+  format, the naming and the four-case recovery decision are a pure leaf
+  module; the pure *spine* (`journalableDoc`/`journalOf`/`journalRequests`/
+  `journalLiveKeys` in EditorState + EditorDoc) says what should be
+  journalled; **every byte of IO is driver-side and modelled on the linter**
+  — a `JournalTick` armed by `maybeArmJournal` when
+  `journalFingerprint` moves, exactly like `maybeArmLint`/`LintTick`.
+  Six invariants carry it.
+  **(1) It can never endanger the real file.** Everything happens inside one
+  directory of our own, written temp-file-then-`renameFile`; the save path is
+  untouched; every operation is wrapped in `try` and a failure is one
+  status-line note (`drvJournalWarned` stops it nagging), never a dialog and
+  never a block. The directory is created `0700` via `Term.setPrivateMode`
+  — a platform-layer function precisely because `src/` must stay portable
+  (the Windows twin is a documented no-op).
+  **(2) Removal is derived, never announced.** `journalLiveKeys` answers
+  "which documents would a crash still lose", and `sweepJournals` deletes
+  anything in `drvJournals` (the journals *this session* wrote or adopted)
+  that isn't in it — run after every batch, so it is immediate. That is why
+  there is no `EffDropJournal` on the save/close paths: Ctrl+S, Save As, Save
+  All, close, quit-with-discard, Revert, undo-back-to-clean and toggling
+  `journal = off` all drop the journal without knowing journals exist, and no
+  future save path can forget to. The only explicit effects are the recovery
+  dialog's two answers — `EffDropJournals` (Discard) and `EffAdoptJournals`
+  (Recover). **Keep for later emits nothing**, and that is exactly what
+  preserves it: nothing outside `drvJournals` is ever deleted.
+  **(3) Staleness is per document, and it has to be.** `edEditSeq` is global,
+  so a test built on it would rewrite every modified document's journal
+  whenever any one of them was touched — hence `edDocSeq` (the active
+  document's own counter, bumped beside `edEditSeq` in `afterEdit`/`undo`/
+  `redo`, *and* in `csvMod`, which `edEditSeq` never sees, and on the
+  inactive-document branch of `replaceInOpenDocs`) against `edJournalSeq`
+  (what the file on disk holds). All three fields plus `edDocId` are per
+  document, in `Editor` *and* `Document`, through `captureDoc`/`restoreDoc`.
+  **(4) A CSV journals its table, not its buffer** (`journalTextOf`, the
+  per-document form of `syncCsvToBuffer` — which only sees the active fields
+  and so cannot reach an inactive table). Views with no live buffer under
+  them — image, pager, PDF, workbook, container-derived DOCX/EPUB — and
+  `cmedit://` pseudo-paths never journal.
+  **(5) Untitled buffers need a stable id.** Zipper positions shift, so
+  `edDocId` comes from the monotonic `edNextDocId` (handed out in `doNew`,
+  the one place besides `newEditor` an untitled buffer is born) and names
+  `untitled-<id>.cmj`. At startup `seedJournalIds` pushes the counter past
+  every untitled journal still on disk, so a fresh buffer cannot be numbered
+  over one the user kept.
+  **(6) The write-behind is bounded in traffic and off the event-loop
+  thread — and it is the *pass*, not the debounce, that is spaced.** A
+  journal is a whole buffer, so a fixed 2 s tick means a 40 MB buffer under
+  editing writes ~10 MB/s to `~/.cache` for as long as the session lasts
+  (measured; plan 0027). The pure `journalDelayUs :: Int -> Int` spaces
+  passes at `journalBudgetBps` (2 MB/s) over `journalPendingBytes` — the
+  summed size of the *stale* documents, from `bufChars`, never by
+  serialising to find out — floored at the old 2 s so every ordinary file
+  (up to 4 MB) behaves exactly as before, and ceilinged at 30 s because past
+  that the journal fails at its own job. It is applied as a **rate floor,
+  not a longer debounce**: a debounce is replaced by every keystroke, so a
+  20 s debounce under steady typing would journal *nothing at all*. Hence
+  `maybeArmJournal`'s three rules — the first write after a quiet stretch
+  still lands one 2 s debounce later, a pending timer is never pushed out,
+  and a fresh one is armed no sooner than one interval after
+  `drvJournalLast`. The pass itself runs on a background thread
+  (`startJob JJournal`, one at a time; a tick that finds one in flight
+  re-arms, like `LintTick` deferring on its rate floor), because serialising
+  *and* writing 40 MB costs ~100 ms and 0011 §4 said this must never be a
+  stall — and the fork happens **before** the serialisation, which is the
+  larger half, since `journalRequests` hands over unforced records.
+  Backgrounding costs exactly two races, both closed by **`drvJournalGate`
+  (an `MVar Bool`)**: it serialises every mutation of `drvJournals` and
+  every rename-into-place against `sweepJournals`, and the writer
+  **re-checks `journalLiveKeys` under it immediately before renaming** — so
+  a document saved mid-write has its temp file discarded instead of its
+  journal appearing *after* the sweep that would have removed it (the sweep
+  cannot delete a file that does not exist yet, which is why the check has
+  to be the writer's). The gate's `Bool` is the second race:
+  `dropJournalsOnExit` closes it, so an in-flight write cannot resurrect a
+  journal the user just discarded. And the completion (`SMJournal`, over the
+  search queue like every other background result) carries **the edit
+  counter the record captured**, not the document's counter now
+  (`journalsWritten [(key, seq)]`) — otherwise an edit landing during the
+  write would be marked journalled and never written.
+  Startup (`startupJournals`, before the first frame) is: GC the directory
+  (`gcJournalDir` — stray `.tmp` files, the 256 MB oldest-first cap, then
+  30-day-old journals whose file is gone; size before content, so it never
+  reads what it is deleting), parse what's left, stat each `jPath`,
+  `classifyJournal`, and hand the survivors to `openRecoverDialog`
+  (`DKRecover`, Recover / Discard / Keep for later). Recovery installs
+  `addStagedDoc`-shaped modified documents (`recoveredDoc`) whose disk-mtime
+  baseline is the *journal's*, so `RecoverChanged` arrives already carrying
+  the ◆; a journal for an already-open path patches that document rather than
+  opening a second copy; and `docSavedBuffer` is deliberately `emptyBuffer`,
+  not the recovered text, or the first edit-and-undo would declare the
+  document clean and delete the only copy of it. **The exit drop is gated on
+  `edQuit`** (`dropJournalsOnExit`): the `finally` block also runs on
+  SIGTERM/SIGHUP, and deleting journals on a SIGHUP would defeat the feature
+  in its headline scenario — an SSH drop.
+- **Session restore (`~/.config/cmedit/session`, `--restore` /
+  `restore-session`).** The journal brings back unsaved *content*; this brings
+  back the *arrangement* — the open folder, the open files in order with their
+  cursors, and which one was active. The file is `Cmedit.ConfigFile`'s
+  (`Session`, `parseSessionText`/`renderSessionText`, next to the recents,
+  reusing their `line:col:path` encoding under a `cmedit-session 1` version
+  line; an unknown version means "no session", since a later format's lines
+  would arrive looking exactly like malformed ones). Four invariants:
+  **persistence is the recents' discipline, plus one startup write** —
+  `maybePersistSession` rewrites when `sessionShape` (folder, ordered paths,
+  active index) moves and the exit `finally` writes once more with live
+  cursors, so opening/closing/switching persists and typing does not; writing
+  *during* the session is the whole point, because the SIGKILL that
+  `--restore` is meant to compose with never reaches the `finally`. The
+  initial shape is written unconditionally at startup (the change-driven
+  persist compares against a baseline seeded from it, so a shape-quiet run
+  would otherwise write nothing and a SIGKILL would leave the previous
+  session's file); `pty_session.py` scenario 4 pins this. **Restore runs before the journal scan**
+  (`buildInitialEditor`, ahead of `startupJournals`), so `recoverJournals`'
+  already-open-path patching lands on the restored documents instead of
+  opening a second copy of each. **Untitled buffers are not recorded** —
+  there is no path to reopen, and their content is the journal's job, which
+  is what keeps the two features complementary rather than overlapping (the
+  `cmedit://` manual is excluded for the same reason the recents exclude it).
+  And **every file goes through the ordinary `openPath`/`classifyFileWith`
+  guards**, so an image, workbook, PDF or newly-oversized file lands in the
+  view it belongs in *today*; missing files are skipped and counted
+  ("Restored 4 of 5 files" vs "Session restored"), never an error.
+  The pure parts are `ConfigFile.planRestore` (the index arithmetic: counting
+  the survivors ahead of the recorded active index re-addresses it against the
+  shortened list, and lands on the next survivor when the active file is
+  itself gone) and `EditorDoc.sessionForPersist`/`sessionShape`/
+  `seedSessionPos` (the last clamps like `restoreRecentPos`, but addresses a
+  named document rather than the active one, because a restore opens several
+  files before any is looked at). `--restore` always restores and files named
+  alongside it open *on top* and end up active; the config key applies only to
+  a start with no arguments, and only `--restore` says so when there was
+  nothing to restore.
 - **Syntax highlighting (`Cmedit.Syntax`).** Per-language lexers return one
   `Tok` per character plus a trailing `HlState`, threaded across lines so
   multi-line constructs (block comments, Python docstrings, Markdown fences,

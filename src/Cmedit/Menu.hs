@@ -48,6 +48,7 @@ data MenuAction
   | MAToggleExplorer           -- ^ Show/focus/hide the file-explorer panel.
   | MAToggleCsv                -- ^ Toggle CSV table view (for .csv files).
   | MAToggleRtf                -- ^ Toggle the formatted RTF view (for .rtf files); shares Alt+T with 'MAToggleCsv', which no file can also be.
+  | MAArchiveView              -- ^ Swap a ZIP container (.docx/.xlsx/.epub) between its rendered reading view and its archive listing. Shares Alt+T with the two toggles above for the same reason they share it: Alt+T means "show this file as the other thing it is", and a file is only ever one kind of container.
   | MAToggleFreezeHeader       -- ^ Freeze the first table row while scrolling.
   | MASortColumn               -- ^ Sort the table by the current column (toggles asc/desc).
   | MACycleLineEnding          -- ^ Switch the saved line ending (LF ⇄ CRLF).
@@ -136,6 +137,10 @@ menuBar =
       -- Mutually exclusive with the table rows above: a file is .csv or .rtf,
       -- so at most one of these groups survives 'Cmedit.Editor.pruneEntries'.
       , MEItem "For&matted View (RTF)" "Alt+T" MAToggleRtf
+      -- Relabelled per document ("Document View" when the listing is what is
+      -- showing) and pruned unless the active file is a container that has
+      -- both views.
+      , MEItem "&Archive Contents" "Alt+T" MAArchiveView
       , MESep
       , MEItem "&Word Wrap"       "Alt+Z" MAToggleWordWrap
       , MEItem "&Line Numbers"    "Alt+L" MAToggleLineNumbers

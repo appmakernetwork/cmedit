@@ -59,6 +59,7 @@ module Cmedit.Pdf
   , pdfLines
   , pdfLineCount
   , pdfPageCount
+  , pdfPageLine
     -- * Laid-out lines (what the renderer draws)
   , PdfLine(..)
   , layoutPdf
@@ -96,6 +97,7 @@ module Cmedit.Pdf
   , pdfCurrentPage
     -- * Presentation
   , pdfStatus
+  , pdfPlainText
   ) where
 
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
@@ -2022,6 +2024,15 @@ pdfPageStarts pd = case pdCache pd of
 pdfLineCount :: PdfDoc -> Int
 pdfLineCount = Seq.length . pdfLines
 
+-- | First laid-out line of page @n@ (1-based).
+--
+-- Not @pdTop@ after a 'pdfGoToPage': that is the scroll position, which
+-- 'pdfClamp' pulls back on the last pages of a document. See
+-- 'Cmedit.Rtf.rtfSectionLine' for the same distinction.
+pdfPageLine :: Int -> PdfDoc -> Int
+pdfPageLine n pd =
+  fromMaybe 0 (Seq.lookup (max 0 (n - 1)) (pdfPageStarts pd))
+
 pdfPageCount :: PdfDoc -> Int
 pdfPageCount = Seq.length . pdPages
 
@@ -2213,3 +2224,16 @@ pdfStatus pd =
   "Page " ++ show (pdfCurrentPage pd) ++ " of " ++ show (pdfPageCount pd)
     ++ "   Ln " ++ show (pdTop pd + 1) ++ " of " ++ show (pdfLineCount pd)
     ++ "   PDF "
+
+-- | The whole document as plain text: one line per reconstructed block, in
+-- reading order, with pages separated by a blank line.
+--
+-- The paragraphs rather than the laid-out lines, for the reason
+-- 'Cmedit.Rtf.rtfPlainText' gives: a file wrapped to the width the terminal
+-- happened to be is a worse artifact than one the reader can wrap itself.
+pdfPlainText :: PdfDoc -> Text
+pdfPlainText pd = T.unlines (concatMap pageLines (toList (pdPages pd)))
+  where
+    pageLines pg = map parLine (pgPars pg) ++ [T.empty]
+    parLine p | ppKind p == PKBlank = T.empty
+              | otherwise = T.concat (map psText (ppRuns p))

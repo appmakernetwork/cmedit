@@ -15,7 +15,7 @@ import Data.Maybe (fromMaybe, isJust, isNothing, mapMaybe)
 import Data.Char (toLower)
 import Data.Text (Text)
 import qualified Data.Text as T
-import System.FilePath (takeDirectory, takeExtension, takeFileName)
+import System.FilePath (dropExtension, takeDirectory, takeExtension, takeFileName)
 
 import Data.Array (Array)
 
@@ -24,7 +24,7 @@ import Cmedit.TextBuffer
 import Cmedit.Width (colToDisplay, displayToCol, wrapLine)
 import Cmedit.ConfigFile
   ( Config(..), ThemeName(..), defaultConfig, RecentEntry(..)
-  , maxRecentEntries, maxHistoryEntries )
+  , maxRecentEntries, maxHistoryEntries, Session(..), maxSessionFiles )
 import Cmedit.Menu
 import Cmedit.Dialog
 import Cmedit.Browser (Browser(..), FileNode(..), Entry)
@@ -47,11 +47,15 @@ import Cmedit.Image (Image(..), ImgMode(..), renderImage, viewFit)
 import Cmedit.Syntax (HlCache, CommentSyntax(..), langComment, langForPath)
 
 import Cmedit.History (pushHist)
+import Cmedit.Journal (Journal(..), RecoveryCase(..))
+import qualified Cmedit.Journal as J
 import Cmedit.Pager (PagerDoc(..))
 import Cmedit.Rtf (RtfDoc(..))
 import Cmedit.Pdf (PdfDoc(..))
 import qualified Cmedit.Pdf as Pdf
 import qualified Cmedit.Rtf as Rtf
+import Cmedit.Xlsx (Workbook(..))
+import qualified Cmedit.Xlsx as Xlsx
 import qualified Cmedit.Pager as Pg
 import Cmedit.EditorState
 import Cmedit.EditorEdit
@@ -93,7 +97,7 @@ setLoaded path lr ed =
         , edFocus = FEdit, edDialog = Nothing, edSearchMode = False
         , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
         , edCsv = Nothing, edCsvStash = Nothing
-        , edImage = Nothing, edRtf = Nothing, edPdf = Nothing
+        , edImage = Nothing, edRtf = Nothing, edSheets = Nothing, edPdf = Nothing
         , edDiags = []                        -- a reloaded file's stale diags must not survive
         , edEditSeq = edEditSeq ed + 1         -- fresh buffer: the driver must re-lint (also covers Revert)
         }
@@ -120,14 +124,23 @@ setLoaded path lr ed =
 -- a file; toggles go through 'plainToCsv', which preserves the undo history).
 enterCsv :: Editor -> Editor
 enterCsv ed =
-  ed { edCsv = Just (Csv.mkCsvView (csvDelimOf ed) (bufferToText LF False (edBuffer ed)))
+  ed { edCsv = Just (Csv.mkCsvLines (csvDelimOf ed) (bufLines (edBuffer ed)))
      , edCsvStash = Nothing }
 
 -- Serialise the table back into the line buffer (so plaintext / save see it).
+--
+-- A workbook's grid is exempt, and this is the one place that has to know it:
+-- an @.xlsx@ has no buffer under it and no serialiser back to its own format,
+-- so turning a sheet into CSV here and letting a save path write it would
+-- replace someone's workbook with one sheet of it as text. Every route to
+-- that is already guarded ('containerDisabledActions'), and this is the
+-- backstop under all of them.
 syncCsvToBuffer :: Editor -> Editor
-syncCsvToBuffer ed = case edCsv ed of
-  Nothing -> ed
-  Just v  -> ed { edBuffer = fromText (Csv.csvToText v) }
+syncCsvToBuffer ed
+  | isJust (edSheets ed) = ed
+  | otherwise = case edCsv ed of
+      Nothing -> ed
+      Just v  -> ed { edBuffer = fromText (Csv.csvToText v) }
 
 -- | Toggle between the CSV table view and plain text (only for CSV files).
 -- The cursor is carried across: leaving the table drops the text cursor at the
@@ -154,15 +167,29 @@ csvToPlain v0 ed =
 plainToCsv :: Editor -> Editor
 plainToCsv ed =
   let Pos l c  = edCursor ed
+      -- Only the stash comparison needs the buffer as one 'Text'; the parse
+      -- reads the lines directly, so a toggle with nothing stashed never
+      -- materialises a second copy of the file.
       bufText  = bufferToText LF False (edBuffer ed)
-      base     = Csv.mkCsvView (csvDelimOf ed) bufText
+      base     = Csv.mkCsvLines (csvDelimOf ed) (bufLines (edBuffer ed))
+      -- With nothing stashed the buffer is the only source for the table's
+      -- saved baseline, and 'mkCsvLines' adopts whatever it is handed — which
+      -- is right for a document that is clean and wrong for one that is dirty
+      -- for a reason the table cannot see. A staged workspace replace is
+      -- exactly that: 'stagedDoc' opens a .csv with no table and no stash and a
+      -- buffer that differs from disk, so parsing it into a fresh baseline made
+      -- the next 'csvMod' declare the document clean and drop the staged change
+      -- (and its journal) silently. 'markUnsaved' is the same guard the
+      -- crash-recovery installer uses, and for the same reason.
+      fresh | bufModified ed (edBuffer ed) || metaModified ed = Csv.markUnsaved base
+            | otherwise                                       = base
       -- Reuse the stashed table model (and its undo) if the text was not edited
       -- while in plain-text view; otherwise keep the history but rebase onto the
       -- newly-parsed grid so an undo still reverts the text edit.
       v        = case edCsvStash ed of
                    Just s | Csv.csvToText s == bufText -> s
                           | otherwise                  -> Csv.rebaseHistory s base
-                   Nothing -> base
+                   Nothing -> fresh
       (r, cc)  = Csv.textPosCell v l c
   in (csvPut (Csv.setCursor r cc v) ed { edCsvStash = Nothing }) { edStatus = "Table mode" }
 
@@ -197,7 +224,7 @@ toggleRtf :: Editor -> Editor
 toggleRtf ed
   | not (isRtfFile ed) = ed { edStatus = "Formatted view is only for .rtf files" }
   | isJust (edRtf ed) =
-      ensureVisible ed { edRtf = Nothing, edStatus = "Raw RTF markup \x2014 editable" }
+      ensureVisible ed { edRtf = Nothing, edSheets = Nothing, edStatus = "Raw RTF markup \x2014 editable" }
   | otherwise = enterRtf ed
 
 -- | Re-derive and re-lay-out the formatted view when anything it is computed
@@ -224,9 +251,16 @@ refreshRtf ed = case edRtf ed of
 -- already parsed (it is the expensive part) and is laid out here, against the
 -- window width, the first time it is shown.
 
--- | Install a parsed PDF as the active document.
-pdfLoaded :: FilePath -> PdfDoc -> Editor -> Editor
-pdfLoaded path pd ed = touchRecent path $ refreshPdf $ ensureVisible ed
+-- | The shape every buffer-less read-only document has in common: an empty
+-- buffer, no undo, no diagnostics, every view mode cleared and the file marked
+-- read-only. The caller sets its own view field and status on top.
+--
+-- Four things now arrive this way — a PDF, a DOCX or EPUB reading view and an
+-- XLSX workbook — and the danger of writing the record out four times is not
+-- duplication but /drift/: a field added to 'Editor' and set in three of the
+-- four leaves one view mode able to survive into a document that is not it.
+blankReadOnly :: FilePath -> String -> Editor -> Editor
+blankReadOnly path status ed = ed
   { edBuffer = emptyBuffer, edSavedBuffer = emptyBuffer
   , edCursor = origin, edSelAnchor = Nothing, edDesiredCol = 0
   , edTop = 0, edLeft = 0
@@ -236,10 +270,7 @@ pdfLoaded path pd ed = touchRecent path $ refreshPdf $ ensureVisible ed
   , edFinalNewline = True
   , edReadOnly = True
   , edUndo = Seq.empty, edRedo = Seq.empty, edLastEdit = EKNone
-  , edStatus = T.pack ("Viewing " ++ takeFileName path ++ "  "
-                ++ show (Pdf.pdfPageCount pd) ++ " page" ++ plural (Pdf.pdfPageCount pd)
-                ++ (if T.null (pdNote pd) then "" else "  \x2014 " ++ T.unpack (pdNote pd))
-                ++ "  \x2014 read-only")
+  , edStatus = T.pack status
     -- Same rule as the image and paged views: an open from the explorer panel
     -- keeps its focus, because a read-only view has no keystroke editing to
     -- receive it.
@@ -247,10 +278,38 @@ pdfLoaded path pd ed = touchRecent path $ refreshPdf $ ensureVisible ed
   , edDialog = Nothing, edSearchMode = False
   , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
   , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edRtf = Nothing
-  , edPager = Nothing
-  , edPdf = Just pd
+  , edSheets = Nothing, edPager = Nothing, edPdf = Nothing
   , edHlCache = Nothing, edDiags = []
   }
+
+-- | The same, as a zipper snapshot (for a file opened but not made active).
+blankReadOnlyDoc :: FilePath -> Document
+blankReadOnlyDoc path = Document
+  { docBuffer = emptyBuffer, docSavedBuffer = emptyBuffer, docCursor = origin
+  , docSelAnchor = Nothing, docDesiredCol = 0, docTop = 0, docLeft = 0
+  , docPath = Just path, docModified = False
+  , docDiskMtime = Nothing, docDiskChanged = False
+  , docLineEnding = LF, docSavedEol = LF, docEncoding = Utf8, docSavedEnc = Utf8
+  , docFinalNewline = True, docReadOnly = True
+  , docUndo = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone, docOverwrite = False
+  , docDiscard = False, docCsv = Nothing, docCsvStash = Nothing
+  , docImage = Nothing, docRtf = Nothing, docSheets = Nothing, docPager = Nothing
+  , docPdf = Nothing
+  , docHlCache = Nothing
+  , docDiags = []
+  -- Read-only, so never journalled; and titled, so the id is unused anyway.
+  , docDocId = 0, docDocSeq = 0, docJournalSeq = 0
+  }
+
+-- | Install a parsed PDF as the active document.
+pdfLoaded :: FilePath -> PdfDoc -> Editor -> Editor
+pdfLoaded path pd ed = touchRecent path $ refreshPdf $ ensureVisible $
+  (blankReadOnly path status ed) { edPdf = Just pd }
+  where
+    status = "Viewing " ++ takeFileName path ++ "  "
+               ++ show (Pdf.pdfPageCount pd) ++ " page" ++ plural (Pdf.pdfPageCount pd)
+               ++ (if T.null (pdNote pd) then "" else "  \x2014 " ++ T.unpack (pdNote pd))
+               ++ "  \x2014 read-only"
 
 -- | Open a parsed PDF as a new document (reusing a pristine empty buffer if
 -- present), mirroring 'setLoadedNew' for text.
@@ -269,20 +328,7 @@ addPdfDocument path pd ed =
   touchRecent path ed { edAfter = edAfter ed ++ [pdfDocSnapshot path pd] }
 
 pdfDocSnapshot :: FilePath -> PdfDoc -> Document
-pdfDocSnapshot path pd = Document
-  { docBuffer = emptyBuffer, docSavedBuffer = emptyBuffer, docCursor = origin
-  , docSelAnchor = Nothing, docDesiredCol = 0, docTop = 0, docLeft = 0
-  , docPath = Just path, docModified = False
-  , docDiskMtime = Nothing, docDiskChanged = False
-  , docLineEnding = LF, docSavedEol = LF, docEncoding = Utf8, docSavedEnc = Utf8
-  , docFinalNewline = True, docReadOnly = True
-  , docUndo = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone, docOverwrite = False
-  , docDiscard = False, docCsv = Nothing, docCsvStash = Nothing
-  , docImage = Nothing, docRtf = Nothing, docPager = Nothing
-  , docPdf = Just pd
-  , docHlCache = Nothing
-  , docDiags = []
-  }
+pdfDocSnapshot path pd = (blankReadOnlyDoc path) { docPdf = Just pd }
 
 -- | Re-lay-out the PDF view when the width it was laid out for has moved (a
 -- resize, the explorer panel opening). Mirrors 'refreshRtf' and
@@ -296,6 +342,83 @@ refreshPdf ed = case edPdf ed of
     let lo = computeLayout ed
     in ed { edPdf = Just (Pdf.pdfRelayout (tabWidthOf ed) (loTextWidth lo)
                             (loTextHeight lo) pd) }
+
+------------------------------------------------------------------------------
+-- Container reading views (DOCX, EPUB, XLSX)
+--
+-- These are the PDF view's shape, not the RTF one's, and for the PDF view's
+-- reason: the file is a ZIP full of XML, so it is binary, so there is no
+-- buffer under the view and nothing Save could write. What they do /not/ need
+-- is new machinery — a DOCX or EPUB is 'edRtf' with a container origin
+-- ("Cmedit.Rtf"), an XLSX is 'edCsv' with 'edSheets' beside it, and the
+-- renderer, key handlers, scroll bars and layout all carry on unchanged.
+
+-- | Install a container-derived formatted document (DOCX, EPUB) as the active
+-- document.
+containerDocLoaded :: FilePath -> RtfDoc -> Editor -> Editor
+containerDocLoaded path rd ed = touchRecent path $ refreshRtf $ ensureVisible $
+  (blankReadOnly path status ed) { edRtf = Just rd }
+  where
+    status = "Viewing " ++ takeFileName path
+               ++ (if Seq.null (rdSects rd) then ""
+                     else "  " ++ show (Rtf.rtfSectionCount rd) ++ " chapter"
+                            ++ plural (Rtf.rtfSectionCount rd))
+               ++ (if T.null (rdNote rd) then "" else "  \x2014 " ++ T.unpack (rdNote rd))
+               ++ "  \x2014 read-only"
+
+-- | Open one as a new document (reusing a pristine empty buffer), or switch to
+-- it if it is already open. Like the PDF and paged views this needs no second
+-- installer for the already-open case: the view is read-only, so switching to
+-- the open copy is the only sane result.
+containerDocLoadedNew :: FilePath -> RtfDoc -> Editor -> Editor
+containerDocLoadedNew path rd ed = case switchToOpen path ed of
+  Just ed'
+    | edFocus ed == FExplorer -> ed' { edFocus = FExplorer }
+    | otherwise               -> ed'
+  Nothing
+    | isPristine ed -> containerDocLoaded path rd ed
+    | otherwise     -> containerDocLoaded path rd ed { edBefore = edBefore ed ++ [captureDoc ed] }
+
+-- | Append one to the open-files list (startup, 2nd+ file).
+addContainerDoc :: FilePath -> RtfDoc -> Editor -> Editor
+addContainerDoc path rd ed =
+  touchRecent path ed { edAfter = edAfter ed ++ [(blankReadOnlyDoc path) { docRtf = Just rd }] }
+
+-- | Install an open workbook as the active document: the showing sheet becomes
+-- the table view, the rest wait in 'edSheets'.
+workbookLoaded :: FilePath -> Workbook -> Editor -> Editor
+workbookLoaded path wb ed = touchRecent path $ ensureVisible $
+  (blankReadOnly path status ed)
+    { edSheets = Just wb, edCsv = Xlsx.wbView wb }
+  where
+    status = "Viewing " ++ takeFileName path ++ "  "
+               ++ show (Xlsx.wbCount wb) ++ " sheet" ++ plural (Xlsx.wbCount wb)
+               ++ (if T.null (wbNote wb) then "" else "  \x2014 " ++ T.unpack (wbNote wb))
+               ++ "  \x2014 read-only"
+
+workbookLoadedNew :: FilePath -> Workbook -> Editor -> Editor
+workbookLoadedNew path wb ed = case switchToOpen path ed of
+  Just ed'
+    | edFocus ed == FExplorer -> ed' { edFocus = FExplorer }
+    | otherwise               -> ed'
+  Nothing
+    | isPristine ed -> workbookLoaded path wb ed
+    | otherwise     -> workbookLoaded path wb ed { edBefore = edBefore ed ++ [captureDoc ed] }
+
+addWorkbookDocument :: FilePath -> Workbook -> Editor -> Editor
+addWorkbookDocument path wb ed =
+  touchRecent path ed
+    { edAfter = edAfter ed
+        ++ [(blankReadOnlyDoc path) { docSheets = Just wb, docCsv = Xlsx.wbView wb }] }
+
+-- | Show a different sheet of the open workbook (0-based, clamped), keeping
+-- the one being left exactly where it was.
+goToSheetIn :: Int -> Editor -> Editor
+goToSheetIn k ed = case (edSheets ed, edCsv ed) of
+  (Just wb, Just v) ->
+    let (wb', v') = Xlsx.wbGoTo v k wb
+    in ed { edSheets = Just wb', edCsv = Just v', edStatus = "" }
+  _ -> ed
 
 -- | Jump the reading view to a page (the Go To command in this mode).
 pdfGoToPageIn :: Int -> Editor -> Editor
@@ -320,9 +443,11 @@ captureDoc ed = Document
   , docImage = edImage ed
   , docPager = edPager ed
   , docRtf = edRtf ed
+  , docSheets = edSheets ed
   , docPdf = edPdf ed
   , docHlCache = edHlCache ed
   , docDiags = edDiags ed
+  , docDocId = edDocId ed, docDocSeq = edDocSeq ed, docJournalSeq = edJournalSeq ed
   }
 
 -- Make a saved 'Document' the active one.
@@ -342,9 +467,11 @@ restoreDoc d ed = refreshPdf $ refreshRtf $ refreshImage $ ensureVisible ed
   , edImage = docImage d
   , edPager = docPager d
   , edRtf = docRtf d
+  , edSheets = docSheets d
   , edPdf = docPdf d
   , edHlCache = docHlCache d
   , edDiags = docDiags d
+  , edDocId = docDocId d, edDocSeq = docDocSeq d, edJournalSeq = docJournalSeq d
   , edFocus = FEdit, edDialog = Nothing, edSearchMode = False
   , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
   }
@@ -459,11 +586,13 @@ docFromLoad seqNow path lr = Document
   , docImage = Nothing
   , docPager = Nothing
   , docPdf = Nothing
+  , docSheets = Nothing
   , docHlCache = Nothing
   , docDiags = []
+  -- Titled, so its journal is named by its path and the id is never read.
+  , docDocId = 0, docDocSeq = 0, docJournalSeq = 0
   , docCsv = if isCsvPath path
-               then Just (Csv.mkCsvView (csvDelimForPath path)
-                            (bufferToText LF False (lrBuffer lr)))
+               then Just (Csv.mkCsvLines (csvDelimForPath path) (bufLines (lrBuffer lr)))
                else Nothing
     -- Parsed now, laid out when it first becomes the active document and a
     -- window width exists to wrap to (restoreDoc -> refreshRtf).
@@ -539,7 +668,7 @@ pagerLoaded pg ed = touchRecent (pgPath pg) ed
   , edFocus = if edFocus ed == FExplorer then FExplorer else FEdit
   , edDialog = Nothing, edSearchMode = False
   , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
-  , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edRtf = Nothing
+  , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edRtf = Nothing, edSheets = Nothing
   , edPdf = Nothing
   , edPager = Just pg
   , edHlCache = Nothing, edDiags = []
@@ -590,9 +719,11 @@ imageDocSnapshot path frames = Document
   , docUndo = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone, docOverwrite = False
   , docDiscard = False, docCsv = Nothing, docCsvStash = Nothing
   , docImage = Just (mkImageDoc frames)
-  , docPager = Nothing, docRtf = Nothing, docPdf = Nothing
+  , docPager = Nothing, docRtf = Nothing, docSheets = Nothing, docPdf = Nothing
   , docHlCache = Nothing
   , docDiags = []
+  -- Read-only, so never journalled; and titled, so the id is unused anyway.
+  , docDocId = 0, docDocSeq = 0, docJournalSeq = 0
   }
 
 -- | A 'Document' snapshot for a paged (too-large-to-load) file, so it can sit
@@ -609,10 +740,12 @@ pagerDocSnapshot pg = Document
   , docFinalNewline = True, docReadOnly = True
   , docUndo = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone, docOverwrite = False
   , docDiscard = False, docCsv = Nothing, docCsvStash = Nothing
-  , docImage = Nothing, docRtf = Nothing, docPdf = Nothing
+  , docImage = Nothing, docRtf = Nothing, docSheets = Nothing, docPdf = Nothing
   , docPager = Just pg
   , docHlCache = Nothing
   , docDiags = []
+  -- Read-only, so never journalled; and titled, so the id is unused anyway.
+  , docDocId = 0, docDocSeq = 0, docJournalSeq = 0
   }
 
 -- | Re-scale the active image's cached cell grid if the view size, paint
@@ -823,6 +956,96 @@ recentsForPersist ed = map overlay (edRecent ed)
       Just (Pos l c) -> e { reLine = l, reCol = c }
       Nothing        -> e
 
+------------------------------------------------------------------------------
+-- Session restore: what is recorded, and where a restored cursor lands
+--
+-- The driver owns the file ("Cmedit.App"); this is the question it asks and
+-- the answer it installs. Only paths are recorded — an untitled buffer has
+-- nothing to reopen, and what it *contains* is the crash journal's job, which
+-- is why the two features compose rather than overlap.
+
+-- | The documents the session file records: their index in the zipper, their
+-- path and the document itself, in open order.
+--
+-- Shared by 'sessionForPersist' and 'sessionShape' so the two cannot disagree
+-- about /which/ documents are recorded — and, deliberately, carrying the
+-- 'Document' rather than a finished 'RecentEntry', so that the shape can be
+-- computed without ever asking a document where its cursor is. See
+-- 'sessionShape'.
+--
+-- The manual's @cmedit:\/\/@ pseudo-path is excluded for the same reason the
+-- recents exclude it: there is no such file to reopen.
+sessionDocs :: Editor -> [(Int, FilePath, Document)]
+sessionDocs ed =
+  [ (i, p, d)
+  | (i, d) <- zip [0 :: Int ..] (allOpenDocs ed)
+  , Just p <- [docPath d]
+  , not ("cmedit://" `isPrefixOf` p) ]
+
+-- | Which recorded document is the active one. Counting the recorded documents
+-- ahead of the active one maps its position in the zipper onto its position in
+-- the list we write; when the active document is itself unrecorded (untitled),
+-- that lands on the next one, which is the closest thing a restore can honour.
+sessionActiveIx :: Editor -> [(Int, FilePath, Document)] -> Int
+sessionActiveIx ed recorded =
+  min (max 0 (length recorded - 1)) (length [ () | (i, _, _) <- recorded, i < here ])
+  where here = length (edBefore ed)
+
+-- | The session as it should be persisted: the open folder, every open
+-- document that has a real path (in open order, with live cursor positions),
+-- and which of them is active.
+sessionForPersist :: Editor -> Session
+sessionForPersist ed = Session
+  { seFolder = explorerRoot ed
+  , seFiles  = take maxSessionFiles
+                 [ RecentEntry p (posLine pos) (posCol pos)
+                 | (_, p, d) <- recorded, let pos = docCursorPos d ]
+  , seActive = sessionActiveIx ed recorded
+  }
+  where recorded = sessionDocs ed
+
+-- | Fingerprint of the session's /shape/ — everything the file records apart
+-- from cursor positions. The driver rewrites when this moves, exactly as it
+-- does for the recents: opening, closing and switching files are session
+-- changes; moving the cursor is not.
+--
+-- It is computed from the paths directly, and that is load-bearing rather than
+-- tidy. It used to project the shape out of a whole 'sessionForPersist' — which
+-- reads as free, since the positions are dropped — but 'RecentEntry' has strict
+-- fields, so building one forces the position it was about to discard, and
+-- 'docCursorPos' on a table document is a walk over the rows above the cursor.
+-- The driver asks for this after /every/ key batch, so that put ~390 ms of
+-- re-serialisation on each keystroke typed into the last row of a large CSV
+-- (plan 0029). Nothing here may force a 'docCursorPos'.
+sessionShape :: Editor -> (Maybe FilePath, [FilePath], Int)
+sessionShape ed =
+  ( explorerRoot ed
+  , take maxSessionFiles [ p | (_, p, _) <- recorded ]
+  , sessionActiveIx ed recorded )
+  where recorded = sessionDocs ed
+
+-- | Put a restored document's cursor where the session recorded it, clamped to
+-- the buffer as it is now — the file may have been edited (or truncated) by
+-- something else since. Same shape as 'restoreRecentPos', but addressing a
+-- named document rather than the active one, because a restore opens several
+-- files before any of them is looked at. Views with no text cursor (CSV,
+-- image, pager, PDF, container-derived) are left alone.
+seedSessionPos :: FilePath -> Pos -> Editor -> Editor
+seedSessionPos path want ed
+  | edPath ed == Just path, isPlainDoc (captureDoc ed) =
+      let (pos, dc) = seatIn (edBuffer ed)
+      in ensureVisible ed { edCursor = pos, edDesiredCol = dc }
+  | otherwise = ed { edBefore = map upd (edBefore ed), edAfter = map upd (edAfter ed) }
+  where
+    seatIn buf = let p = clampPos want buf
+                     ln = getLine' (posLine p) buf
+                 in (p, colToDisplay (tabWidthOf ed) (posCol p) ln)
+    -- docTop is left at 0: restoreDoc runs ensureVisible when the document is
+    -- switched to, so the window is chosen against the size it will be shown at.
+    upd d | docPath d == Just path, isPlainDoc d =
+              let (p, dc) = seatIn (docBuffer d) in d { docCursor = p, docDesiredCol = dc }
+          | otherwise = d
+
 -- | How many recent files the File menu offers.
 recentMenuMax :: Int
 recentMenuMax = 6
@@ -950,8 +1173,12 @@ newFileFlow ed
   | isPristine ed = doNew ed
   | otherwise     = doNew (ed { edBefore = edBefore ed ++ [captureDoc ed] })
 
+-- The one place (besides 'newEditor') an untitled buffer is born, so the one
+-- place a fresh document id must be handed out: an untitled journal is named
+-- @untitled-\<id\>@, and reusing the id of a buffer still open in the zipper
+-- would point two documents at one journal file.
 doNew :: Editor -> Editor
-doNew ed = ensureVisible ed
+doNew ed0 = ensureVisible ed
   { edBuffer = emptyBuffer, edSavedBuffer = emptyBuffer, edCursor = origin, edSelAnchor = Nothing
   , edDesiredCol = 0, edTop = 0, edLeft = 0
   , edPath = Nothing, edModified = False
@@ -961,9 +1188,16 @@ doNew ed = ensureVisible ed
   , edUndo = Seq.empty, edRedo = Seq.empty, edLastEdit = EKNone
   , edStatus = "New file", edFocus = FEdit, edDialog = Nothing, edSearchMode = False
   , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
-  , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edRtf = Nothing
+  , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edRtf = Nothing, edSheets = Nothing
   , edPdf = Nothing
   }
+  where ed = freshDocId ed0
+
+-- | Give the active slot a brand-new document identity, with no journal
+-- written for it yet.
+freshDocId :: Editor -> Editor
+freshDocId ed = ed { edDocId = edNextDocId ed, edNextDocId = edNextDocId ed + 1
+                   , edDocSeq = 0, edJournalSeq = 0 }
 
 -- | Open the built-in manual ("Cmedit.Manual") as a read-only Markdown
 -- document -- an ordinary document, so navigation, find, word wrap and the
@@ -990,7 +1224,7 @@ openManual ed0 = case findOpenIndex manualPath ed of
          , edStatus = manualStatus
          , edFocus = FEdit, edDialog = Nothing, edSearchMode = False
          , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
-         , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edRtf = Nothing
+         , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edRtf = Nothing, edSheets = Nothing
          , edPdf = Nothing
          }
   where
@@ -1020,8 +1254,55 @@ doClose ed0 = case edAfter ed of
       Just p | p /= manualPath -> recordRecent p (activeCursorPos ed0) ed0
       _ -> ed0
 
+-- | What Save As means in a view that has no buffer: a suggested filename and
+-- the text to write there.
+--
+-- These views are read-only because nothing can write their format back — but
+-- that is an argument against writing a @.xlsx@, not against writing anything
+-- at all. So Save As becomes an /export/ of what is on screen, in the plainest
+-- format that holds it: a workbook's sheet as CSV, a document as text.
+--
+-- 'Nothing' means the view has nothing to export. That is the image view
+-- (there is no text) and the paged view (the file on disk already /is/ the
+-- text, so an export would be a slow copy of it).
+--
+-- Note what this is not: it is not @edBuffer@. Before it existed, Save As on
+-- any of these views wrote the empty buffer underneath them and re-pointed the
+-- document at the file it had just emptied.
+exportSuggestion :: Editor -> Maybe (FilePath, Text)
+exportSuggestion ed
+  | Just _ <- edSheets ed, Just v <- edCsv ed =
+      Just (base ++ sheetSuffix ++ ".csv", Csv.csvToText v)
+  | Just rd <- edRtf ed, Rtf.rtfDerived rd = Just (base ++ ".txt", Rtf.rtfPlainText rd)
+  | Just pd <- edPdf ed                    = Just (base ++ ".txt", Pdf.pdfPlainText pd)
+  | otherwise = Nothing
+  where
+    base = maybe "untitled" dropExtension (edPath ed)
+    -- A workbook has several sheets and this exports one of them, so the name
+    -- says which. Sanitised, because a sheet may be called "Q1/Q2".
+    sheetSuffix = case edSheets ed of
+      Just wb | not (T.null (Xlsx.wbName wb)) ->
+        "-" ++ map safe (T.unpack (T.take 40 (Xlsx.wbName wb)))
+      _ -> ""
+    safe c | c `elem` ("/\\:*?\"<>|" :: String) || c < ' ' = '_'
+           | otherwise = c
+
+-- | Is Save As an export in this view, and does it have anything to export?
+-- The views with neither a buffer nor exportable text refuse rather than
+-- writing an empty file.
+saveAsRefusal :: Editor -> Maybe String
+saveAsRefusal ed
+  | isJust (exportSuggestion ed) = Nothing
+  | isJust (edImage ed)  = Just "There is no text in an image to save"
+  | isJust (edPager ed)  = Just "This file is open read-only \x2014 it is already on disk as it is"
+  | otherwise            = Nothing
+
 saveAsDialogFlow :: Editor -> Editor
-saveAsDialogFlow ed = openDialog (mkSaveAs (T.pack (seed (edPath ed)))) ed
+saveAsDialogFlow ed = case saveAsRefusal ed of
+  Just msg -> ed { edStatus = T.pack msg }
+  Nothing  -> case exportSuggestion ed of
+    Just (p, _) -> openDialog (mkExportAs (T.pack (exportTitle ed)) (T.pack p)) ed
+    Nothing     -> openDialog (mkSaveAs (T.pack (seed (edPath ed)))) ed
   where
     -- The manual's pseudo-path is not writable; offer a plain filename instead.
     -- An archive's buffer is its listing, not its bytes ("Cmedit.Zip"), so
@@ -1032,7 +1313,27 @@ saveAsDialogFlow ed = openDialog (mkSaveAs (T.pack (seed (edPath ed)))) ed
                   | otherwise        = p
     seed Nothing  = ""
 
+-- | The export dialog's title, which is where the difference from an ordinary
+-- Save As is explained: this writes a copy and leaves the open document alone.
+exportTitle :: Editor -> String
+exportTitle ed
+  | isJust (edSheets ed) = "Export Sheet as CSV"
+  | otherwise            = "Export as Text"
+
 gotoLine :: Text -> Editor -> Editor
+-- A workbook is divided into sheets and an EPUB into chapters, so Go To means
+-- those here — the same reinterpretation the PDF view makes for pages, and for
+-- the same reason. Both are checked before the PDF and pager cases only
+-- because they cannot coexist with them; the order carries no meaning.
+gotoLine t ed | isJust (edSheets ed) =
+  case reads (T.unpack (T.strip t)) :: [(Int, String)] of
+    ((n, _) : _) -> goToSheetIn (n - 1) ed
+    _ -> ed { edStatus = "Invalid sheet number" }
+gotoLine t ed | Just rd <- edRtf ed, Rtf.rtfSectionCount rd > 0 =
+  case reads (T.unpack (T.strip t)) :: [(Int, String)] of
+    ((n, _) : _) ->
+      ed { edRtf = Just (Rtf.rtfGoToSection (rtfHeight ed) n rd), edStatus = "" }
+    _ -> ed { edStatus = "Invalid chapter number" }
 -- A PDF is divided into pages, so this is where a reader wants to go: the
 -- dialog is titled "Go to Page" in this mode ('openGoTo') and the number is
 -- read as one. Laid-out row numbers move with the window width and would mean
@@ -1135,6 +1436,277 @@ savedAll saved ed =
   -- untitled files that Save All couldn't write). Otherwise re-lint the active
   -- document now that it is on disk (save-time-only tools too).
   in if edQuitting ed2 then noEff (quitStep ed2) else (ed2, [EffLintNow])
+
+------------------------------------------------------------------------------
+-- Crash-recovery journal: what to write, and what recovery installs
+--
+-- The driver owns the timer, the directory and every byte of IO
+-- ("Cmedit.App"); this is the question it asks. Two invariants live here and
+-- nowhere else:
+--
+--   * __The set of journals that should exist is derived, never maintained.__
+--     'journalLiveKeys' answers "which documents would a crash lose right
+--     now", and the driver deletes any journal it wrote that is not in that
+--     answer. So a save, a close, a revert, an undo back to unmodified and a
+--     toggle into a view with no buffer all drop the journal without any of
+--     them knowing the journal exists — there is no save or close path that
+--     can forget to say so, because none of them says anything.
+--
+--   * __A journal is rewritten only when its document moved.__ That is the
+--     'docJournalSeq' \/ 'docDocSeq' comparison, and it is per document for
+--     the reason spelled out at 'edDocSeq': the global edit counter would make
+--     typing in one file rewrite every other file's journal.
+
+-- | Every open document that would lose content in a crash, keyed by journal
+-- file name. The driver's authority on which journals should exist.
+-- Turning the key off mid-session answers "nothing", which makes the driver
+-- delete this session's journals — the point of @journal = off@ is that no
+-- copy of what you are editing is left in the cache, and one written before
+-- the switch is exactly such a copy.
+journalLiveKeys :: Editor -> [FilePath]
+journalLiveKeys ed
+  | not (cfgJournal (edConfig ed)) = []
+  | otherwise = [ journalKeyOf d | d <- allOpenDocs ed, journalableDoc d ]
+
+-- | The documents whose journal is out of date: modified, journalable, and
+-- carrying edits their journal file does not hold.
+staleJournalDocs :: Editor -> [Document]
+staleJournalDocs ed
+  | not (cfgJournal (edConfig ed)) = []
+  | otherwise = [ d | d <- allOpenDocs ed
+                    , journalableDoc d
+                    , docJournalSeq d /= docDocSeq d ]
+
+-- | The journals that are out of date and should be written now, each with the
+-- value of its document's edit counter that the record captures.
+--
+-- The counter travels with the request because the write is asynchronous: by
+-- the time the file is on disk the document may have moved again, and settling
+-- 'docJournalSeq' to /that/ value (rather than to what was written) would
+-- declare a journal current which is one keystroke behind — the newer edits
+-- would then never be written. See 'journalsWritten'.
+journalRequests :: Editor -> [(FilePath, Int, Journal)]
+journalRequests ed =
+  [ (journalKeyOf d, docDocSeq d, journalOf d) | d <- staleJournalDocs ed ]
+
+-- | Roughly how many bytes the next write-behind pass would write.
+--
+-- Deliberately an estimate: it exists to /schedule/ the write, and the only
+-- way to know exactly is to serialise the buffers — which is the work being
+-- scheduled. One character is counted as one byte (true for the ASCII that
+-- dominates source and log files, an under-count for text that is mostly
+-- non-Latin) plus one separator per line. The count comes from 'bufChars',
+-- which the buffer maintains, so this is O(open documents) however large they
+-- are.
+--
+-- A CSV document's buffer is stale under its table, so its estimate is the
+-- text as of the last sync rather than the grid that will actually be written.
+-- Same order of magnitude, which is all a timer interval needs.
+journalPendingBytes :: Editor -> Int
+journalPendingBytes ed = sum (map docJournalBytes (staleJournalDocs ed))
+  where docJournalBytes d = let b = docBuffer d in bufChars b + lineCount b
+
+-- | Minimum spacing (µs) between two journal write-behind passes, given the
+-- bytes one pass would write. Also the debounce after the last edit, at the
+-- floor.
+--
+-- The journal rewrites whole buffers, so its cost is the buffer's size and its
+-- /traffic/ is that size divided by the interval. At the shipped 2 s a 40 MB
+-- buffer under editing means ~10 MB/s of writes to @~\/.cache@ for as long as
+-- the session lasts — measured, and far more than this feature is worth.
+-- Spacing the passes by size instead bounds that at 'journalBudgetBps' while
+-- leaving ordinary files (anything up to 4 MB) at exactly the 2 s they have
+-- always had.
+--
+-- Both ends are clamped on purpose. The floor is what a journal is /for/: 2 s
+-- is the promise about how much a crash can take. The ceiling is the same
+-- promise from the other side — past half a minute the feature starts failing
+-- at its own job, so the very largest buffers give the budget back rather than
+-- widening the window further (a 100 MB buffer, the largest that opens as
+-- text, lands at ~3.3 MB/s instead of 2).
+-- The size test comes before the arithmetic so the multiplication cannot
+-- overflow: past the byte count that already reaches the ceiling there is
+-- nothing left to compute.
+journalDelayUs :: Int -> Int
+journalDelayUs bytes
+  | bytes <= 0                = journalMinDelayUs
+  | bytes >= atCeilingBytes   = journalMaxDelayUs
+  | otherwise                 = max journalMinDelayUs
+                                    ((bytes * 1000000) `div` journalBudgetBps)
+  where atCeilingBytes = (journalMaxDelayUs `div` 1000000) * journalBudgetBps
+
+-- | The floor on 'journalDelayUs': the write-behind debounce every buffer
+-- small enough not to matter still gets.
+journalMinDelayUs :: Int
+journalMinDelayUs = 2000000
+
+-- | The ceiling on 'journalDelayUs'; see there for why it is not simply larger.
+journalMaxDelayUs :: Int
+journalMaxDelayUs = 30000000
+
+-- | Steady-state write budget (bytes\/second) the write-behind is allowed to
+-- spend on @~\/.cache@ while a large buffer is being edited. Two megabytes a
+-- second is around what one ordinary save costs, spread over a second — enough
+-- that the journal is never the reason a disk is busy, and small enough that a
+-- laptop's SSD or a network home directory does not notice it.
+journalBudgetBps :: Int
+journalBudgetBps = 2 * 1024 * 1024
+
+-- | What the driver watches to decide a journal write is due. Changes when a
+-- document is edited, saved, closed or opened — and when the config key is
+-- toggled, so turning journalling on mid-session writes the backlog.
+journalFingerprint :: Editor -> (Bool, [(FilePath, Int)])
+journalFingerprint ed =
+  ( cfgJournal (edConfig ed)
+  , [ (journalKeyOf d, docDocSeq d) | d <- allOpenDocs ed, journalableDoc d ] )
+
+-- | Driver callback: these journal files now hold the content their document
+-- had at the given edit counter, so stop offering to rewrite /that/ version.
+-- Matching is by journal key rather than by path because an untitled buffer
+-- has no path.
+--
+-- The counter is the one the write captured, not the document's current one:
+-- the write happens off the event-loop thread, so the document may have been
+-- edited since it started, and those edits are still unjournalled. Recording
+-- the captured value leaves the document stale, which is exactly right — the
+-- next tick writes it again.
+journalsWritten :: [(FilePath, Int)] -> Editor -> Editor
+journalsWritten done ed = ed
+  { edJournalSeq = maybe (edJournalSeq ed) id (lookup (journalKeyOf (captureDoc ed)) done)
+  , edBefore = map upd (edBefore ed)
+  , edAfter  = map upd (edAfter ed)
+  }
+  where upd d = case lookup (journalKeyOf d) done of
+                  Just s  -> d { docJournalSeq = s }
+                  Nothing -> d
+
+-- | Startup: make sure a new untitled buffer cannot be given the id of an
+-- untitled journal that is still on disk (one the user kept for later, or one
+-- we have just recovered) and clobber it on the next write-behind tick.
+seedJournalIds :: [Int] -> Editor -> Editor
+seedJournalIds used ed =
+  ed { edNextDocId = maximum (edNextDocId ed : map (+ 1) used) }
+
+-- | Open the startup recovery prompt for the journals the driver found.
+-- Nothing to offer ⇒ the editor is returned untouched, so this is safe to
+-- call unconditionally.
+openRecoverDialog :: [RecoverItem] -> Editor -> Editor
+openRecoverDialog [] ed = ed
+openRecoverDialog items ed =
+  openDialog (mkConfirm DKRecover "Unsaved Changes Recovered" msg
+                ["Recover", "Discard", "Keep for later"])
+             ed { edRecover = items }
+  where
+    n   = length items
+    msg = T.unlines $
+      [ T.pack (show n ++ " file" ++ plural n
+                ++ " had unsaved changes when CMeDit last exited.")
+      , "" ]
+        ++ [ "  " <> describeRecover it | it <- take maxRecoverListed items ]
+        ++ [ T.pack ("  \x2026 and " ++ show (n - maxRecoverListed) ++ " more")
+           | n > maxRecoverListed ]
+
+-- How many files the recovery prompt names before it stops and counts. The
+-- dialog is a modal box on an 80-column terminal, not a report.
+maxRecoverListed :: Int
+maxRecoverListed = 8
+
+-- One line of the recovery listing: what it is, and the caveat if any.
+describeRecover :: RecoverItem -> Text
+describeRecover it =
+  label <> maybe "" (\note -> " \x2014 " <> note) (J.recoveryNote (riCase it))
+  where
+    label = case jPath (riJournal it) of
+      Just p  -> T.pack (takeFileName p)
+      Nothing -> "(untitled buffer)"
+
+-- | The Recover button: install every offered journal as a modified document.
+--
+-- Shaped like 'Cmedit.EditorFind.addStagedDoc'\'s result — a dirty buffer with
+-- the file's own metadata — with two differences that matter. The disk-mtime
+-- baseline is the one the /journal/ recorded, not the file's mtime now, so
+-- 'RecoverChanged' arrives already carrying the @◆@ the stale-file machinery
+-- would have shown; and a journal whose path is already open (a file named on
+-- the command line, say) patches that document instead of opening a second
+-- copy of it.
+--
+-- Nothing here writes anything: recovering leaves every file on disk exactly
+-- as it was, and the recovered documents are unsaved buffers the user can
+-- inspect, save or close.
+recoverJournals :: Editor -> Editor
+recoverJournals ed0
+  | null items = closeDialog ed0 { edRecover = [] }
+  | otherwise  = (restoreDoc (docs !! k) ed1 { edBefore = take k docs
+                                             , edAfter  = drop (k + 1) docs })
+                   { edStatus = T.pack ("Recovered " ++ show n ++ " unsaved file"
+                                        ++ plural n ++ " \x2014 nothing has been "
+                                        ++ "written to disk") }
+  where
+    items = edRecover ed0
+    n     = length items
+    ed1   = (closeDialog ed0) { edRecover = [] }
+    -- A pristine empty buffer is replaced rather than kept around beside the
+    -- recovered work, exactly as opening a file into it would.
+    base  = if isPristine ed1 then [] else allOpenDocs ed1
+    (docs, landed) = foldl step (base, []) items
+    -- Land on the first thing recovered.
+    k = case reverse landed of
+          (i : _) -> i
+          []      -> min (length (edBefore ed1)) (length docs - 1)
+    step (ds, seen) it =
+      let d = recoveredDoc it
+      in case findIndex ((== docPath d) . docPath) ds of
+           -- The same file is already open: apply the journal to it, so
+           -- recovery cannot produce two documents for one path.
+           Just i | isJust (docPath d) ->
+             (take i ds ++ [d] ++ drop (i + 1) ds, seen ++ [i])
+           _ -> (ds ++ [d], seen ++ [length ds])
+
+-- One recovered journal as an unsaved document.
+recoveredDoc :: RecoverItem -> Document
+recoveredDoc it = Document
+  { docBuffer = buf
+    -- Deliberately not @buf@: the saved baseline is what the modified flag is
+    -- computed against, and a recovered document differs from disk by
+    -- definition — that is why its journal existed. Seeding the baseline with
+    -- the recovered text would let the first edit-and-undo declare the
+    -- document clean and delete the journal that is still the only copy.
+  , docSavedBuffer = emptyBuffer
+  , docCursor = clampPos (jCursor j) buf, docSelAnchor = Nothing
+  , docDesiredCol = 0, docTop = 0, docLeft = 0
+  , docPath = jPath j, docModified = True
+  , docDiskMtime = jMtime j, docDiskChanged = riCase it == RecoverChanged
+  , docLineEnding = jEol j, docSavedEol = jEol j
+  , docEncoding = jEnc j, docSavedEnc = jEnc j
+  , docFinalNewline = jFinalNewline j, docReadOnly = jReadOnly j
+  , docUndo = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone
+  , docOverwrite = False, docDiscard = False
+  , docCsvStash = Nothing, docImage = Nothing, docPager = Nothing
+  , docPdf = Nothing, docSheets = Nothing, docHlCache = Nothing, docDiags = []
+    -- 'Csv.markUnsaved' for exactly the reason 'docSavedBuffer' is empty above,
+    -- and it has to be said twice because the table carries its own baseline:
+    -- 'mkCsvLines' would adopt the recovered grid as the saved one, and then a
+    -- single Ctrl+Z (which need not even have an undo step to pop) recomputes
+    -- the flag through 'csvMod', declares the document clean, sweeps away the
+    -- journal that is the only copy of the work and lets Ctrl+Q leave silently.
+  , docCsv = case jPath j of
+      Just p | isCsvPath p ->
+        Just (Csv.markUnsaved (Csv.mkCsvLines (csvDelimForPath p) (bufLines buf)))
+      _ -> Nothing
+  , docRtf = case jPath j of
+      Just p | isRtfPath p -> Just (Rtf.mkRtfDoc 0 (bufLines buf))
+      _ -> Nothing
+    -- The id has to be the one the journal file is *named* after, or the
+    -- write-behind would write the recovered buffer to a second file and
+    -- leave the original behind for the next startup to offer again.
+  , docDocId = fromMaybe 0 (J.untitledIndexOf (riKey it))
+    -- The journal on disk already holds exactly this content, so it is
+    -- current: adopting it must not trigger a redundant rewrite.
+  , docDocSeq = 1, docJournalSeq = 1
+  }
+  where
+    j   = riJournal it
+    buf = J.journalBuffer j
 
 -- | Alt+Left: go back to the previous location (pushing the current one onto
 -- the forward trail). Stops in untitled buffers are only reachable while that
@@ -1247,16 +1819,20 @@ csvPut v ed = let (rv, fr, w) = csvViewportFor ed v
               in ed { edCsv = Just (Csv.ensureVisible rv fr w v) }
 
 -- A mutating table change (marks the document modified).
--- Apply a new table view and recompute the modified flag by comparing the grid
--- against the saved state, so editing a cell back to its original value clears
--- the flag. The comparison short-circuits at the first changed cell, and is
--- skipped entirely for very large tables to keep per-keystroke editing snappy.
+-- Apply a new table view and take the modified flag from the table, which
+-- maintains it as state ('Csv.csvDirty') rather than comparing the grid against
+-- the saved one — so editing a cell back to its original value clears the flag,
+-- exactly, at any table size, in O(1) (plan 0028).
+-- The per-document edit counter is bumped here and not in 'afterEdit': a table
+-- edit never touches the line buffer, so this is the only funnel through which
+-- the crash-recovery journal can learn that the grid moved.
 csvMod :: CsvView -> Editor -> Editor
-csvMod v ed = (csvPut v ed) { edModified = Csv.isModified v || metaModified ed, edStatus = "" }
+csvMod v ed = (csvPut v ed) { edModified = Csv.isModified v || metaModified ed
+                            , edDocSeq = edDocSeq ed + 1, edStatus = "" }
 
--- Kept as a named alias for the undo/redo call sites; 'Csv.isModified' is
--- pointer-accelerated, so the exact reconciliation is cheap at any table size
--- (there is no longer a big-table cutoff that fakes the flag).
+-- Kept as a named alias for the undo/redo call sites; 'Csv.isModified' is a
+-- field read, so the exact reconciliation is cheap at any table size (there is
+-- no longer a big-table cutoff that fakes the flag).
 csvModUndo :: CsvView -> Editor -> Editor
 csvModUndo = csvMod
 

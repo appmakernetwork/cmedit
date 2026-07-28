@@ -4,23 +4,28 @@
 -- "Cmedit.Editor"; this module is the thin shell around it.
 module Cmedit.App
   ( run
+  , convertFiles
+    -- * Exposed for testing
+  , convertPath
   ) where
 
 import Control.Concurrent (ThreadId, forkIO, getNumCapabilities, killThread, myThreadId)
+import Control.Concurrent.MVar (MVar, newMVar, modifyMVar, modifyMVar_, readMVar)
 import Control.Concurrent.STM
 import GHC.Conc (getNumProcessors, setNumCapabilities)
 import Control.Exception (SomeException, bracket, bracket_, catch, finally, handle, mask_, throwIO, try)
-import Control.Monad (foldM, forM, forM_, unless, void, when)
+import Control.Monad (filterM, foldM, forM, forM_, unless, void, when)
 import qualified Data.ByteString as BS
 import Data.ByteString.Builder (Builder, char7, hPutBuilder)
 import Data.Foldable (toList)
 import Data.IORef
-import Data.List (isPrefixOf, sort, sortOn)
+import Data.List (isPrefixOf, isSuffixOf, sort, sortOn)
 import qualified Data.Map.Strict as M
 import qualified Data.Sequence as Seq
 import qualified Data.Sequence as Seq
-import Data.Maybe (fromMaybe, isJust, isNothing)
-import Data.Time.Clock (UTCTime)
+import Data.Maybe (fromMaybe, isJust, isNothing, mapMaybe)
+import Data.Time.Clock (UTCTime, diffUTCTime, getCurrentTime)
+import qualified Data.Set as Set
 import Data.Word (Word8)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -30,9 +35,11 @@ import GHC.Clock (getMonotonicTime)
 import GHC.Stats
 import Text.Printf (printf)
 import System.Directory
-  ( canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, doesFileExist
-  , findExecutable, getCurrentDirectory, getFileSize, getModificationTime, listDirectory
-  , removeDirectoryRecursive, removeFile, renamePath )
+  ( XdgDirectory(XdgCache)
+  , canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, doesFileExist
+  , findExecutable, getCurrentDirectory, getFileSize, getModificationTime
+  , getXdgDirectory, listDirectory
+  , removeDirectoryRecursive, removeFile, renameFile, renamePath )
 import System.FilePath ((</>), makeRelative, splitDirectories, takeDirectory, takeFileName)
 import System.IO
 import System.Process
@@ -49,7 +56,8 @@ import Cmedit.Caps
 import Cmedit.Clipboard
 import Cmedit.ConfigFile
   ( RecentEntry(..), ThemeName(..), loadRecentFile, saveRecentFile
-  , loadHistoryFile, saveHistoryFile, configFilePath, updateConfigText )
+  , loadHistoryFile, saveHistoryFile, configFilePath, updateConfigText
+  , Session(..), RestorePlan(..), planRestore, loadSessionFile, saveSessionFile )
 import Cmedit.Definition (DefReq(..))
 import qualified Cmedit.Definition as D
 import Cmedit.Editor
@@ -59,7 +67,16 @@ import Cmedit.Pager (PagerDoc(..))
 import qualified Cmedit.Pager as Pg
 import Cmedit.Pdf (PdfDoc(..))
 import qualified Cmedit.Pdf as Pdf
+import qualified Cmedit.DocText as DocText
+import qualified Cmedit.Docx as Docx
+import qualified Cmedit.Epub as Epub
+import qualified Cmedit.Odf as Odf
+import qualified Cmedit.Csv as Csv
+import qualified Cmedit.Xlsx as Xlsx
+import qualified Cmedit.Rtf as Rtf
 import Cmedit.Input
+import Cmedit.Journal (Journal(..))
+import qualified Cmedit.Journal as J
 import Cmedit.Lint
   ( LinterId, Linter(..), Diag(..), LintAvail
   , linters, linterById, parseLintOutput, maxDiagsPerFile )
@@ -74,17 +91,17 @@ import Cmedit.Types
 
 -- | Run the editor: open any named files, then loop until the user quits.
 -- @cfgWarns@ are problems found in the user's config file, surfaced on the
--- status line once the screen is up.
-run :: Config -> [String] -> [FilePath] -> Bool -> Bool -> IO ()
-run cfg cfgWarns files readOnly statsOnExit = do
+-- status line once the screen is up. @restoreFlag@ is @--restore@.
+run :: Config -> [String] -> [FilePath] -> Bool -> Bool -> Bool -> IO ()
+run cfg cfgWarns files readOnly statsOnExit restoreFlag = do
   inTty  <- hIsTerminalDevice stdin
   outTty <- hIsTerminalDevice stdout
   if not (inTty && outTty)
     then hPutStrLn stderr "cmedit: stdin and stdout must be a terminal"
-    else runTui cfg cfgWarns files readOnly statsOnExit
+    else runTui cfg cfgWarns files readOnly statsOnExit restoreFlag
 
-runTui :: Config -> [String] -> [FilePath] -> Bool -> Bool -> IO ()
-runTui cfg cfgWarns files readOnly statsOnExit = do
+runTui :: Config -> [String] -> [FilePath] -> Bool -> Bool -> Bool -> IO ()
+runTui cfg cfgWarns files readOnly statsOnExit restoreFlag = do
   -- Configure the handles BEFORE entering raw mode. GHC's hSetBuffering /
   -- hSetEcho snapshot the current terminal state and restore it when the
   -- standard handles are finalised at exit; if we entered raw mode first, that
@@ -103,7 +120,12 @@ runTui cfg cfgWarns files readOnly statsOnExit = do
     size <- getTerminalSize
     recents <- loadRecentFile
     (findHist, replHist) <- loadHistoryFile
-    ed0'' <- buildInitialEditor cfg recents size files readOnly
+    -- --restore always restores; the config key only does so for a start with
+    -- nothing named, since naming files is itself a statement about what to open.
+    let restoreReq = if restoreFlag then Just True
+                     else if cfgRestoreSession cfg && null files then Just False
+                     else Nothing
+    ed0'' <- buildInitialEditor cfg recents size files readOnly restoreReq
     -- The on-disk history is a plain list; the editor keeps it in a bounded
     -- Seq (see Cmedit.History), so convert at this boundary only.
     let ed0' = ed0'' { edFindHist = Seq.fromList findHist
@@ -117,10 +139,16 @@ runTui cfg cfgWarns files readOnly statsOnExit = do
                                     1 -> ""
                                     n -> " (+" ++ show (n - 1) ++ " more)"))) ed0'
                 _ -> ed0'
+    -- Before the first frame: collect the journal directory and, if a previous
+    -- session left unsaved work behind, open the recovery prompt over the
+    -- welcome status. Skipped entirely when the key is off — nothing is read
+    -- and nothing is offered.
+    journalDir <- journalDirPath
+    ed0J <- if cfgJournal cfg then startupJournals journalDir ed0 else pure ed0
     -- The kernel often knows the terminal's pixel size (ws_xpixel/ws_ypixel);
     -- when it does, the image view gets the true cell aspect ratio from the
     -- first frame. The XTWINOPS replies refine or supply it later.
-    ed0Px <- applyTerminalPixels ed0
+    ed0Px <- applyTerminalPixels ed0J
     editorRef <- newIORef ed0Px
     prevRef   <- newIORef (Nothing :: Maybe Screen)
     titleRef  <- newIORef ""
@@ -132,6 +160,13 @@ runTui cfg cfgWarns files readOnly statsOnExit = do
     dirMtimes <- newIORef M.empty
     focused   <- newIORef True
     recentsRef <- newIORef (map rePath (edRecent ed0))
+    sessionRef <- newIORef (sessionShape ed0Px)
+    -- Persist the *initial* shape too, not just changes to it. The baseline
+    -- above makes 'maybePersistSession' write only when the shape moves, so a
+    -- session whose shape never moves after startup would otherwise write
+    -- nothing at all — and a SIGKILL would then leave the /previous/ session's
+    -- file for @--restore@ to trust.
+    saveSessionFile (sessionForPersist ed0Px)
     quickGen  <- newTVarIO 0
     capsRef   <- newIORef defaultCaps
     pointerRef <- newIORef "default"
@@ -142,11 +177,18 @@ runTui cfg cfgWarns files readOnly statsOnExit = do
     lintAvRef <- newIORef (edLintAvail ed0Px)
     lintRunRef <- newIORef Nothing
     lintLastRef <- newIORef 0
+    journalsRef <- newIORef Set.empty
+    journalFpRef <- newIORef (journalFingerprint ed0Px)
+    journalWarnRef <- newIORef False
+    journalLastRef <- newIORef 0
+    journalRunRef <- newIORef False
+    journalGate <- newMVar True
     jobsRef <- newIORef M.empty
     stats <- newDrvStats
-    let drv = Drv loadQ searchQ searchGen defGen dirMtimes focused recentsRef quickGen
+    let drv = Drv loadQ searchQ searchGen defGen dirMtimes focused recentsRef sessionRef quickGen
                   capsRef pointerRef themeRef gfxRef lintGen lintFpRef lintAvRef lintRunRef
-                  lintLastRef stats jobsRef
+                  lintLastRef journalDir journalsRef journalFpRef journalWarnRef
+                  journalLastRef journalRunRef journalGate stats jobsRef
     src       <- mkHandleSource stdin
     clickRef  <- newIORef (ClickState 0 (-1) (-1) 0)
     mainTid   <- myThreadId
@@ -160,7 +202,7 @@ runTui cfg cfgWarns files readOnly statsOnExit = do
     -- Probe which external linters are installed (off the main thread; the
     -- result arrives as an SMLintAvail message). The root, when a workspace
     -- folder was opened, lets node-local tools in node_modules/.bin be found.
-    forkDetectLinters drv (explorerRootOf ed0Px)
+    forkDetectLinters drv (explorerRoot ed0Px)
 
     bracket_
       (enterScreen ed0)
@@ -168,23 +210,38 @@ runTui cfg cfgWarns files readOnly statsOnExit = do
       ((do fillPagerNow drv editorRef      -- a paged file named on the command line
            renderNow drv editorRef prevRef titleRef
            eventLoop editorRef prevRef titleRef q drv src)
-        -- Always record the recents (with final cursor positions) and the
-        -- find/replace history on the way out — including SIGTERM/SIGHUP.
+        -- Always record the recents and the session (both with final cursor
+        -- positions) and the find/replace history on the way out — including
+        -- SIGTERM/SIGHUP.
         `finally` (do edF <- readIORef editorRef
                       saveRecentFile (recentsForPersist edF)
+                      saveSessionFile (sessionForPersist edF)
                       saveHistoryFile (toList (edFindHist edF))
-                                      (toList (edReplHist edF))))
+                                      (toList (edReplHist edF))
+                      dropJournalsOnExit drv edF))
     when statsOnExit (reportStats drv)
 
 -- Construct the starting editor. Directory arguments open as the workspace
 -- folder (the explorer panel); file arguments are loaded (the first becomes the
 -- active document, the rest join the open-files list).
-buildInitialEditor :: Config -> [RecentEntry] -> (Int, Int) -> [FilePath] -> Bool -> IO Editor
-buildInitialEditor cfg recents size args readOnly = do
+--
+-- @restoreReq@ is 'Just' when a session restore was asked for (the flag inside
+-- says whether it was asked for explicitly, which decides whether "there was no
+-- session" is worth saying). The restore runs /first/, so files named on the
+-- command line open on top of it and end up active — the argument you typed is
+-- what you wanted to look at.
+buildInitialEditor :: Config -> [RecentEntry] -> (Int, Int) -> [FilePath] -> Bool
+                   -> Maybe Bool -> IO Editor
+buildInitialEditor cfg recents size args readOnly restoreReq = do
   tagged <- mapM (\a -> (,) a <$> doesDirectoryExist a) args
   let dirs  = [ a | (a, True)  <- tagged ]
       files = [ a | (a, False) <- tagged ]
-  base <- loadInitialFiles cfg recents size files readOnly
+      base0 = (newEditor size cfg) { edStatus = "Welcome to CMeDit \x2014 press F1 for help"
+                                   , edRecent = recents }
+  base1 <- case restoreReq of
+             Nothing       -> pure base0
+             Just explicit -> restoreSession explicit base0
+  base <- loadInitialFiles cfg base1 files readOnly
   case dirs of
     []       -> pure base
     (d0 : _) -> do
@@ -194,32 +251,88 @@ buildInitialEditor cfg recents size args readOnly = do
       -- Keep editing focus when files were also opened; else focus the panel.
       pure (if null files then ed else ed { edFocus = FEdit })
 
--- Load the file arguments (no directories) into a fresh editor. The persisted
--- recents are installed first so opening a remembered file restores its cursor.
-loadInitialFiles :: Config -> [RecentEntry] -> (Int, Int) -> [FilePath] -> Bool -> IO Editor
-loadInitialFiles cfg recents size files readOnly = do
-  let base = (newEditor size cfg) { edStatus = "Welcome to CMeDit \x2014 press F1 for help"
-                                  , edRecent = recents }
+-- Load the file arguments (no directories) into the starting editor. The
+-- persisted recents are already installed, so opening a remembered file
+-- restores its cursor.
+loadInitialFiles :: Config -> Editor -> [FilePath] -> Bool -> IO Editor
+loadInitialFiles cfg base files readOnly =
   case files of
     [] -> pure base
     (f0 : rest) -> do
       -- Store canonical paths so re-opening the same file (e.g. via the browser,
       -- which yields absolute paths) is recognised as already-open.
       f0' <- canonicalizeSafe f0
-      ed0' <- openPath setLoaded imageLoaded f0' base
+      -- setLoadedNew is setLoaded on a pristine editor, so this is the ordinary
+      -- startup; after a restore it opens a new document (or switches to the
+      -- restored one) instead of overwriting what was just put back.
+      ed0' <- openPath setLoadedNew imageLoadedNew f0' base
       let ed1 = if readOnly then ed0' { edReadOnly = True } else ed0'
-      foldM addOne ed1 rest
+      foldM (addOne cfg) ed1 rest
+
+-- 2nd+ files named on the command line; silently skip binary/too-large ones.
+addOne :: Config -> Editor -> FilePath -> IO Editor
+addOne cfg e f0 = do
+  f <- canonicalizeSafe f0
+  o <- classifyFileWith (cfgPagedView cfg) f
+  pure $ case o of
+    OutText p lr  -> addDocument p lr e
+    OutImage p im -> addImageDocument p im e
+    OutPaged pg   -> addPagerDocument pg e
+    OutPdf p pd   -> addPdfDocument p pd e
+    OutDoc p rd   -> addContainerDoc p rd e
+    OutBook p wb  -> addWorkbookDocument p wb e
+    OutError _    -> e
+
+-- | Reopen the last session: the workspace folder if it is still a directory,
+-- then every recorded file that still exists, each through the ordinary
+-- 'classifyFile' guards — so an image, a workbook, a PDF or a file that grew
+-- past 'maxOpenBytes' lands in the view it would land in today, not the one it
+-- was in last week. Files that are gone are skipped and counted; nothing here
+-- is ever an error, because a session is a convenience and its absence must
+-- not stand between the user and an editor.
+--
+-- Runs before the journal scan, deliberately: recovery patches documents that
+-- are already open ('recoverJournals'), so restoring first is what makes a
+-- crashed session come back whole rather than as two copies of each file.
+restoreSession :: Bool -> Editor -> IO Editor
+restoreSession explicit ed0 = do
+  msess <- loadSessionFile
+  case msess of
+    Nothing -> pure (nothingToRestore ed0)
+    Just s -> do
+      flags <- mapM (doesFileExist . rePath) (seFiles s)
+      let plan = planRestore flags s
+      (edF, folderOK) <- restoreFolder (seFolder s) ed0
+      edD <- foldM openRestored edF (rpFiles plan)
+      let n     = length (rpFiles plan)
+          total = rpRecorded plan
+          ed1   = switchToFile (rpActive plan) edD
+          -- The folder alone is a session worth having restored.
+          ed2 | n == 0 && not folderOK = nothingToRestore ed0
+              | n == total             = ed1 { edStatus = "Session restored" }
+              | otherwise = ed1 { edStatus = T.pack ("Restored " ++ show n ++ " of "
+                                                     ++ show total ++ " file"
+                                                     ++ (if total == 1 then "" else "s")) }
+      -- Restored files mean there is something to edit; the panel is context.
+      pure (if n > 0 then ed2 { edFocus = FEdit } else ed2)
   where
-    -- 2nd+ files named on the command line; silently skip binary/too-large ones.
-    addOne e f0 = do
-      f <- canonicalizeSafe f0
-      o <- classifyFileWith (cfgPagedView cfg) f
-      pure $ case o of
-        OutText p lr  -> addDocument p lr e
-        OutImage p im -> addImageDocument p im e
-        OutPaged pg   -> addPagerDocument pg e
-        OutPdf p pd   -> addPdfDocument p pd e
-        OutError _    -> e
+    nothingToRestore ed
+      | explicit  = ed { edStatus = "No previous session to restore" }
+      | otherwise = ed        -- the config key asked quietly; leave the welcome
+    openRestored ed e = do
+      ed' <- openPath setLoadedNew imageLoadedNew (rePath e) ed
+      pure (seedSessionPos (rePath e) (Pos (reLine e) (reCol e)) ed')
+
+-- The recorded workspace folder, if it is still a directory. Same installation
+-- path as File ▸ Open Folder, so the panel comes back in the same state.
+restoreFolder :: Maybe FilePath -> Editor -> IO (Editor, Bool)
+restoreFolder Nothing ed = pure (ed, False)
+restoreFolder (Just dir) ed = do
+  isDir <- doesDirectoryExist dir
+  if not isDir then pure (ed, False) else do
+    cpath   <- canonicalizeSafe dir
+    entries <- listEntries cpath
+    pure (explorerStart cpath entries ed, True)
 
 -- | Refresh the status bar's live counters when @debug-stats@ is on (and clear
 -- them if it was just turned off). Returns whether anything changed, so the
@@ -360,6 +473,7 @@ data Drv = Drv
   , drvDirMtimes :: !(IORef (M.Map FilePath UTCTime))  -- ^ Each listed dir's mtime at listing time (for the freshness poll).
   , drvFocused   :: !(IORef Bool)     -- ^ Terminal focus, if the terminal reports it (defaults True).
   , drvRecents   :: !(IORef [FilePath])  -- ^ Paths of the recents list as last persisted (order matters).
+  , drvSession   :: !(IORef SessionShape) -- ^ The session shape as last persisted; a change rewrites the file.
   , drvQuickGen  :: !(TVar Int)       -- ^ id of the newest quick-open walk (independent of searches).
   , drvCaps      :: !(IORef TermCaps) -- ^ What the startup probes learned about the terminal.
   , drvPointer   :: !(IORef String)   -- ^ The last OSC 22 pointer shape emitted (hover hint).
@@ -372,6 +486,27 @@ data Drv = Drv
       -- ^ The lint pass currently in flight, if any: (generation, runner).
       --   Starting a pass kills the previous one — see 'startLintRun'.
   , drvLintLast  :: !(IORef Double)   -- ^ Monotonic time the last pass started (rate floor).
+  , drvJournalDir :: !FilePath        -- ^ @~\/.cache\/cmedit\/journal@; resolved once, created (0700) on first write.
+  , drvJournals  :: !(IORef (Set.Set FilePath))
+      -- ^ Journal file names this session is responsible for: the ones it has
+      --   written, plus any the recovery dialog adopted. Nothing outside this
+      --   set is ever deleted, which is what makes "Keep for later" mean it.
+  , drvJournalFp :: !(IORef JournalFp) -- ^ Last-seen journal fingerprint; the write-behind arms when it changes.
+  , drvJournalWarned :: !(IORef Bool)  -- ^ A journal write has already failed and been reported; don't nag every 2 s.
+  , drvJournalLast :: !(IORef Double)  -- ^ Monotonic time the last write-behind pass started (the size-scaled rate floor).
+  , drvJournalRun  :: !(IORef Bool)
+      -- ^ A write-behind pass is in flight. Set on the event-loop thread
+      --   /before/ the fork and cleared by the worker's @finally@, which is why
+      --   it is this and not a lookup in 'drvJobs': that table is written after
+      --   'forkIO' returns, so a job that finished first would leave an entry
+      --   nothing ever clears — harmless for a search, permanent here.
+  , drvJournalGate :: !(MVar Bool)
+      -- ^ Serialises every mutation of 'drvJournals' — and every rename of a
+      --   journal into place — against the sweep, and carries the one bit that
+      --   says whether journal writes are still wanted at all. See
+      --   'withJournalGate': it is what keeps a write that is in flight from
+      --   resurrecting the journal of a document that was saved (or of a
+      --   session that has just quit) while the bytes were being written.
   , drvStats     :: !DrvStats        -- ^ Session counters for @--stats-on-exit@.
   , drvJobs      :: !(IORef (M.Map JobKind ThreadId))
       -- ^ At most one background job of each kind. Starting one cancels the
@@ -408,7 +543,7 @@ bump f drv = modifyIORef' (f (drvStats drv)) (+ 1)
 
 -- | Kinds of background work the driver supervises. At most one of each runs;
 -- the input reader and the main loop are deliberately not in this list.
-data JobKind = JSearch | JDefs | JQuickOpen | JLoad | JReplace
+data JobKind = JSearch | JDefs | JQuickOpen | JLoad | JReplace | JJournal
   deriving (Eq, Ord, Show)
 
 -- | What the driver watches to decide a fresh lint pass is due: the active
@@ -426,6 +561,11 @@ lintFingerprint ed =
   ( edPath ed, edEditSeq ed, isJust (edCsv ed)
   , cfgLint cfg, cfgLintOn cfg, edLintAvail ed )
   where cfg = edConfig ed
+
+-- | What the driver watches to decide the crash-recovery journals are out of
+-- date: the config key plus, per document that would lose content in a crash,
+-- its journal name and its own edit counter. See 'Editor.journalFingerprint'.
+type JournalFp = (Bool, [(FilePath, Int)])
 
 -- | Identity of an on-screen kitty/sixel placement: re-emitted only when any
 -- part of this changes (or after a full redraw invalidated the terminal).
@@ -454,6 +594,24 @@ maybePersistRecents drv editorRef = do
     saveRecentFile (recentsForPersist ed)
     writeIORef (drvRecents drv) paths
 
+-- | The open folder, the open documents in order, and which is active — what
+-- the session file records apart from cursor positions.
+type SessionShape = (Maybe FilePath, [FilePath], Int)
+
+-- | Persist the session when its shape changed, on exactly the recents' terms:
+-- opening, closing and switching files rewrite the file; typing and moving the
+-- cursor do not. Positions are written once more on exit — but writing during
+-- the session is what makes @--restore@ useful after a SIGKILL, which is the
+-- case that has no exit at all.
+maybePersistSession :: Drv -> IORef Editor -> IO ()
+maybePersistSession drv editorRef = do
+  ed <- readIORef editorRef
+  let shape = sessionShape ed
+  old <- readIORef (drvSession drv)
+  when (shape /= old) $ do
+    saveSessionFile (sessionForPersist ed)
+    writeIORef (drvSession drv) shape
+
 -- | Collapse a run of consecutive drag events (same button) to its last one.
 --
 -- A terminal reporting motion can deliver dozens of drag events per batch; only
@@ -481,13 +639,18 @@ data SearchMsg
   | SMQuickDone  !Int             -- ^ quick-gen, the quick-open walk finished.
   | SMLint       !Int !FilePath ![Diag]  -- ^ lint-gen, one file's diagnostics (empty list clears old squiggles).
   | SMLintAvail  !LintAvail       -- ^ detected linter availability (from the startup / on-demand probe).
+  | SMJournal    ![(FilePath, Int)] !Int
+      -- ^ A write-behind pass finished: the journals that now hold their
+      --   document's content as of the given edit counter, and how many writes
+      --   failed. Journals that were skipped because the document had been
+      --   saved meanwhile are in neither number.
 
 ------------------------------------------------------------------------------
 -- Main loop
 
 -- One thing the loop woke up for.
 data LoopAction = GotKey !Key | GotLoad !LoadOutcome | GotSearch !SearchMsg
-                | Tick | FsTick | ImgTick | LintTick | IdleTick
+                | Tick | FsTick | ImgTick | LintTick | JournalTick | IdleTick
 
 -- Spinner animation interval (µs) while a background file load is in progress.
 spinnerDelayUs :: Int
@@ -510,6 +673,17 @@ lintDebounceUs = 500000
 -- deferred, not dropped — the debounce re-arms and it runs when the floor lifts.
 lintMinIntervalUs :: Int
 lintMinIntervalUs = 2000000
+
+-- Write-behind delay (µs) between the last edit and journalling the documents
+-- that have unsaved changes. Two seconds of active typing costs one write of a
+-- few KB, which is nothing next to what the linter already does — and the
+-- upper bound on what a crash can take with it.
+--
+-- It is the *floor* of the pure 'journalDelayUs', which spaces the passes
+-- further apart when the buffers being rewritten are large enough for the
+-- traffic to matter. Every ordinary file sits exactly here.
+journalDebounceUs :: Int
+journalDebounceUs = journalMinDelayUs
 
 -- Hard cap (µs) on any one linter invocation; a tool that hangs is terminated
 -- and yields no diagnostics rather than wedging the runner thread.
@@ -538,17 +712,18 @@ eventLoop :: IORef Editor -> IORef (Maybe Screen) -> IORef String
 eventLoop editorRef prevRef titleRef q drv _src = do
   pollT0 <- registerDelay fsPollDelayUs
   idle0  <- armIdle
-  loop pollT0 Nothing idle0
+  loop pollT0 Nothing Nothing idle0
   where
     loadQ   = drvLoadQ drv
     searchQ = drvSearchQ drv
     -- Arm the idle-collection timer. Re-armed by every branch that does work,
     -- so it only fires after a genuinely quiet stretch.
     armIdle = Just <$> registerDelay idleGcDelayUs
-    -- The loop carries three software timers: 'pollT' (filesystem freshness),
-    -- 'mlint' (the lint debounce, armed when the lint fingerprint changes) and
-    -- 'midle' (the idle collection, disarmed once it has fired).
-    loop pollT mlint midle = do
+    -- The loop carries four software timers: 'pollT' (filesystem freshness),
+    -- 'mlint' (the lint debounce, armed when the lint fingerprint changes),
+    -- 'mjour' (the crash-recovery journal write-behind, armed the same way)
+    -- and 'midle' (the idle collection, disarmed once it has fired).
+    loop pollT mlint mjour midle = do
       -- While a file is loading or a search is running, arm a timer so the
       -- spinner animates; otherwise block purely on input / load / search results.
       ed0 <- readIORef editorRef
@@ -581,6 +756,9 @@ eventLoop editorRef prevRef titleRef q drv _src = do
         `orElse` (case mlint of
                     Just tv -> readTVar tv >>= check >> pure LintTick
                     Nothing -> retry)
+        `orElse` (case mjour of
+                    Just tv -> readTVar tv >>= check >> pure JournalTick
+                    Nothing -> retry)
         `orElse` (case midle of
                     Just tv -> readTVar tv >>= check >> pure IdleTick
                     Nothing -> retry)
@@ -589,20 +767,24 @@ eventLoop editorRef prevRef titleRef q drv _src = do
         -- A background load finished: install it, apply any pending result-jump,
         -- and drop the spinner.
         GotLoad o -> do
-          modifyIORef' editorRef (applyPendingJump . endLoading . applyOutcome setLoadedNew imageLoadedNew o)
+          modifyIORef' editorRef (applyPendingDoc . applyPendingJump . endLoading . applyOutcome setLoadedNew imageLoadedNew o)
           fillPagerNow drv editorRef
           maybePersistRecents drv editorRef
+          maybePersistSession drv editorRef
           case o of
             OutText p _  -> notifyUnfocused drv ("Finished loading " ++ takeFileName p)
             OutImage p _ -> notifyUnfocused drv ("Finished loading " ++ takeFileName p)
             OutPaged pg  -> notifyUnfocused drv ("Finished indexing " ++ takeFileName (pgPath pg))
             OutPdf p _   -> notifyUnfocused drv ("Finished reading " ++ takeFileName p)
+            OutDoc p _   -> notifyUnfocused drv ("Finished reading " ++ takeFileName p)
+            OutBook p _  -> notifyUnfocused drv ("Finished reading " ++ takeFileName p)
             OutError _   -> pure ()
           renderNow drv editorRef prevRef titleRef
           -- A load installed a fresh buffer (fingerprint changed): (re-)arm lint.
           mlint' <- maybeArmLint mlint
+          mjour' <- maybeArmJournal mjour
           idle' <- armIdle
-          loop pollT mlint' idle'
+          loop pollT mlint' mjour' idle'
         -- A streamed search/replace result: drain the whole backlog and fold it
         -- in before a *single* repaint — a broad search (a common word over a huge
         -- tree) floods thousands of results, and repainting per result would peg
@@ -621,19 +803,20 @@ eventLoop editorRef prevRef titleRef q drv _src = do
           -- Detection completing (SMLintAvail) changes the fingerprint, which
           -- arms the initial lint for a file opened before any keystroke.
           mlint' <- maybeArmLint mlint
+          mjour' <- maybeArmJournal mjour
           idle' <- armIdle
-          loop pollT mlint' idle'
+          loop pollT mlint' mjour' idle'
         -- Advance the spinner(s) / About animation one frame.
         Tick -> do
           modifyIORef' editorRef (tickLoading . searchTick . tickAbout)
           renderNow drv editorRef prevRef titleRef
-          armIdle >>= loop pollT mlint
+          armIdle >>= loop pollT mlint mjour
         -- Advance the animated image one frame ('tickImage' re-checks that
         -- the editor still owns playback before stepping).
         ImgTick -> do
           modifyIORef' editorRef tickImage
           renderNow drv editorRef prevRef titleRef
-          armIdle >>= loop pollT mlint
+          armIdle >>= loop pollT mlint mjour
         -- The debounce fired: run the linters for the active document (if any
         -- still apply) and disarm the timer.
         LintTick -> do
@@ -641,7 +824,16 @@ eventLoop editorRef prevRef titleRef q drv _src = do
           -- Deferred by the rate floor: keep the timer armed so it runs shortly.
           mlint' <- if started then pure Nothing
                                else Just <$> registerDelay lintMinIntervalUs
-          armIdle >>= loop pollT mlint'
+          armIdle >>= loop pollT mlint' mjour
+        -- The write-behind fired: journal every modified document whose
+        -- journal is out of date, then disarm (the next edit re-arms). A pass
+        -- that could not start because the previous one is still writing is
+        -- deferred, not dropped — the same bargain 'LintTick' strikes.
+        JournalTick -> do
+          started <- writeJournals drv editorRef
+          mjour' <- if started then pure Nothing
+                               else Just <$> registerDelay journalDebounceUs
+          armIdle >>= loop pollT mlint mjour'
         -- The editor has been quiet: collect once, so a transient spike (a
         -- parsed table, a finished search, a closed document) is released
         -- instead of held for the rest of the session. Not re-armed — the next
@@ -649,7 +841,7 @@ eventLoop editorRef prevRef titleRef q drv _src = do
         IdleTick -> do
           bump stIdleGcs drv
           performMajorGC
-          loop pollT mlint Nothing
+          loop pollT mlint mjour Nothing
         -- Periodic filesystem freshness pass; repaint only if it changed anything.
         FsTick -> do
           changed <- pollFs drv editorRef
@@ -661,7 +853,7 @@ eventLoop editorRef prevRef titleRef q drv _src = do
           -- A quiet poll is not activity: keep the idle timer running so a
           -- 2-second poll can never starve the idle collection.
           midle' <- if changed then armIdle else pure midle
-          registerDelay fsPollDelayUs >>= \pt -> loop pt mlint midle'
+          registerDelay fsPollDelayUs >>= \pt -> loop pt mlint mjour midle'
         -- A key: drain everything else already queued and apply the whole batch
         -- before a single repaint (so held keys / fast typing never lag).
         GotKey k -> do
@@ -673,11 +865,13 @@ eventLoop editorRef prevRef titleRef q drv _src = do
               -- through its key handler) may need a different window.
               fillPagerNow drv editorRef
               maybePersistRecents drv editorRef
+              maybePersistSession drv editorRef
               renderNow drv editorRef prevRef titleRef
               -- Edits/undo/redo/file-switch changed the fingerprint → debounce.
               mlint' <- maybeArmLint mlint
+              mjour' <- maybeArmJournal mjour
               idle' <- armIdle
-              loop pollT mlint' idle'
+              loop pollT mlint' mjour' idle'
             else pure ()   -- quit or EOF: stop the loop
 
     handleSearchMsg msg = case msg of
@@ -724,6 +918,18 @@ eventLoop editorRef prevRef titleRef q drv _src = do
       SMLintAvail av -> do
         writeIORef (drvLintAvail drv) av
         modifyIORef' editorRef (lintersDetected av)
+      -- A finished write-behind pass. The model is told which journals now
+      -- hold which version, so a document edited while its journal was being
+      -- written stays stale and is rewritten by the next tick.
+      SMJournal done failed -> do
+        unless (null done) (modifyIORef' editorRef (journalsWritten done))
+        when (failed > 0) $ do
+          warned <- readIORef (drvJournalWarned drv)
+          unless warned $ do
+            writeIORef (drvJournalWarned drv) True
+            modifyIORef' editorRef
+              (setStatus (T.pack ("Cannot write the crash-recovery journal in "
+                                  ++ drvJournalDir drv ++ " \x2014 saving is unaffected")))
 
     -- Does a search-queue message need a repaint even when no search panel is
     -- shown? Only a lint result for the active file, or fresh availability while
@@ -731,6 +937,9 @@ eventLoop editorRef prevRef titleRef q drv _src = do
     lintAffectsView ed m = case m of
       SMLint _ path _ -> edPath ed == Just path
       SMLintAvail _   -> isJust (edDialog ed)
+      -- Only the one-off "cannot write the journal" note is visible; a
+      -- successful pass changes nothing on screen.
+      SMJournal _ failed -> failed > 0
       -- These change the open documents and clear the loading overlay, so they
       -- must repaint whatever is on screen.
       SMStaged _ _    -> True
@@ -754,6 +963,55 @@ eventLoop editorRef prevRef titleRef q drv _src = do
             else do
               writeIORef (drvLintFp drv) fp
               Just <$> registerDelay lintDebounceUs
+
+    -- Journal upkeep after a batch, in two halves.
+    --
+    -- The *removals* happen here and now, not on the timer: a journal exists
+    -- to be recovered, and one left behind after its document was saved or
+    -- closed would offer stale content at the next startup. They are derived
+    -- rather than announced — 'journalLiveKeys' says which documents would
+    -- still lose content in a crash, and anything else this session wrote is
+    -- deleted — so there is no save, close, revert or undo path that can
+    -- forget to drop a journal, because none of them has to know journals
+    -- exist. When nothing has changed this is a set difference and no syscall.
+    --
+    -- The *writes* are debounced exactly like the lint pass: arm on a changed
+    -- fingerprint, and re-arming simply replaces the pending timer.
+    --
+    -- The one wrinkle is size. A pass rewrites whole buffers, so for a large
+    -- one the passes have to be spaced further apart than 2 s
+    -- ('journalDelayUs') or the traffic to ~/.cache is measured in tens of
+    -- MB/s. But a *debounce* cannot be lengthened to do that: each keystroke
+    -- replaces the pending timer, so a 20 s debounce under steady typing would
+    -- push the write out for as long as the typing lasted and journal nothing
+    -- at all. So the long interval is applied as a rate floor instead — the
+    -- shape 'lintMinIntervalUs' already uses:
+    --
+    --   * the first write after a quiet period still lands one debounce after
+    --     the last edit, so a big file is protected as promptly as a small one;
+    --   * a timer that is already pending is left alone rather than pushed out,
+    --     so continuous typing cannot starve the write;
+    --   * and a fresh timer is armed no sooner than one interval after the
+    --     previous pass started, which is what bounds the traffic.
+    maybeArmJournal mjour = do
+      ed <- readIORef editorRef
+      sweepJournals drv ed
+      let fp = journalFingerprint ed
+      old <- readIORef (drvJournalFp drv)
+      if fp == old
+        then pure mjour
+        else do
+          writeIORef (drvJournalFp drv) fp
+          let iv = journalDelayUs (journalPendingBytes ed)
+          if iv <= journalDebounceUs
+            then Just <$> registerDelay journalDebounceUs   -- ordinary sizes: a plain debounce
+            else case mjour of
+              Just _  -> pure mjour        -- already due; typing must not defer it
+              Nothing -> do
+                now  <- getMonotonicTime
+                prev <- readIORef (drvJournalLast drv)
+                let dueIn = round ((prev + fromIntegral iv / 1e6 - now) * 1e6)
+                Just <$> registerDelay (max journalDebounceUs dueIn)
 
     -- Run the debounced lint pass for the active document (edit-time tools).
     -- Returns False when the rate floor deferred it, so the caller re-arms.
@@ -987,6 +1245,16 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
         performEffects drv effs ed1
       Left err      -> pure (setError err ed')
 
+  -- Save As in a view with no buffer: write a copy of what is on screen and
+  -- leave the open document alone. Deliberately not 'onSaved' — nothing about
+  -- the workbook or PDF this came from has been saved, and marking it so would
+  -- be a lie the modified flag then carried around.
+  EffExportTo path txt -> do
+    res <- saveFile path Utf8 Cmedit.TextBuffer.LF True (fromText txt)
+    pure $ case res of
+       Right (n, _) -> ed { edStatus = T.pack ("Exported " ++ show n ++ " bytes to " ++ path) }
+       Left err     -> setError err ed
+
   EffOpen path -> do
     bump stOpened drv
     -- Canonicalise so the already-open check (in setLoadedNew/imageLoadedNew)
@@ -1006,7 +1274,7 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
                               >>= atomically . writeTQueue loadQ)
         pure (beginLoading (takeFileName cpath) ed)
       -- Small files install inline; apply any pending result-jump immediately.
-      _ -> applyPendingJump . flip (applyOutcome setLoadedNew imageLoadedNew) ed
+      _ -> applyPendingDoc . applyPendingJump . flip (applyOutcome setLoadedNew imageLoadedNew) ed
              <$> classifyFileWith (cfgPagedView (edConfig ed)) cpath
 
   -- Reload the active file in place, discarding unsaved edits (the Revert
@@ -1183,7 +1451,7 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
   -- Re-probe which linters are installed (e.g. after opening the Settings
   -- dialog); the result arrives as an SMLintAvail message.
   EffDetectLinters -> do
-    forkDetectLinters drv (explorerRootOf ed)
+    forkDetectLinters drv (explorerRoot ed)
     pure ed
 
   -- Run an immediate lint pass of the active document (save-time tools too),
@@ -1200,13 +1468,41 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
     forkLintNow drv ed
     pure ed
 
+  -- The recovery dialog's Discard: delete the journals outright. They were
+  -- never adopted, so the sweep would have left them alone forever.
+  -- Under the gate like every other mutation of 'drvJournals', so a write-behind
+  -- pass running at the same moment cannot rename one of these back in.
+  EffDropJournals names -> do
+    withJournalGate drv $ \_ -> do
+      mapM_ (removeJournalFile (drvJournalDir drv)) names
+      modifyIORef' (drvJournals drv) (`Set.difference` Set.fromList names)
+    pure ed
+
+  -- The recovery dialog's Recover: the journals now belong to open documents,
+  -- so take responsibility for removing them when those documents are saved
+  -- or closed. (Keep for later emits nothing, which is what keeps them.)
+  EffAdoptJournals names -> do
+    withJournalGate drv $ \_ ->
+      modifyIORef' (drvJournals drv) (Set.union (Set.fromList names))
+    pure ed
+
+  -- Swap a container between its rendered view and its archive listing. The
+  -- in-place installers are the right ones here (not the -New variants): the
+  -- file is already open and this replaces the view of it, so switching to
+  -- "the already-open copy" would be a no-op that never showed the other view.
+  EffContainerView path listing -> do
+    o <- if listing then zipOutcome path else archiveOutcome path
+    pure $ case o of
+       OutText p lr -> setLoaded p lr ed
+       OutDoc  p rd -> containerDocLoaded p rd ed
+       OutBook p wb -> workbookLoaded p wb ed
+       OutError msg -> setError msg ed
+       -- An archive can produce none of these; if the file has been replaced
+       -- on disk by something else entirely, say so rather than guess.
+       _            -> setError (takeFileName path ++ ": not an archive any more") ed
+
 ------------------------------------------------------------------------------
 -- Linting (external-linter integration)
-
--- | The workspace/explorer root, when a folder is open. Used to find
--- node-local tools (@node_modules/.bin@) and as a fallback CWD hint.
-explorerRootOf :: Editor -> Maybe FilePath
-explorerRootOf ed = fnPath . brRoot <$> edExplorer ed
 
 -- | Probe linter availability off the main thread and post the result back as
 -- an 'SMLintAvail' message.
@@ -1474,6 +1770,8 @@ data LoadOutcome
   | OutImage !FilePath ![(Image, Int)]   -- ^ Frames + delays (ms); singleton for a still.
   | OutPaged !PagerDoc                   -- ^ Too large for a buffer: the read-only paged view.
   | OutPdf   !FilePath !PdfDoc           -- ^ A PDF, already extracted into its reading view.
+  | OutDoc   !FilePath !RtfDoc           -- ^ A DOCX or EPUB, already mapped onto the formatted reading view.
+  | OutBook  !FilePath !Workbook         -- ^ An XLSX, already mapped onto the read-only grid.
   | OutError !String
 
 -- Read and classify a path without touching the editor. Refuses files that are
@@ -1497,7 +1795,7 @@ classifyFileWith pagedOK path = do
     -- binary, so the refusal below would otherwise be the whole story, and
     -- they can be arbitrarily large, so the size check must not see them
     -- either: 'zipOutcome' never reads more than the table of contents.
-    else if maybe False Z.zipMagic hdr4 then zipOutcome path else do
+    else if maybe False Z.zipMagic hdr4 then archiveOutcome path else do
       msz <- fileSizeSafe path
       case msz of
         -- Too large for a buffer. Rather than refusing outright, offer the
@@ -1554,6 +1852,433 @@ fillPagerNow _drv ref = do
         modifyIORef' ref (pagerFilled from lns)
       _ -> pure ()
 
+------------------------------------------------------------------------------
+-- Crash-recovery journal (the IO half; the decisions are in "Cmedit.Journal"
+-- and the pure spine at 'journalRequests' / 'journalLiveKeys')
+--
+-- Nothing here may endanger a real file. Every path in this section is inside
+-- one directory of our own, the save path is not touched by any of it, and a
+-- failure at any point is a status-line note — never a dialog, never a block,
+-- never a reason a save does not happen. That is why every operation below is
+-- wrapped in 'try' and its result thrown away.
+
+-- | @~\/.cache\/cmedit\/journal@ (respecting @XDG_CACHE_HOME@). Resolved once
+-- at startup; the directory itself is created lazily, on the first write.
+journalDirPath :: IO FilePath
+journalDirPath = (</> "journal") <$> getXdgDirectory XdgCache "cmedit"
+
+-- Journals for files that no longer exist are removed once they are this old.
+-- An untitled journal has no file to check, so age alone retires it.
+journalMaxAgeSecs :: Double
+journalMaxAgeSecs = 30 * 24 * 3600
+
+-- Ceiling on the whole journal directory, evicting oldest-first. Without it a
+-- long-lived @~/.cache@ could accumulate every buffer ever left unsaved.
+journalDirCapBytes :: Integer
+journalDirCapBytes = 256 * 1024 * 1024
+
+-- | Create the journal directory if it isn't there, restricted to its owner.
+--
+-- The 0700 is not decoration: these files hold the /content/ of whatever was
+-- being edited, and @~/.cache@ is not private by default under a permissive
+-- umask. 'setPrivateMode' is the platform layer's (a no-op on Windows, whose
+-- profile directory is already per-user).
+ensureJournalDir :: FilePath -> IO ()
+ensureJournalDir dir = do
+  createDirectoryIfMissing True dir
+  setPrivateMode dir
+
+-- | Hold the journal gate: the mutual exclusion that every mutation of
+-- 'drvJournals', and every rename of a journal into place, runs under.
+--
+-- The flag it carries is "are journal writes still wanted", which
+-- 'dropJournalsOnExit' clears. Held for a rename and a couple of set
+-- operations and never across the serialisation or the bulk write, so a
+-- background writer cannot make the event loop wait on it for more than
+-- microseconds.
+withJournalGate :: Drv -> (Bool -> IO a) -> IO a
+withJournalGate drv act =
+  modifyMVar (drvJournalGate drv) (\open -> (,) open <$> act open)
+
+-- What became of one journal write. A skip is not a failure: it means the
+-- document stopped being worth journalling while we were writing it.
+data JournalOutcome = JWrote | JSkipped | JFailed
+  deriving (Eq)
+
+-- | Write one journal atomically: a temp file beside it, then a rename — the
+-- same discipline 'saveFile' uses, so a crash mid-write leaves the previous
+-- journal intact rather than a half one. The temp file is deliberately not
+-- named @.cmj@, so the startup scan can never mistake it for a journal.
+--
+-- The rename is where the liveness re-check lives (see 'writeJournals'): the
+-- bytes were serialised from a document that may since have been saved, closed
+-- or reverted, and putting the file in place then would leave a journal for a
+-- document nothing will ever sweep — the next startup would offer to "recover"
+-- work the user had already saved.
+writeJournalFile :: Drv -> IORef Editor -> FilePath -> FilePath -> Journal
+                 -> IO JournalOutcome
+writeJournalFile drv editorRef dir name j = do
+  let path = dir </> name
+      tmp  = path ++ ".tmp"
+  r <- try $ do
+    BS.writeFile tmp (J.serializeJournal j)
+    withJournalGate drv $ \open -> do
+      ed <- readIORef editorRef
+      if open && name `elem` journalLiveKeys ed
+        then do renameFile tmp path
+                modifyIORef' (drvJournals drv) (Set.insert name)
+                pure JWrote
+        else do discard tmp
+                pure JSkipped
+  pure $ case r :: Either SomeException JournalOutcome of
+    Left _  -> JFailed
+    Right o -> o
+  where discard t = void (try (removeFile t) :: IO (Either SomeException ()))
+
+-- | The debounced write-behind: journal every modified document whose journal
+-- is out of date, and tell the pure model which ones now hold current content.
+--
+-- The pass runs on a background thread. The reason is size: a journal is a
+-- whole buffer, and for a 40 MB one the serialisation and the write together
+-- cost ~100 ms (measured — and the serialisation is the larger half, which is
+-- why the fork happens /before/ it: 'journalRequests' hands over unforced
+-- records and the writer is what forces them). On the event-loop thread that
+-- is a stall between frames, which plan 0011 §4 said this feature must never
+-- be. Returns False if a pass is still in flight, so the caller re-arms rather
+-- than starting a second writer over the same temp files.
+--
+-- Backgrounding introduces exactly two races, and 'withJournalGate' closes
+-- both:
+--
+--   * __The document is saved while its journal is being written.__ The sweep
+--     runs on the event-loop thread and cannot delete a file that does not
+--     exist yet, so the /writer/ re-checks 'journalLiveKeys' under the gate
+--     immediately before the rename and drops the temp file instead if the
+--     answer changed. Sweep and rename exclude each other, so whichever runs
+--     second sees the other's work: rename-then-sweep leaves the name in
+--     'drvJournals' for the sweep to delete, and sweep-then-rename finds the
+--     document no longer live. (The unlocked fast path in 'sweepJournals' is
+--     safe for the same reason — missing an insert there means the writer's
+--     own check is what handles it.)
+--   * __The session quits while a journal is being written__, which would put
+--     a journal back after 'dropJournalsOnExit' had removed it, and offer it
+--     at the next startup. Quitting closes the gate; a writer that finds it
+--     closed discards.
+--
+-- The completion travels back through the search queue like every other
+-- background result, carrying the edit counter each record captured rather
+-- than the document's counter now — see 'journalsWritten'.
+--
+-- A failure is reported once and then kept quiet: the condition (an unwritable
+-- cache directory, a full disk) will not fix itself in two seconds, and a
+-- status line that says so on every tick would be worse than useless.
+writeJournals :: Drv -> IORef Editor -> IO Bool
+writeJournals drv editorRef = do
+  busy <- readIORef (drvJournalRun drv)
+  if busy
+    then pure False
+    else do
+      ed <- readIORef editorRef
+      let reqs = journalRequests ed
+      unless (null reqs) $ do
+        getMonotonicTime >>= writeIORef (drvJournalLast drv)
+        writeIORef (drvJournalRun drv) True
+        startJob drv JJournal
+          (journalPass drv editorRef reqs
+             `finally` writeIORef (drvJournalRun drv) False)
+      pure True
+
+-- | One write-behind pass, on its own thread. Forcing each 'Journal' — which
+-- is where a CSV table is serialised and a buffer is flattened and encoded —
+-- happens here, inside 'writeJournalFile', not on the caller's thread.
+journalPass :: Drv -> IORef Editor -> [(FilePath, Int, Journal)] -> IO ()
+journalPass drv editorRef reqs = do
+  let dir = drvJournalDir drv
+  made <- try (ensureJournalDir dir) :: IO (Either SomeException ())
+  outs <- forM reqs $ \(name, sq, j) -> case made of
+            Left _  -> pure (JFailed, (name, sq))
+            Right _ -> do o <- writeJournalFile drv editorRef dir name j
+                          pure (o, (name, sq))
+  let done   = [ p | (JWrote, p) <- outs ]
+      failed = length [ () | (JFailed, _) <- outs ]
+  unless (null done && failed == 0) $
+    atomically (writeTQueue (drvSearchQ drv) (SMJournal done failed))
+
+-- | Delete every journal this session is responsible for that no longer
+-- describes anything recoverable. Called after each batch; a set difference
+-- and, almost always, no syscall at all.
+sweepJournals :: Drv -> Editor -> IO ()
+sweepJournals drv ed = do
+  mine0 <- readIORef (drvJournals drv)
+  -- The overwhelmingly common case: this session has written no journal, so
+  -- there is nothing that could need removing, nothing to compute, and no
+  -- reason to touch the gate. A background write that lands between this read
+  -- and the next batch is covered by its own liveness check at rename time.
+  unless (Set.null mine0) $ withJournalGate drv $ \_ -> do
+    mine <- readIORef (drvJournals drv)
+    let stale = mine `Set.difference` Set.fromList (journalLiveKeys ed)
+    unless (Set.null stale) $ do
+      mapM_ (removeJournalFile (drvJournalDir drv)) (Set.toList stale)
+      modifyIORef' (drvJournals drv) (`Set.difference` stale)
+
+-- | Teardown: remove this session's journals — but only if the user actually
+-- quit.
+--
+-- This runs from the same @finally@ that persists the recents, which also runs
+-- when a terminating signal tore us down. That distinction is the whole point:
+-- a SIGHUP is an SSH connection dropping, which is precisely the case the
+-- journal exists for, and deleting the journals there would defeat the
+-- feature in its headline scenario. 'edQuit' is set only by a quit flow, and
+-- a quit flow has already asked about (and been told to discard) every unsaved
+-- change — so it is the one exit after which there is nothing left to recover.
+--
+-- Closing the gate is what makes this final even with a write in flight: a
+-- writer that has serialised a journal but not yet renamed it into place finds
+-- the gate shut and throws its temp file away, instead of recreating a journal
+-- the user has just been asked about and chosen to discard.
+dropJournalsOnExit :: Drv -> Editor -> IO ()
+dropJournalsOnExit drv edF = when (edQuit edF) $ do
+  mine <- modifyMVar (drvJournalGate drv) $ \_ -> do
+            ms <- readIORef (drvJournals drv)
+            writeIORef (drvJournals drv) Set.empty
+            pure (False, ms)
+  mapM_ (removeJournalFile (drvJournalDir drv)) (Set.toList mine)
+
+removeJournalFile :: FilePath -> FilePath -> IO ()
+removeJournalFile dir name = do
+  r <- try (removeFile (dir </> name)) :: IO (Either SomeException ())
+  pure (either (const ()) id r)
+
+-- | The startup pass: collect the journal directory, then offer whatever is
+-- left over from a previous session.
+--
+-- Order matters. Garbage collection runs first so the scan never reads a
+-- journal that is about to be thrown away, and the size cap runs before
+-- anything is read so a runaway cache cannot be slurped into memory on the way
+-- to being deleted. Reading is capped per journal at 'maxOpenBytes', the same
+-- limit that governs opening the file it came from.
+--
+-- Every step is best-effort: this runs before the first frame, and no state of
+-- the cache directory may stop the editor from starting.
+startupJournals :: FilePath -> Editor -> IO Editor
+startupJournals dir ed = do
+  r <- try (scan) :: IO (Either SomeException [RecoverItem])
+  let items = either (const []) id r
+  -- Seed the untitled numbering past every journal still on disk — recovered
+  -- or kept — so a fresh untitled buffer cannot be numbered over one of them.
+  pure . openRecoverDialog items
+       . seedJournalIds (mapMaybe (J.untitledIndexOf . riKey) items) $ ed
+  where
+    scan = do
+      exists <- doesDirectoryExist dir
+      if not exists then pure [] else do
+        names <- listDirectory dir
+        gcJournalDir dir names
+        survivors <- filterM (doesFileExist . (dir </>))
+                             (filter J.isJournalFileName names)
+        mapMaybe id <$> mapM (readRecoverItem dir) survivors
+
+-- One journal file, if it is one we can use and its document is worth
+-- offering back.
+readRecoverItem :: FilePath -> FilePath -> IO (Maybe RecoverItem)
+readRecoverItem dir name = do
+  r <- try $ do
+    sz <- getFileSize (dir </> name)
+    if sz > maxOpenBytes then pure Nothing else do
+      bs <- BS.readFile (dir </> name)
+      case J.parseJournal bs of
+        Nothing -> pure Nothing
+        Just j  -> do
+          -- The journal's own baseline is what it was written against; this is
+          -- the file's mtime *now*, which is the other half of the question.
+          now <- maybe (pure Nothing) fileMtime (jPath j)
+          pure (Just (RecoverItem name (J.classifyJournal j now) j))
+  pure $ case r :: Either SomeException (Maybe RecoverItem) of
+    Left _  -> Nothing
+    Right x -> x
+
+-- | Bounded housekeeping over the journal directory: one listing, one stat per
+-- entry, and at most one read per journal that survives both rules.
+--
+--   * Anything over the directory cap goes, oldest first. Size is checked
+--     before content is, so this never has to read what it is deleting.
+--   * A journal older than 'journalMaxAgeSecs' whose file is gone (or which
+--     never had one) goes: it describes work that can no longer be placed.
+--     A recent one is kept however hopeless it looks — the journal may be the
+--     only surviving copy, which is exactly when it earns its keep.
+--   * Stray @.tmp@ files (a crash between write and rename) go unconditionally.
+gcJournalDir :: FilePath -> [FilePath] -> IO ()
+gcJournalDir dir names = do
+  forM_ (filter (".tmp" `isSuffixOf`) names) (removeJournalFile dir)
+  stats <- fmap (mapMaybe id) $ forM (filter J.isJournalFileName names) $ \n -> do
+    r <- try (do sz <- getFileSize (dir </> n)
+                 mt <- getModificationTime (dir </> n)
+                 pure (n, sz, mt))
+    pure (either (const Nothing) Just (r :: Either SomeException (FilePath, Integer, UTCTime)))
+  -- Oldest first, so the eviction order and the age test read the same way.
+  let byAge = sortOn (\(_, _, mt) -> mt) stats
+      overCap = evict (sum [ sz | (_, sz, _) <- byAge ]) byAge
+      evict total ((n, sz, _) : rest)
+        | total > journalDirCapBytes = n : evict (total - sz) rest
+      evict _ _ = []
+  mapM_ (removeJournalFile dir) overCap
+  now <- getCurrentTime
+  forM_ [ x | x@(n, _, _) <- byAge, n `notElem` overCap ] $ \(n, _, mt) ->
+    when (realToFrac (diffUTCTime now mt) > journalMaxAgeSecs) $ do
+      orphan <- journalIsOrphan (dir </> n)
+      when orphan (removeJournalFile dir n)
+
+-- Does this (old) journal describe a file that is no longer there — or no file
+-- at all? Only asked of journals past the age limit, so the read is rare.
+journalIsOrphan :: FilePath -> IO Bool
+journalIsOrphan path = do
+  r <- try $ do
+    bs <- BS.readFile path
+    case J.parseJournal bs >>= jPath of
+      Nothing -> pure True                   -- untitled, and long past its day
+      Just p  -> not <$> doesFileExist p
+  pure (either (const True) id (r :: Either SomeException Bool))
+
+------------------------------------------------------------------------------
+-- Command-line conversion
+--
+-- Every reading view in this editor turns some awkward format into text a
+-- terminal can show; the same work makes it a converter, and a converter is
+-- what you want when the terminal is not there. @cmedit paper.pdf > paper.txt@
+-- writes the text to stdout and one line about it to stderr, which is the only
+-- arrangement that works with a redirect: the description has to go somewhere
+-- other than the thing being redirected.
+--
+-- No flag is needed because the editor cannot run without a terminal on stdout
+-- anyway, so a redirected stdout can only mean this. (@--convert@ forces it
+-- when stdout /is/ a terminal, for a quick look.)
+
+-- | Convert each named file to text (or CSV) on stdout, describing each on
+-- stderr. Returns 'False' if any of them could not be converted.
+convertFiles :: Config -> Int -> [FilePath] -> IO Bool
+convertFiles cfg sheetNo paths = do
+  hSetBinaryMode stdout True
+  -- The descriptions carry arrows and quotes, and stderr's encoding follows
+  -- the locale — which under LANG=C would make writing one an exception
+  -- rather than a message.
+  hSetEncoding stderr utf8
+  results <- forM paths $ \path -> do
+    r <- convertPath cfg sheetNo path
+    case r of
+       Left err -> hPutStrLn stderr ("cmedit: " ++ err) >> pure False
+       Right (txt, desc) -> do
+         BS.hPutStr stdout (TE.encodeUtf8 txt)
+         hFlush stdout
+         -- After the write, so the line describes something that happened.
+         hPutStrLn stderr desc
+         pure True
+  pure (and results)
+
+-- | One file's converted text, and a line describing what was read and what
+-- came out of it.
+--
+-- The formats each go to whatever plainly holds them: a spreadsheet is CSV, a
+-- document is text. An image has no text and says so rather than emitting
+-- nothing; a file too large for a buffer is /already/ text, and saying so
+-- beats spending a gigabyte of reading to copy it.
+convertPath :: Config -> Int -> FilePath -> IO (Either String (T.Text, String))
+convertPath cfg sheetNo path = do
+  isDir  <- doesDirectoryExist path
+  exists <- doesFileExist path
+  -- A missing path is a new empty buffer to the editor, which is exactly right
+  -- there and exactly wrong here: there is nothing to convert, and reporting
+  -- "0 characters" for a typo would be worse than saying so.
+  if | isDir      -> pure (Left (nm ++ " is a directory"))
+     | not exists -> pure (Left (nm ++ ": no such file"))
+     | otherwise  -> convertOutcome <$> classifyFileWith (cfgPagedView cfg) path
+  where
+    nm = takeFileName path
+
+    convertOutcome o = case o of
+      OutError e   -> Left e
+      OutImage _ _ -> Left (nm ++ " is an image \x2014 there is no text in it to convert")
+      OutPaged _   -> Left (nm ++ " is already plain text, and too large to load \x2014 use cat")
+      OutPdf _ pd  -> ok (Pdf.pdfPlainText pd)
+                         ("PDF, " ++ count (Pdf.pdfPageCount pd) "page")
+      OutDoc _ rd  -> ok (Rtf.rtfPlainText rd)
+                         (T.unpack (originName (rdOrigin rd)) ++ ", "
+                          ++ count (Rtf.rtfParCount rd) "paragraph")
+      OutBook _ wb -> book wb
+      OutText p lr
+        -- An .rtf is text on disk, so it arrives as a buffer of markup — and
+        -- markup is the one thing nobody redirecting this wants.
+        | isRtfPath p ->
+            let rd = Rtf.mkRtfDoc 0 (bufLines (lrBuffer lr))
+            in ok (Rtf.rtfPlainText rd)
+                  ("RTF document, " ++ count (Rtf.rtfParCount rd) "paragraph")
+        | otherwise ->
+            let txt = bufferToText Cmedit.TextBuffer.LF (lrFinalNewline lr) (lrBuffer lr)
+                what | isArchivePath p = "archive listing"
+                     | otherwise       = "text"
+            in ok txt what
+
+    ok txt what = Right (txt, nm ++ ": " ++ what ++ " \x2192 " ++ produced txt)
+    produced txt = count (T.length txt) "character"
+    count n unit = show n ++ " " ++ unit ++ (if n == 1 then "" else "s")
+
+    originName org = case org of
+      RtfFromContainer f -> f
+      RtfFromBuffer      -> T.pack "document"
+
+    -- A CSV holds one table, so a workbook converts one sheet — the first
+    -- unless told otherwise, and the description says which and how to get
+    -- the rest. Emitting all of them would produce something that is not a
+    -- CSV at all.
+    book wb =
+      let n = Xlsx.wbCount wb
+          k = max 0 (min (n - 1) (sheetNo - 1))
+      in case Seq.lookup k (wbSheets wb) of
+           Nothing -> Left (nm ++ " has no sheets")
+           Just v  ->
+             let txt = Csv.csvToText v
+                 name = maybe T.empty id (Seq.lookup k (wbNames wb))
+                 more | n > 1 = "  (of " ++ show n ++ "; --sheet N for the others)"
+                      | otherwise = ""
+             in Right ( txt
+                      , nm ++ ": workbook, sheet " ++ show (k + 1) ++ " \x201c"
+                        ++ T.unpack name ++ "\x201d \x2192 "
+                        ++ count (Csv.nRows v) "row" ++ ", "
+                        ++ count (Csv.nCols v) "column" ++ " as CSV" ++ more )
+
+-- | Decode a document to searchable text for the workspace search's
+-- "search in documents" option, or 'Nothing' if it is not one after all.
+--
+-- It goes through 'classifyFileWith', which is the point: the text searched is
+-- byte-for-byte the text the reading view would show, so a hit is always
+-- something the user can then see. Reimplementing a lighter-weight extraction
+-- here would be faster and would eventually disagree with the view, which is
+-- the one failure this feature cannot afford — a search that finds a phrase the
+-- reader cannot then find is worse than one that never looked.
+--
+-- Runs on a grep worker, never on the main thread.
+extractDocFile :: FilePath -> IO (Maybe DocText.DocExtract)
+extractDocFile path = do
+  o <- try (classifyFileWith False path) :: IO (Either SomeException LoadOutcome)
+  pure $ case o of
+    Left _   -> Nothing
+    Right ok -> case ok of
+      OutPdf  _ pd -> Just (DocText.extractPdf pd)
+      OutDoc  _ rd -> Just (DocText.extractRtf (rtfKindOf path) rd)
+      OutBook _ wb -> Just (DocText.extractBook wb)
+      -- An .rtf is text on disk, so it arrives as a buffer of markup; the
+      -- searchable document is what parsing that markup yields, exactly as in
+      -- 'convertPath'.
+      OutText p lr
+        | isRtfPath p -> Just (DocText.extractRtf S.DKWord
+                                 (Rtf.mkRtfDoc 0 (bufLines (lrBuffer lr))))
+      -- Anything else means the container did not map to a reading view and
+      -- fell back to its archive listing. Searching that would report matches
+      -- on the names of members inside the file, which is not what "search in
+      -- documents" promises, so it is skipped.
+      _ -> Nothing
+  where
+    rtfKindOf p = if isEpubPath p then S.DKBook else S.DKWord
+
 -- | Read at most @n@ bytes from the front of a file (for magic-number and
 -- binary sniffing without slurping).
 readHead :: FilePath -> Int -> IO (Maybe BS.ByteString)
@@ -1573,41 +2298,304 @@ readAt path off n = do
          :: IO (Either SomeException BS.ByteString)
   pure (either (const Nothing) Just r)
 
+-- | Read an archive's table of contents: the two short reads, whatever the
+-- archive's size. The tail holds the end-of-central-directory record; that
+-- record points at the central directory. Nothing is decompressed here, so an
+-- archive whose members are encrypted reads exactly like one whose members are
+-- not.
+archiveDir :: FilePath -> IO (Either String (Integer, Z.Eocd, [Z.ZipEntry]))
+archiveDir path = do
+  msz <- fileSizeSafe path
+  case msz of
+    Nothing -> pure (Left "cannot measure the archive")
+    Just sz -> do
+      let tlen = fromInteger (min (toInteger Z.eocdSearchBytes) sz)
+      mtl <- readAt path (sz - toInteger tlen) tlen
+      case mtl of
+        Nothing -> pure (Left "cannot read the end of the archive")
+        Just tl -> case Z.findEocd tl (sz - toInteger (BS.length tl)) of
+          Left err -> pure (Left err)
+          Right ec -> do
+            mcd <- readAt path (Z.ecCdOff ec)
+                     (fromInteger (min Z.maxCentralBytes (Z.ecCdSize ec)))
+            pure $ case mcd of
+              Nothing -> Left "cannot read the archive's central directory"
+              Just cd -> fmap ((,,) sz ec) (Z.parseCentral (Z.ecPrefix ec) cd)
+
 -- | Turn a ZIP archive into its read-only listing document ("Cmedit.Zip").
---
--- Two short reads whatever the archive's size: the tail, which holds the
--- end-of-central-directory record, and the central directory that record
--- points at. Nothing is decompressed, so an archive whose members are
--- encrypted lists exactly like one whose members are not.
 --
 -- The result is an ordinary 'OutText' outcome, which is the point: from here
 -- on the listing is just a read-only buffer, and every installer, view and
 -- key handler downstream needs to know nothing about archives.
 zipOutcome :: FilePath -> IO LoadOutcome
-zipOutcome path = do
-  msz <- fileSizeSafe path
-  mt  <- fileMtime path
-  case msz of
-    Nothing -> pure (bad "cannot measure the archive")
-    Just sz -> do
-      let tlen = fromInteger (min (toInteger Z.eocdSearchBytes) sz)
-      mtl <- readAt path (sz - toInteger tlen) tlen
-      case mtl of
-        Nothing -> pure (bad "cannot read the end of the archive")
-        Just tl -> case Z.findEocd tl (sz - toInteger (BS.length tl)) of
-          Left err -> pure (bad err)
-          Right ec -> do
-            mcd <- readAt path (Z.ecCdOff ec)
-                     (fromInteger (min Z.maxCentralBytes (Z.ecCdSize ec)))
-            case mcd of
-              Nothing -> pure (bad "cannot read the archive's central directory")
-              Just cd -> pure $ case Z.parseCentral cd of
-                Left err -> bad err
-                Right es ->
-                  let txt = Z.zipListing (takeFileName path) sz es (Z.ecComment ec)
-                  in OutText path
-                       (LoadResult (fromText txt) Cmedit.TextBuffer.LF Utf8 True True mt)
+zipOutcome path = listingOutcome path Nothing
+
+-- The listing, optionally prefaced with why a reading view was not shown
+-- instead. That preface is the whole graceful floor: every failure anywhere in
+-- the container readers below lands here, so a damaged @.docx@ opens as its
+-- table of contents and says what went wrong, rather than refusing.
+listingOutcome :: FilePath -> Maybe String -> IO LoadOutcome
+listingOutcome path mnote = do
+  mt <- fileMtime path
+  r  <- archiveDir path
+  pure $ case r of
+    Left err -> bad err
+    Right (sz, ec, es) ->
+      let txt = Z.zipListing (takeFileName path) sz es (Z.ecComment ec)
+          txt' = case mnote of
+                   Nothing -> txt
+                   Just n  -> T.pack ("\x26a0 " ++ n ++ "\n\n") <> txt
+      in OutText path
+           (LoadResult (fromText txt') Cmedit.TextBuffer.LF Utf8 True True mt)
   where bad msg = OutError (takeFileName path ++ ": " ++ msg)
+
+------------------------------------------------------------------------------
+-- Container reading views (DOCX / EPUB / XLSX)
+--
+-- The shape of all three: read the table of contents (cheap, and needed for
+-- the listing anyway), decide from the /member names/ which format this is,
+-- then extract and map only the members that format actually needs. Nothing
+-- reads the archive as a whole, so a 1 GB @.docx@ full of photographs costs
+-- the members its text lives in and no more.
+--
+-- Every failure returns @Left@ and every @Left@ becomes the listing plus a
+-- note. That is deliberate and is the same shape as the image view's
+-- half-block fallback: the floor is always something the user can look at.
+
+-- | An archive, as the best view of it we can build: the rendered document
+-- when the container is one we read, otherwise its listing.
+archiveOutcome :: FilePath -> IO LoadOutcome
+archiveOutcome path = do
+  r <- archiveDir path
+  case r of
+    Left err -> pure (OutError (takeFileName path ++ ": " ++ err))
+    Right (_, _, es) -> do
+      let names = map Z.zeName es
+      out <- withArchive path es $ \get ->
+        if | Just body <- Docx.docxBodyMember names -> Just <$> docxOutcome path get body
+           | Xlsx.isXlsx names                      -> Just <$> xlsxOutcome path get
+           | Epub.isEpub names                      -> Just <$> epubOutcome path get
+           | Odf.isOdf names                        -> Just <$> odfOutcome path get
+           | otherwise                              -> pure Nothing
+      case out of
+        Nothing          -> listingOutcome path Nothing
+        Just (Right o)   -> pure o
+        Just (Left note) -> listingOutcome path (Just note)
+
+-- Open the archive once and hand the body a \"read this member\" function.
+-- Once, because an e-book's chapters are one member each and re-opening the
+-- file per chapter would turn a book into a few hundred opens.
+--
+-- @Nothing@ means \"not a container we read\"; a @Left@ means we tried and
+-- could not. Both end at the listing, but only the second has anything to say
+-- about why.
+withArchive :: FilePath -> [Z.ZipEntry]
+            -> (MemberReader -> IO (Maybe (Either String LoadOutcome)))
+            -> IO (Maybe (Either String LoadOutcome))
+withArchive path es act = do
+  r <- try (withBinaryFile path ReadMode (\h -> act (readMember h es)))
+         :: IO (Either SomeException (Maybe (Either String LoadOutcome)))
+  pure (either (\e -> Just (Left (show e))) id r)
+
+-- Extract one member by name. Two seeks: the local header (whose name and
+-- extra lengths are its own, not the central directory's — see
+-- 'Cmedit.Zip.localDataOffset') and then the data.
+readMember :: Handle -> [Z.ZipEntry] -> T.Text -> IO (Either String BS.ByteString)
+readMember h es nm = case Z.findEntry nm es of
+  Nothing -> pure (Left ("the archive has no \"" ++ T.unpack nm ++ "\""))
+  Just e  -> do
+    r <- try $ do
+      hSeek h AbsoluteSeek (max 0 (Z.zeOffset e))
+      hdr <- BS.hGet h Z.localHeaderBytes
+      case Z.localDataOffset hdr of
+        Left err   -> pure (Left err)
+        Right skip -> do
+          hSeek h AbsoluteSeek (max 0 (Z.zeOffset e) + toInteger skip)
+          -- A member written with a data descriptor can record no compressed
+          -- size; reading the cap is what lets it still be read.
+          let want | Z.zePacked e > 0 = min Z.maxMemberBytes (Z.zePacked e)
+                   | otherwise        = Z.maxMemberBytes
+          raw <- BS.hGet h (fromInteger want)
+          pure (Z.memberBytes e raw)
+    pure (either (\ex -> Left (show (ex :: SomeException))) id r)
+
+type MemberReader = T.Text -> IO (Either String BS.ByteString)
+
+-- | A Word document: one member, one mapping, and the formatted view.
+docxOutcome :: FilePath -> MemberReader -> T.Text -> IO (Either String LoadOutcome)
+docxOutcome path get body = do
+  r <- get body
+  pure $ case r of
+    Left err -> Left err
+    Right bs ->
+      let (pars, cut) = Docx.docxPars bs
+          note | cut       = "truncated \x2014 only part of the document is shown"
+               | otherwise = T.empty
+      in if Seq.null pars
+           then Left "this document has no readable text"
+           else Right (OutDoc path
+                        (Rtf.mkRtfDocFrom (RtfFromContainer "DOCX") Seq.empty note pars))
+
+-- | An e-book: container to package document to spine, then a chapter at a
+-- time. Chapters become the formatted view's sections, so @[@ and @]@ turn
+-- them and Go To reads a chapter number.
+--
+-- A chapter that cannot be read is /skipped/ rather than fatal: a book with
+-- one damaged file is still a book. Running out of the character budget stops
+-- the walk and says so, which is the same bargain the other readers make with
+-- their caps.
+epubOutcome :: FilePath -> MemberReader -> IO (Either String LoadOutcome)
+epubOutcome path get = do
+  mc <- get Epub.containerPath
+  case mc of
+    Left err -> pure (Left err)
+    Right cbs -> case Epub.epubOpfPath cbs of
+      Nothing  -> pure (Left "this e-book's container names no package document")
+      Just opf -> do
+        mo <- get opf
+        case mo of
+          Left err -> pure (Left err)
+          Right obs -> do
+            let base  = T.dropWhileEnd (== '/') (fst (T.breakOnEnd "/" opf))
+                hrefs = take Epub.maxEpubChapters (Epub.epubSpine base obs)
+            (chs, cut, skipped) <- readChapters get hrefs
+            let pars  = Seq.fromList (concatMap (toList . snd) chs)
+                sects = Seq.fromList (zip (scanl (+) 0 (map (Seq.length . snd) chs))
+                                          (map fst chs))
+                title = Epub.epubTitle obs
+                note  = T.intercalate "; " (
+                          [ "truncated \x2014 only part of the book is shown" | cut ]
+                          -- A chapter the archive could not give us is skipped
+                          -- rather than fatal, but silence about it would leave
+                          -- a book quietly missing pages.
+                          ++ [ T.pack (show skipped) <> " chapter"
+                               <> (if skipped == 1 then "" else "s") <> " unreadable"
+                             | skipped > 0 ]
+                          ++ [ t | let t = title, not (T.null t) ])
+            pure $ if Seq.null pars
+                     then Left "this e-book has no readable chapters"
+                     else Right (OutDoc path
+                                  (Rtf.mkRtfDocFrom (RtfFromContainer "EPUB") sects note pars))
+
+-- Walk the spine, stopping at the character budget. Titles come from each
+-- chapter's own <title>, falling back to its first line of text and then to
+-- its file name — because a chapter list of "part0007.xhtml" helps nobody.
+--
+-- Returns the chapters, whether the budget cut the walk short, and how many
+-- the archive could not give us: a missing chapter is skipped rather than
+-- fatal (a book with one damaged file is still a book) but it is /counted/,
+-- because a reader who is quietly missing pages should be told.
+readChapters :: MemberReader -> [T.Text]
+             -> IO ([(T.Text, Seq.Seq Rtf.RtfPar)], Bool, Int)
+readChapters get = go 0 0 []
+  where
+    go _ !bad acc [] = pure (reverse acc, False, bad)
+    go !n !bad acc (hf : rest)
+      | n >= Epub.maxEpubChars = pure (reverse acc, True, bad)
+      | otherwise = do
+          r <- get hf
+          case r of
+            Left _   -> go n (bad + 1) acc rest
+            Right bs ->
+              let ps = Epub.htmlPars bs
+              -- An empty chapter is not an unreadable one: plenty of books
+              -- have a cover page whose whole content is an image.
+              in if Seq.null ps
+                   then go n bad acc rest
+                   else go (n + parsChars ps) bad ((chapterTitle bs hf ps, ps) : acc) rest
+
+parsChars :: Seq.Seq Rtf.RtfPar -> Int
+parsChars = sum . map (sum . map (T.length . Rtf.rrText) . Rtf.rpRuns) . toList
+
+chapterTitle :: BS.ByteString -> T.Text -> Seq.Seq Rtf.RtfPar -> T.Text
+chapterTitle bs href ps
+  | not (T.null t)     = T.take 60 t
+  | not (T.null first) = T.take 60 first
+  | otherwise          = T.takeWhileEnd (/= '/') href
+  where
+    t     = T.strip (Epub.htmlTitle bs)
+    first = case toList ps of
+              (p : _) -> T.strip (T.concat (map Rtf.rrText (Rtf.rpRuns p)))
+              []      -> T.empty
+
+-- | An OpenDocument file: one member for both kinds, and the kind decided by
+-- what is inside @\<office:body\>@ rather than by the extension or the
+-- @mimetype@ member — which repackaging tools drop.
+--
+-- Both branches land on views that already exist: a text document is the
+-- formatted view a @.docx@ uses, a spreadsheet is the grid an @.xlsx@ uses,
+-- and a presentation or drawing is neither and falls through to the listing.
+odfOutcome :: FilePath -> MemberReader -> IO (Either String LoadOutcome)
+odfOutcome path get = do
+  r <- get Odf.odfContentPath
+  pure $ case r of
+    Left err -> Left err
+    Right bs -> case Odf.odfKind bs of
+      Nothing -> Left "this OpenDocument file is not a document or a spreadsheet"
+      Just Odf.OdfText ->
+        let (pars, cut) = Odf.odfPars bs
+            note | cut       = "truncated \x2014 only part of the document is shown"
+                 | otherwise = T.empty
+        in if Seq.null pars
+             then Left "this document has no readable text"
+             else Right (OutDoc path
+                          (Rtf.mkRtfDocFrom (RtfFromContainer "ODT") Seq.empty note pars))
+      Just Odf.OdfSheet ->
+        let (sheets, cut) = Odf.odfSheets bs
+            (filled, computed, unsupported) = Xlsx.resolveFormulas sheets
+            note = T.intercalate "; " (
+                     [ T.pack (show computed) <> " formulas computed" | computed > 0 ]
+                     ++ [ T.pack (show unsupported) <> " not computed" | unsupported > 0 ]
+                     ++ [ "some sheets truncated" | cut ]
+                     -- Unlike an .xlsx, an .ods stores each cell's *displayed*
+                     -- text, so the number formats are already applied and
+                     -- there is nothing to warn about.
+                     ++ [ "as shown by the spreadsheet" ])
+        in if null filled
+             then Left "this spreadsheet has no sheets"
+             else Right (OutBook path (Xlsx.mkWorkbook filled note))
+
+-- | A workbook: the sheet list in tab order, each sheet's member found through
+-- the relationship table, all of them mapped to grids.
+xlsxOutcome :: FilePath -> MemberReader -> IO (Either String LoadOutcome)
+xlsxOutcome path get = do
+  mw <- get Xlsx.workbookPath
+  case mw of
+    Left err -> pure (Left err)
+    Right wbs -> do
+      rels <- either (const []) Xlsx.relTargets <$> get "xl/_rels/workbook.xml.rels"
+      strs <- either (const Seq.empty) Xlsx.sharedStrings <$> get "xl/sharedStrings.xml"
+      let refs = Xlsx.sheetRefs wbs
+      sheets <- forM (zip [0 ..] (take maxSheets refs)) $ \(k, (nm, _)) -> do
+        r <- get (Xlsx.sheetMemberPath refs rels k)
+        pure $ case r of
+          Left _   -> (nm, Seq.empty, M.empty, False)
+          Right bs -> let (g, fs, cut) = Xlsx.sheetGrid strs bs in (nm, g, fs, cut)
+      -- Formulas the file answered for itself are already in the grid; this
+      -- fills in only the ones it left blank (a library-written workbook), and
+      -- says how many it could and could not do.
+      let (filled, computed, unsupported) =
+            Xlsx.resolveFormulas [ (nm, g, fs) | (nm, g, fs, _) <- sheets ]
+          cut = any (\(_, _, _, c) -> c) sheets
+          -- The news first, the standing caveat last: the status line is
+          -- clipped where the right-hand zones begin, and what a reader most
+          -- needs to know is which numbers on screen cmedit worked out itself.
+          note = T.intercalate "; " (
+                   [ T.pack (show computed) <> " formulas computed" | computed > 0 ]
+                   ++ [ T.pack (show unsupported) <> " not computed" | unsupported > 0 ]
+                   ++ [ "some sheets truncated" | cut ]
+                   ++ [ "only the first " <> T.pack (show maxSheets) <> " sheets"
+                      | length refs > maxSheets ]
+                   -- Stated rather than guessed at: see "Cmedit.Xlsx".
+                   ++ [ "cached values, no number formats" ])
+      pure $ if null sheets
+               then Left "this workbook has no sheets"
+               else Right (OutBook path (Xlsx.mkWorkbook filled note))
+  where
+    -- Excel itself is bounded only by memory here; a workbook with thousands
+    -- of sheets is generated, not authored, and every one of them is a grid
+    -- this would materialise.
+    maxSheets = 256
 
 -- Apply a load outcome to the editor via the matching pure installer.
 applyOutcome :: (FilePath -> LoadResult -> Editor -> Editor)
@@ -1621,6 +2609,8 @@ applyOutcome installText installImage o ed = case o of
   -- sane result.
   OutPaged pg   -> pagerLoadedNew pg ed
   OutPdf p pd   -> pdfLoadedNew p pd ed
+  OutDoc p rd   -> containerDocLoadedNew p rd ed
+  OutBook p wb  -> workbookLoadedNew p wb ed
   OutError msg  -> setError msg ed
 
 -- Open a path synchronously (used at startup and for Revert). The interactive
@@ -1651,7 +2641,13 @@ looksLikeDecoded :: FilePath -> IO Bool
 looksLikeDecoded path = do
   r <- try (withBinaryFile path ReadMode (\h -> BS.hGet h 1024))
          :: IO (Either SomeException BS.ByteString)
-  pure (either (const False) (\bs -> isJust (sniffImage bs) || Pdf.sniffPdf bs) r)
+  -- An archive is here for the container reading views: listing one is two
+  -- short reads, but rendering a .docx or an .epub inflates members and maps
+  -- their XML, which is decode cost by any measure. Sniffing cannot tell the
+  -- two apart from the first kilobyte, so every archive crosses at the lower
+  -- threshold; the cost of being wrong is a spinner nobody sees.
+  pure (either (const False)
+               (\bs -> isJust (sniffImage bs) || Pdf.sniffPdf bs || Z.zipMagic bs) r)
 
 -- List a directory for the file browser as (fullPath, isDirectory, size) tuples
 -- (size is Nothing for directories). Unreadable directories yield an empty
@@ -1730,6 +2726,7 @@ runWalker q genRef req = runScan ScanSpec
   , scProgress   = \n -> atomically (writeTQueue q (SMProgress gen n))
   , scDone       = \n trunc -> do atomically (writeTQueue q (SMProgress gen n))
                                   atomically (writeTQueue q (SMDone gen trunc))
+  , scDocs       = sqDocs req
   }
   where gen = sqGen req
 
@@ -1747,6 +2744,7 @@ runDefWalker q genRef req = runScan ScanSpec
   , scEmit       = \fr -> atomically (writeTQueue q (SMDefFile gen fr))
   , scProgress   = \_ -> pure ()
   , scDone       = \_ _ -> atomically (writeTQueue q (SMDefDone gen))
+  , scDocs       = False   -- definitions live in source, not in documents.
   }
   where gen = dfGen req
 
@@ -1803,6 +2801,11 @@ data ScanSpec = ScanSpec
   , scEmit       :: FileResult -> IO ()
   , scProgress   :: Int -> IO ()
   , scDone       :: Int -> Bool -> IO ()   -- ^ files scanned, hit a cap.
+  , scDocs       :: Bool
+    -- ^ Also decode documents (PDF, Word\/OpenDocument, workbook, e-book) and
+    -- search their text. Off for the definition scan, which is looking for
+    -- source code, and off by default for term search — decoding one document
+    -- costs what grepping a hundred source files costs.
   }
 
 -- | Recursively scan the tree under the root, grep matching text files, and
@@ -1842,30 +2845,48 @@ runScan spec = do
                  else Just . (hdr <>) <$> BS.hGetContents h)
           :: IO (Either SomeException (Maybe BS.ByteString))
 
-      grepFile path = do
-        ebs <- readTextFile path
-        case ebs of
-          Right (Just bs) | Just matcher <- scMatcherFor spec path -> do
-            let lr  = loadFromBytes False Nothing bs
-                txt = bufferToText Cmedit.TextBuffer.LF False (lrBuffer lr)
-                (ms, ftrunc, cnt) = S.fileMatchesWith matcher txt
-            unless (null ms) $ do
-              -- Reserve room under the caps atomically (workers race for it).
-              -- Stop once the match cap OR the result-file cap is reached, so
-              -- both a match-dense and a spread-thin (1-per-file) broad search
-              -- terminate promptly instead of scanning the whole tree.
-              -- Forcing cnt runs the whole scan HERE, on this worker — never
-              -- lazily on the UI thread when the result is rendered.
-              won <- cnt `seq` atomicModifyIORef' capRef $ \(total, files) ->
-                       if total >= S.maxTotalMatches || files >= S.maxResultFiles
-                         then ((total, files), False)
-                         else ((total + cnt, files + 1), True)
-              if won
-                then do
-                  ok <- alive
-                  when ok $ scEmit spec (FileResult path ms False ftrunc)
-                else atomicWriteIORef truncRef True
-          _ -> pure ()   -- unreadable, binary, or no matcher for this file
+      -- Publish one file's matches, if there is room under the caps.
+      --
+      -- Reserving room is atomic (workers race for it) and stops once the match
+      -- cap OR the result-file cap is reached, so both a match-dense and a
+      -- spread-thin (1-per-file) broad search terminate promptly instead of
+      -- scanning the whole tree. Forcing cnt runs the whole scan HERE, on this
+      -- worker — never lazily on the UI thread when the result is rendered.
+      emitResult path ms ftrunc cnt kind = unless (null ms) $ do
+        won <- cnt `seq` atomicModifyIORef' capRef $ \(total, files) ->
+                 if total >= S.maxTotalMatches || files >= S.maxResultFiles
+                   then ((total, files), False)
+                   else ((total + cnt, files + 1), True)
+        if won
+          then do
+            ok <- alive
+            when ok $ scEmit spec (FileResult path ms False ftrunc kind)
+          else atomicWriteIORef truncRef True
+
+      -- A document is decoded rather than read: same matcher and the same caps,
+      -- but the text comes from the reading view's own extraction and each
+      -- match is addressed by a page/chapter/sheet rather than a line number.
+      grepDoc path = case scMatcherFor spec path of
+        Nothing      -> pure ()
+        Just matcher -> do
+          mdx <- extractDocFile path
+          case mdx of
+            Nothing -> pure ()
+            Just dx ->
+              let (ms, ftrunc, cnt) = DocText.docMatches matcher dx
+              in emitResult path ms ftrunc cnt (Just (DocText.dxKind dx))
+
+      grepFile path
+        | scDocs spec && S.documentExtension path = grepDoc path
+        | otherwise = do
+            ebs <- readTextFile path
+            case ebs of
+              Right (Just bs) | Just matcher <- scMatcherFor spec path -> do
+                let lr  = loadFromBytes False Nothing bs
+                    txt = bufferToText Cmedit.TextBuffer.LF False (lrBuffer lr)
+                    (ms, ftrunc, cnt) = S.fileMatchesWith matcher txt
+                emitResult path ms ftrunc cnt Nothing
+              _ -> pure ()   -- unreadable, binary, or no matcher for this file
 
       -- A grep worker: drain candidate paths until the end-of-walk sentinel.
       -- Once superseded or capped it keeps draining (cheaply) so the walker
@@ -1901,8 +2922,15 @@ runScan spec = do
                 Just EntryDir   -> unless (S.dirPruned (scExclude spec) name) (walk path)
                 Just (EntryFile sz) -> do
                       let rel = makeRelative (scRoot spec) path
-                      when (sz <= S.maxFileBytesToSearch
-                            && not (S.binaryExtension name)
+                          -- A document is admitted on the document rules
+                          -- instead of the text ones: it is binary by
+                          -- extension (that is why it needs decoding at all),
+                          -- and its size cap is the larger one.
+                          isDoc = scDocs spec && S.documentExtension name
+                          sized = if isDoc then sz <= S.maxDocBytesToSearch
+                                           else sz <= S.maxFileBytesToSearch
+                                                && not (S.binaryExtension name)
+                      when (sized
                             && S.pathIncluded (scInclude spec) (scExclude spec) rel
                             && path `notElem` scSkip spec) $
                         atomically (writeTBQueue pathQ (Just path))

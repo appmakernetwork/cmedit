@@ -21,6 +21,8 @@ module Cmedit.Term
     -- * Directory-walk stat
   , EntryStat(..)
   , statEntry
+    -- * Private files
+  , setPrivateMode
   ) where
 
 import Control.Concurrent (ThreadId)
@@ -33,7 +35,8 @@ import Foreign.Storable (peek)
 import System.Environment (lookupEnv)
 import System.IO
 import System.Posix.Files
-  (FileStatus, getSymbolicLinkStatus, isSymbolicLink, isDirectory, isRegularFile, fileSize)
+  ( FileStatus, getSymbolicLinkStatus, isSymbolicLink, isDirectory, isRegularFile
+  , fileSize, setFileMode )
 import System.Posix.IO (stdInput, stdOutput)
 import System.Posix.Signals
 import System.Posix.Signals.Exts (windowChange)
@@ -194,3 +197,15 @@ statEntry path = do
       | isDirectory st    -> Just EntryDir
       | isRegularFile st  -> Just (EntryFile (toInteger (fileSize st)))
       | otherwise         -> Just EntryOther
+
+-- | Restrict a path to its owner (@0700@ / @rwx------@).
+--
+-- The crash-recovery journal directory holds the /content/ of whatever was
+-- being edited, so it must not be world-readable in a shared @~\/.cache@ or
+-- under a permissive umask. Best-effort: a failure here is not a reason to
+-- refuse to journal, and the Windows twin has no mode bits to set at all
+-- (the profile directory is already per-user there).
+setPrivateMode :: FilePath -> IO ()
+setPrivateMode path = do
+  r <- try (setFileMode path 0o700) :: IO (Either SomeException ())
+  pure (either (const ()) id r)

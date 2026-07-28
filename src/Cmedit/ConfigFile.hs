@@ -7,7 +7,8 @@
 -- The config file lives at @~\/.config\/cmedit\/config@ (respecting
 -- @XDG_CONFIG_HOME@) and holds @key = value@ lines; the recent-files list at
 -- @~\/.config\/cmedit\/recent@ holds one @line:col:path@ entry per line
--- (1-based, most recent first) so re-opening a file restores the cursor.
+-- (1-based, most recent first) so re-opening a file restores the cursor; the
+-- session at @~\/.config\/cmedit\/session@ records what was open last time.
 module Cmedit.ConfigFile
   ( -- * Configuration
     Config(..)
@@ -26,6 +27,16 @@ module Cmedit.ConfigFile
   , recentFilePath
   , loadRecentFile
   , saveRecentFile
+    -- * Session (what @--restore@ reopens)
+  , Session(..)
+  , maxSessionFiles
+  , parseSessionText
+  , renderSessionText
+  , RestorePlan(..)
+  , planRestore
+  , sessionFilePath
+  , loadSessionFile
+  , saveSessionFile
     -- * Find/replace input history
   , maxHistoryEntries
   , parseHistoryText
@@ -75,6 +86,8 @@ data Config = Config
   , cfgTrimTrailingWs :: !Bool   -- ^ Strip trailing whitespace from each line on save.
   , cfgEnsureFinalNl  :: !Bool   -- ^ Make sure the file ends with a newline on save.
   , cfgFreezeHeader   :: !Bool   -- ^ CSV table view: pin the first row while scrolling (View ▸ Freeze Header Row toggles it per-session).
+  , cfgJournal        :: !Bool   -- ^ Journal unsaved changes to @~\/.cache\/cmedit\/journal@ so a crash can be recovered from (off for editing secrets).
+  , cfgRestoreSession :: !Bool   -- ^ Reopen the last session (folder + files) when started with no arguments; @--restore@ forces it.
   , cfgTheme          :: !ThemeName
   , cfgPagedView      :: !Bool   -- ^ Offer the read-only paged view for files too large to load, instead of refusing them.
   , cfgDebugStats     :: !Bool   -- ^ Show live session counters (frames, heap, jobs) on the status bar.
@@ -95,6 +108,8 @@ defaultConfig = Config
   , cfgTrimTrailingWs = False
   , cfgEnsureFinalNl  = False
   , cfgFreezeHeader   = True    -- spreadsheets almost always have a header row
+  , cfgJournal        = True    -- losing unsaved work is worse than a cache file
+  , cfgRestoreSession = False   -- opt-in: a bare `cmedit` should stay a blank page
   , cfgTheme          = ThemeAuto   -- follow the terminal background; dark when undetectable
   , cfgPagedView      = True
   , cfgDebugStats     = False
@@ -141,6 +156,8 @@ applyKey key val cfg = case key of
   "trim-trailing-whitespace" -> boolKey (\b -> cfg { cfgTrimTrailingWs = b })
   "final-newline"            -> boolKey (\b -> cfg { cfgEnsureFinalNl = b })
   "freeze-header"            -> boolKey (\b -> cfg { cfgFreezeHeader = b })
+  "journal"                  -> boolKey (\b -> cfg { cfgJournal = b })
+  "restore-session"          -> boolKey (\b -> cfg { cfgRestoreSession = b })
   "theme" -> case map toLower val of
     "dark-terminal"  -> Right cfg { cfgTheme = ThemeDark }
     "dark"           -> Right cfg { cfgTheme = ThemeDark }   -- legacy spelling
@@ -196,6 +213,15 @@ configKeysHelp =
   , "                     (default false)."
   , "freeze-header = BOOL Pin a CSV table's first row while scrolling"
   , "                     (default true)."
+  , "journal = BOOL       Keep a crash-recovery journal of unsaved changes"
+  , "                     under ~/.cache/cmedit/journal, offered back the"
+  , "                     next time cmedit starts (default true). Journals"
+  , "                     hold file content, so set it to off when editing"
+  , "                     secrets."
+  , "restore-session = BOOL"
+  , "                     Reopen the last session's folder and files when"
+  , "                     cmedit is started with no arguments (default"
+  , "                     false). --restore does the same on demand."
   , "theme = auto|dark-terminal|light-terminal|cherry-blossom|flashbang|"
   , "        midnight|graphite"
   , "                     Colour theme; 'auto' follows the terminal"
@@ -235,6 +261,8 @@ configFields =
   , ("trim-trailing-whitespace", renderBool . cfgTrimTrailingWs)
   , ("final-newline",            renderBool . cfgEnsureFinalNl)
   , ("freeze-header",            renderBool . cfgFreezeHeader)
+  , ("journal",                  renderBool . cfgJournal)
+  , ("restore-session",          renderBool . cfgRestoreSession)
   , ("theme",                    renderTheme . cfgTheme)
   , ("paged-view",               renderBool . cfgPagedView)
   , ("debug-stats",              renderBool . cfgDebugStats)
@@ -325,24 +353,147 @@ maxRecentEntries = 50
 parseRecentText :: Text -> [RecentEntry]
 parseRecentText txt =
   take maxRecentEntries
-    [ e | raw <- T.lines txt, Just e <- [parseLine (T.strip raw)] ]
-  where
-    parseLine line
-      | T.null line = Nothing
-      | otherwise =
-          let (lt, rest1) = T.breakOn ":" line
-              (ct, rest2) = T.breakOn ":" (T.drop 1 rest1)
-              path        = T.unpack (T.drop 1 rest2)
-          in do l <- readMaybe (T.unpack lt)
-                c <- readMaybe (T.unpack ct)
-                if null path || T.null rest1 || T.null rest2
-                  then Nothing
-                  else Just (RecentEntry path (max 0 (l - 1)) (max 0 (c - 1)))
+    [ e | raw <- T.lines txt, Just e <- [parseRecentLine (T.strip raw)] ]
+
+-- | One @line:col:path@ entry. Only the first two colons separate, so a path
+-- may contain as many as it likes. Shared with the session file, which reuses
+-- this encoding rather than inventing a second one.
+parseRecentLine :: Text -> Maybe RecentEntry
+parseRecentLine line
+  | T.null line = Nothing
+  | otherwise =
+      let (lt, rest1) = T.breakOn ":" line
+          (ct, rest2) = T.breakOn ":" (T.drop 1 rest1)
+          path        = T.unpack (T.drop 1 rest2)
+      in do l <- readMaybe (T.unpack lt)
+            c <- readMaybe (T.unpack ct)
+            if null path || T.null rest1 || T.null rest2
+              then Nothing
+              else Just (RecentEntry path (max 0 (l - 1)) (max 0 (c - 1)))
+
+renderRecentLine :: RecentEntry -> Text
+renderRecentLine e =
+  T.pack (show (reLine e + 1) ++ ":" ++ show (reCol e + 1) ++ ":" ++ rePath e)
 
 renderRecentText :: [RecentEntry] -> Text
-renderRecentText entries = T.unlines
-  [ T.pack (show (reLine e + 1) ++ ":" ++ show (reCol e + 1) ++ ":" ++ rePath e)
-  | e <- take maxRecentEntries entries ]
+renderRecentText entries =
+  T.unlines (map renderRecentLine (take maxRecentEntries entries))
+
+------------------------------------------------------------------------------
+-- Session
+--
+-- What was open last time, so @--restore@ (or @restore-session = on@) can put
+-- it back. The file is rewritten whenever the session's /shape/ changes and
+-- once more on the way out — the same discipline as the recents list, and for
+-- a sharper reason: a session that is only written on a clean exit is exactly
+-- the one a SIGKILL loses, which is the case the crash journal exists for.
+--
+-- It records paths, not content. Untitled buffers are deliberately absent:
+-- there is nothing to reopen, and their content is the journal's business.
+
+-- | The open documents (in zipper order, with their cursors), which of them
+-- was active, and the workspace folder if one was open.
+data Session = Session
+  { seFolder :: !(Maybe FilePath)  -- ^ The open workspace folder, if any.
+  , seFiles  :: ![RecentEntry]     -- ^ Open documents in order, with cursor positions.
+  , seActive :: !Int               -- ^ Index into 'seFiles' of the active document.
+  } deriving (Eq, Show)
+
+-- | How many open files a session records. A session larger than this is a
+-- runaway, not a workspace, and restoring it would be slower than opening the
+-- files by hand.
+maxSessionFiles :: Int
+maxSessionFiles = 50
+
+sessionVersion :: Int
+sessionVersion = 1
+
+-- | Render a session. The first line is the version, so a future format can be
+-- told from this one instead of being half-understood.
+renderSessionText :: Session -> Text
+renderSessionText s = T.unlines $
+  [ T.pack ("cmedit-session " ++ show sessionVersion) ]
+    ++ [ T.pack ("folder: " ++ f) | Just f <- [seFolder s] ]
+    ++ [ T.pack ("active: " ++ show (seActive s)) ]
+    ++ map renderRecentLine (take maxSessionFiles (seFiles s))
+
+-- | Parse the session file. Unknown lines are skipped the way the config
+-- parser skips them (this is user-visible state on disk, not a format we can
+-- assume intact); an unknown version means \"no session\" rather than a
+-- guess, since a later format's lines would only look like malformed ones.
+parseSessionText :: Text -> Maybe Session
+parseSessionText txt = case dropWhile (T.null . T.strip) rawLines of
+  (v : rest) | versionOK v -> Just (finish (foldl step (Nothing, [], 0) rest))
+  _ -> Nothing
+  where
+    rawLines = map (T.strip . T.dropWhileEnd (== '\r')) (T.lines txt)
+    versionOK line = case T.words line of
+      ["cmedit-session", n] -> readMaybe (T.unpack n) == Just sessionVersion
+      _                     -> False
+    step acc@(folder, files, active) line
+      | T.null line = acc
+      | Just f <- T.stripPrefix "folder:" line =
+          -- An empty value is no folder, not a folder named "".
+          (if T.null (T.strip f) then Nothing else Just (T.unpack (T.strip f)), files, active)
+      | Just a <- T.stripPrefix "active:" line =
+          (folder, files, maybe active id (readMaybe (T.unpack (T.strip a))))
+      | Just e <- parseRecentLine line = (folder, e : files, active)
+      | otherwise = acc
+    finish (folder, files, active) =
+      Session folder (take maxSessionFiles (reverse files)) active
+
+-- | What a restore should actually do, given which recorded files are still
+-- there. Separated from the IO so the index arithmetic — the only part that
+-- can be wrong — is a pure function with a test.
+data RestorePlan = RestorePlan
+  { rpFiles    :: ![RecentEntry]  -- ^ The files to open, in session order.
+  , rpActive   :: !Int            -- ^ Index into 'rpFiles' of the one to make active.
+  , rpRecorded :: !Int            -- ^ How many files the session recorded (for \"4 of 5\").
+  } deriving (Eq, Show)
+
+-- | Plan a restore: @exists@ carries one flag per 'seFiles' entry, in order
+-- (a short list is treated as \"the rest are gone\").
+planRestore :: [Bool] -> Session -> RestorePlan
+planRestore exists s = RestorePlan kept active (length files)
+  where
+    files  = seFiles s
+    tagged = zip files (exists ++ repeat False)
+    kept   = [ e | (e, True) <- tagged ]
+    -- The recorded index addresses the list as it was; after the missing files
+    -- are dropped it has to address the list as it is. Counting the survivors
+    -- ahead of it does that, and when the active file is itself gone the count
+    -- lands on the next survivor — the nearest thing to where the user left.
+    want   = max 0 (min (length files - 1) (seActive s))
+    active = max 0 (min (length kept - 1) (length (filter snd (take want tagged))))
+
+-- | @~\/.config\/cmedit\/session@.
+sessionFilePath :: IO FilePath
+sessionFilePath = (</> "session") <$> configDir
+
+-- | Load the last session, if there is a readable one.
+loadSessionFile :: IO (Maybe Session)
+loadSessionFile = do
+  r <- try readIt :: IO (Either SomeException (Maybe Session))
+  pure (either (const Nothing) id r)
+  where
+    readIt = do
+      path <- sessionFilePath
+      exists <- doesFileExist path
+      if exists then parseSessionText <$> TIO.readFile path else pure Nothing
+
+-- | Persist the session (atomically, via a temp file). Failures are swallowed,
+-- like the recents: losing the session must never take the editor down.
+saveSessionFile :: Session -> IO ()
+saveSessionFile s = do
+  _ <- try writeIt :: IO (Either SomeException ())
+  pure ()
+  where
+    writeIt = do
+      path <- sessionFilePath
+      createDirectoryIfMissing True (takeDirectory path)
+      let tmp = path ++ ".tmp"
+      TIO.writeFile tmp (renderSessionText s)
+      renameFile tmp path
 
 ------------------------------------------------------------------------------
 -- Find / replace input history

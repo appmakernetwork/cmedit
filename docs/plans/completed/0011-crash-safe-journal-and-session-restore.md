@@ -1,9 +1,71 @@
 # 0011 — Crash-safe edit journal and session restore
 
 **Theme:** capability — the long session's other risk is losing it
-**Status:** proposal
-**Estimated effort:** 3–4 days
-**Risk:** medium (touches saving; must never make data loss *more* likely)
+**Status:** ✅ **RESOLVED** — implemented 2026-07-27
+**Risk (as shipped):** low — the save path is untouched, journals live in their
+own directory, a failed journal write is a status-line note, and removal is
+*derived* from the model rather than enumerated per save path
+
+---
+
+## Resolved
+
+Shipped as planned in shape: `Cmedit.Journal` is a pure leaf module owning the
+file format, the journal naming and the recovery decision (all unit-tested);
+every byte of IO is driver-side and modelled on the linter — a 2 s
+`JournalTick` debounce armed after any batch that moves the journal
+fingerprint, exactly the `maybeArmLint`/`LintTick` pattern §2.2 named. Startup
+GC + scan + `classifyJournal` feed a `DKRecover` dialog (Recover / Discard /
+Keep for later); recovery installs `addStagedDoc`-shaped modified documents
+with the journal's baseline mtime, so the ◆ stale machinery communicates the
+changed-on-disk case as §2.3 intended. The `journal = on|off` config key, its
+Settings row, the 0700 directory (a `setPrivateMode` added to both platform
+`Term.hs` twins) and the README/manual privacy notes all landed.
+
+Differences from the plan as written, all deliberate:
+
+- **The baseline mtime is an exact integer** (picoseconds since the epoch),
+  not §2.1's decimal: recovery's central question is `base == cur`, and a
+  lossy decimal means the clean case never fires on a sub-second filesystem.
+  Relatedly the header is one key per line (unknown-key tolerance needs it),
+  the path is show-escaped (POSIX filenames may contain newlines), and the
+  body is the buffer's lines joined with LF with *no* trailing separator, so
+  a final blank line survives the round trip. EOL/BOM/final-newline are
+  metadata, as saveFile models them.
+- **Staleness is a per-document counter (`edDocSeq`), not `edEditSeq`.** The
+  plan's `edJournalSeq` records the last *journalled* value as designed, but
+  against a per-doc counter: `edEditSeq` is global, so a keystroke in one file
+  would restale every other modified file's journal on every tick.
+- **Removal is derived, never announced.** Instead of teaching each save/close
+  path to emit a drop effect, `journalLiveKeys` answers "which documents would
+  a crash still lose" and the driver sweeps `drvJournals` (the journals this
+  session wrote or adopted) against that after every batch. Ctrl+S, Save As,
+  Save All, close, quit-with-discard, Revert, undo-back-to-clean and switching
+  `journal = off` all drop the journal without knowing journals exist, and no
+  future save path can forget to. Only the recovery dialog's answers are
+  effects (`EffDropJournals` / `EffAdoptJournals`); Keep for later emits
+  nothing — nothing outside `drvJournals` is ever deleted, which is what makes
+  "keep" mean it.
+- **"Clean exit" means a confirmed quit (`edQuit`), not every graceful
+  teardown.** The `finally` block also runs on SIGTERM/SIGHUP — and SIGHUP is
+  an SSH drop, the headline scenario this feature exists for. Those exits
+  preserve journals; only a quit flow that already confirmed discarding
+  removes them.
+- **Untitled journals are named by a stable per-document id**
+  (`edDocId`/`edNextDocId`), seeded at startup past every untitled journal
+  still on disk, so a fresh untitled buffer can never clobber one the user
+  chose to keep.
+
+Verification: `make test` **3 016 passing** (journal format round-trips, the
+table-driven recovery decision, selection/fingerprint/drop coverage, recovery
+installation); `make windows-check` clean; and a PTY integration harness
+([`bench/pty_journal.py`](../bench/pty_journal.py)) covering §4's scenarios —
+type → SIGKILL → restart → recover → byte-identical save, journal removal on
+in-session save and on clean exit (second startup shows no dialog), and Keep
+for later surviving a later clean exit.
+
+The §6 follow-on (full session restore) remains open, as a separate smaller
+plan, as proposed.
 
 ---
 

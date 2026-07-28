@@ -1105,6 +1105,7 @@ drawRtf th ed rd lo arr = do
       tabw = tabWidthOf ed
       dark = isDarkTheme (resolvedTheme ed)
       ls   = Rtf.rtfLines rd
+      sel  = Rtf.rtfSelection rd
   forM_ [0 .. loTextHeight lo - 1] $ \row -> do
     let li = rdTop rd + row
         sr = loTextTop lo + row
@@ -1116,9 +1117,14 @@ drawRtf th ed rd lo arr = do
             drawStr arr cols rows sr (loTextLeft lo) (thGutter th)
               (replicate (loTextWidth lo) '\x2500')
         | otherwise -> do
+            -- The selection highlight is the text view's own mechanism over
+            -- this view's coordinates: laid-out line and character index.
             let baseAt = rtfBaseAt th dark (rlSpans l)
+                (selRange, selEOL) = case lineSelInterval sel li (T.length (rlText l)) of
+                  Just (a, b, eol) -> (Just (a, b), eol)
+                  Nothing          -> (Nothing, False)
                 cells  = expandLineCells tabw False baseAt (thSelection th) (thWhitespace th)
-                           Nothing False [] []
+                           selRange selEOL [] []
                            (urlLinksIn 0 (T.length (rlText l)) (rlText l))
                            (rlText l)
                 -- The layout's leading pad is indent plus alignment; clip
@@ -1604,7 +1610,7 @@ drawHints th ed lo arr = do
                             then (++ [("A+R", "ReplaceAll"), ("^\x21b5", "ReplaceFile")]) else id) (edSearch ed)
          [ ("\x21b5", "Search/Open"), ("Tab", "Field"), ("\x2191\x2193", "Move")
          , ("\x2190\x2192", "Fold"), ("A+C", "Case"), ("A+W", "Word")
-         , ("A+X", "Regex"), ("A+H", "Replace"), ("Esc", "Editor") ]
+         , ("A+X", "Regex"), ("A+D", "InDocs"), ("A+H", "Replace"), ("Esc", "Editor") ]
        | edFocus ed == FExplorer =
          [ ("\x2191\x2193", "Move"), ("\x21b5", "Open"), ("Ins", "New")
          , ("F2", "Rename"), ("Del", "Delete"), (".", "Hidden")
@@ -1612,6 +1618,22 @@ drawHints th ed lo arr = do
        | isJust (edPdf ed) =
          [ ("[ ]", "Page"), ("^G", "GoToPage"), ("^F", "Find"), ("F3", "FindNext")
          , ("^C", "Copy"), ("^O", "Open"), ("^Q", "Quit"), ("F10", "Menu") ]
+       -- The container reading views are read-only, so the editing hints below
+       -- would all be lies. What they offer instead is what they can do: turn
+       -- the unit they are divided into, and show the archive underneath.
+       | isJust (edSheets ed) =
+         [ ("[ ]", "Sheet"), ("^G", "GoToSheet"), ("^C", "Copy"), ("A+T", "Archive")
+         , ("^O", "Open"), ("^W", "Close"), ("^Q", "Quit"), ("F10", "Menu") ]
+       -- The formatted view, whether it came from .rtf markup or from a
+       -- container. Both scroll and select; only the way *out* of them
+       -- differs, so only that hint does.
+       | Just rd <- edRtf ed =
+         [ ("[ ]", "Chapter") | Rtf.rtfSectionCount rd > 0 ] ++
+         [ ("^G", "GoTo") | Rtf.rtfSectionCount rd > 0 ] ++
+         [ ("\x2191\x2193", "Scroll"), ("drag", "Select"), ("^F", "Find")
+         , ("^C", "Copy")
+         , ("A+T", if Rtf.rtfDerived rd then "Archive" else "Markup")
+         , ("^O", "Open"), ("^W", "Close"), ("^Q", "Quit"), ("F10", "Menu") ]
        | otherwise = case edImage ed of
        Just _ ->
          [ ("a", "ASCII/Colour"), ("^O", "Open"), ("^W", "Close")
@@ -2197,6 +2219,7 @@ ctlStyle _ ss ctl = case ctl of
   CtlCase       -> if ssCase ss then onSty else offSty
   CtlWord       -> if ssWord ss then onSty else offSty
   CtlRegex      -> if ssRegex ss then onSty else offSty
+  CtlDocs       -> if ssDocs ss then onSty else offSty
   CtlReplToggle -> if ssShowReplace ss then onSty else offSty
   -- The Replace All button reverses to blue when it holds keyboard focus.
   CtlReplaceAll -> if S.focusedReplaceAll ss then Style BrightWhite Blue attrBold
@@ -2223,7 +2246,11 @@ drawResultRow th ss arr cols rows r left w srow selected = do
             nm   = shortName (frPath fr)
             dir  = relPathTo (ssRoot ss) (frPath fr)
             cnt  = S.fileMatchCount fr
-            cntS = show cnt ++ (if frTruncated fr then "+" else "")
+            -- A document result says so on its header row: its matches are
+            -- addressed by page/chapter/sheet rather than by line, and it
+            -- cannot be replaced in.
+            kindS = maybe "" (\k -> " " ++ S.docKindName k) (frDoc fr)
+            cntS = show cnt ++ (if frTruncated fr then "+" else "") ++ kindS
             nmSty  = if selected then selSty { styleAttr = attrBold } else Style BrightWhite Default attrBold
             dirSty = if selected then selSty else Style BrightBlack Default attrNone
             cntSty = if selected then selSty else Style BrightBlack Default attrNone
@@ -2240,8 +2267,14 @@ drawResultRow th ss arr cols rows r left w srow selected = do
     SRMatch fi mi -> case Seq.lookup fi (ssResults ss) of
       Just fr -> case drop mi (frMatches fr) of
         (m : _) -> do
-          let lnS   = show (mLine m + 1)
-              gutW  = 6
+          let -- For a document, the line number is meaningless (the view's rows
+              -- are a function of the window width), so the unit the view can
+              -- navigate to is shown in its place. Widening the gutter for a
+              -- document keeps the labels from clipping, and is consistent
+              -- within a file group because every match in one has the same
+              -- kind of label.
+              lnS  = maybe (show (mLine m + 1)) (T.unpack . snd) (mUnit m)
+              gutW = if isJust (frDoc fr) then 8 else 6
               lnCol = left + 4
               lnSty = if selected then selSty else Style BrightBlack Default attrNone
               txtCol = left + 4 + gutW
@@ -2380,6 +2413,7 @@ drawCsvTable th ed v lo arr = do
       cellS  = thText th
       cellSel = Style BrightWhite Blue attrNone     -- active cell
       cellSelExt = Style Black Cyan attrNone        -- other selected cells
+      cellFind = thFindMatch th                     -- lit while the Find dialog is open
       headRow0 = (thText th) { styleAttr = attrBold }
       sepS   = Style BrightBlack Default attrNone
   -- Column-header row (selected columns lit).
@@ -2404,7 +2438,13 @@ drawCsvTable th ed v lo arr = do
           sx = cl + gut + x - xoff
           isCursor = r == curRow && c == curCol
           editingHere = isCursor && Csv.isEditing v
+          -- Live find highlighting, on the same terms as the text view's:
+          -- every matching cell is lit while the dialog is open. It sits below
+          -- the cursor (which Find has just moved onto the first hit, and which
+          -- must stay obviously the cursor) and above the selection and the
+          -- header, since a search is the thing being looked at right now.
           st | isCursor              = cellSel
+             | liveCellMatch ed (Csv.cellAt r c v) = cellFind
              | inSelRow r && inSelCol c = cellSelExt
              | r == 0                = headRow0
              | otherwise             = cellS
@@ -2524,13 +2564,22 @@ computeCursor ed lo = case edFocus ed of
   -- through to the text path would blink a cursor over the picture at the
   -- stale buffer's position, so hide it.
   FEdit | isJust (edImage ed) -> Nothing
-  -- Likewise the formatted RTF view: it is a projection of the buffer, with
-  -- no position of its own for a cursor to mean. Falling through would park a
-  -- blinking cursor wherever the buffer cursor happens to sit, which is a
-  -- point in the *markup* and so lands somewhere arbitrary on screen. (If the
-  -- view ever grows a text selection to copy from, that selection — not the
-  -- buffer's cursor — is what would want showing here.)
-  FEdit | isJust (edRtf ed) -> Nothing
+  -- The formatted view is a projection of the buffer (or of a container's
+  -- XML), with no position of its own for the *buffer's* cursor to mean:
+  -- falling through would park a blinking cursor wherever that cursor happens
+  -- to sit, which is a point in the markup and so lands somewhere arbitrary on
+  -- screen. What it does have is its own selection, and while one is being
+  -- made its caret is the one thing on screen worth pointing at — exactly the
+  -- PDF view's rule below, and for the same reason.
+  FEdit | Just rd <- edRtf ed ->
+    case rdAnchor rd of
+      Nothing -> Nothing
+      Just _ ->
+        let Pos l _ = rdCaret rd
+            sr = loTextTop lo + (l - rdTop rd)
+            sc = loTextLeft lo + Rtf.rtfCellOfPos (tabWidthOf ed) (rdCaret rd) rd
+        in if sr >= loTextTop lo && sr < loTextTop lo + loTextHeight lo && sc < loCols lo
+             then Just (sr, sc) else Nothing
   -- The PDF view has no buffer for a cursor to sit in — but it does have a
   -- selection, and while one is being made the caret is the one thing on
   -- screen worth pointing at. With no selection it goes back to having no

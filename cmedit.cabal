@@ -46,6 +46,7 @@ library
                       Cmedit.Input
                       Cmedit.Clipboard
                       Cmedit.TextBuffer
+                      Cmedit.Journal
                       Cmedit.EditorState
                       Cmedit.EditorEdit
                       Cmedit.EditorDoc
@@ -55,15 +56,26 @@ library
                       Cmedit.Dialog
                       Cmedit.Browser
                       Cmedit.Search
+                      Cmedit.DocText
                       Cmedit.Definition
                       Cmedit.QuickOpen
                       Cmedit.Regex
                       Cmedit.Syntax
                       Cmedit.Csv
+                      Cmedit.History
+                      Cmedit.Lint
                       Cmedit.Inflate
                       Cmedit.Image
+                      Cmedit.Pager
                       Cmedit.Pdf
+                      Cmedit.Rtf
                       Cmedit.Zip
+                      Cmedit.Xml
+                      Cmedit.Docx
+                      Cmedit.Xlsx
+                      Cmedit.Formula
+                      Cmedit.Epub
+                      Cmedit.Odf
                       Cmedit.Render
                       Cmedit.App
                       Cmedit.Help

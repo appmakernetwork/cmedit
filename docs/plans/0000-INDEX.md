@@ -13,12 +13,13 @@ for how to build it, which mode produced which number, and the two
 laziness traps that make naive measurements of this codebase wrong in
 *both* directions).
 
-## Status — 17 of 20 closed (v0.4.1)
+## Status — 18 of 20 closed
 
 **Every confirmed defect is fixed**, every non-capability plan is closed —
-either implemented, or closed on a measurement showing it was unnecessary — and
-the huge-file paged view (`0012`) has landed. Two capability plans remain, plus
-one partially-landed renderer plan.
+either implemented, or closed on a measurement showing it was unnecessary —
+and the huge-file paged view (`0012`) and the crash-safe journal (`0011`) have
+landed. One capability plan remains (`0015`), plus one partially-landed
+renderer plan (`0003`).
 
 | | Before | After |
 |---|---|---|
@@ -29,7 +30,7 @@ one partially-landed renderer plan.
 | Heap held by copying one line out of a 49 MB file | 49 MB | **~0** |
 | Saving a 49 MB file | 117 ms, 440 MB allocated | **35 ms, 67 MB** |
 | One keystroke in a 300 001-row CSV cell | 7.4 ms, 22 MB | **~0** |
-| Opening that CSV | 4 340 ms, 8.8 GB allocated | **1 077 ms, 3.9 GB** |
+| Opening that CSV | 4 340 ms, 8.8 GB allocated | **794 ms, 852 MB** (`0016` then `0026`) |
 | A 4 MiB paste | 592 ms, 1 142 MB | **8 ms, 22 MB** |
 | `scaleRGBA` per image placement | 66 ms, 63 MB | **17 ms, 21 MB** |
 | Concurrent linter processes while typing | 5 | **1** |
@@ -135,7 +136,7 @@ recording what shipped and the before/after measurement.
 | [0008](completed/0008-csv-table-stability-at-scale.md) | CSV table memory and cost at spreadsheet scale | memory | ✅ **CLOSED** — retention fixed via `0001`; rest measured unnecessary | — |
 | [0009](completed/0009-undo-as-edit-log.md) | Undo as an edit log instead of snapshots | memory (design change) | ⛔ **CLOSED** — its own gate not met (undo memory is flat) | — |
 | [0010](completed/0010-background-work-supervision.md) | Supervising background threads and cancellation | resource stability | ✅ **DONE** (load-outcome gen → noted) | — |
-| [0011](incomplete/0011-crash-safe-journal-and-session-restore.md) | Crash-safe edit journal and session restore | capability | 3–4 days | medium |
+| [0011](completed/0011-crash-safe-journal-and-session-restore.md) | Crash-safe edit journal and session restore | capability | ✅ **DONE** (session restore was deferred to `0025`, now also done) | — |
 | [0012](completed/0012-huge-file-read-only-paging.md) | Huge files: paged read-only view | capability | ✅ **DONE** (in-file search deferred) | — |
 | [0013](completed/0013-streaming-save-and-lower-copy-load.md) | Streaming save; lower-copy load | memory spike | ✅ **DONE** (per-line decode → `0005`) | — |
 | [0014](completed/0014-text-slice-pinning.md) | Text slice pinning at escape boundaries | memory leak | ✅ **DONE** (§4.1; compaction deferred to `0005`) | — |
@@ -145,6 +146,43 @@ recording what shipped and the before/after measurement.
 | [0018](completed/0018-image-pipeline-cost.md) | Image decode off the main thread; list-free scaler | UI stall | ✅ **DONE** (decoders left, §2.4) | — |
 | [0019](completed/0019-case-insensitive-search-throughput.md) | Case-insensitive search: stop lowercasing every line | throughput | ⛔ **CLOSED** — both fixes measured worse; tests + notes kept | — |
 | [0020](completed/0020-performance-invariants-in-the-docs.md) | Codify the performance invariants in the docs | recurrence prevention | ✅ **DONE** (+ `make lint-invariants`) | — |
+
+## Capability proposals added 2026-07-26
+
+Four feature plans, written after the 0.5.x view-mode work (RTF, PDF, ZIP)
+proved out the derived-read-only-view pattern. They are separate from the
+performance effort above (the "17 of 20" tally does not count them). The
+first pair cashes in machinery that already exists; the second pair exploits
+the pure-core architecture directly.
+
+| # | Title | Theme | Effort | Notes |
+|---|---|---|---|---|
+| [0021](completed/0021-office-and-ebook-reading-views.md) | Office and e-book reading views (`.xlsx`, `.docx`, `.epub`) | capability | ✅ **DONE** | Shipped with all three views; the shared XML parser and ZIP member extraction are now available to `0022` |
+| [0022](incomplete/0022-sqlite-database-browser.md) | SQLite database browser | capability | 4–6 days | Read-only, size-independent (pager-style windowing over b-trees); shares `0021`'s read-only grid |
+| [0023](incomplete/0023-macro-recording-and-repeat.md) | Macro recording, playback, repeat-last-edit | capability | 2–3 days (+1) | Near-free because `Key` is pure data and `update` is deterministic; warm-up for `0024` |
+| [0024](incomplete/0024-input-journal-and-deterministic-replay.md) | Input-stream journal and deterministic replay | capability + testing | 4–6 days | Bug repro, replay testing, behavioural diffing. Complements `0011` (now shipped — see its §2); build after `0023` |
+| [0025](completed/0025-session-restore.md) | Full session restore (`--restore`, `restore-session`) | capability | ✅ **DONE** | `0011` §6 cashed in: a `session` file of folder + open paths + cursors, restored *before* journal recovery so crash content lands in the restored documents |
+
+`0025` joined this table later: it is not one of the four, but `0011` §6's
+follow-on, kept here so the capability work reads in one place.
+
+## Performance follow-ups added 2026-07-27
+
+Two optimisation plans written and shipped after `0011`/`0025` landed, in the
+measure-first discipline of the original set:
+
+| # | Title | Theme | Effort | Notes |
+|---|---|---|---|---|
+| [0026](completed/0026-csv-parse-allocation.md) | CSV open: parse off the buffer lines, strict width scan | allocation + latency | ✅ **DONE** | 32 MB CSV open: 1 090 ms / 3.7 GB alloc → **794 ms / 852 MB** (unquoted fast path 684 ms / 425 MB, RSS 587 → 240 MB). Also *found* the modified-table `isModified` cost (2.3 ms/keystroke) — recorded in its §, needs its own plan |
+| [0027](completed/0027-adaptive-journal-write-behind.md) | Adaptive journal write-behind, off-thread writes | resource stability + latency | ✅ **DONE** | Steady-state journal traffic for a 40 MB buffer 10 → **2 MB/s** (rate floor, not a longer debounce — a debounce resets per keystroke and would journal *nothing*); write off the loop thread, worst keystroke 96 → 32 ms |
+| [0028](completed/0028-csv-modified-flag-cost.md) | CSV modified flag in O(1) (`csvDirty`, the `csvWidths` discipline) | latency + allocation | ✅ **DONE** | `isModified` on a modified 223k-row table: 2.5 ms + 14 MB *per keystroke* → **0/0** (the unmodified case was never free either — 0016's 0.04 ms was a floated-out probe). Adversarial review confirmed the invariants and fixed two latent recovered/staged-CSV baselines that let one Ctrl+Z sweep the only journal copy. Found along the way: ~390 ms/keystroke at the *last row* of a huge CSV, driver-side — became `0029` |
+| [0029](completed/0029-csv-last-row-keystroke-cost.md) | CSV last-row keystroke cost (session shape forced the cursor) | latency | ✅ **DONE** | The 390 ms was `sessionShape` (0025) forcing a strict cursor field it then discarded, which for a table is `cellTextPos` re-serialising every row above the cursor. Shape no longer asks documents for cursors (pinned with an error-bomb grid) + a sparse newline-count cache in the `csvWidths` discipline: last-row keystroke **386 → 1.7 ms**, position-independent. Costs recorded: table open +30 %, undo pair +9 %. Adversarially reviewed clean (~24 000 independent assertions). Found along the way, still open: Ctrl+G is dead in the CSV *table* view while its menu entry advertises it |
+
+Suggested order within the set: `0023` → `0021` (DOCX stage first) → `0022`
+→ `0024` after `0011`. `0021`/`0022` share the read-only grid mechanism —
+`0021` landed first and built it (`Csv.mkCsvGrid` plus the `edSheets`
+read-only wall), along with `Cmedit.Xml` and `Cmedit.Zip`'s member
+extraction, so `0022` starts from those.
 
 ## Checked and found healthy (do not "fix" these)
 

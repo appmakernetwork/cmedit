@@ -51,6 +51,7 @@ import Cmedit.History (pushHist)
 import Cmedit.Pager (PagerDoc(..))
 import qualified Cmedit.Pager as Pg
 import qualified Cmedit.Rtf as Rtf
+import qualified Cmedit.Xlsx as Xlsx
 import qualified Cmedit.Pdf as Pdf
 import Cmedit.EditorState
 
@@ -256,7 +257,7 @@ undo ed = case Seq.viewl (edUndo ed) of
       , edLastEdit = EKNone
       , edModified = metaModified ed || bufModified ed (usBuffer u)
       , edStatus = ""
-      , edEditSeq = edEditSeq ed + 1
+      , edEditSeq = edEditSeq ed + 1, edDocSeq = edDocSeq ed + 1
       }
 
 redo :: Editor -> Editor
@@ -272,7 +273,7 @@ redo ed = case Seq.viewl (edRedo ed) of
       , edLastEdit = EKNone
       , edModified = metaModified ed || bufModified ed (usBuffer u)
       , edStatus = ""
-      , edEditSeq = edEditSeq ed + 1
+      , edEditSeq = edEditSeq ed + 1, edDocSeq = edDocSeq ed + 1
       }
 
 ------------------------------------------------------------------------------
@@ -293,10 +294,16 @@ removeSelection ed = case getSelection ed of
 metaModified :: Editor -> Bool
 metaModified ed = edLineEnding ed /= edSavedEol ed || edEncoding ed /= edSavedEnc ed
 
+-- Two counters, deliberately: 'edEditSeq' is global (it fingerprints "some
+-- buffer changed" for the lint debounce), while 'edDocSeq' belongs to the
+-- active document alone and is what the crash-recovery journal compares
+-- against. A global counter cannot answer "is *this* document's journal
+-- stale?" — typing in one file would advance it for every other open file and
+-- rewrite all of their journals.
 afterEdit :: Editor -> Editor
 afterEdit ed =
   ensureVisible ed { edModified = metaModified ed || bufModified ed (edBuffer ed), edStatus = ""
-                   , edEditSeq = edEditSeq ed + 1 }
+                   , edEditSeq = edEditSeq ed + 1, edDocSeq = edDocSeq ed + 1 }
 
 typeChar :: Char -> Editor -> Editor
 typeChar ch ed0
@@ -420,6 +427,15 @@ copy ed | Just pd <- edPdf ed =
     Just _  ->
       let txt = detach (Pdf.pdfSelText pd)
       in (ed { edClipboard = txt, edStatus = "Copied" }, [EffCopy txt])
+-- The formatted view has the same selection over the same kind of laid-out
+-- text, and copying out of it is the same thing: what is on screen, detached,
+-- since the slice would otherwise pin the whole laid-out document.
+copy ed | Just rd <- edRtf ed =
+  case Rtf.rtfSelection rd of
+    Nothing -> (ed { edStatus = "Nothing selected \x2014 drag over the text to select it" }, [])
+    Just _  ->
+      let txt = detach (Rtf.rtfSelText rd)
+      in (ed { edClipboard = txt, edStatus = "Copied" }, [EffCopy txt])
 copy ed = case getSelection ed of
   Just (a, b) ->
     let txt = detach (textInRange a b (edBuffer ed))
@@ -451,6 +467,7 @@ cut ed0
 
 selectAll :: Editor -> Editor
 selectAll ed | Just pd <- edPdf ed = ed { edPdf = Just (Pdf.pdfSelectAll pd) }
+selectAll ed | Just rd <- edRtf ed = ed { edRtf = Just (Rtf.rtfSelectAll rd) }
 selectAll ed =
   ensureVisible ed { edSelAnchor = Just origin
                    , edCursor = endPos (edBuffer ed)
@@ -608,6 +625,12 @@ settingsSpec =
   , ( Nothing, "Freeze CSV header", offOn
     , boolIx cfgFreezeHeader
     , "Keep a table's first row pinned while scrolling." )
+  , ( Nothing, "Crash-recovery journal", offOn
+    , boolIx cfgJournal
+    , "Journal unsaved changes to ~/.cache/cmedit; off when editing secrets." )
+  , ( Nothing, "Restore session on start", offOn
+    , boolIx cfgRestoreSession
+    , "Reopen the last session's files and folder when started with no arguments." )
   -- Linting rows (row 'nEditingSettings' onward). The master switch first, then
   -- one row per 'linters' entry in table order. Per-linter hints and the
   -- availability notes are filled in by 'mkSettings' from 'edLintAvail'.
@@ -669,7 +692,10 @@ statusRightInfo ed = flatten segs
       -- not apply. The line ending still does: the buffer underneath is a
       -- real text file that Save writes.
       Nothing -> case edRtf ed of
-        Just rd -> [ plain (Rtf.rtfStatus rd), zone SZLineEnding eol, plain " " ]
+        -- A container-derived formatted view (DOCX, EPUB) has no buffer, so
+        -- there is no line ending to show or click either.
+        Just rd | Rtf.rtfDerived rd -> [ zone SZGoTo (Rtf.rtfStatus rd) ]
+                | otherwise -> [ plain (Rtf.rtfStatus rd), zone SZLineEnding eol, plain " " ]
         Nothing -> segsDoc
     segsDoc = case edImage ed of
       Just idoc ->
@@ -689,9 +715,14 @@ statusRightInfo ed = flatten segs
                           then cellRef ++ "  " ++ show (r1 - r0 + 1)
                                  ++ "\xd7" ++ show (c1 - c0 + 1) ++ " sel"
                           else cellRef
-          in [ plain (selRef ++ "   " ++ show (Csv.nRows v) ++ " rows x "
-                      ++ show (Csv.nCols v) ++ " cols   TABLE  ")
-             , zone SZLineEnding eol, plain " " ]
+              dims = show (Csv.nRows v) ++ " rows x " ++ show (Csv.nCols v) ++ " cols"
+          -- A workbook says which sheet instead of which line ending: there
+          -- is no text file underneath one, and the sheet is what moves.
+          in case edSheets ed of
+               Just wb -> [ plain (selRef ++ "   " ++ dims ++ "   ")
+                          , zone SZGoTo (Xlsx.wbStatus wb) ]
+               Nothing -> [ plain (selRef ++ "   " ++ dims ++ "   TABLE  ")
+                          , zone SZLineEnding eol, plain " " ]
         Nothing ->
           -- A diagnostics count zone (errors/warnings), shown only when the
           -- active document has any, prefixed with the tool(s) that produced
@@ -742,7 +773,16 @@ statusClick col ed =
        _                  -> noEff ed
 
 openGoTo :: Editor -> Editor
-openGoTo ed = openDialog (if isJust (edPdf ed) then mkGoToPage else mkGoToLine) ed
+openGoTo ed = openDialog dlg ed
+  where
+    -- Whatever unit the active view is actually divided into. A laid-out row
+    -- number would mean nothing in any of these, which is the point of asking
+    -- for something else instead ('Cmedit.EditorDoc.gotoLine' reads it).
+    dlg | isJust (edPdf ed)                = mkGoToPage
+        | isJust (edSheets ed)             = mkGoToUnit "Sheet"
+        | Just rd <- edRtf ed
+        , Rtf.rtfSectionCount rd > 0       = mkGoToUnit "Chapter"
+        | otherwise                        = mkGoToLine
 
 -- | Jump to the next diagnostic after the cursor in (line, col) order, wrapping
 -- to the first; a no-op with a "No problems" note when there are none. The

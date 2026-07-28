@@ -92,7 +92,11 @@ escape sequences and the POSIX `termios` API.
   quotes and dashes decode properly, and font tables, style sheets, embedded
   pictures and every other `{\*\...}` destination are skipped rather than shown.
   **Alt+T** toggles to the raw markup, which edits and saves like any other text
-  file (with the control words syntax-highlighted). The formatted view is
+  file (with the control words syntax-highlighted). You can **select text with
+  the mouse** (double-click for a word, triple for a line, Shift+click to
+  extend, or Shift+arrows) and **Ctrl+C** copies it, so quoting a paragraph out
+  of a document you are reading is one gesture; **Ctrl+A** takes the whole
+  thing and **Esc** clears. The formatted view is
   read-only by design: it is a projection of the buffer and is never written
   back, so the parts of a document it does not model cannot be lost on save.
 - **PDF reading view**: opening a `.pdf` (detected by magic bytes, so the
@@ -136,7 +140,7 @@ escape sequences and the POSIX `termios` API.
   arithmetic decoder, loop filter and all — and Netpbm) is written from first
   principles using only GHC boot libraries.
 - **Archive listings**: opening a `.zip` — or anything built on it, a `.jar`,
-  `.whl`, `.docx`, `.epub`, `.apk` (detected by magic bytes, not by name) —
+  `.whl`, `.apk` (detected by magic bytes, not by name) —
   shows its contents as a read-only file tree with sizes, compression savings
   and timestamps, instead of refusing it as binary. Only the archive's table of
   contents is read, never its members, so this costs two short reads however
@@ -144,6 +148,49 @@ escape sequences and the POSIX `termios` API.
   the part that is encrypted, and members that are get flagged. The listing is
   an ordinary read-only buffer, so Find, word wrap, Go To Line and copying all
   work on it as usual; the archive itself can never be written to.
+- **Office and e-book reading views**: a `.docx`, `.xlsx`, `.odt`, `.ods` or
+  `.epub` is a ZIP full of XML, so instead of stopping at the listing cmedit
+  reads it.
+  A **Word document** shows as a document — headings, bold/italic/underline,
+  colour, alignment, indents, bullets and tables on tab stops, reflowed to your
+  window. A **workbook** opens in the spreadsheet grid, with `[` / `]` turning
+  the sheets and **Ctrl+G** jumping to one by number; gaps in a sheet are real
+  and are shown, shared strings and inline strings are resolved, and formulas
+  show the value Excel last calculated. Where a workbook was written by a
+  *library* rather than by Excel — `openpyxl`, `xlsxwriter`, `pandas.to_excel`
+  — there is no cached value to show, and those cells used to come up blank;
+  cmedit now **evaluates the formula itself**: around fifty functions (`SUM`,
+  `AVERAGE`, `IF`, `COUNT`/`COUNTIF`, `MIN`/`MAX`, `ROUND`, `SUMIF`,
+  `VLOOKUP`, the text and maths families), the full operator set, ranges
+  including whole columns, cross-sheet references and chains of formulas. A
+  value the file already gives is **never** recomputed, so nothing cmedit works
+  out can contradict the program that wrote the file; a formula it cannot parse
+  or has no function for is left blank and counted, and the status bar reports
+  both totals. Number formats are still not applied, so a date reads as its
+  stored serial number, and the status bar says so. **OpenDocument** files —
+  `.odt` and `.ods`, what LibreOffice writes — go through the same two views,
+  with one difference in their favour: an `.ods` stores each cell's *displayed*
+  text as well as its value, so dates and currencies read as
+  `15/01/2024` and `$1,234.50` rather than as the numbers underneath them.
+  (`.odp` and `.odg` are positioned shapes rather than documents, and fall back
+  to the listing.) **Ctrl+Shift+S** exports
+  the sheet you are looking at as a CSV file (and, in the document views, the
+  document as plain text) — an export, not a Save As: it writes a copy and
+  leaves the workbook itself open and untouched. An **e-book** shows its chapters in
+  reading order, with `[` / `]` turning chapters and **Ctrl+G** going to one by
+  number; the container, package document and spine are followed properly, so
+  the chapters are the ones the book actually orders. The document views
+  **select and copy** exactly as the RTF and PDF ones do — drag, double-click a
+  word, triple-click a line, Shift+arrows, Ctrl+A, then Ctrl+C — and a
+  workbook copies a rectangular block of cells the way a CSV file does.
+  Everything the readers do
+  not model is skipped rather than mis-rendered, all three are **read-only**
+  (there is no serialiser back to any of these formats, and could not be), and
+  **Alt+T** shows the archive listing underneath — with Alt+T again coming back.
+  Any failure at any stage falls back to that listing with a note saying why, so
+  a damaged file still opens. Only the members a format needs are ever
+  decompressed, so a 1 GB `.docx` full of photographs costs the members its
+  text lives in and no more.
 - **Six themes plus auto**: `theme = light-terminal` in the config (or
   View ▸ Theme to pick one live, with preview) swaps the syntax palette for one readable on
   light terminal backgrounds; dark-terminal and light-terminal keep your
@@ -181,6 +228,21 @@ escape sequences and the POSIX `termios` API.
   files
   — it prunes `.git`/`node_modules`/build dirs, skips binaries and huge files,
   and can be superseded instantly by the next search.
+- **Search inside documents (Alt+D)**: the same panel can look inside **PDFs,
+  Word and OpenDocument files, workbooks and e-books**, decoding each one
+  through the very reader that would display it — so anything found is
+  something you can then go and look at. Off by default, because decoding one
+  document costs roughly what grepping a hundred source files costs (measured:
+  0.22 s → 1.1 s once forty PDFs join a source tree).
+  Hits are addressed by something intrinsic to the document rather than by a
+  line number — these views reflow to your window, so a stored row would point
+  somewhere else in a wider one: a PDF says `p.7`, an e-book `ch.3`, a Word or
+  OpenDocument file a paragraph, a workbook the cell (`B4`). Enter opens the
+  document at that unit and highlights the term there. A workbook is searched
+  cell by cell, so a phrase spanning two columns is deliberately not a match.
+  **Replace never touches a document**: none of these formats can be written
+  back, so they are excluded from every replace path and the panel reports how
+  many it left alone rather than skipping them silently.
 - **Line operations**: duplicate the current line or selected lines (Ctrl+D,
   or Shift+Alt+↑/↓ to copy up/down), move them up/down with Alt+↑/↓ (held moves
   undo as one step), delete the line (Ctrl+Shift+K), and join lines (Alt+J,
@@ -221,11 +283,32 @@ escape sequences and the POSIX `termios` API.
   save, and both keep the file marked modified until then). The **status bar
   is clickable** too: `Ln, Col` opens Go to Line, `INS/OVR` toggles overwrite,
   and the `UTF-8`/`LF` cells switch encoding/line endings directly.
+- **Crash recovery**: unsaved changes are journalled every couple of seconds to
+  `~/.cache/cmedit/journal` (a directory created mode `0700`; a very large file
+  a little less often, and always on a background thread), so an SSH drop, a
+  closed terminal or an OOM kill does not take the last hour with it. The next
+  time cmedit starts it lists what it found and offers to **Recover**,
+  **Discard** or **Keep for later**; recovered files come back as unsaved
+  buffers, so nothing is written over your file until you save it. A journal is
+  deleted as soon as its document is saved or closed, and on a clean exit. The
+  journal holds file *content* in your cache directory — if you edit secrets,
+  put `journal = off` in the config (or turn the row off in File ▸ Settings) and
+  none is ever written.
+- **Session restore**: `cmedit --restore` reopens the files you had open last
+  time — in the same order, with the same cursor positions, the same workspace
+  folder and the same file in front. Put `restore-session = true` in the config
+  (or turn on "Restore session on start" in File ▸ Settings) to have a bare
+  `cmedit` do it; naming files on the command line still just opens those, and
+  files named alongside `--restore` open on top of the restored session. The
+  list lives in `~/.config/cmedit/session` and holds paths and cursors only,
+  never file content. Files that have since been deleted are skipped with a note
+  ("Restored 4 of 5 files"), and it composes with crash recovery: restore runs
+  first, so unsaved changes from a crash come back *in* the restored files.
 - **Undo / redo** with sensible coalescing of typing runs.
 - **A settings page and config file**: File ▸ Settings (`Ctrl+,`) lists every
   option — tab width, indent style, auto-indent, theme, word wrap, line
-  numbers, whitespace markers, the save-time cleanups and the CSV header
-  freeze — as arrow-key value pickers grouped by topic, with a one-line hint
+  numbers, whitespace markers, the save-time cleanups, the CSV header
+  freeze, the crash-recovery journal and session restore — as arrow-key value pickers grouped by topic, with a one-line hint
   for the highlighted row. Changes apply **live** behind the dialog; Save
   writes them back to `~/.config/cmedit/config` surgically (your comments and
   unknown lines survive), and Cancel/Esc reverts everything. The same file can
@@ -328,6 +411,7 @@ cmedit [OPTIONS] [FILE|DIR...]
       --line-numbers / --no-line-numbers   (default: hidden)
       --no-auto-indent
       --readonly
+      --restore           Reopen last session's files, folder and cursors.
 ```
 
 Run `cmedit --help` for the full key map and the list of config-file keys
@@ -352,18 +436,46 @@ Run `cmedit --help` for the full key map and the list of config-file keys
 | Select all | Ctrl+A |
 | Find / Find next / prev / Replace | Ctrl+F / F3 / Shift+F3 / Ctrl+R |
 | Find in Files / Replace in Files | F4 / F6 |
+| Search inside documents (in the search panel) | Alt+D |
 | Search toggles (in the panel) | Alt+C case, Alt+W word, Alt+X regex, Alt+R replace-all |
-| Go to line (page, in the PDF view) / Go to bracket | Ctrl+G / Ctrl+] |
+| Go to line (page in a PDF, chapter in an e-book, sheet in a workbook) / Go to bracket | Ctrl+G / Ctrl+] |
 | Go back / forward (history) | Alt+← / Alt+→ |
 | Switch open files | Alt+. / Alt+, , Alt+1…9, or the Window menu (Alt+W) |
 | Word wrap / Line numbers | Alt+Z / Alt+L |
-| Table view (CSV) / formatted view (RTF) | Alt+T |
-| Previous / next page (PDF view) | `[` / `]` |
-| Select / copy in the PDF view | drag, double/triple-click, Shift+arrows / Ctrl+C |
+| Table view (CSV) / formatted view (RTF) / archive contents (DOCX, XLSX, EPUB) | Alt+T |
+| Previous / next page (PDF), chapter (EPUB), sheet (XLSX) | `[` / `]` |
+| Select / copy in a reading view (PDF, RTF, DOCX, EPUB) | drag, double/triple-click, Shift+arrows / Ctrl+C |
+| Export a sheet as CSV / a reading view as text | Ctrl+Shift+S |
 | Sort CSV column (table view) | Alt+S |
+| Find in the table view (searches cells, moves the cell cursor) | Ctrl+F / F3 / Shift+F3 |
 | Menu | F10, or Alt+letter, or click |
 | Move by word / to document ends | Ctrl+Left/Right / Ctrl+Home/End |
 | Extend selection | hold Shift with any movement key |
+
+## Converting from the command line
+
+Every reading view turns an awkward format into text a terminal can show, so
+the same work makes cmedit a converter — and a converter is what you want when
+the terminal is not there:
+
+```sh
+cmedit report.docx > report.txt      # .pdf .odt .epub .rtf too
+cmedit book.xlsx   > book.csv        # .ods too; --sheet N picks another sheet
+cmedit paper.pdf | grep -i abstract
+```
+
+No flag is needed: the editor draws on stdout, so a redirected stdout cannot
+mean "open the editor" and can only mean "give me the text". The converted
+content goes to **stdout** and one line describing it to **stderr** — which is
+the only arrangement that survives a redirect:
+
+```
+report.docx: DOCX, 96 paragraphs → 8032 characters
+book.xlsx: workbook, sheet 1 “Sales” → 42 rows, 5 columns as CSV  (of 3; --sheet N for the others)
+```
+
+`--convert` forces it when stdout *is* a terminal. An image (no text) or a file
+too large to load (already plain text) says so and exits non-zero.
 
 ## Architecture
 
@@ -396,6 +508,7 @@ logic unit-testable without a terminal.
 | `Cmedit.Menu` / `Cmedit.Dialog` | Menu and dialog data + pure helpers |
 | `Cmedit.Browser` | Lazy file-tree model for the Open dialog |
 | `Cmedit.Search` | Workspace find/replace model: matching, globs, result tree |
+| `Cmedit.DocText` | Reading-view documents flattened to searchable text, each line addressed by page/chapter/paragraph/cell |
 | `Cmedit.Definition` | Go-to-definition: per-language definition shapes + picker dialog model |
 | `Cmedit.QuickOpen` | Ctrl+P go-to-file picker: fuzzy matcher + ranked-list model |
 | `Cmedit.Regex` | From-scratch linear-time regex engine — Thompson NFA / Pike VM (for regex search) |
@@ -406,7 +519,13 @@ logic unit-testable without a terminal.
 | `Cmedit.Pdf` | From-scratch PDF reader: object scan, filters, content-stream interpreter, fonts, and page→document reconstruction |
 | `Cmedit.Pager` | Read-only paged view of files too large to load: sparse line index + windowed reads |
 | `Cmedit.Rtf` | RTF parser + document layout for the read-only formatted view of `.rtf` files |
-| `Cmedit.Zip` | ZIP central-directory reader + the file-tree listing shown for an archive |
+| `Cmedit.Zip` | ZIP central-directory reader, single-member extraction, and the file-tree listing shown for an archive |
+| `Cmedit.Xml` | Small non-validating XML pull parser (entities, CDATA, local-name matching), shared by the three container readers |
+| `Cmedit.Docx` | `word/document.xml` → the formatted view's paragraph model |
+| `Cmedit.Xlsx` | Workbook, worksheets and shared strings → the read-only spreadsheet grid |
+| `Cmedit.Formula` | Spreadsheet formula parser and evaluator, for the cells a workbook left uncalculated |
+| `Cmedit.Epub` | Container/package/spine plumbing + a minimal XHTML → paragraph mapper |
+| `Cmedit.Odf` | OpenDocument `.odt`/`.ods`: the automatic-style table, then the same two targets |
 | `Cmedit.About` | The About box's animated wordmark (pure frame→cells generation) |
 | `Cmedit.Render` | Model → cell grid, and the diff to escape codes |
 | `Cmedit.App` | IO driver: setup/teardown, reader thread, event loop |

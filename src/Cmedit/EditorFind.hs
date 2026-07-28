@@ -41,6 +41,8 @@ import qualified Cmedit.Regex as Rx
 import Cmedit.Csv (CsvView(..))
 import Cmedit.Pdf (PdfDoc(..))
 import qualified Cmedit.Pdf as Pdf
+import Cmedit.Rtf (RtfDoc(..))
+import qualified Cmedit.Rtf as Rtf
 import qualified Cmedit.Csv as Csv
 import Cmedit.About (aboutCanvasH, aboutCanvasMinW, aboutTotalFrames)
 import Cmedit.Clipboard (CopyOutcome(..))
@@ -230,13 +232,30 @@ matchCountCap = 1000
 liveCountMaxChars :: Int
 liveCountMaxChars = 4 * 1024 * 1024
 
+-- | The same bound for a grid, whose cost is its /cell/ count rather than its
+-- character count: the live count is a full scan whenever the matches are
+-- sparse, and it runs on every keystroke in the dialog.
+--
+-- Measured on the real binary through a PTY: a 100 000-cell sheet cost up to
+-- 58 ms per keystroke in the Find dialog, which is visible lag while typing; a
+-- 20 000-cell one is around 12 ms, or one frame's worth. Past the bound the
+-- count is simply not shown — exactly what a >4 MB text file does — and Find
+-- itself is unaffected, because /finding/ stops at the first match.
+liveCountMaxCells :: Int
+liveCountMaxCells = 20000
+
 -- | While the Find/Replace dialog is open with a single-line term: that term
 -- and its options, live from the dialog field (so the highlight follows as you
--- type). Multi-line terms and the CSV table view opt out.
+-- type).
+--
+-- Multi-line terms opt out: the highlight is a per-line span list, and a term
+-- that spans lines has no single line to belong to. The table view used to opt
+-- out too, back when the only consumer was 'liveMatchSpans' and a grid had
+-- nothing to do with character ranges; it now has 'liveCellMatch', which
+-- highlights whole cells.
 liveFindTerm :: Editor -> Maybe (Text, Bool, Bool)
 liveFindTerm ed = case edDialog ed of
   Just d | dlgKind d `elem` [DKFind, DKReplace]
-         , isNothing (edCsv ed)
          , let t = fieldValue 0 d
          , not (T.null t), not (hasNewline t)
          -> Just (t, optionValue 0 d, dlgKind d == DKFind && optionValue 1 d)
@@ -248,6 +267,18 @@ liveMatchSpans :: Editor -> Text -> [(Int, Int)]
 liveMatchSpans ed line = case liveFindTerm ed of
   Nothing -> []
   Just (t, cs, ww) -> [ (i, i + T.length t) | i <- matchIndicesNO cs ww t line ]
+
+-- | Does this cell match the term in the open Find\/Replace dialog?
+--
+-- The table view's answer to 'liveMatchSpans', and coarser on purpose: a grid
+-- highlights whole /cells/ rather than character ranges, because a cell is
+-- what Find Next steps to and what the cursor lands on. Called per visible
+-- cell per frame, which is cheap — only the cells on screen are drawn — so
+-- there is nothing to cache and nothing to invalidate.
+liveCellMatch :: Editor -> Text -> Bool
+liveCellMatch ed cell = case liveFindTerm ed of
+  Nothing          -> False
+  Just (t, cs, ww) -> not (null (matchIndices cs ww t cell))
 
 -- Match count over the whole buffer, stopping as soon as the cap is passed.
 countMatchesCapped :: Int -> Bool -> Bool -> Text -> Buffer -> Int
@@ -268,13 +299,28 @@ refreshFindCount ed = case edDialog ed of
 
 findCountMsg :: Editor -> Dialog -> Text
 findCountMsg ed d
+  | Just rd <- edRtf ed =
+      let ms = rtfAllMatches cs ww t rd
+      in if T.null t || hasNewline t then ""
+         else if null ms then "No matches"
+         else if length ms > matchCountCap then T.pack (show matchCountCap ++ "+ matches")
+         else T.pack (show (length ms) ++ " match" ++ (if length ms == 1 then "" else "es"))
   | Just pd <- edPdf ed =
       let ms = pdfAllMatches cs ww t pd
       in if T.null t || hasNewline t then ""
          else if null ms then "No matches"
          else if length ms > matchCountCap then T.pack (show matchCountCap ++ "+ matches")
          else T.pack (show (length ms) ++ " match" ++ (if length ms == 1 then "" else "es"))
-  | isJust (edCsv ed) || T.null t || hasNewline t = ""
+  -- A grid counts matching *cells*, not occurrences, because a cell is the
+  -- unit Find Next steps through — saying "5 matches" and then stopping four
+  -- times would be a different number from the one on screen.
+  | Just v <- edCsv ed =
+      if T.null t || Csv.nRows v * Csv.nCols v > liveCountMaxCells then ""
+      else let n' = length (take (matchCountCap + 1) (csvMatchingCells cs ww t v))
+           in if n' == 0 then "No matches"
+              else if n' > matchCountCap then T.pack (show matchCountCap ++ "+ cells")
+              else T.pack (show n' ++ " matching cell" ++ (if n' == 1 then "" else "s"))
+  | T.null t || hasNewline t = ""
   | bufChars (edBuffer ed) > liveCountMaxChars = ""
   | n == 0 = "No matches"
   | n > matchCountCap = T.pack (show matchCountCap ++ "+ matches")
@@ -307,6 +353,7 @@ findAgain :: Bool -> Editor -> Editor
 findAgain forward ed
   | T.null (edSearchTerm ed) = openFind ed
   | Just pd <- edPdf ed = pdfFindWith False forward ed pd
+  | Just rd <- edRtf ed = rtfFindWith False forward ed rd
   | Just v <- edCsv ed = csvFindWith False forward ed v   -- search cells, advance
   | otherwise =
       let buf = edBuffer ed
@@ -320,6 +367,7 @@ findAgain forward ed
 doFind :: Editor -> Editor
 doFind ed
   | Just pd <- edPdf ed = pdfFindWith True True ed pd
+  | Just rd <- edRtf ed = rtfFindWith True True ed rd
   | Just v <- edCsv ed = csvFindWith True True ed v        -- search cells from current
   | otherwise = selectMatch
       (searchFrom (edSearchTerm ed) (edSearchCase ed) (edSearchWord ed) (edCursor ed) (edBuffer ed)) ed
@@ -370,6 +418,111 @@ pdfOrdinalMsg a ms
   | otherwise = T.pack ("Match " ++ show k ++ " of " ++ show (length ms))
   where k = length (takeWhile ((/= a) . fst) ms) + 1
 
+-- | Land on a workspace-search hit inside a document, once its reading view is
+-- the active one.
+--
+-- A document match cannot be addressed the way 'applyPendingJump' addresses a
+-- text one: these views have no buffer, and their laid-out rows are a function
+-- of the terminal width, so a stored (line, column) would point somewhere else
+-- in a wider window. What was stored instead is the unit — the page, chapter,
+-- paragraph or sheet — which is intrinsic to the document, plus the term. So
+-- landing is two steps: go to the unit, then run the view's /own/ in-file find
+-- from the top of it. The second step is what puts the highlight exactly on the
+-- match, and it is also why a term the layout happened to break across a line
+-- lands on the unit rather than on the word — the same bargain the view's Find
+-- has always made, and much better than not opening it at all.
+--
+-- The relayout is not optional: the caches these units are resolved through are
+-- built lazily, and a jump that arrives before the first one (a background load
+-- landing) would otherwise resolve every unit to line 0.
+applyPendingDoc :: Editor -> Editor
+applyPendingDoc ed = case edPendingDoc ed of
+  Just (p, unit, term) | edPath ed == Just p ->
+    let ed0 = ed { edPendingDoc = Nothing, edSearchTerm = detach term
+                 , edSearchMode = False, edFocus = FEdit }
+        h   = max 1 (rtfHeight ed0)
+    in if | Just _ <- edPdf ed0 ->
+              let edR = refreshPdf ed0
+              in case edPdf edR of
+                   Just pd -> let pd1 = Pdf.pdfGoToPage h unit pd
+                                  pd2 = Pdf.pdfSetCaret (Pos (Pdf.pdfPageLine unit pd1) 0) pd1
+                              in pdfFindWith True True edR pd2
+                   Nothing -> edR
+          | Just _ <- edRtf ed0 ->
+              let edR = refreshRtf ed0
+              in case edRtf edR of
+                   Just rd ->
+                     let secs = Rtf.rtfSectionCount rd > 0
+                         rd1 | secs      = Rtf.rtfGoToSection h unit rd
+                             | otherwise = Rtf.rtfGoToPar h unit rd
+                         -- The unit's own first line, NOT rdTop: a short
+                         -- document clamps the scroll back to 0, and seeding
+                         -- the find there would land on the first match in the
+                         -- document rather than the first in the unit named.
+                         ln | secs      = Rtf.rtfSectionLine unit rd1
+                            | otherwise = fst (Rtf.rtfParLineRange unit rd1)
+                         rd2 = Rtf.rtfSetCaret (Pos ln 0) rd1
+                     in rtfFindWith True True edR rd2
+                   Nothing -> edR
+          -- A workbook's unit is the sheet; the cell is found by the grid's own
+          -- search from the top-left, which is what puts the cursor on it.
+          -- 'goToSheetIn' indexes sheets from 0 (it is what 'gotoLine' calls
+          -- with @n - 1@); a unit is 1-based like every other one here.
+          | Just _ <- edSheets ed0 ->
+              let edS = goToSheetIn (unit - 1) ed0
+              in case edCsv edS of
+                   Just v  -> csvFindWith True True edS (Csv.setCursor 0 0 v)
+                   Nothing -> edS
+          | otherwise -> ed0
+  _ -> ed
+
+-- Open the file for a document match and land on it. Already-open files switch
+-- instantly; others load via 'EffOpen' and the landing applies on completion,
+-- exactly as for a text match.
+openDocMatch :: FilePath -> Int -> Text -> Editor -> (Editor, [Effect])
+openDocMatch path unit term ed =
+  let ed0 = (pushNavIfFar (Just path) (Pos 0 0) ed)
+              { edPendingDoc = Just (path, unit, detach term), edSearchMode = False }
+  in case findOpenIndex path ed0 of
+       Just k  -> noEff (applyPendingDoc (switchToFile k ed0))
+       Nothing -> (ed0 { edFocus = FEdit }, [EffOpen path])
+
+-- Search the laid-out formatted document (RTF, DOCX, ODT, EPUB) and select the
+-- match.
+--
+-- An exact mirror of 'pdfFindWith', because the two views are the same view:
+-- laid-out lines cached against the width, a caret-and-anchor selection over
+-- them, and no buffer underneath. The same three consequences hold — the text
+-- searched is the reflowed text on screen (so a term the original document
+-- broke across a line is not found, as in the wrapped text view), Find Next
+-- measures from the caret while Find Previous measures from the start of the
+-- current selection, and the hit becomes the selection so Find and Ctrl+C
+-- compose.
+rtfFindWith :: Bool -> Bool -> Editor -> RtfDoc -> Editor
+rtfFindWith inclusive forward ed rd =
+  case pick of
+    ((a, b) : _) ->
+      (ed { edRtf = Just (Rtf.rtfScrollToCaret (rtfHeight ed) (Rtf.rtfSelectRange a b rd)) })
+        { edStatus = pdfOrdinalMsg a matches }
+    [] -> ed { edStatus = "Not found: " <> flat1 (edSearchTerm ed) }
+  where
+    here = rdCaret rd
+    back = maybe here fst (Rtf.rtfSelection rd)
+    matches = rtfAllMatches (edSearchCase ed) (edSearchWord ed) (edSearchTerm ed) rd
+    started p = if inclusive then p >= here else p > here
+    pick | forward   = filter (started . fst) matches ++ matches
+         | otherwise = reverse (filter ((< back) . fst) matches) ++ reverse matches
+
+-- Every match in the laid-out document, in reading order, capped like
+-- 'pdfAllMatches' so a one-letter term in a long document costs a bounded scan.
+rtfAllMatches :: Bool -> Bool -> Text -> RtfDoc -> [(Pos, Pos)]
+rtfAllMatches cs ww term rd
+  | T.null term || hasNewline term = []
+  | otherwise = take (matchCountCap + 1)
+      [ (Pos li i, Pos li (i + T.length term))
+      | li <- [0 .. Rtf.rtfLineCount rd - 1]
+      , i <- matchIndices cs ww term (Rtf.rtfLineTextAt rd li) ]
+
 -- Search the table cells (row-major) for the search term and move the
 -- selection to the matching cell, which the renderer highlights.
 csvFindWith :: Bool -> Bool -> Editor -> CsvView -> Editor
@@ -378,8 +531,36 @@ csvFindWith inclusive forward ed v =
                                     (edSearchTerm ed) (Csv.cellAt r c v)))
   in case filter matches (csvSearchOrder v inclusive forward) of
        ((r, c) : _) -> (csvPut (Csv.setCursor r c v) ed)
-                         { edStatus = T.pack ("Found in " ++ Csv.colLabel c ++ show (r + 1)) }
+                         { edStatus = csvOrdinalMsg (r, c) ed v }
        []           -> ed { edStatus = "Not found: " <> flat1 (edSearchTerm ed) }
+
+-- | \"Match 2 of 3 in B4\" for a cell just found — the grid's 'matchOrdinalMsg'.
+-- The cell reference is the part that matters (it is how you say where you are
+-- in a spreadsheet), and the ordinal tells you whether there is more to see.
+csvOrdinalMsg :: (Int, Int) -> Editor -> CsvView -> Text
+csvOrdinalMsg (r, c) ed v
+  -- Same bound as the live count, and for the same reason: Find Next would
+  -- otherwise re-scan the whole grid on every press just to number the hit.
+  -- The cell reference is the part that matters and it always shows.
+  | Csv.nRows v * Csv.nCols v > liveCountMaxCells = T.pack ("Found in " ++ ref)
+  | length capped > matchCountCap = T.pack ("Found in " ++ ref)
+  | otherwise = case [ i | (i, rc) <- zip [1 :: Int ..] capped, rc == (r, c) ] of
+      (k : _) -> T.pack ("Match " ++ show k ++ " of " ++ show (length capped) ++ " in " ++ ref)
+      []      -> T.pack ("Found in " ++ ref)
+  where
+    ref = Csv.colLabel c ++ show (r + 1)
+    capped = take (matchCountCap + 1)
+               (csvMatchingCells (edSearchCase ed) (edSearchWord ed) (edSearchTerm ed) v)
+
+-- | Every matching cell, in row-major order. Lazy, so a capped caller stops
+-- the scan: a spreadsheet-sized grid must not be walked in full just to put a
+-- number in a dialog.
+csvMatchingCells :: Bool -> Bool -> Text -> CsvView -> [(Int, Int)]
+csvMatchingCells cs ww t v
+  | T.null t  = []
+  | otherwise = [ (r, c)
+                | r <- [0 .. Csv.nRows v - 1], c <- [0 .. Csv.nCols v - 1]
+                , not (null (matchIndices cs ww t (Csv.cellAt r c v))) ]
 
 -- The order in which to scan cells, starting at (or after) the current cell.
 csvSearchOrder :: CsvView -> Bool -> Bool -> [(Int, Int)]
@@ -636,7 +817,7 @@ buildSearchReq gen ss ed = SearchReq
   , sqCase = ssCase ss, sqWord = ssWord ss, sqRegex = ssRegex ss
   , sqInclude = S.parseGlobs (sfText (ssInclude ss))
   , sqExclude = S.parseGlobs (sfText (ssExclude ss))
-  , sqSkip = openPathsList ed }
+  , sqSkip = openPathsList ed, sqDocs = ssDocs ss }
 
 -- | Start a search from the current panel state (Enter, or an option toggle).
 runSearch :: Editor -> (Editor, [Effect])
@@ -670,7 +851,7 @@ searchOpenDocs root req ed =
   case S.compileMatcher (sqCase req) (sqWord req) (sqRegex req) (sqTerm req) of
     Left _  -> []
     Right m ->
-      [ FileResult p ms False trunc
+      [ S.plainResult p ms False trunc
       | d <- allOpenDocs (syncCsvToBuffer ed)
       , Just p <- [docPath d]
       , Just rel <- [relativeTo root p]
@@ -746,31 +927,64 @@ runReplaceAll :: Editor -> (Editor, [Effect])
 runReplaceAll ed = case edSearch ed of
   Nothing -> noEff ed
   Just ss
-    | null (S.resultPaths ss) -> noEff ed { edSearch = Just ss { ssMessage = "Nothing to replace" } }
-    | length (S.resultPaths ss) > replaceConfirmThreshold ->
-        let n = length (S.resultPaths ss)
+    | null (S.replaceablePaths ss) ->
+        noEff ed { edSearch = Just ss { ssMessage = nothingToReplace ss } }
+    | length (S.replaceablePaths ss) > replaceConfirmThreshold ->
+        let n = length (S.replaceablePaths ss)
         in noEff (openDialog (mkConfirm DKConfirmReplaceAll "Replace in Files"
              (T.pack ("Replace every occurrence of \x201C" ++ T.unpack (flat1 (sfText (ssFind ss)))
-                      ++ "\x201D across " ++ show n ++ " files?"))
+                      ++ "\x201D across " ++ show n ++ " files?" ++ skipNote ss))
              ["Replace All", "Cancel"]) ed)
-    | otherwise -> doReplace (S.resultPaths ss) ed
+    | otherwise -> doReplace (S.replaceablePaths ss) ed
+
+-- Why there is nothing to replace: distinguishing "no results" from "results,
+-- but every one of them is in a file we cannot write" matters, because the
+-- second looks like a bug and is not one.
+nothingToReplace :: SearchState -> Text
+nothingToReplace ss
+  | S.docResultCount ss > 0 =
+      T.pack ("Nothing to replace \x2014 " ++ show (S.docResultCount ss)
+              ++ pluralIs (S.docResultCount ss) " match is" " matches are"
+              ++ " in documents, which cmedit reads but cannot write")
+  | otherwise = "Nothing to replace"
+
+-- Appended to the Replace All confirmation when some results are being left
+-- alone, so the file count in the prompt is never quietly smaller than the one
+-- on screen.
+skipNote :: SearchState -> String
+skipNote ss
+  | n > 0 = "  (" ++ show n ++ pluralIs n " document is" " documents are" ++ " skipped)"
+  | otherwise = ""
+  where n = S.docResultCount ss
+
+-- Singular/plural forms of a whole clause (the shared 'plural' in
+-- "Cmedit.EditorState" only supplies the trailing @s@).
+pluralIs :: Int -> String -> String -> String
+pluralIs n one many = if n == 1 then one else many
 
 -- | Replace only within the file of the currently-selected result row
 -- (Ctrl/Shift+Enter on a result). Lets you apply changes file-by-file rather
 -- than all at once — the terminal analogue of VS Code's per-file replace.
 runReplaceFile :: Editor -> (Editor, [Effect])
 runReplaceFile ed = case edSearch ed of
-  Just ss -> case selectedResultFile ss of
-    Just p  -> doReplace [p] ed
+  Just ss -> case selectedResultResult ss of
+    Just fr | not (S.replaceable fr) ->
+      noEff ed { edSearch = Just ss { ssMessage =
+        "Cannot replace in a document \x2014 cmedit reads this format but cannot write it" } }
+    Just fr -> doReplace [frPath fr] ed
     Nothing -> noEff ed
   Nothing -> noEff ed
 
+-- The result under (or containing) the selected row.
+selectedResultResult :: SearchState -> Maybe FileResult
+selectedResultResult ss = case S.selectedRow ss of
+  Just (SRFile fi)    -> Seq.lookup fi (ssResults ss)
+  Just (SRMatch fi _) -> Seq.lookup fi (ssResults ss)
+  Nothing             -> Nothing
+
 -- The file path of the file under (or containing) the selected result row.
 selectedResultFile :: SearchState -> Maybe FilePath
-selectedResultFile ss = case S.selectedRow ss of
-  Just (SRFile fi)    -> frPath <$> Seq.lookup fi (ssResults ss)
-  Just (SRMatch fi _) -> frPath <$> Seq.lookup fi (ssResults ss)
-  Nothing             -> Nothing
+selectedResultFile = fmap frPath . selectedResultResult
 
 -- | Above this many files a Replace All is written straight to disk (with a
 -- re-run search to refresh) rather than opened as unsaved tabs — staging hundreds
@@ -814,8 +1028,18 @@ replaceParams ss = (sfText (ssFind ss), sfText (ssReplace ss), ssCase ss, ssWord
 stageReplaceDone :: Int -> Editor -> Editor
 stageReplaceDone total ed =
   let nDirty = length (modifiedDocPaths ed)
+      -- Below 'replaceConfirmThreshold' there is no confirmation dialog to
+      -- carry the skip note, so it belongs here: a replace that quietly did
+      -- nothing to the PDF in the results reads as a bug rather than as the
+      -- deliberate refusal it is.
+      nDocs  = maybe 0 S.docResultCount (edSearch ed)
+      skipped | nDocs > 0 = " \x2014 " ++ show nDocs
+                            ++ pluralIs nDocs " document was" " documents were"
+                            ++ " skipped (read-only formats)"
+              | otherwise = ""
       note   = "Replaced " ++ groupThousands total ++ " occurrence" ++ plural total
                  ++ " in " ++ show nDirty ++ " file" ++ plural nDirty
+                 ++ skipped
                  ++ " \x2014 review, then Ctrl+S (File \x25b8 Save All to save all)"
   in (relayout ed) { edSearchMode = False
                    , edFocus = if isJust (edExplorer ed) then FExplorer else FEdit
@@ -846,9 +1070,12 @@ stagedDoc path lr buf' = Document
   , docRedo = Seq.empty, docLastEdit = EKNone
   , docOverwrite = False, docDiscard = False
   , docCsv = Nothing, docCsvStash = Nothing, docImage = Nothing
-  , docPager = Nothing, docRtf = Nothing, docPdf = Nothing
+  , docPager = Nothing, docRtf = Nothing, docSheets = Nothing, docPdf = Nothing
   , docHlCache = Nothing
   , docDiags = []
+  -- Titled (so the id is unused) and modified with no journal yet: the
+  -- write-behind picks it up on its next tick, like any other unsaved change.
+  , docDocId = 0, docDocSeq = 1, docJournalSeq = 0
   }
 
 -- | The substitution used by a workspace Replace All, shared by the open-buffer
@@ -881,13 +1108,19 @@ replaceInOpenDocs subst paths ed =
                                , edSelAnchor = Nothing, edModified = True, edStatus = ""
                                -- bypasses afterEdit, so bump the lint edit
                                -- counter here or squiggles pin to stale spots
-                               , edEditSeq = edEditSeq ed1 + 1 }, c)
+                               -- (and the journal counter, or the staged
+                               -- replacement never reaches the journal)
+                               , edEditSeq = edEditSeq ed1 + 1
+                               , edDocSeq = edDocSeq ed1 + 1 }, c)
         | otherwise = (ed, 0)
       onDoc d
         | hit d = let snap   = UndoState (docBuffer d) (docCursor d) (docSelAnchor d)
                       (b, c) = doBuf (docBuffer d)
                   in (d { docBuffer = b, docModified = True
                         , docUndo = pushHist maxUndo snap (docUndo d)
+                        -- An inactive document edited in place: its own counter
+                        -- is the only signal the journal write-behind gets.
+                        , docDocSeq = docDocSeq d + 1
                         , docRedo = Seq.empty }, c)
         | otherwise = (d, 0)
       (before', bc) = unzipSum (map onDoc (edBefore edA))
@@ -908,15 +1141,17 @@ replaceDone total ed =
 -- Search-view key handling
 
 -- Controls drawn on the Find/Replace header lines (also used for mouse hits).
-data SearchCtl = CtlCase | CtlWord | CtlRegex | CtlReplToggle | CtlReplaceAll
+data SearchCtl = CtlCase | CtlWord | CtlRegex | CtlDocs | CtlReplToggle | CtlReplaceAll
   deriving (Eq, Show)
 
 -- | The clickable controls on the Find line, right-aligned within the region
--- @[x0, x0+w)@: match-case, whole-word, regex, and the replace-row toggle.
+-- @[x0, x0+w)@: match-case, whole-word, regex, search-in-documents, and the
+-- replace-row toggle.
 -- Returns @(startCol, text, ctl)@; the renderer and the mouse handler share this.
 findLineCtls :: Int -> Int -> [(Int, String, SearchCtl)]
 findLineCtls x0 w =
-  let items = [("Aa", CtlCase), ("W", CtlWord), (".*", CtlRegex), ("\x21c5R", CtlReplToggle)]
+  let items = [ ("Aa", CtlCase), ("W", CtlWord), (".*", CtlRegex)
+              , ("Doc", CtlDocs), ("\x21c5R", CtlReplToggle) ]
       labels = map (\(s, c) -> ('[' : s ++ "]", c)) items
       total = sum (map (\(s, _) -> length s + 1) labels)
       start = x0 + w - total

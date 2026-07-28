@@ -17,12 +17,17 @@ module Cmedit.Editor
   , addDocument
   , fileCount
   , fileIndex
+  , switchToFile
   , entriesFor
     -- * Recent files
   , touchRecent
   , recordRecent
   , recentsForPersist
   , recentMenuPaths
+    -- * Session restore
+  , sessionForPersist
+  , sessionShape
+  , seedSessionPos
     -- * Image view mode
   , ImageDoc(..)
   , mkImageDoc
@@ -46,6 +51,7 @@ module Cmedit.Editor
   , rtfActive
   , rtfHeight
   , isRtfPath
+  , isEpubPath
   , isRtfFile
     -- * PDF reading view
   , PdfDoc(..)
@@ -55,6 +61,19 @@ module Cmedit.Editor
   , refreshPdf
   , pdfActive
   , pdfHeight
+    -- * Container reading views (DOCX / EPUB / XLSX)
+  , RtfOrigin(..)
+  , Workbook(..)
+  , containerDocLoaded
+  , containerDocLoadedNew
+  , addContainerDoc
+  , workbookLoaded
+  , workbookLoadedNew
+  , addWorkbookDocument
+  , goToSheetIn
+  , containerViewActive
+  , containerListing
+  , isContainerPath
   , isArchivePath
   , refreshImage
   , imageCrop
@@ -108,6 +127,7 @@ module Cmedit.Editor
   , update
   , resize
   , openManual
+  , doClose
     -- * IO callbacks (results handed back by the driver)
   , setLoaded
   , setLoadedNew
@@ -129,6 +149,7 @@ module Cmedit.Editor
   , explorerLoaded
   , explorerTreeHeight
   , explorerRootName
+  , explorerRoot
   , explorerCloseCol
   , explorerCollapseCol
   , fileMarkFor
@@ -156,6 +177,10 @@ module Cmedit.Editor
   , saveAll
   , savedAll
   , applyPendingJump
+  , applyPendingDoc
+  , openDocMatch
+  , runReplaceAll
+  , rtfDisabledActions
   , SearchCtl(..)
   , findLineCtls
   , searchFieldValueCol
@@ -193,6 +218,7 @@ module Cmedit.Editor
   , getSelection
   , currentLine
   , liveMatchSpans
+  , liveCellMatch
   , bracketPair
   , scrollBarInfo
   , hScrollBarInfo
@@ -209,6 +235,24 @@ module Cmedit.Editor
   , nextProblemAvailable
   , diagUnderCursor
   , jumpNextDiag
+    -- * Crash-recovery journal (the pure spine; IO lives in "Cmedit.App")
+  , RecoverItem(..)
+  , journalableDoc
+  , journalKeyOf
+  , journalOf
+  , journalTextOf
+  , journalLiveKeys
+  , journalRequests
+  , journalFingerprint
+  , journalsWritten
+  , journalPendingBytes
+  , journalDelayUs
+  , journalMinDelayUs
+  , journalMaxDelayUs
+  , journalBudgetBps
+  , seedJournalIds
+  , openRecoverDialog
+  , recoverJournals
   , applySaveFixups
   , applySaveFixupsAll
   , tabWidthOf
@@ -224,6 +268,17 @@ module Cmedit.Editor
     -- * Pure helpers exposed for testing
   , replaceAllText
   , replaceAllStatus
+  , runAction
+  , doFind
+  , findAgain
+  , openFind
+  , exportSuggestion
+  , saveAsRefusal
+  , saveAsDialogFlow
+  , isPlainDoc
+  , openGoTo
+  , gotoLine
+  , captureDoc
   ) where
 
 import Data.Char (isAlpha, isAlphaNum, isSpace, isDigit)
@@ -245,8 +300,10 @@ import Cmedit.Types
 import Cmedit.History (pushHist)
 import Cmedit.Pager (PagerDoc(..))
 import qualified Cmedit.Pager as Pg
-import Cmedit.Rtf (RtfDoc(..))
+import Cmedit.Rtf (RtfDoc(..), RtfOrigin(..))
 import qualified Cmedit.Rtf as Rtf
+import Cmedit.Xlsx (Workbook(..))
+import qualified Cmedit.Xlsx as Xlsx
 import Cmedit.Pdf (PdfDoc(..))
 import qualified Cmedit.Pdf as Pdf
 import Cmedit.TextBuffer
@@ -353,25 +410,44 @@ handlePagerKey key pg ed = case key of
 -- file switching, the explorer, workspace search) keep working.
 handleRtfKey :: Key -> RtfDoc -> Editor -> (Editor, [Effect])
 handleRtfKey key rd ed = case key of
+  -- An e-book is divided into chapters, so it can be turned by them — the
+  -- same keys the PDF view turns pages with. A document with no sections
+  -- (an .rtf, a .docx) falls through to the read-only note below.
+  KChar '[' | secs -> go (Rtf.rtfPrevSection h rd)
+  KChar ']' | secs -> go (Rtf.rtfNextSection h rd)
+  KChar 'p' | secs -> go (Rtf.rtfPrevSection h rd)
+  KChar 'n' | secs -> go (Rtf.rtfNextSection h rd)
+  -- Plain movement scrolls the *window*, which is what a reader's view is
+  -- for, and deliberately leaves any selection alone so you can scroll to see
+  -- the rest of what you highlighted. Shift+movement moves the caret and
+  -- extends the selection, the way it does everywhere else.
+  KArrow d m | hasShift m -> extend (arrowMove d)
   KArrow DDown _  -> scroll 1
   KArrow DUp _    -> scroll (-1)
+  KArrow DLeft _  -> noEff ed
+  KArrow DRight _ -> noEff ed
+  KPageDown m | hasShift m -> extend (pageMove h)
+  KPageUp m   | hasShift m -> extend (pageMove (-h))
   KPageDown _     -> scroll h
   KPageUp _       -> scroll (-h)
-  KHome m | hasCtrl m -> go (Rtf.rtfGoTop rd)
-  KEnd m  | hasCtrl m -> go (Rtf.rtfGoBottom h rd)
+  KHome m | hasShift m, hasCtrl m -> extend Rtf.rtfCaretTop
+          | hasShift m            -> extend Rtf.rtfCaretHome
+  KEnd m  | hasShift m, hasCtrl m -> extend Rtf.rtfCaretBottom
+          | hasShift m            -> extend Rtf.rtfCaretEnd
   KHome _         -> go (Rtf.rtfGoTop rd)
   KEnd _          -> go (Rtf.rtfGoBottom h rd)
+  -- Esc drops the selection (there is nothing else for it to cancel here).
+  KEsc | isJust (Rtf.rtfSelection rd) -> go (Rtf.rtfClearSel rd)
   KMouse me
     | meButton me == MBWheelDown -> scroll 3
     | meButton me == MBWheelUp   -> scroll (-3)
-    -- Anything else in the text area is swallowed. The chrome that *does*
-    -- take mouse input (menu bar, explorer, status zones, both scrollbars) is
-    -- matched by 'dispatchKey' before it ever gets here; what is left is a
-    -- click on the rendered document, and this view has no cursor to move.
-    -- Falling through to 'handleEditKey' would drag a selection through the
-    -- invisible markup buffer — and set 'edMouseSelecting', which gates the
-    -- scrollbar guard, so a stray click would then jam the scrollbar too.
-    | otherwise -> noEff ed
+    -- Everything else in the text area selects. The chrome that *does* take
+    -- mouse input (menu bar, explorer, status zones, both scrollbars) is
+    -- matched by 'dispatchKey' before it ever gets here, so what is left is a
+    -- press, drag or release on the rendered document. It must never fall
+    -- through to 'handleEditKey', which would drag a selection through the
+    -- invisible markup buffer instead of this one.
+    | otherwise -> noEff (handleRtfMouse me rd ed)
   -- The formatted view is a projection; typing belongs to the markup.
   KChar _     -> readOnlyNote
   KEnter      -> readOnlyNote
@@ -384,10 +460,54 @@ handleRtfKey key rd ed = case key of
   _           -> handleEditKey key ed
   where
     h = max 1 (rtfHeight ed)
+    secs = Rtf.rtfSectionCount rd > 0
     go rd' = noEff ed { edRtf = Just rd' }
     scroll d = go (Rtf.rtfScroll h d rd)
-    readOnlyNote =
-      noEff ed { edStatus = "Formatted view is read-only \x2014 Alt+T edits the RTF markup" }
+    -- A caret move brings the window with it, since the point of moving the
+    -- caret is to see where it went.
+    extend f = go (Rtf.rtfScrollToCaret h (Rtf.rtfExtendTo f rd))
+    arrowMove d = case d of
+      DUp    -> Rtf.rtfCaretUp
+      DDown  -> Rtf.rtfCaretDown
+      DLeft  -> Rtf.rtfCaretLeft
+      DRight -> Rtf.rtfCaretRight
+    pageMove n p = iterate (if n < 0 then Rtf.rtfCaretUp else Rtf.rtfCaretDown) p !! abs n
+    readOnlyNote
+      | Rtf.rtfDerived rd = noEff ed { edStatus = T.pack (containerRefusal ed) }
+      | otherwise =
+          noEff ed { edStatus = "Formatted view is read-only \x2014 Alt+T edits the RTF markup" }
+
+-- | Mouse in the formatted view: select text to copy out of it.
+--
+-- Character for character the PDF view's ('handlePdfMouse'), because the two
+-- views are the same reader over the same laid-out-line coordinates — double
+-- click takes a word, triple a line, Shift+click extends what is there, and
+-- 'edMouseSelecting' is set for the duration so the chrome's "not while a
+-- selection drag is in progress" guards hold off. A plain click deliberately
+-- leaves no caret behind: with no selection this view shows no cursor, so a
+-- stray click should leave no trace.
+handleRtfMouse :: MouseEvent -> RtfDoc -> Editor -> Editor
+handleRtfMouse me rd ed
+  | mePressed me && not (meDrag me) =
+      case meClicks me of
+        n | n >= 3    -> put (uncurry Rtf.rtfSelectRange (Rtf.rtfLineRange pos rd) rd)
+          | n == 2    -> put (uncurry Rtf.rtfSelectRange (Rtf.rtfWordRange pos rd) rd)
+          | hasShift (meMods me), isJust (rdAnchor rd) ->
+              put (rd { rdCaret = Rtf.rtfClampPos rd pos })
+          | otherwise ->
+              (put (Rtf.rtfSelectRange pos pos rd)) { edMouseSelecting = True }
+  | meDrag me && edMouseSelecting ed = put rd { rdCaret = Rtf.rtfClampPos rd pos }
+  -- Release: a click that never moved leaves anchor == caret, which reads as
+  -- no selection; drop the anchor so no cursor is drawn for it.
+  | otherwise =
+      (put (if isJust (Rtf.rtfSelection rd) then rd else Rtf.rtfClearSel rd))
+        { edMouseSelecting = False }
+  where
+    lo = computeLayout ed
+    pos = Rtf.rtfPosAtCell (tabWidthOf ed)
+            (rdTop rd + (meRow me - loTextTop lo))
+            (meCol me - loTextLeft lo) rd
+    put rd' = ed { edRtf = Just rd' }
 
 -- | Keys in the PDF reading view. A reader's view like the formatted RTF one,
 -- with the addition PDF brings and no other view has: the document is divided
@@ -549,7 +669,8 @@ pruneEntries ed = map (relabelEntry ed)
       | otherwise = filter (\e -> case e of MEItem _ _ MANextProblem -> False; _ -> True) es
     -- Line ending / BOM are meaningless for a read-only image or a PDF.
     dropFileProps es
-      | isJust (edImage ed) || isJust (edPager ed) || isJust (edPdf ed) = tidySeps (filter keep es)
+      | isJust (edImage ed) || isJust (edPager ed) || isJust (edPdf ed)
+        || containerViewActive ed = tidySeps (filter keep es)
       | otherwise = es
       where keep (MEItem _ _ a) = a `notElem` [MACycleLineEnding, MAToggleBom]
             keep MESep          = True
@@ -563,8 +684,16 @@ pruneEntries ed = map (relabelEntry ed)
       where keep (MEItem _ _ a) = a `notElem` lineOpActions
             keep MESep          = True
     -- Each view-mode entry survives only for the file type it applies to.
-    dropTV = dropViewModes (\a -> if a == MAToggleRtf then not (isRtfFile ed)
-                                                      else not (isCsvFile ed))
+    dropTV = dropViewModes unwantedMode
+    unwantedMode a = case a of
+      MAToggleRtf   -> not (isRtfFile ed)
+      MAArchiveView -> not (containerViewActive ed || containerListing ed)
+      -- A workbook keeps the freeze-header row (it is a view setting, and a
+      -- spreadsheet has a header row more often than a CSV does) and loses
+      -- the two that write: the table toggle has no text to toggle to, and
+      -- sorting would rearrange a grid nothing can save.
+      MAToggleFreezeHeader -> not (isCsvFile ed || isJust (edSheets ed))
+      _             -> not (isCsvFile ed)
     -- In the read-only image view there is no text to search: drop the in-file
     -- Find / Replace / Go to Line entries (workspace Find/Replace in Files stay).
     dropImageFind es
@@ -577,7 +706,7 @@ pruneEntries ed = map (relabelEntry ed)
                      | isJust (edRtf ed)   = rtfDisabledActions
                      | isJust (edPdf ed)   = pdfDisabledActions
                      | otherwise           = imageDisabledFind
-            keep (MEItem _ _ a) = a `notElem` disabled
+            keep (MEItem _ _ a) = a `notElem` disabled || goToUnitOK a ed
             keep MESep          = True
     -- Save All only appears when more than one file is open and something is
     -- unsaved (there's nothing to "save all" of a single file).
@@ -651,9 +780,75 @@ pdfDisabledActions =
 -- and the view re-derives from it, so their effect is visible and coherent.)
 rtfDisabledActions :: [MenuAction]
 rtfDisabledActions =
-  [ MAFind, MAFindNext, MAFindPrev, MAReplace, MAGoToLine, MAGoToDef
+  -- Find is deliberately NOT here, though it was until the workspace search
+  -- learned to look inside documents. It searches the laid-out text the view
+  -- is showing ('rtfFindWith'), the way the PDF view's has always done, and
+  -- the hit becomes the selection — which is what makes finding and copying
+  -- out of a read-only document compose. Replace stays: there is no
+  -- serialiser back to any of these formats.
+  [ MAReplace, MAGoToLine, MAGoToDef
   , MAGoToBracket, MANextProblem
-  , MACut, MACopy, MAPaste, MADelete, MASelectAll ]
+  -- Copy and Select All are deliberately absent: the view has its own
+  -- selection over the laid-out text ('handleRtfMouse'), and copying out of a
+  -- document you are reading is most of what that selection is for.
+  , MACut, MAPaste, MADelete ]
+
+-- | Swap a container between its rendered reading view and its archive
+-- listing (Alt+T, View \x25b8 Archive Contents).
+--
+-- A round trip through the driver rather than a pure toggle, because both
+-- views are read from the file and neither is derived from the other: the
+-- listing comes from the central directory, the document from a decompressed
+-- member. That also means the driver re-sniffs, so a container that has been
+-- replaced on disk since it was opened lands wherever it now belongs — and a
+-- document view that can no longer be built falls back to the listing by the
+-- ordinary rule rather than by a special case here.
+archiveViewFlow :: Editor -> (Editor, [Effect])
+archiveViewFlow ed = case edPath ed of
+  Just p | containerViewActive ed ->
+             (ed { edStatus = "Reading the archive\x2026" }, [EffContainerView p True])
+         | containerListing ed ->
+             (ed { edStatus = "Reading the document\x2026" }, [EffContainerView p False])
+  _ -> noEff ed { edStatus = "This file has no archive view" }
+
+-- | Actions refused in a ZIP-container reading view (DOCX, EPUB, XLSX).
+--
+-- The two halves have the same cause. Everything that /writes/ is out because
+-- there is no buffer under the view and no serialiser back to the format —
+-- for the formatted half that is Cut\/Paste\/Delete\/Undo\/Redo (already
+-- covered by 'rtfDisabledActions'), and for a workbook it is additionally the
+-- grid actions, which would rearrange a table nothing can save. Save, Save All
+-- and Revert are out for the same reason a PDF's are.
+--
+-- What is /not/ here matters as much: Copy, Find and Go To all work in the
+-- workbook grid, and Find and Go To in the formatted view where the document
+-- has chapters to go to ('goToUnitOK').
+containerDisabledActions :: [MenuAction]
+containerDisabledActions =
+  [ MASave, MASaveAll, MARevert
+  , MACut, MAPaste, MADelete, MAUndo, MARedo
+  , MAReplace, MASortColumn, MAToggleCsv
+  , MAGoToDef, MAGoToBracket, MANextProblem ]
+
+-- Why a container view refused, in its own terms.
+containerRefusal :: Editor -> String
+containerRefusal ed
+  | isJust (edSheets ed) =
+      "A workbook is open read-only \x2014 cmedit reads .xlsx but cannot write one"
+  | otherwise =
+      "This document is open read-only \x2014 Alt+T shows the archive it came from"
+
+-- | Is this the Go To action in a view that /does/ have units to go to — an
+-- e-book's chapters, a workbook's sheets?
+--
+-- Go To is in 'rtfDisabledActions' because a laid-out row number means nothing
+-- in a reflowed document. That reasoning stops applying the moment the
+-- document has chapters, which is exactly the reinterpretation
+-- 'Cmedit.EditorDoc.gotoLine' makes.
+goToUnitOK :: MenuAction -> Editor -> Bool
+goToUnitOK MAGoToLine ed =
+  isJust (edSheets ed) || maybe False ((> 0) . Rtf.rtfSectionCount) (edRtf ed)
+goToUnitOK _ _ = False
 
 -- Rewrite value-carrying menu labels to show the document's current setting.
 relabelEntry :: Editor -> MenuEntry -> MenuEntry
@@ -662,6 +857,21 @@ relabelEntry ed e = case e of
   -- 'gotoLine'), so the menu has to say so — the dialog already does.
   MEItem _ acc MAGoToLine | isJust (edPdf ed) ->
     MEItem "&Go to Page\x2026" acc MAGoToLine
+  -- And two more units for the same one action: a workbook's sheets, an
+  -- e-book's chapters.
+  MEItem _ acc MAGoToLine | isJust (edSheets ed) ->
+    MEItem "&Go to Sheet\x2026" acc MAGoToLine
+  MEItem _ acc MAGoToLine | Just rd <- edRtf ed, Rtf.rtfSectionCount rd > 0 ->
+    MEItem "&Go to Chapter\x2026" acc MAGoToLine
+  -- One entry, both directions: from the rendered document it offers the
+  -- archive, from the archive it offers the document back.
+  MEItem _ acc MAArchiveView | containerListing ed ->
+    MEItem "&Document View" acc MAArchiveView
+  -- Save As is an export in the buffer-less views, and says so.
+  MEItem _ acc MASaveAs | isJust (edSheets ed) ->
+    MEItem "&Export Sheet as CSV\x2026" acc MASaveAs
+  MEItem _ acc MASaveAs | isJust (exportSuggestion ed) ->
+    MEItem "&Export as Text\x2026" acc MASaveAs
   MEItem _ acc MACycleLineEnding ->
     MEItem (T.pack ("Line E&ndings: " ++ eolName (edLineEnding ed))) acc MACycleLineEnding
   MEItem _ acc MAToggleBom ->
@@ -702,7 +912,8 @@ dropViewModes unwanted es = case span isModeItem es of
     isModeItem _              = False
 
 viewModeActions :: [MenuAction]
-viewModeActions = [MAToggleCsv, MAToggleFreezeHeader, MASortColumn, MAToggleRtf]
+viewModeActions =
+  [MAToggleCsv, MAToggleFreezeHeader, MASortColumn, MAToggleRtf, MAArchiveView]
 
 windowEntries :: Editor -> [MenuEntry]
 windowEntries ed =
@@ -738,12 +949,20 @@ runAction a ed0 =
        then noEff ed { edStatus = "This file is open read-only (too large to edit)" }
      -- As above, this also makes the keyboard shortcuts (Ctrl+F/R/G/X/V, F3)
      -- inert while the formatted view is showing, not just the pruned menu.
-     else if isJust (edRtf ed) && a `elem` rtfDisabledActions
-       then noEff ed { edStatus = "Not available in the formatted view \x2014 Alt+T edits the RTF markup" }
+     else if isJust (edRtf ed) && a `elem` rtfDisabledActions && not (goToUnitOK a ed)
+       then noEff ed { edStatus = if containerViewActive ed
+                                    then T.pack (containerRefusal ed)
+                                    else "Not available in the formatted view \x2014 Alt+T edits the RTF markup" }
      else if isJust (edPdf ed) && a `elem` pdfDisabledActions
        then noEff ed { edStatus = "Not available in the PDF view" }
      else if isJust (edPdf ed) && a `elem` [MASave, MASaveAll, MARevert]
        then noEff ed { edStatus = "A PDF is open read-only \x2014 this view cannot write one" }
+     -- A container reading view has no buffer under it and no serialiser back
+     -- to the format, so the same guard applies — and, for a workbook, to the
+     -- table actions that would edit the grid. Guarding here and not only in
+     -- 'pruneEntries' is what makes the keyboard shortcuts inert too.
+     else if containerViewActive ed && a `elem` containerDisabledActions
+       then noEff ed { edStatus = T.pack (containerRefusal ed) }
      else case a of
        MANew        -> noEff (newFileFlow ed)
        MAOpen       -> openBrowser ed
@@ -787,6 +1006,7 @@ runAction a ed0 =
        MAToggleWhitespace  -> noEff ed { edShowWhitespace = not (edShowWhitespace ed) }
        MAToggleCsv  -> noEff (toggleCsv ed)
        MAToggleRtf  -> noEff (toggleRtf ed)
+       MAArchiveView -> archiveViewFlow ed
        MAToggleFreezeHeader -> noEff (toggleFreezeHeader ed)
        MASortColumn -> noEff (sortCsvColumn ed)
        MACycleLineEnding -> noEff (cycleLineEnding ed)
@@ -852,7 +1072,12 @@ applySettingRow k v ed = case k of
   10 -> upd (\c -> c { cfgEnsureFinalNl = on }) ed
   11 -> let ed1 = (upd (\c -> c { cfgFreezeHeader = on }) ed) { edFreezeHeader = on }
         in maybe ed1 (\vw -> csvPut vw ed1) (edCsv ed1)   -- re-scroll under the new freeze
-  12 ->                                                  -- master linting switch
+  -- Journalling is driver-side (the write-behind timer reads edConfig), so
+  -- there is no session mirror to update here.
+  12 -> upd (\c -> c { cfgJournal = on }) ed
+  -- Likewise startup-only: nothing in this session reads it again.
+  13 -> upd (\c -> c { cfgRestoreSession = on }) ed
+  14 ->                                                  -- master linting switch
     let ed1 = upd (\c -> c { cfgLint = on }) ed
     -- Off means no future pass will ever clear diagnostics, so drop them
     -- everywhere now (active doc and zipper) — squiggles must not outlive
@@ -861,8 +1086,8 @@ applySettingRow k v ed = case k of
        else ed1 { edDiags = []
                 , edBefore = map (\d -> d { docDiags = [] }) (edBefore ed1)
                 , edAfter  = map (\d -> d { docDiags = [] }) (edAfter ed1) }
-  _ | k >= 13, k - 13 < length linters ->                -- one row per linter
-        let lid = linId (linters !! (k - 13))
+  _ | k >= 15, k - 15 < length linters ->                -- one row per linter
+        let lid = linId (linters !! (k - 15))
             ed1 = upd (\c -> c { cfgLintOn = setLintOn lid on (cfgLintOn c) }) ed
         -- Turning a linter off immediately drops its squiggles on the active
         -- doc; zipper docs refresh on their next lint pass.
@@ -1151,8 +1376,11 @@ handleAlt c ed = case c of
   'z' -> runAction MAToggleWordWrap ed
   'l' -> runAction MAToggleLineNumbers ed
   -- Alt+T is "show this file as the thing it describes": the table for a CSV,
-  -- the document for an RTF. A file is at most one of those.
-  't' -> runAction (if isRtfFile ed then MAToggleRtf else MAToggleCsv) ed
+  -- the document for an RTF, the archive listing (or back) for a container.
+  -- A file is at most one of those.
+  't' | containerViewActive ed || containerListing ed -> runAction MAArchiveView ed
+      | isRtfFile ed -> runAction MAToggleRtf ed
+      | otherwise    -> runAction MAToggleCsv ed
   's' -> runAction MASortColumn ed
   'j' -> runAction MAJoinLines ed
   '.' -> noEff (nextFile ed)
@@ -1424,6 +1652,10 @@ cancelDialog ed =
   in case dlgKind <$> edDialog ed of
        -- The explorer's file-management prompts hand focus back to the panel.
        Just k | k `elem` [DKNewPath, DKRename, DKConfirmDelete] -> backToExplorer base
+       -- Esc out of the recovery prompt is "Keep for later": the journals are
+       -- untouched (nothing has adopted them), and the offer is dropped so the
+       -- buffers it was holding are not retained for the whole session.
+       Just DKRecover -> base { edRecover = [] }
        _ -> base
 
 -- Enter pressed: pick the focused button (or the primary one).
@@ -1441,8 +1673,16 @@ dispatchDialog kind btn d ed = case kind of
     | otherwise -> noEff (cancelDialog ed)
   DKSaveAs
     | btn == 0 -> let p = T.unpack (T.strip (fieldValue 0 d))
-                  in if null p then noEff (cancelDialog ed)
-                     else (closeDialog ed { edPath = Just p }, [EffSaveTo p])
+                  in if null p then noEff (cancelDialog ed) else case exportSuggestion ed of
+                       -- An export writes a copy: the document keeps its own
+                       -- path, because it is still the workbook (or PDF, or
+                       -- e-book) and a later Ctrl+S must not aim at the CSV.
+                       Just (_, txt)
+                         | Just p == edPath ed ->
+                             noEff (closeDialog ed)
+                               { edStatus = "That is the file this view came from \x2014 choose another name" }
+                         | otherwise -> (closeDialog ed, [EffExportTo p txt])
+                       Nothing -> (closeDialog ed { edPath = Just p }, [EffSaveTo p])
     | otherwise -> noEff (cancelDialog ed)
   DKGoToLine
     | btn == 0 -> noEff (gotoLine (fieldValue 0 d) (closeDialog ed))
@@ -1493,9 +1733,23 @@ dispatchDialog kind btn d ed = case kind of
     | otherwise -> noEff (cancelDialog ed)
   DKConfirmReplaceAll
     | btn == 0  -> case edSearch ed of
-                     Just ss -> doReplace (S.resultPaths ss) (closeDialog ed)
+                     Just ss -> doReplace (S.replaceablePaths ss) (closeDialog ed)
                      Nothing -> noEff (closeDialog ed)
     | otherwise -> noEff (cancelDialog ed)
+  -- The startup recovery prompt. Recover installs the journals as unsaved
+  -- documents and adopts their files (so saving or closing one removes it);
+  -- Discard deletes them; Keep for later emits nothing at all, which is
+  -- precisely what leaves them alone — the driver only ever removes journals
+  -- it has taken responsibility for.
+  DKRecover -> case btn of
+    0 -> (recoverJournals ed, [EffAdoptJournals keys])
+    1 -> ( answered (T.pack ("Discarded " ++ show (length keys)
+                             ++ " recovered file" ++ plural (length keys)))
+         , [EffDropJournals keys] )
+    _ -> noEff (answered "Kept the unsaved changes \x2014 you will be asked again next time")
+    where
+      keys = map riKey (edRecover ed)
+      answered s = (closeDialog ed { edRecover = [] }) { edStatus = s }
   DKAbout   -> noEff (closeDialog ed)
   DKHelp
     | btn == 0  -> noEff (openManual (closeDialog ed))
@@ -2286,6 +2540,7 @@ handleSearchKey key ed = case edSearch ed of
       KAltChar 'c' -> runSearch ed { edSearch = Just (S.clampCursor ss { ssCase = not (ssCase ss) }) }
       KAltChar 'w' -> runSearch ed { edSearch = Just (S.clampCursor ss { ssWord = not (ssWord ss) }) }
       KAltChar 'x' -> runSearch ed { edSearch = Just (S.clampCursor ss { ssRegex = not (ssRegex ss) }) }
+      KAltChar 'd' -> runSearch ed { edSearch = Just (S.clampCursor ss { ssDocs = not (ssDocs ss) }) }
       KAltChar 'r' | ssShowReplace ss -> runReplaceAll ed
       KAltChar 'h' -> noEff ed { edSearch = Just (S.clampCursor ss { ssShowReplace = not (ssShowReplace ss) }) }
       -- Any other Alt+letter opens its menu (over the search view, which stays up).
@@ -2350,6 +2605,10 @@ searchActivate ed ss = case S.selectedRow ss of
   Just (SRMatch fi mi) ->
     case Seq.lookup fi (ssResults ss) of
       Just fr -> case drop mi (frMatches fr) of
+        -- A document match is addressed by unit, not by line: open the reading
+        -- view at that page/chapter/sheet and let it find the term there.
+        (m : _) | Just (unit, _) <- mUnit m ->
+                    openDocMatch (frPath fr) unit (S.searchActiveTerm ss) ed
         (m : _) -> let (c, len) = case mCols m of ((c0, l0) : _) -> (c0, l0); [] -> (0, 0)
                    in openMatch (frPath fr) (mLine m) c len ed
         _ -> noEff ed
@@ -2422,6 +2681,7 @@ headerClick hl clickCol left w ss ed = case hl of
     Just CtlCase       -> runSearch ed { edSearch = Just (ss { ssCase = not (ssCase ss) }) }
     Just CtlWord       -> runSearch ed { edSearch = Just (ss { ssWord = not (ssWord ss) }) }
     Just CtlRegex      -> runSearch ed { edSearch = Just (ss { ssRegex = not (ssRegex ss) }) }
+    Just CtlDocs       -> runSearch ed { edSearch = Just (ss { ssDocs = not (ssDocs ss) }) }
     Just CtlReplToggle -> noEff ed { edSearch = Just (S.clampCursor ss { ssShowReplace = not (ssShowReplace ss) }) }
     _                  -> focusFieldAt SFFind clickCol left ss ed
   HLReplace  -> if clickReplaceAll clickCol left w
@@ -2628,8 +2888,44 @@ completeMouse me cp ed
 
 handleCsvKey :: Key -> CsvView -> Editor -> (Editor, [Effect])
 handleCsvKey key v ed
-  | Csv.isEditing v = handleCsvEdit key v ed
-  | otherwise       = handleCsvNav key v ed
+  | isJust (edSheets ed) = handleSheetKey key v ed
+  | Csv.isEditing v      = handleCsvEdit key v ed
+  | otherwise            = handleCsvNav key v ed
+
+-- | Keys in an open workbook's grid ("Cmedit.Xlsx").
+--
+-- The grid /is/ the CSV table view, so navigation, selection, copy, the column
+-- drags and both scroll bars come from 'handleCsvNav' unchanged. What this
+-- adds is the two things a workbook needs and a CSV file does not: sheets to
+-- turn (@[@ and @]@, as the PDF view turns pages), and a read-only wall in
+-- front of every key that would change a cell — swallowed with a note rather
+-- than left to appear to work on a grid that can never be written back.
+handleSheetKey :: Key -> CsvView -> Editor -> (Editor, [Effect])
+handleSheetKey key v ed = case key of
+  KChar '['       -> sheet (-1)
+  KChar ']'       -> sheet 1
+  -- Editing.
+  KChar _         -> readOnlyNote
+  KEnter          -> readOnlyNote
+  KModEnter       -> readOnlyNote
+  KBackspace      -> readOnlyNote
+  KDelete _       -> readOnlyNote
+  KPaste _        -> readOnlyNote
+  KFn 2 _         -> readOnlyNote
+  KAltChar '\DEL' -> readOnlyNote           -- delete column
+  KCtrlChar 'x'   -> readOnlyNote
+  KCtrlChar 'v'   -> readOnlyNote
+  KCtrlChar 'z'   -> readOnlyNote
+  KCtrlChar 'y'   -> readOnlyNote
+  KCtrlChar 'g'   -> runAction MAGoToLine ed -- "Go to Sheet", in this view
+  KCtrlChar 's'   -> runAction MASave ed     -- refused, and says why
+  KArrow _ m | hasAlt m -> readOnlyNote      -- Alt+arrows insert/delete rows and columns
+  _               -> handleCsvNav key v ed
+  where
+    sheet d = case edSheets ed of
+      Just wb -> noEff (goToSheetIn (Xlsx.wbIdx wb + d) (csvPut v ed))
+      Nothing -> noEff ed
+    readOnlyNote = noEff ed { edStatus = T.pack (containerRefusal ed) }
 
 handleCsvNav :: Key -> CsvView -> Editor -> (Editor, [Effect])
 handleCsvNav key v ed = case key of

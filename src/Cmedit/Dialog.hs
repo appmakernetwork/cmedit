@@ -10,10 +10,12 @@ module Cmedit.Dialog
     -- * Constructors
   , mkOpen
   , mkSaveAs
+  , mkExportAs
   , mkFind
   , mkReplace
   , mkGoToLine
   , mkGoToPage
+  , mkGoToUnit
   , mkNewPath
   , mkRename
   , mkConfirm
@@ -72,6 +74,7 @@ data DialogKind
   | DKConfirmRevert
   | DKConfirmOverwrite
   | DKConfirmReplaceAll
+  | DKRecover        -- ^ Startup: journals from a previous session were found (Recover / Discard / Keep for later).
   | DKAbout
   | DKHelp           -- ^ The F1 keyboard card (Manual button + styled overlay).
   | DKTheme          -- ^ View ▸ Theme: one button per colour theme, live-previewed.
@@ -124,6 +127,14 @@ mkSaveAs :: Text -> Dialog
 mkSaveAs path = Dialog DKSaveAs "Save As"
   [field "Path:" path] [] [] ["Save", "Cancel"] 0 "" False
 
+-- | Save As for a view with no buffer, where it writes a /copy/ of what is on
+-- screen and leaves the open document where it was. Same dialog kind, so the
+-- confirm path stays a single case; the title and the button are what say
+-- which of the two this is.
+mkExportAs :: Text -> Text -> Dialog
+mkExportAs title path = Dialog DKSaveAs title
+  [field "Path:" path] [] [] ["Export", "Cancel"] 0 "" False
+
 mkFind :: Text -> Bool -> Bool -> Dialog
 mkFind term caseSens wholeWord = Dialog DKFind "Find"
   [field "Find:" term]
@@ -147,6 +158,12 @@ mkGoToLine = Dialog DKGoToLine "Go to Line"
 mkGoToPage :: Dialog
 mkGoToPage = Dialog DKGoToLine "Go to Page"
   [field "Page:" ""] [] [] ["Go", "Cancel"] 0 "" False
+
+-- | And for the two container views that are divided into something else
+-- again: an EPUB's chapters and a workbook's sheets.
+mkGoToUnit :: Text -> Dialog
+mkGoToUnit unit = Dialog DKGoToLine ("Go to " <> unit)
+  [field (unit <> ":") ""] [] [] ["Go", "Cancel"] 0 "" False
 
 -- | Explorer "new file/folder" prompt. @where_@ names the directory it will
 -- be created in (display only; the caller re-derives it on confirm).

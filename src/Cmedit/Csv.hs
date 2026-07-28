@@ -5,8 +5,11 @@
 module Cmedit.Csv
   ( CsvView(..)
   , mkCsvView
+  , mkCsvGrid
+  , mkCsvLines
   , csvToText
   , csvParse
+  , csvParseLines
     -- * Dimensions / access
   , nRows
   , nCols
@@ -76,12 +79,20 @@ module Cmedit.Csv
   , undo
   , redo
   , rebaseHistory
+    -- * The modified flag
   , isModified
   , markSaved
+  , markUnsaved
+  , CsvDirty(..)
+  , dirtyFrom
+    -- * The embedded-newline map (0029)
+  , computeNl
+  , rowNl
+  , linesBefore
   ) where
 
 import Data.Char (chr, ord)
-import Data.Foldable (toList)
+import Data.Foldable (foldl', toList)
 import Data.List (elemIndex, nub, sortBy)
 import Data.Maybe (fromMaybe)
 import Text.Read (readMaybe)
@@ -120,13 +131,45 @@ data CsvView = CsvView
   , csvUndo   :: !(Seq Grid)
   , csvRedo   :: !(Seq Grid)
   , csvSaved  :: !Grid                -- ^ Grid as last saved/loaded (for the modified flag).
+  , csvDirty  :: !CsvDirty            -- ^ How 'csvRows' differs from 'csvSaved', maintained
+                                      --   incrementally by 'withCell'/'withRows'/undo/redo
+                                      --   (comparing the two grids per keystroke cost 2.3 ms
+                                      --   and 14 MB on a 223 000-row table). See 'CsvDirty'.
   , csvSelAnchor :: !(Maybe (Int, Int)) -- ^ Other corner of a rectangular cell selection.
   , csvWidths :: !(Seq Int)           -- ^ Clamped display width per column, kept in sync with
                                       --   'csvRows' by 'withRows'/undo/redo (scanning the whole
                                       --   grid per keystroke would freeze large tables).
   , csvUserW  :: !(Map Int Int)       -- ^ User width overrides (header-border drag), by column.
                                       --   Sparse; wins over the content-fitted 'csvWidths' entry.
+  , csvNl     :: !(Map Int Int)       -- ^ Rows that carry embedded newlines, and how many each
+                                      --   contributes to the serialised CSV. Sparse — absent
+                                      --   means zero — and kept in sync with 'csvRows' by
+                                      --   'withRows'\/'withCell'\/undo\/redo. This is what makes
+                                      --   'cellTextPos' cheap; see 'linesBefore'.
   } deriving (Show)
+
+-- | How far 'csvRows' has diverged from 'csvSaved' — the modified flag, kept as
+-- state instead of recomputed.
+--
+-- The invariant is a biconditional, and both directions are load-bearing:
+--
+--  * @DirtyShape@ holds /exactly when/ the two grids have different shapes —
+--    a different row count, or some row index at which the two rows have
+--    different lengths. It is not an "I don't know" marker: 'withCell' relies
+--    on the forward direction to keep it across a cell write without looking
+--    at the grid, and every constructor of it relies on the reverse direction
+--    to be allowed to say @DirtyCells@ at all.
+--  * @DirtyCells n@ holds exactly when the shapes are equal and exactly @n@
+--    cell positions hold different text.
+--
+-- So @isModified v@ is @csvRows v /= csvSaved v@, in O(1). Cells rather than
+-- rows because the count is then maintained by a /delta/ — a cell write knows
+-- the old text, the new text and the saved text, which is everything needed to
+-- add or drop one from the count without consulting anything else. That is
+-- what makes the common case (typing) O(log rows) rather than O(rows), and it
+-- is why editing a cell back to its saved value correctly clears the flag.
+data CsvDirty = DirtyShape | DirtyCells !Int
+  deriving (Show, Eq)
 
 maxUndo :: Int
 maxUndo = 500
@@ -136,15 +179,26 @@ maxUndo = 500
 
 -- | Build a table view from CSV text, using the given delimiter.
 mkCsvView :: Char -> Text -> CsvView
-mkCsvView delim t =
-  let rows0 = csvParse delim t
-      rows  = if Seq.null rows0 then Seq.singleton (Seq.singleton T.empty) else rows0
+mkCsvView delim t = mkCsvGrid delim (csvParse delim t)
+
+-- | Build a table view from a grid somebody else produced.
+--
+-- The grid is the whole model, so a producer that is not CSV text — an XLSX
+-- worksheet ("Cmedit.Xlsx") — reaches the table view through here and gets
+-- navigation, selection, copy, column widths and both scroll bars for free.
+-- What it does /not/ get is a way back: 'csvToText' would serialise a
+-- workbook's sheet to CSV, which is not what its file is, so the views built
+-- this way are marked read-only by the editor and never saved.
+mkCsvGrid :: Char -> Grid -> CsvView
+mkCsvGrid delim rows0 =
+  let rows  = if Seq.null rows0 then Seq.singleton (Seq.singleton T.empty) else rows0
   in CsvView
        { csvRows = rows, csvCurRow = 0, csvCurCol = 0, csvTop = 0, csvLeft = 0
        , csvXOff = 0
        , csvEdit = Nothing, csvDelim = delim, csvUndo = Seq.empty, csvRedo = Seq.empty
-       , csvSaved = rows, csvSelAnchor = Nothing
-       , csvWidths = computeWidths rows, csvUserW = Map.empty }
+       , csvSaved = rows, csvDirty = DirtyCells 0, csvSelAnchor = Nothing
+       , csvWidths = computeWidths rows, csvUserW = Map.empty
+       , csvNl = computeNl delim rows }
 
 -- | Serialise the grid back to CSV text (records joined by @\\n@; the caller's
 -- buffer applies the file's actual line ending).
@@ -163,80 +217,174 @@ quoteField delim f
 
 -- | Parse CSV text into a grid of cells (RFC 4180-ish: quoted fields, @\"\"@
 -- escapes, embedded delimiters and newlines).
--- | Parse CSV text into a grid.
 --
--- Operates on 'Text' throughout. The previous version unpacked the whole file
--- to a 'String' and accumulated each field as a reversed @[Char]@, which cost
--- 4.3 s and 8.8 GB of allocation to open a 32 MB file. The common case — an
--- unquoted field — is now a single 'T.break', whose result is a slice with no
--- copying at all; only fields that actually contain quotes are rebuilt.
+-- A thin wrapper over 'csvParseLines': the parser's input is a list of lines,
+-- and a whole-file 'Text' is one @T.split@ away from being that. Splitting
+-- first is not a reinterpretation — a @\\n@ is a record terminator in every
+-- position the parser cares about — and it means there is exactly *one* CSV
+-- parser rather than a text one and a line one that could drift apart.
+-- ('pasteClip' and the tests are the only remaining callers; the editor's own
+-- load path goes straight to 'csvParseLines'.)
 --
--- Quirks of the original are preserved deliberately: a doubled @""@ inside a
--- quoted field is an escaped quote, stray text after a closing quote is
--- appended to the field rather than rejected, and CR / CRLF / LF all end a
--- record.
+-- Quirks of the original @String@ parser are preserved deliberately: a doubled
+-- @\"\"@ inside a quoted field is an escaped quote, stray text after a closing
+-- quote is appended to the field rather than rejected, and CR / CRLF / LF all
+-- end a record.
 csvParse :: Char -> Text -> Grid
-csvParse delim = Seq.fromList . rows
+csvParse delim t = parseFrom delim (T.split (== '\n') t)
+
+-- | Parse a grid straight from a buffer's lines — the editor's own
+-- representation of a loaded file.
+--
+-- This is the load path, and skipping the round trip through one whole-file
+-- 'Text' is the point of it. @mkCsvView delim (bufferToText LF False buf)@
+-- rebuilt the entire file as a second array (125 MB of allocation on a 32 MB
+-- file) purely so the parser could take it apart again along exactly the
+-- newlines the buffer had just been split on; worse, the cells then pointed
+-- into *that* copy, so the document held two whole copies of the file for as
+-- long as it stayed open. Parsing from the lines makes every unquoted cell a
+-- slice of the same array the buffer's lines are slices of.
+--
+-- Equivalence with the text parser is by construction (they are the same
+-- engine, and @T.split (== '\\n') . T.intercalate "\\n"@ is the identity on a
+-- list of lines) and is pinned by a fuzz test in the suite.
+csvParseLines :: Char -> Seq Text -> Grid
+csvParseLines delim = parseFrom delim . toList
+
+-- | The table view for a buffer's lines. 'mkCsvView' is this over 'csvParse'.
+mkCsvLines :: Char -> Seq Text -> CsvView
+mkCsvLines delim ls = mkCsvGrid delim (csvParseLines delim ls)
+
+-- The parser proper. The input is a cursor into a list of lines: the
+-- unconsumed remainder of the current line, and the lines after it. The
+-- newline between one line and the next is implicit — never materialised, and
+-- never scanned for — which is what makes this cheap enough to run on a file's
+-- worth of lines.
+--
+-- The common case, a line with no quote and no stray CR, takes a fast path
+-- ('fastRow') that is one 'T.break' loop over the delimiter and nothing else,
+-- every cell a slice with no copying. Only lines that really contain a quote
+-- pay for the character-level machinery, and only fields that contain a
+-- doubled quote are rebuilt.
+--
+-- Cells are forced before they are stored, here as everywhere: a 'Seq' is
+-- element-lazy, and a grid of two million thunks each holding a parser closure
+-- is the shape of problem this codebase has had before.
+data Cur = Cur !Text ![Text]
+
+-- The outcome of one field: its text, the cursor after it, and what ended it.
+-- The cursor is UNPACKed into it: a field's result is then one allocation
+-- rather than two, which at a dozen fields a row over a million rows is worth
+-- having.
+data Fld = FDelim   !Text {-# UNPACK #-} !Cur
+         | FNewline !Text {-# UNPACK #-} !Cur
+         | FEof     !Text {-# UNPACK #-} !Cur
+
+parseFrom :: Char -> [Text] -> Grid
+parseFrom delim ls0 = Seq.fromList (rows (mkCur ls0))
   where
-    rows t
-      | T.null t = []
-      | otherwise = let (row, rest, more) = oneRow t
-                    in row : if more then rows rest else []
+    mkCur []       = Cur T.empty []
+    mkCur (l : ls) = Cur l ls
 
-    oneRow t = collect t []
-    collect t acc =
-      let (f, rest, term) = field t
-      in case term of
-           TDelim   -> collect rest (f : acc)
-           TNewline -> (Seq.fromList (reverse (f : acc)), rest, not (T.null rest))
-           TEof     -> (Seq.fromList (reverse (f : acc)), rest, False)
+    -- "The remaining text is empty" — the text parser's termination test,
+    -- expressed on the cursor.
+    atEnd (Cur cur rest) = T.null cur && null rest
 
-    isSep c = c == delim || c == '\n' || c == '\r'
+    -- 'rows' is entered at the start of a record, which is the start of a line
+    -- except after a lone CR mid-line (which ends a record where it stands).
+    -- The fast path is right either way: it says "this record is the rest of
+    -- the cursor's line", and a record does end at the line end unless a quote
+    -- or a CR intervenes — which is exactly what 'plain' rules out.
+    rows c@(Cur cur rest)
+      | atEnd c = []
+      | plain cur =
+          fastRow cur :
+            (case rest of
+               []       -> []
+               (l : ls) -> let c' = Cur l ls in if atEnd c' then [] else rows c')
+      | otherwise =
+          let (row, c', more) = oneRow c
+          in row : if more then rows c' else []
 
-    field t = case T.uncons t of
-      Just ('"', cs) -> quoted cs []
-      _              -> unquoted t
+    -- No quoting and no embedded CR: the record is exactly this line's fields.
+    plain = not . T.any (\ch -> ch == '"' || ch == '\r')
+
+    -- @Seq.fromList . T.split (== delim)@, but strict: 'T.split' returns a
+    -- lazy list whose tail thunks cost more than the cells they defer, and the
+    -- bang is what keeps a parsed cell from being a selector thunk on the
+    -- 'T.break' pair.
+    fastRow t0 = mkRow (go t0 [])
+      where go t acc = case T.break (== delim) t of
+              (!f, r) | T.null r  -> f : acc
+                      | otherwise -> go (T.tail r) (f : acc)
+
+    oneRow c0 = collect c0 []
+    collect c acc = case field c of
+      FDelim   f c' -> collect c' (f : acc)
+      FNewline f c' -> (mkRow (f : acc), c', not (atEnd c'))
+      FEof     f c' -> (mkRow (f : acc), c', False)
+    mkRow acc = Seq.fromList (reverse acc)
+
+    field c@(Cur cur rest)
+      | not (T.null cur), T.head cur == '"' = quoted (Cur (T.tail cur) rest) []
+      | otherwise                           = unquoted c
 
     -- Unquoted: everything up to the next delimiter or record end. One scan,
     -- no copy (the value is a slice of the source).
-    unquoted t =
-      let (val, rest) = T.break isSep t
-      in case T.uncons rest of
-           Nothing -> (val, T.empty, TEof)
-           Just (c, cs)
-             | c == delim -> (val, cs, TDelim)
-             | c == '\n'  -> (val, cs, TNewline)
-             | otherwise  -> (val, dropLF cs, TNewline)      -- '\r'
+    unquoted (Cur cur rest) =
+      let (val, r) = T.break (\ch -> ch == delim || ch == '\r') cur
+      in if T.null r
+           then endOfLine val rest
+           else if T.head r == delim
+                  then FDelim val (Cur (T.tail r) rest)
+                  else afterCR val (T.tail r) rest
+
+    -- End of a line with nothing left to consume on it: the implicit newline
+    -- ends the record, unless there is no next line, in which case it is EOF.
+    endOfLine val []        = FEof val (Cur T.empty [])
+    endOfLine val (l : ls)  = FNewline val (Cur l ls)
+
+    -- A CR ends the record and swallows an LF after it — which, at the end of
+    -- a line, is the implicit newline, so the next record starts on the line
+    -- after (this is the CR half of CRLF as seen by 'csvParse', whose input
+    -- has already been split on LF).
+    afterCR val cs rest
+      | T.null cs = endOfLine val rest
+      | otherwise = FNewline val (Cur cs rest)
 
     -- Quoted: segments between quote characters, joined only when the field
-    -- really contains a doubled quote.
-    quoted t acc =
-      let (seg, rest) = T.break (== '"') t
-      in case T.uncons rest of
-           Nothing -> (joinSegs (seg : acc), T.empty, TEof)   -- unterminated
-           Just (_, r2) -> case T.uncons r2 of
-             Just ('"', r3) -> quoted r3 (T.singleton '"' : seg : acc)
-             _              -> close r2 (joinSegs (seg : acc))
+    -- really spans lines or contains a doubled quote.
+    quoted (Cur cur rest) acc =
+      let (seg, r) = T.break (== '"') cur
+      in if T.null r
+           then case rest of                       -- the quote spans the line end
+                  []       -> FEof (joinSegs (seg : acc)) (Cur T.empty [])
+                  (l : ls) -> quoted (Cur l ls) (nlText : seg : acc)
+           else
+             let r2 = T.tail r
+             in if not (T.null r2) && T.head r2 == '"'
+                  then quoted (Cur (T.tail r2) rest) (quoteText : seg : acc)
+                  else close (Cur r2 rest) (joinSegs (seg : acc))
 
     joinSegs [seg] = seg
     joinSegs segs  = T.concat (reverse segs)
 
     -- After a closing quote: a delimiter or record end, or (tolerated) stray
     -- text, which is appended to the field.
-    close r val = case T.uncons r of
-      Nothing -> (val, T.empty, TEof)
-      Just (c, cs)
-        | c == delim -> (val, cs, TDelim)
-        | c == '\n'  -> (val, cs, TNewline)
-        | c == '\r'  -> (val, dropLF cs, TNewline)
-        | otherwise  -> let (v2, rest2, term2) = unquoted cs
-                        in (val <> T.singleton c <> v2, rest2, term2)
+    close (Cur cur rest) val
+      | T.null cur = endOfLine val rest
+      | c == delim = FDelim val (Cur cs rest)
+      | c == '\r'  = afterCR val cs rest
+      | otherwise  = case unquoted (Cur cs rest) of
+          FDelim   v2 c' -> FDelim   (val <> T.singleton c <> v2) c'
+          FNewline v2 c' -> FNewline (val <> T.singleton c <> v2) c'
+          FEof     v2 c' -> FEof     (val <> T.singleton c <> v2) c'
+      where c  = T.head cur
+            cs = T.tail cur
 
-    dropLF t = case T.uncons t of
-      Just ('\n', cs) -> cs
-      _               -> t
-
-data Term = TDelim | TNewline | TEof
+nlText, quoteText :: Text
+nlText    = T.singleton '\n'
+quoteText = T.singleton '"'
 
 ------------------------------------------------------------------------------
 -- Dimensions / access
@@ -307,12 +455,14 @@ clampUserW w = max 2 (min 200 w)
 -- did a @Seq.adjust'@ per cell, rebuilding O(log cols) spine nodes 3.6 million
 -- times when a large table is opened. This runs on load and on any change of
 -- shape, so it is worth the explicit loop.
+-- Both loops walk the 'Seq's directly rather than through 'toList': a list cell
+-- per grid cell is 2.7 million cons cells on a 32 MB table, for nothing.
 computeWidths :: Grid -> Seq Int
 computeWidths rows =
-  let cols = max 1 (maximum (0 : map Seq.length (toList rows)))
+  let cols = max 1 (foldl' (\ !m row -> max m (Seq.length row)) 0 rows)
   in Seq.fromList (elems (runSTUArray (do
        a <- newArray (0, cols - 1) (clampW 1)
-       forM_ (toList rows) $ \row ->
+       forM_ rows $ \row ->
          let go !_ [] = pure ()
              go !c (cell : rest)
                | c >= cols = pure ()
@@ -321,7 +471,7 @@ computeWidths rows =
                    old <- readArray a c
                    when (w > old) (writeArray a c w)
                    go (c + 1) rest
-         in go 0 (toList row)
+         in go (0 :: Int) (toList row)
        pure a)))
 
 -- The true width of one column (for when an edit shrinks a cell that may have
@@ -369,6 +519,176 @@ syncWidths old ws new
           (w1, redoCols) = foldl upd (ws, []) changes
       in foldl (\w c -> Seq.update c (colWidth new c) w) w1 (nub redoCols)
 
+------------------------------------------------------------------------------
+-- Embedded newlines, as maintained state
+--
+-- Third cache on the same discipline as 'csvWidths' (0016) and 'csvDirty'
+-- (0028), for the same reason: 'cellTextPos' — "which line of the serialised
+-- file does this cell start on?" — is asked once per document event and used
+-- to be answered by re-serialising every row above the cursor. On a
+-- 223 209-row table at the last row that cost 383 ms and 1 651 MB (plan 0029).
+--
+-- What it stores is the /sparse/ map of rows that contain an embedded newline
+-- at all, and how many each contributes. Sparse because that is the shape of
+-- real data: the 32 MB benchmark corpus has 446 such rows out of 223 209, and
+-- an ordinary table has none, in which case the map is empty and the prefix
+-- sum is zero without looking at anything.
+--
+-- The invariant is an equality, and 'cellTextPos' depends on it exactly: for
+-- every row index @i@,
+--
+--   @Map.findWithDefault 0 i (csvNl v)@  ==  the number of newlines in row
+--   @i@'s serialised form — that is, in @csvToText@ of a one-row grid holding
+--   it, which is what the test's oracle actually computes
+--
+-- which holds because serialisation cannot change a newline count:
+-- 'quoteField' only wraps a field in quotes and doubles the quotes inside it,
+-- and the joins between fields contribute a delimiter each (which is a
+-- newline only in the degenerate case the second term below covers).
+
+-- | Newlines row @row@ contributes to the serialised CSV.
+rowNl :: Char -> Row -> Int
+rowNl delim row =
+  foldl' (\ !a c -> a + nlCount c) 0 row
+    + (if delim == '\n' then max 0 (Seq.length row - 1) else 0)
+
+-- | The whole map, from scratch. O(grid); runs on load and wherever a change
+-- cannot be carried.
+computeNl :: Char -> Grid -> Map Int Int
+computeNl delim rows =
+  Map.fromDistinctAscList (reverse (Seq.foldlWithIndex step [] rows))
+  where
+    -- Walks the 'Seq's directly: a 'toList' here is a cons cell and a tuple per
+    -- row for nothing, the same reason 'computeWidths' avoids one.
+    step acc i row = let k = rowNl delim row in if k > 0 then (i, k) : acc else acc
+
+-- | Carry the map across a grid change — the twin of 'syncWidths' and
+-- 'syncDirty', with the same cost model: pointer-equal rows are skipped, so a
+-- change that touches one row costs O(rows) pointer hops and one row's cells.
+-- A change of row /count/ shifts every later index, so it recomputes.
+syncNl :: Char -> Grid -> Map Int Int -> Grid -> Map Int Int
+syncNl delim old m new
+  | ptrEq old new = m
+  | Seq.length old /= Seq.length new = computeNl delim new
+  | otherwise = go m 0 (toList old) (toList new)
+  where
+    go !acc !i (o : os) (w : ws)
+      | ptrEq o w = go acc (i + 1) os ws
+      | otherwise = go (setNl i (rowNl delim w) acc) (i + 1) os ws
+    go !acc _ _ _ = acc
+
+-- | Record a row's count, keeping the map sparse (zero means absent).
+setNl :: Int -> Int -> Map Int Int -> Map Int Int
+setNl i k m
+  | k <= 0    = Map.delete i m
+  | otherwise = Map.insert i k m
+
+-- | Extra lines contributed by the rows /above/ row @r@ — the quantity
+-- 'cellTextPos' needs. O(log rows + rows-above-that-are-multi-line), which is
+-- O(log rows) for a table with no embedded newlines at all.
+linesBefore :: CsvView -> Int -> Int
+linesBefore v r
+  | Map.null m || r <= 0 = 0
+  | otherwise            = Map.foldl' (+) 0 (fst (Map.split r m))
+  where m = csvNl v
+
+------------------------------------------------------------------------------
+-- The modified flag, as maintained state
+--
+-- Same discipline as the width cache above, and for the same reason: the
+-- quantity is wanted on every keystroke, and computing it from the grid is
+-- O(rows). The three functions below are the only producers of a 'CsvDirty',
+-- and 'withCell' / 'withRows' / undo / redo / 'markSaved' / 'markUnsaved' /
+-- 'mkCsvGrid' / 'rebaseHistory' are the only places a 'CsvView' may set the
+-- field — exactly the set of places allowed to set 'csvWidths', plus the three
+-- that move 'csvSaved'.
+
+-- | The dirty state from scratch: one pointer-accelerated pass over the grid.
+--
+-- Run when a grid appears wholesale (a mode toggle rebasing onto a new parse)
+-- or when the incremental state cannot be carried (a cell write that padded the
+-- grid, or a shape change that may have restored the saved shape). Never on the
+-- typing path.
+--
+-- Every 'ptrEq' in this section is a fast path in front of a real comparison,
+-- and a spurious 'False' costs time and never correctness. That is not a
+-- formality here: the design this replaced leaned on @ptrEq (csvRows v)
+-- (csvSaved v)@ to make the unmodified case free, and measurement showed that
+-- particular test returning 'False' under @-O2@ for a grid whose two fields
+-- were assigned from the same binding a moment earlier — while the row-level
+-- tests below, on elements of two 'toList's, do fire. So a correctness argument
+-- may never rest on one, and a cost argument may not either (plan 0028).
+dirtyFrom :: Grid -> Grid -> CsvDirty
+dirtyFrom saved rows
+  | ptrEq saved rows = DirtyCells 0
+  | Seq.length saved /= Seq.length rows = DirtyShape
+  | otherwise = go 0 (toList rows) (toList saved)
+  where
+    go !n (r : rs) (s : ss)
+      | ptrEq r s                      = go n rs ss
+      | Seq.length r /= Seq.length s   = DirtyShape
+      | otherwise                      = go (n + rowDirty s r) rs ss
+    go !n _ _ = DirtyCells n
+
+-- | How many cells of two same-length rows differ.
+rowDirty :: Row -> Row -> Int
+rowDirty a b = go 0 (toList a) (toList b)
+  where
+    go !n (x : xs) (y : ys) | ptrEq x y || x == y = go n xs ys
+                            | otherwise           = go (n + 1) xs ys
+    go !n _ _ = n
+
+-- | Carry the dirty state across a grid change — the twin of 'syncWidths', and
+-- with the same cost model: pointer-equal rows are skipped, so a change that
+-- touches one row costs O(rows) pointer hops and one row comparison.
+--
+-- A change of shape is the cheap case rather than the expensive one: a row
+-- inserted or deleted is answered by the row-count test alone, and a column
+-- inserted or deleted by the first row the walk looks at. Only the shape-equal
+-- changes (sort, replace-all, a same-shaped paste) actually count cells, and
+-- those already rebuild the grid.
+syncDirty :: Grid -> CsvDirty -> Grid -> Grid -> CsvDirty
+syncDirty saved d old new
+  | ptrEq old new = d
+  | otherwise = case d of
+      -- The shape differed before; this change may have restored it, and only
+      -- a full pass can say. (Structural edits are rare next to typing.)
+      DirtyShape -> dirtyFrom saved new
+      DirtyCells n
+        | Seq.length old /= Seq.length new -> DirtyShape
+        | otherwise -> go n 0 (toList old) (toList new)
+  where
+    go !n !i (o : os) (w : ws)
+      | ptrEq o w = go n (i + 1) os ws
+      | otherwise = case Seq.lookup i saved of
+          Just sv | Seq.length w == Seq.length sv ->
+                      go (n - rowDirty sv o + rowDirty sv w) (i + 1) os ws
+                  | otherwise -> DirtyShape
+          Nothing -> dirtyFrom saved new    -- invariant broken; recompute exactly
+    go !n _ _ _ = DirtyCells n
+
+-- | Carry the dirty state across a write of one cell, in O(log rows): the
+-- caller knows the cell, so the count moves by at most one and nothing else in
+-- the grid needs looking at.
+--
+-- @old@ is the cell's text before the write, @new@ after. A write that /grew/
+-- the grid (padding a short row or appending rows) changes the shape and is
+-- handed to 'dirtyFrom'; the caller passes @grew@ because it is the one that
+-- knows whether 'ensureCell' had anything to do.
+dirtyCell :: Grid -> CsvDirty -> Bool -> Int -> Int -> Text -> Text -> Grid -> CsvDirty
+dirtyCell saved d grew r c old new rows'
+  | grew = dirtyFrom saved rows'
+  | otherwise = case d of
+      -- The shape still differs from saved: overwriting a cell cannot change
+      -- that, and the biconditional in 'CsvDirty' is what lets us say so
+      -- without looking.
+      DirtyShape   -> DirtyShape
+      DirtyCells n -> case Seq.lookup r saved >>= Seq.lookup c of
+        Nothing -> dirtyFrom saved rows'    -- invariant broken; recompute exactly
+        Just sv -> DirtyCells (n - diffBit old sv + diffBit new sv)
+  where
+    diffBit x y = if ptrEq x y || x == y then 0 else 1 :: Int
+
 -- Display width of a cell: its widest line (cells may contain newlines).
 -- Uses @max 1@ per glyph to agree with the renderer, which emits at least
 -- one grid cell per code point; this matters for emoji whose presentation is
@@ -379,12 +699,24 @@ syncWidths old ws new
 -- (ZWSP, LTR/RTL marks, BOM, …) are counted as zero — terminals emit
 -- nothing for those and the cursor does not advance, so including them
 -- would over-reserve the column by one cell per occurrence.
+--
+-- One strict fold over the text, carrying (widest line so far, current line).
+-- The obvious spelling — @maximum . map (sum . map effW . T.unpack) . T.splitOn
+-- "\\n"@ — unpacks every cell to a @String@ (a cons cell and a boxed 'Char' per
+-- character) and allocates a list of slices per cell. That is the single
+-- largest cost of opening a table: 2 697 MB of the 3 719 MB a 32 MB CSV used to
+-- allocate, because 'computeWidths' calls this on every one of its 2.7 million
+-- cells. The fold allocates nothing.
 cellWidth :: Text -> Int
-cellWidth = maximum . (0 :) . map lineW . T.splitOn (T.pack "\n")
+cellWidth t = case T.foldl' step (W 0 0) t of W best cur -> max best cur
   where
-    lineW = sum . map effW . T.unpack
-    effW c | isInvisibleFormat c = 0
-           | otherwise           = max 1 (charWidth c)
+    step (W best cur) c
+      | c == '\n'           = W (max best cur) 0
+      | isInvisibleFormat c = W best cur
+      | otherwise           = W best (cur + max 1 (charWidth c))
+
+-- Strict accumulator for 'cellWidth': (widest completed line, current line).
+data W = W !Int !Int
 
 -- | A cell's display rows grow with embedded newlines, but a row is capped at
 -- this many lines on screen (taller cells scroll while being edited).
@@ -435,7 +767,9 @@ rowAtLineOffset v off = go (csvTop v) 0
 withRows :: (Grid -> Grid) -> CsvView -> CsvView
 withRows f v =
   let rows' = f (csvRows v)
-  in v { csvRows = rows', csvWidths = syncWidths (csvRows v) (csvWidths v) rows' }
+  in v { csvRows = rows', csvWidths = syncWidths (csvRows v) (csvWidths v) rows'
+       , csvDirty = syncDirty (csvSaved v) (csvDirty v) (csvRows v) rows'
+       , csvNl = syncNl (csvDelim v) (csvRows v) (csvNl v) rows' }
 
 -- | Write one cell, updating the width cache in O(1) for the common case.
 --
@@ -452,10 +786,23 @@ withRows f v =
 --
 -- Structural edits (row/column insert & delete, sort, paste, mapCells) keep
 -- using 'withRows', where a diff or a full recomputation is the right answer.
+--
+-- The modified flag rides along on the same knowledge (plan 0028): the cell's
+-- old text, its new text and its saved text are everything needed to move the
+-- dirty-cell count by one, so 'isModified' stays exact without the grid
+-- comparison that used to cost 2.3 ms and 14 MB per keystroke once a large
+-- table had been edited at all.
 withCell :: Int -> Int -> Text -> CsvView -> CsvView
 withCell r c t v =
-  let old   = cellAt r c v
-      rows' = setCell r c t (csvRows v)
+  let oldRow = Seq.lookup r (csvRows v)
+      old    = maybe T.empty (fromMaybe T.empty . Seq.lookup c) oldRow
+      rows'  = setCell r c t (csvRows v)
+      -- Did 'ensureCell' have to pad? Then the shape moved and the counts and
+      -- widths both need recomputing. In practice the cursor is always inside
+      -- the grid, so this never fires.
+      grew   = case oldRow of
+                 Just row -> c < 0 || c >= Seq.length row
+                 Nothing  -> True
       ws    = csvWidths v
       wNew  = clampW (cellWidth t)
       wOld  = clampW (cellWidth old)
@@ -465,7 +812,17 @@ withCell r c t v =
         | wOld < cur                  = ws
         | otherwise                   = Seq.update c (colWidth rows' c) ws
         where cur = Seq.index ws c
-  in v { csvRows = rows', csvWidths = ws' }
+      -- The newline map rides the same knowledge: the row's count moves by the
+      -- difference between the cell that left and the one that arrived, so
+      -- nothing outside this row is looked at. A write that /grew/ the grid
+      -- moved every later row index, so that one recomputes.
+      nl'
+        | grew      = computeNl (csvDelim v) rows'
+        | otherwise = setNl r (Map.findWithDefault 0 r (csvNl v) - nlCount old + nlCount t)
+                            (csvNl v)
+  in v { csvRows = rows', csvWidths = ws'
+       , csvDirty = dirtyCell (csvSaved v) (csvDirty v) grew r c old t rows'
+       , csvNl = nl' }
 
 snapshot :: CsvView -> CsvView
 snapshot v = v { csvUndo = pushHist maxUndo (csvRows v) (csvUndo v), csvRedo = Seq.empty }
@@ -636,9 +993,11 @@ hScrollTo x v =
 -- the table view and the plain-text view. They mirror 'csvToText' exactly:
 -- records joined by @\\n@, fields by the delimiter, each field requoted.
 
--- Serialised text of a whole row (matches one line family of 'csvToText').
-rowSerial :: CsvView -> Int -> Text
-rowSerial v i = T.intercalate (delimT v) (map (quoteField (csvDelim v)) (toList (rowAt i v)))
+-- (There used to be a @rowSerial@ here — the serialised text of a whole row —
+-- and both mappings below walked every row above the target through it. That
+-- is what plan 0029 removed: the only thing they needed from those rows was
+-- how many lines each takes up, and 'csvNl' knows that without building any
+-- text at all.)
 
 -- Serialised prefix of row @r@ up to (not including) field @c@, with the
 -- trailing delimiter that precedes field @c@.
@@ -658,20 +1017,31 @@ lastLineLen = T.length . last . T.splitOn (T.pack "\n")
 
 -- | Buffer @(line, column)@ at which a given cell begins in the serialised CSV
 -- (accounting for any earlier rows/fields that contain embedded newlines).
+--
+-- The prefix of rows above @r@ is answered from 'csvNl' rather than by
+-- re-serialising them. It used to be the latter, and since the recents, the
+-- session file and the crash journal all ask a table document where its cursor
+-- is, "re-serialise everything above the cursor" was reachable from an ordinary
+-- keystroke: 383 ms and 1 651 MB at the last row of a 223 209-row table
+-- (plan 0029).
 cellTextPos :: CsvView -> Int -> Int -> (Int, Int)
 cellTextPos v r c =
-  let baseLine = r + sum [ nlCount (rowSerial v i) | i <- [0 .. r - 1] ]
+  let baseLine = r + linesBefore v r
       pre      = prefixSerial v r c
   in (baseLine + nlCount pre, lastLineLen pre)
 
 -- | The cell @(row, col)@ that a buffer position falls in. A position sitting
 -- on a delimiter maps to the field just before it; out-of-range positions clamp
 -- to the nearest cell.
+--
+-- The inverse of 'cellTextPos', and it reads 'csvNl' the same way: row @i@
+-- starts at line @i + linesBefore v i@, which is strictly increasing in @i@, so
+-- the row is found by binary search instead of by serialising the file down to
+-- the target line.
 textPosCell :: CsvView -> Int -> Int -> (Int, Int)
 textPosCell v line col =
   let n        = nRows v
-      starts   = scanl (\acc i -> acc + 1 + nlCount (rowSerial v i)) 0 [0 .. n - 1]
-      r        = clampI 0 (n - 1) (lastLE starts line)
+      r        = clampI 0 (n - 1) (lastRowAtOrBefore n line)
       fs       = map (quoteField (csvDelim v)) (toList (rowAt r v))
       colStart = scanl (\acc f -> acc + T.length f + 1) 0 fs
       c        = clampI 0 (max 0 (length fs - 1)) (lastLE (dropLast colStart) col)
@@ -681,6 +1051,17 @@ textPosCell v line col =
     lastLE xs target = length (takeWhile (<= target) xs) - 1
     dropLast [] = []
     dropLast xs = init xs
+    rowStart i = i + linesBefore v i
+    -- Largest i in [0, n] whose row starts at or before @target@; row 0 starts
+    -- at line 0, so a negative target has no answer and clamps to 0 above.
+    lastRowAtOrBefore n target
+      | target < 0 = -1
+      | otherwise  = go 0 n
+      where
+        go lo hi
+          | lo >= hi  = lo
+          | otherwise = let mid = (lo + hi + 1) `div` 2
+                        in if rowStart mid <= target then go mid hi else go lo (mid - 1)
 
 ------------------------------------------------------------------------------
 -- Cell editing
@@ -1274,7 +1655,9 @@ undo v = case Seq.viewl (csvUndo v) of
     clampCursor v { csvRows = g, csvUndo = gs
                   , csvRedo = pushHist maxUndo (csvRows v) (csvRedo v)
                   , csvEdit = Nothing, csvSelAnchor = Nothing
-                  , csvWidths = syncWidths (csvRows v) (csvWidths v) g }
+                  , csvWidths = syncWidths (csvRows v) (csvWidths v) g
+                  , csvDirty = syncDirty (csvSaved v) (csvDirty v) (csvRows v) g
+                  , csvNl = syncNl (csvDelim v) (csvRows v) (csvNl v) g }
 
 redo :: CsvView -> CsvView
 redo v = case Seq.viewl (csvRedo v) of
@@ -1283,7 +1666,9 @@ redo v = case Seq.viewl (csvRedo v) of
     clampCursor v { csvRows = g, csvRedo = gs
                   , csvUndo = pushHist maxUndo (csvRows v) (csvUndo v)
                   , csvEdit = Nothing, csvSelAnchor = Nothing
-                  , csvWidths = syncWidths (csvRows v) (csvWidths v) g }
+                  , csvWidths = syncWidths (csvRows v) (csvWidths v) g
+                  , csvDirty = syncDirty (csvSaved v) (csvDirty v) (csvRows v) g
+                  , csvNl = syncNl (csvDelim v) (csvRows v) (csvNl v) g }
 
 -- | Give @new@ the undo history of @old@, with @old@'s grid pushed as the most
 -- recent undo step. Used when a CSV document is edited as plain text and then
@@ -1292,29 +1677,49 @@ redo v = case Seq.viewl (csvRedo v) of
 rebaseHistory :: CsvView -> CsvView -> CsvView
 rebaseHistory old new =
   new { csvUndo = pushHist maxUndo (csvRows old) (csvUndo old), csvRedo = Seq.empty
-      , csvSaved = csvSaved old }   -- keep the original saved point across a text edit
+      , csvSaved = csvSaved old   -- keep the original saved point across a text edit
+      -- A new saved point means the carried dirty state means nothing; the
+      -- whole file was just re-parsed, so one more pass over it is noise.
+      , csvDirty = dirtyFrom (csvSaved old) (csvRows new) }
+      -- 'csvWidths' and 'csvNl' are deliberately absent: both are functions of
+      -- 'csvRows' alone, this keeps @new@'s grid, and @new@ built them itself.
 
--- | Has the grid diverged from the last saved/loaded state? Runs on every
--- keystroke, so the comparison is pointer-accelerated: persistent 'Seq' edits
--- share every untouched row/cell with the saved grid, so unchanged structure
--- short-circuits in one pointer test instead of a content compare (editing
--- the last row of a huge table would otherwise re-compare everything above
--- it, every key).
+-- | Has the grid diverged from the last saved/loaded state?
+--
+-- O(1): the answer is maintained as state ('csvDirty') by the handful of
+-- functions allowed to move 'csvRows' or 'csvSaved', rather than recomputed
+-- here. It is exact at any table size — the flag drives the title bar, the
+-- quit confirmation, Save All and the crash journal, so an approximation or a
+-- big-table cutoff would be a way to lose a user's work.
+--
+-- It used to be a pointer-accelerated comparison of the two grids, which is
+-- free while the grid /is/ the saved grid (one pointer test) and O(rows) as
+-- soon as it is not. That made the cost land exactly where it hurts: 2.3 ms
+-- and 14 MB per keystroke on a 223 000-row table, from the first edit onwards.
 isModified :: CsvView -> Bool
-isModified v = not (sameGrid (csvRows v) (csvSaved v))
-
-sameGrid :: Grid -> Grid -> Bool
-sameGrid a b =
-  ptrEq a b
-    || (Seq.length a == Seq.length b
-        && and (zipWith sameRow (toList a) (toList b)))
-  where
-    sameRow r s =
-      ptrEq r s
-        || (Seq.length r == Seq.length s
-            && and (zipWith sameCell (toList r) (toList s)))
-    sameCell x y = ptrEq x y || x == y
+isModified v = case csvDirty v of
+  DirtyShape   -> True
+  DirtyCells n -> n /= 0
 
 -- | Mark the current grid as the saved state (called after writing the file).
 markSaved :: CsvView -> CsvView
-markSaved v = v { csvSaved = csvRows v }
+markSaved v = v { csvSaved = csvRows v, csvDirty = DirtyCells 0 }
+
+-- | Declare that there is no saved grid to compare against — the table twin of
+-- a recovered document's empty 'Cmedit.EditorState.docSavedBuffer'.
+--
+-- A view built by 'mkCsvGrid' takes the grid it was handed as its own saved
+-- point, which is right for a file just read off disk and *wrong* for a grid
+-- recovered from a crash journal: that one differs from disk by definition —
+-- that is why the journal existed — so adopting it as the baseline let the
+-- first undo declare the table clean, which drops the journal that is still
+-- the only copy of the work (and then lets Ctrl+Q leave without asking).
+--
+-- The empty grid is an exact baseline rather than a sentinel, so it needs no
+-- special case anywhere else: 'mkCsvGrid' guarantees at least one row, so the
+-- shapes differ, 'DirtyShape' is the biconditional's own answer, and no cell
+-- write can restore a shape of zero rows. Every dirty path stays O(1) on it
+-- (the row-count test answers first), and 'markSaved' re-baselines normally on
+-- the save that resolves the recovery.
+markUnsaved :: CsvView -> CsvView
+markUnsaved v = v { csvSaved = Seq.empty, csvDirty = DirtyShape }

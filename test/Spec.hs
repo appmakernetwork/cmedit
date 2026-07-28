@@ -3,13 +3,13 @@
 -- editor update function.
 module Main (main) where
 
-import Control.Monad (forM_, unless)
+import Control.Monad (forM_, unless, void)
 import Data.Bits (shiftR, (.&.))
 import Data.Foldable (toList)
 import Data.IORef
 import Data.Word (Word8)
 import Data.Either (isLeft)
-import Data.List (foldl', intercalate, isInfixOf, isPrefixOf, isSuffixOf, tails)
+import Data.List (foldl', intercalate, isInfixOf, isPrefixOf, isSuffixOf, nub, tails)
 import System.Directory (getTemporaryDirectory, removeFile)
 import System.FilePath ((</>))
 import Control.Exception (SomeException, evaluate, try)
@@ -35,7 +35,9 @@ import Cmedit.Input
 import Cmedit.Editor
 import Cmedit.ConfigFile
   ( parseConfigText, updateConfigText, RecentEntry(..), parseRecentText
-  , renderRecentText, parseHistoryText, renderHistoryText )
+  , renderRecentText, parseHistoryText, renderHistoryText
+  , Session(..), parseSessionText, renderSessionText
+  , RestorePlan(..), planRestore )
 import Cmedit.QuickOpen (QuickOpen(..))
 import qualified Cmedit.QuickOpen as Q
 import Cmedit.Menu (MenuAction(..), MenuEntry(..), MenuState(..))
@@ -44,13 +46,23 @@ import Cmedit.Browser (Browser(..), FileNode(..))
 import qualified Cmedit.Browser as Br
 import Cmedit.Search (SearchState(..), SField(..), SearchField(..), FileResult(..), Match(..), SRow(..))
 import qualified Cmedit.Search as S
+import qualified Cmedit.DocText as DT
 import Cmedit.Definition (DefLang(..), DefPick(..), DefItem(..), DefReq(..))
 import qualified Cmedit.Definition as D
 import qualified Cmedit.Regex as Rx
 import qualified Data.Sequence as Seq
 import Cmedit.Pager (PagerDoc(..))
 import qualified Cmedit.Pager as Pg
+import Cmedit.Journal (Journal(..), RecoveryCase(..))
+import qualified Cmedit.Journal as J
 import qualified Cmedit.Zip as Z
+import qualified Cmedit.Xml as X
+import qualified Cmedit.Docx as Docx
+import qualified Cmedit.Epub as Epub
+import qualified Cmedit.Xlsx as Xlsx
+import qualified Cmedit.Formula as Fm
+import qualified Cmedit.Odf as Odf
+import Cmedit.App (convertPath)
 import Cmedit.Rtf (RtfDoc(..))
 import Cmedit.Pdf (PdfDoc(..))
 import qualified Cmedit.Pdf as Pdf
@@ -1345,14 +1357,17 @@ main = do
           check "rtf scrollbar drag scrolls back up" (topOf edUp < topOf edDrag)
           checkEq "rtf scrollbar click never moves the hidden buffer cursor"
             (edCursor edMid) (edCursor edS)
-          -- A click on the rendered document is swallowed: it must not start a
-          -- selection drag, which would then gate the scrollbar guard.
+          -- A click on the rendered document starts a selection in the *view*
+          -- and never touches the buffer underneath it.
           let edText = fst (update (click 5 5 True False) edS)
-          check "rtf text click does not start a selection drag"
-            (not (edMouseSelecting edText))
+          check "rtf text click starts a selection drag" (edMouseSelecting edText)
           checkEq "rtf text click leaves the buffer cursor alone"
             (edCursor edText) (edCursor edS)
           checkEq "rtf text click does not scroll" (topOf edText) (topOf edS)
+          -- ...and releasing it ends the drag, so the scrollbar guard reopens.
+          let edUpText = fst (update (click 5 5 False False) edText)
+          check "rtf text release ends the selection drag"
+            (not (edMouseSelecting edUpText))
 
     -- Scrolling is clamped to the laid-out document.
     let Just rd = edRtf edFmt
@@ -1822,7 +1837,7 @@ main = do
         readZip bs =
           case Z.findEocd bs 0 of
             Left e   -> Left e
-            Right ec -> fmap ((,) ec) (Z.parseCentral
+            Right ec -> fmap ((,) ec) (Z.parseCentral (Z.ecPrefix ec)
               (BS.take (fromInteger (Z.ecCdSize ec)) (BS.drop (fromInteger (Z.ecCdOff ec)) bs)))
 
         plain nm dat = (utf8 nm, utf8 dat, 0x800)   -- bit 11: the name is UTF-8
@@ -1900,6 +1915,1527 @@ main = do
           ] $ \(what, bs) ->
       check ("zip survives " ++ what)
         (case readZip bs of Left _ -> True; Right (_, es) -> length es >= 0)
+
+  -- Cmedit.Xml (plan 0021) ----------------------------------------------------
+  -- The shared parser under DOCX, XLSX and EPUB. It is non-validating by
+  -- design, so most of what is asserted here is that malformed input still
+  -- yields the text it looks like rather than nothing at all.
+  do
+    let px = X.parseXml . T.pack
+        texts es = [ t | X.XText t <- es ]
+        names es = [ n | X.XStart n _ <- es ]
+        allText es = T.concat (texts es)
+
+    checkEq "xml elements and text"
+      (px "<a><b>hi</b></a>") [X.XStart "a" [], X.XStart "b" [], X.XText "hi", X.XEnd "b", X.XEnd "a"]
+    -- Self-closing tags produce both halves, so a consumer with a stack never
+    -- has to special-case them.
+    checkEq "xml self-closing emits both halves"
+      (px "<br/>") [X.XStart "br" [], X.XEnd "br"]
+    -- Namespace prefixes are dropped: OOXML producers disagree about them and
+    -- every consumer here matches on the local name.
+    checkEq "xml matches on the local name"
+      (names (px "<w:p><w:r/></w:p>")) ["p", "r"]
+    checkEq "xml attribute names are local too"
+      (px "<c r=\"A1\" t=\"s\"/>")
+      [X.XStart "c" [("r", "A1"), ("t", "s")], X.XEnd "c"]
+    checkEq "xml single-quoted attributes"
+      (px "<a b='x y'/>") [X.XStart "a" [("b", "x y")], X.XEnd "a"]
+    -- XML forbids both of these; real documents contain both.
+    checkEq "xml unquoted attribute"
+      (px "<a b=x/>") [X.XStart "a" [("b", "x")], X.XEnd "a"]
+    checkEq "xml valueless attribute"
+      (px "<a hidden/>") [X.XStart "a" [("hidden", "")], X.XEnd "a"]
+
+    checkEq "xml resolves the five built-in entities"
+      (allText (px "<a>&amp;&lt;&gt;&quot;&apos;</a>")) (T.pack "&<>\"'")
+    checkEq "xml resolves numeric entities"
+      (allText (px "<a>&#65;&#x42;&#8212;</a>")) (T.pack "AB\x2014")
+    checkEq "xml resolves the html entities xhtml uses without a dtd"
+      (allText (px "<a>&nbsp;&mdash;&rsquo;</a>")) (T.pack "\xa0\x2014\x2019")
+    -- An unknown reference is shown, not swallowed: deleting text silently is
+    -- worse than printing something odd.
+    checkEq "xml leaves an unknown entity alone"
+      (allText (px "<a>a&foo;b</a>")) (T.pack "a&foo;b")
+    checkEq "xml text with no ampersand is untouched"
+      (allText (px "<a>plain text</a>")) (T.pack "plain text")
+
+    checkEq "xml keeps CDATA verbatim"
+      (allText (px "<a><![CDATA[x < y & z]]></a>")) (T.pack "x < y & z")
+    checkEq "xml skips comments" (allText (px "<a>x<!-- <b>no</b> -->y</a>")) (T.pack "xy")
+    checkEq "xml skips processing instructions"
+      (allText (px "<?xml version=\"1.0\"?><a>x</a>")) (T.pack "x")
+    checkEq "xml skips a doctype with an internal subset"
+      (allText (px "<!DOCTYPE a [<!ENTITY x \"y\">]><a>hi</a>")) (T.pack "hi")
+
+    -- Malformed input: never an exception, never empty.
+    checkEq "xml survives an unclosed element" (names (px "<a><b>text")) ["a", "b"]
+    checkEq "xml survives a stray close" (names (px "</b><a/>")) ["a"]
+    checkEq "xml renders a bare less-than as itself"
+      (allText (px "<a>3 < 4</a>")) (T.pack "3 < 4")
+    check "xml survives a truncated tag" (length (px "<a b=\"c") >= 0)
+    check "xml survives an unterminated comment" (px "<a><!-- x" == [X.XStart "a" []])
+
+    -- Nesting is bounded: a file built to nest a million elements must stop.
+    let deep n = T.concat (replicate n (T.pack "<x>")) <> T.pack "deep"
+    check "xml bounds nesting depth"
+      (length (X.parseXml (deep (X.maxXmlDepth + 50))) <= X.maxXmlDepth + 1)
+
+    checkEq "xml elemText gathers a subtree's text"
+      (fst (X.elemText (drop 1 (px "<si><r><t>a</t></r><t>b</t></si>")))) (T.pack "ab")
+    checkEq "xml elemText stops at the matching close"
+      (names (snd (X.elemText (drop 1 (px "<si><t>a</t></si><z/>"))))) ["z"]
+
+    checkEq "xml decodes a utf-8 BOM"
+      (X.decodeXmlBytes (BS.pack [0xEF, 0xBB, 0xBF, 0x68, 0x69])) (T.pack "hi")
+    checkEq "xml decodes utf-16 by its BOM"
+      (X.decodeXmlBytes (BS.pack [0xFF, 0xFE, 0x68, 0x00, 0x69, 0x00])) (T.pack "hi")
+    checkEq "xml reads an integer attribute"
+      (X.xAttrInt "n" [("n", "1440")]) (Just 1440)
+    checkEq "xml reads a negative integer attribute"
+      (X.xAttrInt "n" [("n", "-360")]) (Just (-360))
+    checkEq "xml rejects a non-numeric attribute"
+      (X.xAttrInt "n" [("n", "auto")]) Nothing
+
+  -- ZIP member extraction (plan 0021) ------------------------------------------
+  -- The listing never decompresses; the container reading views do. Stored
+  -- members exercise the header walk, and one hand-made DEFLATE stream
+  -- exercises the other branch.
+  do
+    let le16, le32 :: Int -> BS.ByteString
+        le16 n = BS.pack [fromIntegral (n .&. 0xff), fromIntegral ((n `shiftR` 8) .&. 0xff)]
+        le32 n = le16 (n .&. 0xffff) <> le16 ((n `shiftR` 16) .&. 0xffff)
+        utf8 = TE.encodeUtf8 . T.pack
+        -- (name, stored bytes, raw bytes, method, flags, local extra field).
+        -- The local extra field is deliberately a different length from the
+        -- central one: a reader that assumed they matched would land in the
+        -- middle of the data.
+        mk items =
+          let local (nm, _usz, dat, meth, fl, ex) =
+                BS.concat [ le32 0x04034b50, le16 20, le16 fl, le16 meth, le16 0, le16 0
+                          , le32 0, le32 (BS.length dat), le32 (BS.length dat)
+                          , le16 (BS.length nm), le16 (BS.length ex), nm, ex, dat ]
+              locals  = map local items
+              offsets = scanl (+) 0 (map BS.length locals)
+              central (off, (nm, usz, dat, meth, fl, _ex)) =
+                BS.concat [ le32 0x02014b50, le16 20, le16 20, le16 fl, le16 meth
+                          , le16 0, le16 0, le32 0
+                          , le32 (BS.length dat), le32 usz
+                          , le16 (BS.length nm), le16 0, le16 0, le16 0, le16 0
+                          , le32 0, le32 off, nm ]
+              cds   = map central (zip offsets items)
+              eocd  = BS.concat [ le32 0x06054b50, le16 0, le16 0
+                                , le16 (length items), le16 (length items)
+                                , le32 (sum (map BS.length cds)), le32 (sum (map BS.length locals))
+                                , le16 0 ]
+          in BS.concat (locals ++ cds ++ [eocd])
+        readDir bs = case Z.findEocd bs 0 of
+          Left e   -> Left e
+          Right ec -> Z.parseCentral (Z.ecPrefix ec)
+                        (BS.take (fromInteger (Z.ecCdSize ec))
+                                 (BS.drop (fromInteger (Z.ecCdOff ec)) bs))
+        -- Produced by zlib at wbits=-15; expands to the 61-byte string below.
+        deflated = BS.pack [203,72,205,201,201,87,72,73,77,203,73,44,73,85,40,207
+                           ,47,202,73,209,81,200,32,82,16,0]
+        plainTxt = utf8 "hello deflate world, hello deflate world, hello deflate world"
+        stored nm dat = (utf8 nm, BS.length dat, dat, 0, 0x800, BS.empty)
+        arc = mk [ stored "a.txt" (utf8 "first member")
+                 , (utf8 "b.txt", BS.length plainTxt, deflated, 8, 0x800, utf8 "EXTRA-LOCAL")
+                 , (utf8 "enc.txt", 4, utf8 "\0\0\0\0", 0, 0x801, BS.empty)
+                 , (utf8 "lzma.txt", 4, utf8 "xxxx", 14, 0x800, BS.empty)
+                 ]
+        -- What the driver does: seek to the local header, read its own name
+        -- and extra lengths, then take the data span.
+        extract bs e = case Z.localDataOffset (BS.take Z.localHeaderBytes
+                                                (BS.drop (fromInteger (Z.zeOffset e)) bs)) of
+          Left err   -> Left err
+          Right skip -> Z.memberBytes e
+                          (BS.take (fromInteger (Z.zePacked e))
+                                   (BS.drop (fromInteger (Z.zeOffset e) + skip) bs))
+
+    case readDir arc of
+      Left e -> check ("zip extraction: parses the archive (" ++ e ++ ")") False
+      Right es -> do
+        checkEq "zip records each member's local header offset"
+          (map Z.zeOffset es == [] ) False
+        check "zip member offsets are ascending"
+          (and [ a < b | (a, b) <- zip (map Z.zeOffset es) (drop 1 (map Z.zeOffset es)) ])
+        checkEq "zip extracts a stored member"
+          (extract arc (es !! 0)) (Right (utf8 "first member"))
+        -- The local extra field is 11 bytes and the central one is 0; reading
+        -- the local header is the only way to land on the data.
+        checkEq "zip extracts a deflated member past a longer local extra field"
+          (extract arc (es !! 1)) (Right plainTxt)
+        check "zip refuses an encrypted member"
+          (case extract arc (es !! 2) of Left m -> "encrypted" `isInfixOf` m; _ -> False)
+        check "zip refuses an unsupported compression method"
+          (case extract arc (es !! 3) of Left m -> "lzma" `isInfixOf` m; _ -> False)
+        checkEq "zip finds a member by name"
+          (fmap Z.zeName (Z.findEntry (T.pack "b.txt") es)) (Just (T.pack "b.txt"))
+        check "zip reports a missing member" (not (Z.hasEntry (T.pack "nope") es))
+    -- A self-extracting stub shifts every member, not just the directory.
+    case readDir (BS.replicate 777 0x5a <> arc) of
+      Left e -> check ("zip extraction past a stub (" ++ e ++ ")") False
+      Right es ->
+        checkEq "zip corrects member offsets past a self-extracting stub"
+          (extract (BS.replicate 777 0x5a <> arc) (head es)) (Right (utf8 "first member"))
+    check "zip local header rejects a foreign signature"
+      (isLeft (Z.localDataOffset (BS.replicate 30 0x41)))
+    check "zip local header rejects a truncated read"
+      (isLeft (Z.localDataOffset (BS.replicate 10 0x50)))
+
+  -- DOCX mapping (plan 0021) ---------------------------------------------------
+  -- Asserted on the mapped paragraphs rather than on rendered cells, so a
+  -- change to layout or theming does not churn these.
+  do
+    let doc body = TE.encodeUtf8 (T.pack
+          ("<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body>" ++ body ++ "</w:body></w:document>"))
+        pars body = toList (fst (Docx.docxPars (doc body)))
+        parText p = T.concat (map Rtf.rrText (Rtf.rpRuns p))
+        allTexts body = map parText (pars body)
+
+    checkEq "docx reads a paragraph"
+      (allTexts "<w:p><w:r><w:t>hello</w:t></w:r></w:p>") [T.pack "hello"]
+    checkEq "docx joins a paragraph's runs"
+      (allTexts "<w:p><w:r><w:t>a</w:t></w:r><w:r><w:t>b</w:t></w:r></w:p>") [T.pack "ab"]
+    -- Empty paragraphs are dropped and every real one is spaced instead: a
+    -- .docx carries its spacing in a style sheet this reader does not resolve,
+    -- so honouring only the manual blank paragraphs gives an uneven document.
+    checkEq "docx drops empty paragraphs"
+      (allTexts "<w:p><w:r><w:t>a</w:t></w:r></w:p><w:p/><w:p><w:r><w:t>b</w:t></w:r></w:p>")
+      [T.pack "a", T.pack "b"]
+    check "docx spaces ordinary paragraphs"
+      (all Rtf.rpSpace (pars "<w:p><w:r><w:t>a</w:t></w:r></w:p>"))
+
+    -- Character formatting comes from a run's own w:rPr, and OOXML's on/off
+    -- attribute means "on" when absent — getting that backwards makes every
+    -- <w:b/> a no-op.
+    let fmtOf body = map Rtf.rrFmt (concatMap Rtf.rpRuns (pars body))
+    check "docx reads bold"
+      (all Rtf.rfBold (fmtOf "<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>x</w:t></w:r></w:p>"))
+    check "docx honours an explicit w:val=0"
+      (not (any Rtf.rfBold (fmtOf "<w:p><w:r><w:rPr><w:b w:val=\"0\"/></w:rPr><w:t>x</w:t></w:r></w:p>")))
+    check "docx reads italic, underline and strike"
+      (case fmtOf "<w:p><w:r><w:rPr><w:i/><w:u w:val=\"single\"/><w:strike/></w:rPr><w:t>x</w:t></w:r></w:p>" of
+         (f : _) -> Rtf.rfItalic f && Rtf.rfUnder f && Rtf.rfStrike f
+         _       -> False)
+    check "docx treats w:u w:val=none as no underline"
+      (not (any Rtf.rfUnder (fmtOf "<w:p><w:r><w:rPr><w:u w:val=\"none\"/></w:rPr><w:t>x</w:t></w:r></w:p>")))
+    checkEq "docx reads a run colour"
+      (map Rtf.rfColor (fmtOf "<w:p><w:r><w:rPr><w:color w:val=\"CC0000\"/></w:rPr><w:t>x</w:t></w:r></w:p>"))
+      [Just (ColorRGB 0xCC 0 0)]
+    checkEq "docx treats w:color auto as the theme's colour"
+      (map Rtf.rfColor (fmtOf "<w:p><w:r><w:rPr><w:color w:val=\"auto\"/></w:rPr><w:t>x</w:t></w:r></w:p>"))
+      [Nothing]
+    -- Formatting does not leak between runs: each w:r carries its own rPr.
+    check "docx formatting does not leak into the next run"
+      (case fmtOf "<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>a</w:t></w:r><w:r><w:t>b</w:t></w:r></w:p>" of
+         [f1, f2] -> Rtf.rfBold f1 && not (Rtf.rfBold f2)
+         _        -> False)
+
+    -- A heading's size lives in its style, not on its runs, which is the only
+    -- reason a terminal can tell it is a heading at all.
+    check "docx gives a heading style a heading size"
+      (case fmtOf "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr><w:r><w:t>T</w:t></w:r></w:p>" of
+         (f : _) -> Rtf.rfSize f >= 28
+         _       -> False)
+    -- A run that sets its own size keeps it.
+    checkEq "docx honours an explicit w:sz"
+      (map Rtf.rfSize (fmtOf "<w:p><w:r><w:rPr><w:sz w:val=\"20\"/></w:rPr><w:t>x</w:t></w:r></w:p>")) [20]
+
+    -- Twips are OOXML's unit and RTF's alike, which is why the layout's
+    -- twipsToCols transfers unchanged.
+    checkEq "docx reads alignment and indentation"
+      (map (\p -> (Rtf.rpAlign p, Rtf.rpLeft p, Rtf.rpFirst p))
+           (pars "<w:p><w:pPr><w:jc w:val=\"center\"/><w:ind w:left=\"720\" w:firstLine=\"360\"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>"))
+      [(Rtf.AlignCenter, 720, 360)]
+    checkEq "docx reads a hanging indent as a negative first line"
+      (map Rtf.rpFirst
+           (pars "<w:p><w:pPr><w:ind w:left=\"720\" w:hanging=\"360\"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>"))
+      [-360]
+    -- A table's own w:jc must not centre the document: the element stack is
+    -- what tells the two apart.
+    checkEq "docx ignores a table's alignment"
+      (map Rtf.rpAlign
+           (pars "<w:tbl><w:tblPr><w:jc w:val=\"center\"/></w:tblPr><w:tr><w:tc><w:p><w:r><w:t>x</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"))
+      [Rtf.AlignLeft]
+
+    -- A list item gets a bullet because the numbering definitions are not
+    -- resolved; no marks at all would be worse.
+    check "docx marks a list item"
+      (case allTexts "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/></w:numPr></w:pPr><w:r><w:t>item</w:t></w:r></w:p>" of
+         (t : _) -> T.pack "\x2022 " `T.isPrefixOf` t
+         _       -> False)
+
+    -- A table row is one paragraph and its cells are its tab stops; ending a
+    -- paragraph per cell would lose the table's shape entirely.
+    checkEq "docx lays a table row out on tab stops"
+      (allTexts ("<w:tbl><w:tr><w:tc><w:p><w:r><w:t>a</w:t></w:r></w:p></w:tc>"
+                 ++ "<w:tc><w:p><w:r><w:t>b</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"))
+      [T.pack "a\tb"]
+
+    checkEq "docx reads w:tab and w:br"
+      (allTexts "<w:p><w:r><w:t>a</w:t><w:tab/><w:t>b</w:t><w:br/><w:t>c</w:t></w:r></w:p>")
+      [T.pack "a\tb\nc"]
+    -- Skipped subtrees: none of these is document text.
+    checkEq "docx skips field instructions, deletions and drawings"
+      (allTexts ("<w:p><w:r><w:t>keep</w:t></w:r>"
+                 ++ "<w:r><w:instrText>PAGE</w:instrText></w:r>"
+                 ++ "<w:del><w:r><w:delText>gone</w:delText></w:r></w:del>"
+                 ++ "<w:r><w:drawing><wp:docPr name=\"pic\"/></w:drawing></w:r></w:p>"))
+      [T.pack "keep"]
+    checkEq "docx skips hidden text"
+      (allTexts "<w:p><w:r><w:t>a</w:t></w:r><w:r><w:rPr><w:vanish/></w:rPr><w:t>SECRET</w:t></w:r></w:p>")
+      [T.pack "a"]
+    -- mc:Fallback duplicates the mc:Choice beside it; reading both prints a
+    -- text box twice.
+    checkEq "docx skips an alternate-content fallback"
+      (allTexts ("<w:p><mc:AlternateContent><mc:Choice><w:r><w:t>once</w:t></w:r></mc:Choice>"
+                 ++ "<mc:Fallback><w:r><w:t>once</w:t></w:r></mc:Fallback></mc:AlternateContent></w:p>"))
+      [T.pack "once"]
+    -- A page break belongs between two paragraphs, so the rule is drawn after
+    -- the one before it.
+    check "docx puts a page break's rule before the following text"
+      (case pars "<w:p><w:r><w:t>a</w:t></w:r></w:p><w:p><w:r><w:br w:type=\"page\"/></w:r><w:r><w:t>b</w:t></w:r></w:p>" of
+         [p1, p2] -> Rtf.rpBreak p1 && not (Rtf.rpBreak p2) && parText p2 == T.pack "b"
+         _        -> False)
+    checkEq "docx resolves entities in body text"
+      (allTexts "<w:p><w:r><w:t>a &amp; b &lt; c</w:t></w:r></w:p>") [T.pack "a & b < c"]
+
+    -- Detection is by member name, so a renamed container still reads and a
+    -- template with no body still falls through to the listing.
+    checkEq "docx is detected by its body member"
+      (Docx.docxBodyMember (map T.pack ["[Content_Types].xml", "word/document.xml"]))
+      (Just (T.pack "word/document.xml"))
+    checkEq "docx detection declines an archive with no body"
+      (Docx.docxBodyMember (map T.pack ["a.txt", "b/c.txt"])) Nothing
+    -- Damaged input yields no paragraphs, which the driver turns into the
+    -- archive listing plus a note rather than an error.
+    checkEq "docx yields nothing from garbage"
+      (Seq.length (fst (Docx.docxPars (TE.encodeUtf8 (T.pack "<<<not xml &&&"))))) 0
+
+  -- XLSX mapping (plan 0021) ---------------------------------------------------
+  do
+    let sheet body = TE.encodeUtf8 (T.pack ("<worksheet><sheetData>" ++ body ++ "</sheetData></worksheet>"))
+        strs = Seq.fromList (map T.pack ["Region", "Sales", "North"])
+        grid body = let (g, _, _) = Xlsx.sheetGrid strs (sheet body)
+                    in fmap toList (toList g)
+
+    checkEq "xlsx reads an A1 reference" (Xlsx.cellRef (T.pack "A1")) (Just (0, 0))
+    checkEq "xlsx reads a two-letter column" (Xlsx.cellRef (T.pack "AB12")) (Just (27, 11))
+    checkEq "xlsx rejects a reference that is not one" (Xlsx.cellRef (T.pack "hello")) Nothing
+
+    checkEq "xlsx reads inline numbers"
+      (grid "<row r=\"1\"><c r=\"A1\"><v>3.5</v></c></row>") [[T.pack "3.5"]]
+    checkEq "xlsx resolves a shared string"
+      (grid "<row r=\"1\"><c r=\"A1\" t=\"s\"><v>2</v></c></row>") [[T.pack "North"]]
+    checkEq "xlsx reads an inline string"
+      (grid "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>hi</t></is></c></row>") [[T.pack "hi"]]
+    checkEq "xlsx reads a boolean"
+      (grid "<row r=\"1\"><c r=\"A1\" t=\"b\"><v>1</v></c><c r=\"B1\" t=\"b\"><v>0</v></c></row>")
+      [[T.pack "TRUE", T.pack "FALSE"]]
+    -- A formula shows its cached value; this is not a spreadsheet engine and
+    -- must never print the formula source in a cell.
+    checkEq "xlsx shows a formula's cached value, not its source"
+      (grid "<row r=\"1\"><c r=\"A1\"><f>SUM(B1:B9)</f><v>42</v></c></row>") [[T.pack "42"]]
+
+    -- A spreadsheet's shape is part of its meaning, so gaps must materialise.
+    checkEq "xlsx materialises a column gap"
+      (grid "<row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"C1\"><v>3</v></c></row>")
+      [[T.pack "1", T.empty, T.pack "3"]]
+    checkEq "xlsx materialises a missing row"
+      (grid "<row r=\"1\"><c r=\"A1\"><v>1</v></c></row><row r=\"3\"><c r=\"A3\"><v>3</v></c></row>")
+      [[T.pack "1"], [T.empty], [T.pack "3"]]
+    checkEq "xlsx pads every row to the widest"
+      (map length (grid "<row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"B1\"><v>2</v></c></row><row r=\"2\"><c r=\"A2\"><v>3</v></c></row>"))
+      [2, 2]
+    -- A single bad reference must not materialise a million blank cells: past
+    -- the format's own column limit the cell is dropped, not filled up to.
+    checkEq "xlsx ignores a column reference past the format's limit"
+      (grid "<row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"ZZZ1\"><v>x</v></c></row>")
+      [[T.pack "1"]]
+    -- A reference that is not a reference at all falls back to the next
+    -- column, which is what a producer that omits @r@ entirely relies on.
+    checkEq "xlsx places an unreadable reference sequentially"
+      (grid "<row r=\"1\"><c r=\"A1\"><v>1</v></c><c><v>2</v></c></row>")
+      [[T.pack "1", T.pack "2"]]
+
+    let wbXml = TE.encodeUtf8 (T.pack
+          ("<workbook><sheets><sheet name=\"Data\" r:id=\"rId1\"/>"
+           ++ "<sheet name=\"Extra\" r:id=\"rId2\"/></sheets></workbook>"))
+        relsXml = TE.encodeUtf8 (T.pack
+          ("<Relationships><Relationship Id=\"rId1\" Target=\"worksheets/sheet1.xml\"/>"
+           ++ "<Relationship Id=\"rId2\" Target=\"/xl/worksheets/other.xml\"/></Relationships>"))
+        refs = Xlsx.sheetRefs wbXml
+        rels = Xlsx.relTargets relsXml
+    -- Tab order, not creation order: a workbook whose tabs have been dragged
+    -- around has them in neither the member names' order nor the manifest's.
+    checkEq "xlsx reads the sheets in tab order"
+      (map fst refs) (map T.pack ["Data", "Extra"])
+    checkEq "xlsx resolves a sheet through the relationship table"
+      (Xlsx.sheetMemberPath refs rels 0) (T.pack "xl/worksheets/sheet1.xml")
+    checkEq "xlsx resolves an absolute relationship target"
+      (Xlsx.sheetMemberPath refs rels 1) (T.pack "xl/worksheets/other.xml")
+    -- Producers that ship no relationship table are common; the conventional
+    -- naming is right for all of them.
+    checkEq "xlsx falls back to the conventional sheet name"
+      (Xlsx.sheetMemberPath refs [] 1) (T.pack "xl/worksheets/sheet2.xml")
+
+    checkEq "xlsx reads the shared-string table"
+      (toList (Xlsx.sharedStrings (TE.encodeUtf8 (T.pack
+        "<sst><si><t>a</t></si><si><r><t>b</t></r><r><t>c</t></r></si></sst>"))))
+      [T.pack "a", T.pack "bc"]
+    checkEq "xlsx workbook detection" (Xlsx.isXlsx [Xlsx.workbookPath]) True
+    checkEq "xlsx declines an archive with no workbook"
+      (Xlsx.isXlsx (map T.pack ["a.txt"])) False
+
+    -- The open workbook: the showing sheet is the live table view, and
+    -- switching stores it back so returning finds it where it was left.
+    let wb0 = Xlsx.mkWorkbook [ (T.pack "One", Seq.fromList [Seq.fromList [T.pack "a"]])
+                              , (T.pack "Two", Seq.fromList [Seq.fromList [T.pack "b"]]) ]
+                              (T.pack "note")
+    checkEq "workbook counts its sheets" (Xlsx.wbCount wb0) 2
+    checkEq "workbook names the showing sheet" (Xlsx.wbName wb0) (T.pack "One")
+    case Xlsx.wbView wb0 of
+      Nothing -> check "workbook has a view for its first sheet" False
+      Just v0 -> do
+        let moved = setCursor 0 0 v0
+            (wb1, v1) = Xlsx.wbNext moved wb0
+            (wb2, v2) = Xlsx.wbPrev v1 wb1
+        checkEq "workbook turns to the next sheet" (Xlsx.wbIdx wb1) 1
+        checkEq "workbook shows the next sheet's grid" (cellAt 0 0 v1) (T.pack "b")
+        checkEq "workbook turns back" (Xlsx.wbIdx wb2) 0
+        checkEq "workbook restores the sheet it left" (cellAt 0 0 v2) (T.pack "a")
+        checkEq "workbook clamps past the last sheet"
+          (Xlsx.wbIdx (fst (Xlsx.wbGoTo v0 99 wb0))) 1
+        checkEq "workbook clamps before the first"
+          (Xlsx.wbIdx (fst (Xlsx.wbGoTo v0 (-5) wb0))) 0
+        check "workbook status names the sheet"
+          ("Sheet 1/2" `isInfixOf` Xlsx.wbStatus wb0)
+        check "and names it when the name is one cell per character"
+          ("One" `isInfixOf` Xlsx.wbStatus wb0)
+        -- The status bar's right block is measured in characters and its click
+        -- zones with it, so a name in a wide script would shift every zone
+        -- after it. The number survives; the name does not.
+        let wbWide = Xlsx.mkWorkbook
+              [ (T.pack "\x58f2\x4e0a", Seq.fromList [Seq.fromList [T.pack "x"]]) ] T.empty
+        check "a wide sheet name is kept out of the clickable status block"
+          ("Sheet 1/1" `isInfixOf` Xlsx.wbStatus wbWide
+             && not ("\x58f2" `isInfixOf` Xlsx.wbStatus wbWide))
+        checkEq "so the status block stays one cell per character"
+          (lineDisplayWidth 8 (T.pack (Xlsx.wbStatus wbWide)))
+          (length (Xlsx.wbStatus wbWide))
+
+  -- EPUB mapping (plan 0021) ---------------------------------------------------
+  do
+    let bytes = TE.encodeUtf8 . T.pack
+        html body = bytes ("<html><head><title>T</title></head><body>" ++ body ++ "</body></html>")
+        pars body = toList (Epub.htmlPars (html body))
+        parText p = T.concat (map Rtf.rrText (Rtf.rpRuns p))
+        texts body = map parText (pars body)
+
+    -- Container plumbing.
+    checkEq "epub finds the package document"
+      (Epub.epubOpfPath (bytes "<container><rootfiles><rootfile full-path=\"OEBPS/content.opf\"/></rootfiles></container>"))
+      (Just (T.pack "OEBPS/content.opf"))
+    checkEq "epub declines a container with no root file"
+      (Epub.epubOpfPath (bytes "<container/>")) Nothing
+    checkEq "epub is detected by its container member"
+      (Epub.isEpub [Epub.containerPath]) True
+
+    let opf = bytes (concat
+          [ "<package><metadata><dc:title>A Book</dc:title></metadata><manifest>"
+          , "<item id=\"c1\" href=\"ch1.xhtml\" media-type=\"application/xhtml+xml\"/>"
+          , "<item id=\"c2\" href=\"sub/ch%202.xhtml\" media-type=\"application/xhtml+xml\"/>"
+          , "<item id=\"css\" href=\"s.css\" media-type=\"text/css\"/>"
+          , "</manifest><spine><itemref idref=\"c2\"/><itemref idref=\"c1\"/>"
+          , "<itemref idref=\"css\"/><itemref idref=\"gone\"/></spine></package>" ])
+    -- Reading order comes from the spine, not the manifest, and only documents
+    -- are chapters.
+    checkEq "epub reads the spine in reading order"
+      (Epub.epubSpine (T.pack "OEBPS") opf)
+      (map T.pack ["OEBPS/sub/ch 2.xhtml", "OEBPS/ch1.xhtml"])
+    checkEq "epub reads the book's title" (Epub.epubTitle opf) (T.pack "A Book")
+
+    -- Href resolution is one function because getting any part of it wrong
+    -- loses a chapter silently.
+    checkEq "epub resolves an href against the package directory"
+      (Epub.resolveHref (T.pack "OEBPS") (T.pack "text/ch1.xhtml")) (T.pack "OEBPS/text/ch1.xhtml")
+    checkEq "epub resolves an href at the archive root"
+      (Epub.resolveHref T.empty (T.pack "ch1.xhtml")) (T.pack "ch1.xhtml")
+    checkEq "epub percent-decodes an href"
+      (Epub.resolveHref (T.pack "a") (T.pack "b%20c.xhtml")) (T.pack "a/b c.xhtml")
+    checkEq "epub drops a fragment"
+      (Epub.resolveHref (T.pack "a") (T.pack "b.xhtml#part2")) (T.pack "a/b.xhtml")
+    checkEq "epub folds away dot segments"
+      (Epub.resolveHref (T.pack "a/b") (T.pack "../c.xhtml")) (T.pack "a/c.xhtml")
+    checkEq "epub treats a leading slash as the archive root"
+      (Epub.resolveHref (T.pack "a") (T.pack "/x/y.xhtml")) (T.pack "x/y.xhtml")
+
+    -- Chapters.
+    checkEq "epub reads a chapter's title" (Epub.htmlTitle (html "<p>x</p>")) (T.pack "T")
+    checkEq "epub reads paragraphs" (texts "<p>one</p><p>two</p>") [T.pack "one", T.pack "two"]
+    -- Whitespace collapses as HTML says, so a pretty-printed chapter does not
+    -- come out with a ragged left margin.
+    checkEq "epub collapses whitespace"
+      (texts "<p>\n   one    two\n</p>") [T.pack "one two "]
+    checkEq "epub keeps the space between inline elements"
+      (texts "<p><em>a</em> <em>b</em></p>") [T.pack "a b"]
+    checkEq "epub keeps whitespace inside pre"
+      (texts "<pre>  a   b</pre>") [T.pack "  a   b"]
+    -- Inline formatting nests, which a single "current format" cannot express.
+    check "epub nests inline formatting"
+      (case concatMap Rtf.rpRuns (pars "<p><b>a<i>b</i>c</b></p>") of
+         [r1, r2, r3] -> Rtf.rfBold (Rtf.rrFmt r1)
+                       && Rtf.rfBold (Rtf.rrFmt r2) && Rtf.rfItalic (Rtf.rrFmt r2)
+                       && Rtf.rfBold (Rtf.rrFmt r3) && not (Rtf.rfItalic (Rtf.rrFmt r3))
+         _ -> False)
+    check "epub gives a heading a heading size"
+      (case concatMap Rtf.rpRuns (pars "<h1>Title</h1>") of
+         (r : _) -> Rtf.rfSize (Rtf.rrFmt r) >= 28
+         _       -> False)
+    checkEq "epub numbers an ordered list and bullets an unordered one"
+      (texts "<ul><li>a</li></ul><ol><li>x</li><li>y</li></ol>")
+      [T.pack "\x2022 a", T.pack "1. x", T.pack "2. y"]
+    check "epub sets list items tight and paragraphs spaced"
+      (case pars "<p>p</p><ul><li>a</li><li>b</li></ul>" of
+         [p0, l1, l2] -> Rtf.rpSpace p0 && not (Rtf.rpSpace l1) && not (Rtf.rpSpace l2)
+         _            -> False)
+    -- A blockquote's indent outlives the paragraphs inside it, so it cannot
+    -- live on the paragraph being built.
+    check "epub indents a blockquote's paragraphs"
+      (case pars "<blockquote><p>quoted</p></blockquote>" of
+         (p : _) -> Rtf.rpLeft p > 0
+         _       -> False)
+    checkEq "epub lays a table row out on tab stops"
+      (texts "<table><tr><td>a</td><td>b</td></tr></table>") [T.pack "a\tb"]
+    checkEq "epub skips scripts and styles"
+      (texts "<p>keep</p><script>var x=1</script><style>p{}</style>") [T.pack "keep"]
+    checkEq "epub shows an image's alternative text"
+      (texts "<p><img src=\"x.png\" alt=\"a cat\"/></p>") [T.pack "[a cat]"]
+    checkEq "epub reads a line break"
+      (texts "<p>a<br/>b</p>") [T.pack "a\nb"]
+    -- A wrapper element that holds nothing is not a blank line in the book.
+    checkEq "epub drops empty blocks"
+      (length (pars "<div><div></div><p>only</p><div/></div>")) 1
+    -- Non-validating by design: stray markup degrades to the text it looks
+    -- like (what a browser does), and a chapter with no text yields nothing —
+    -- which is what makes the driver fall back to the archive listing.
+    checkEq "epub degrades broken markup to its text"
+      (texts "<p>a <b>b</p> c</b>") [T.pack "a b", T.pack "c"]
+    checkEq "epub yields nothing from a chapter with no text"
+      (Seq.length (Epub.htmlPars (bytes "<html><body><div/><span/></body></html>"))) 0
+
+  -- Container reading views in the editor (plan 0021) ---------------------------
+  -- The views are the RTF and CSV ones with a different origin, so what is
+  -- asserted here is the difference: no buffer, nothing writable, and the
+  -- units each is divided into.
+  do
+    let mkPar t = Rtf.defaultPar { Rtf.rpRuns = [Rtf.RtfRun (T.pack t) Rtf.defaultFmt] }
+        bookPars = Seq.fromList (map mkPar
+          ["Chapter one text", "more", "Chapter two text", "and more", "the end"])
+        sects = Seq.fromList [(0, T.pack "One"), (2, T.pack "Two")]
+        rdBook = Rtf.mkRtfDocFrom (RtfFromContainer (T.pack "EPUB")) sects T.empty bookPars
+        rdDoc  = Rtf.mkRtfDocFrom (RtfFromContainer (T.pack "DOCX")) Seq.empty T.empty bookPars
+        edBase = newEditor (24, 80) defaultConfig
+        edBook = containerDocLoaded "/tmp/x.epub" rdBook edBase
+        edDocx = containerDocLoaded "/tmp/x.docx" rdDoc edBase
+        wbTest = Xlsx.mkWorkbook [ (T.pack "S1", Seq.fromList [Seq.fromList [T.pack "a"]])
+                                 , (T.pack "S2", Seq.fromList [Seq.fromList [T.pack "b"]]) ] T.empty
+        edWb   = workbookLoaded "/tmp/x.xlsx" wbTest edBase
+
+    -- A container view is derived from a binary file: read-only, no buffer,
+    -- no cursor to draw.
+    check "container doc is read-only" (edReadOnly edBook)
+    check "container doc has an empty buffer" (isEmptyBuffer (edBuffer edBook))
+    check "container doc is not a plain document"
+      (not (isPlainDoc (captureDoc edBook)))
+    check "workbook is not a plain document" (not (isPlainDoc (captureDoc edWb)))
+    check "container view is recognised" (containerViewActive edBook && containerViewActive edWb)
+    -- A plain .rtf is *not* a container view: its buffer is live and Save
+    -- writes it.
+    check "an rtf file is not a container view"
+      (not (containerViewActive (enterRtf (setLoaded "/tmp/x.rtf"
+              (emptyLoadResult { lrBuffer = fromText (T.pack "{\\rtf1 hi}") }) edBase))))
+    -- Nothing can move a binary file under its view, so it never re-parses.
+    check "a container view never goes stale" (not (Rtf.rtfStale 999 rdBook))
+
+    -- Save is refused rather than writing an empty buffer over the container.
+    forM_ [("doc", edBook), ("workbook", edWb)] $ \(what, e) ->
+      forM_ [MASave, MASaveAll, MARevert, MAPaste, MACut] $ \a ->
+        check (what ++ " refuses " ++ show a)
+          (let (e', effs) = runAction a e in null effs && edStatus e' /= T.empty)
+    -- A workbook's grid must never be serialised into the buffer and saved as
+    -- CSV: it is one sheet of someone's workbook, not their workbook.
+    check "syncCsvToBuffer leaves a workbook alone"
+      (isEmptyBuffer (edBuffer (syncCsvToBuffer edWb)))
+
+    -- Each view is divided into something, and Go To means that thing.
+    check "an e-book's Go To is titled for chapters"
+      (case edDialog (openGoTo edBook) of
+         Just d  -> T.pack "Chapter" `T.isInfixOf` dlgTitle d
+         Nothing -> False)
+    check "a workbook's Go To is titled for sheets"
+      (case edDialog (openGoTo edWb) of
+         Just d  -> T.pack "Sheet" `T.isInfixOf` dlgTitle d
+         Nothing -> False)
+    -- A .docx has no chapters, so Go To is honestly absent there.
+    check "a docx has no Go To"
+      (let (e', _) = runAction MAGoToLine edDocx in edDialog e' == Nothing)
+
+    checkEq "go to sheet switches the showing grid"
+      (fmap (cellAt 0 0) (edCsv (goToSheetIn 1 edWb))) (Just (T.pack "b"))
+    checkEq "go to sheet clamps" (fmap Xlsx.wbIdx (edSheets (goToSheetIn 9 edWb))) (Just 1)
+    checkEq "go to chapter moves the viewport"
+      (fmap rdTop (edRtf (gotoLine (T.pack "2") edBook)))
+      (fmap (\rd -> rdTop (Rtf.rtfGoToSection (rtfHeight edBook) 2 rd)) (edRtf edBook))
+
+    -- Alt+T offers the archive from the rendered view and the document back
+    -- from the listing.
+    check "Alt+T from a container view asks for the archive"
+      (case runAction MAArchiveView edBook of
+         (_, [EffContainerView p True]) -> p == "/tmp/x.epub"
+         _                              -> False)
+    let edListing = setLoaded "/tmp/x.epub"
+                      (emptyLoadResult { lrBuffer = fromText (T.pack "listing")
+                                       , lrReadOnly = True }) edBase
+    check "the archive listing offers the document back"
+      (containerListing edListing)
+    check "Alt+T from the listing asks for the document"
+      (case runAction MAArchiveView edListing of
+         (_, [EffContainerView _ False]) -> True
+         _                               -> False)
+
+    -- Menus: what is pruned, and what deliberately is not.
+    let viewItems e = [ a | MEItem _ _ a <- entriesFor e 3 ]
+        findItems e = [ a | MEItem _ _ a <- entriesFor e 2 ]
+    check "the container views offer the archive entry"
+      (MAArchiveView `elem` viewItems edBook && MAArchiveView `elem` viewItems edWb)
+    check "a plain document does not" (MAArchiveView `notElem` viewItems edBase)
+    check "a workbook drops the sort and table-toggle entries"
+      (MASortColumn `notElem` viewItems edWb && MAToggleCsv `notElem` viewItems edWb)
+    check "a workbook keeps the freeze-header entry"
+      (MAToggleFreezeHeader `elem` viewItems edWb)
+    check "an e-book keeps Go To in the Find menu"
+      (MAGoToLine `elem` findItems edBook)
+    check "a docx does not" (MAGoToLine `notElem` findItems edDocx)
+
+    -- Section navigation, which is what makes [ and ] mean anything.
+    checkEq "sections are counted" (Rtf.rtfSectionCount rdBook) 2
+    -- A one-line viewport, so the clamp cannot hide the movement (a document
+    -- shorter than the window never scrolls, which is correct and untestable).
+    let laid = Rtf.rtfRelayout 4 40 1 rdBook
+    checkEq "the first section is section one" (Rtf.rtfSectionAt laid) 1
+    checkEq "turning forward reaches the second"
+      (Rtf.rtfSectionAt (Rtf.rtfNextSection 1 laid)) 2
+    checkEq "turning forward again stays at the last"
+      (Rtf.rtfSectionAt (Rtf.rtfNextSection 1 (Rtf.rtfNextSection 1 laid))) 2
+    checkEq "turning back returns to the first"
+      (rdTop (Rtf.rtfPrevSection 1 (Rtf.rtfNextSection 1 laid)))
+      (rdTop (Rtf.rtfGoToSection 1 1 laid))
+    -- Back from *within* a section goes to that section's start first, which
+    -- is what every reader's page-back key does.
+    checkEq "turning back from mid-section returns to its start"
+      (rdTop (Rtf.rtfPrevSection 1 (Rtf.rtfScroll 1 1 (Rtf.rtfGoToSection 1 2 laid))))
+      (rdTop (Rtf.rtfGoToSection 1 2 laid))
+    checkEq "the section title follows the viewport"
+      (Rtf.rtfSectionTitle (Rtf.rtfNextSection 1 laid)) (T.pack "Two")
+    checkEq "a document with no sections reports none" (Rtf.rtfSectionCount rdDoc) 0
+    check "the status bar names the container format"
+      ("EPUB" `isInfixOf` Rtf.rtfStatus laid)
+    -- Same rule for a chapter title as for a sheet name.
+    let wideSect = Seq.fromList [(0, T.pack "\x7ae0")]
+        laidWide = Rtf.rtfRelayout 4 40 1
+          (Rtf.mkRtfDocFrom (RtfFromContainer (T.pack "EPUB")) wideSect T.empty bookPars)
+    checkEq "a wide chapter title keeps the status block one cell per character"
+      (lineDisplayWidth 8 (T.pack (Rtf.rtfStatus laidWide)))
+      (length (Rtf.rtfStatus laidWide))
+    check "and the chapter number still shows"
+      ("Ch 1/1" `isInfixOf` Rtf.rtfStatus laidWide)
+
+  -- Selection in the formatted view (RTF / DOCX / EPUB) -----------------------
+  -- The text view's caret-and-anchor model over laid-out (line, character)
+  -- coordinates, minus everything that writes. Ported from the PDF view, so
+  -- these mirror its assertions.
+  do
+    let mkPar t = Rtf.defaultPar { Rtf.rpRuns = [Rtf.RtfRun (T.pack t) Rtf.defaultFmt] }
+        doc0 = Rtf.mkRtfDocFrom (RtfFromContainer (T.pack "DOCX")) Seq.empty T.empty
+                 (Seq.fromList (map mkPar ["alpha beta", "gamma delta", "epsilon"]))
+        -- Laid out wide enough that each paragraph is one line.
+        doc = Rtf.rtfRelayout 4 40 3 doc0
+        at l c = Pos l c
+
+    checkEq "formatted view lays each paragraph on one line" (Rtf.rtfLineCount doc) 3
+    checkEq "formatted view reads a laid-out line"
+      (Rtf.rtfLineTextAt doc 1) (T.pack "gamma delta")
+
+    -- An untouched document has no selection and so no caret to draw.
+    checkEq "a fresh formatted view has no selection" (Rtf.rtfSelection doc) Nothing
+    checkEq "a fresh formatted view has no anchor" (rdAnchor doc) Nothing
+    checkEq "a fresh formatted view copies nothing" (Rtf.rtfSelText doc) T.empty
+
+    -- Within one line, and across several.
+    let sel1 = Rtf.rtfSelectRange (at 0 6) (at 0 10) doc
+    checkEq "selecting within a line" (Rtf.rtfSelText sel1) (T.pack "beta")
+    let sel2 = Rtf.rtfSelectRange (at 0 6) (at 2 3) doc
+    checkEq "selecting across lines joins them with newlines"
+      (Rtf.rtfSelText sel2) (T.pack "beta\ngamma delta\neps")
+    -- Backwards drags are the same selection.
+    checkEq "a backwards selection is the same text"
+      (Rtf.rtfSelText (Rtf.rtfSelectRange (at 2 3) (at 0 6) doc)) (T.pack "beta\ngamma delta\neps")
+    checkEq "an empty range is no selection"
+      (Rtf.rtfSelection (Rtf.rtfSelectRange (at 1 2) (at 1 2) doc)) Nothing
+
+    checkEq "select all takes the whole document"
+      (Rtf.rtfSelText (Rtf.rtfSelectAll doc)) (T.pack "alpha beta\ngamma delta\nepsilon")
+    checkEq "clearing drops the selection"
+      (Rtf.rtfSelection (Rtf.rtfClearSel sel1)) Nothing
+
+    -- Positions are clamped onto the laid-out document, always.
+    checkEq "a position past the end clamps" (Rtf.rtfClampPos doc (at 99 99)) (at 2 7)
+    checkEq "a negative position clamps" (Rtf.rtfClampPos doc (at (-3) (-3))) (at 0 0)
+
+    -- Double- and triple-click.
+    checkEq "double-click takes the word under it"
+      (Rtf.rtfSelText (uncurry Rtf.rtfSelectRange (Rtf.rtfWordRange (at 1 8) doc) doc))
+      (T.pack "delta")
+    checkEq "double-click off a word selects nothing"
+      (Rtf.rtfWordRange (at 0 5) doc) (at 0 5, at 0 5)
+    checkEq "triple-click takes the line"
+      (Rtf.rtfSelText (uncurry Rtf.rtfSelectRange (Rtf.rtfLineRange (at 1 4) doc) doc))
+      (T.pack "gamma delta")
+
+    -- Shift+movement: the anchor is planted where the caret was.
+    let ext f d = Rtf.rtfExtendTo f d
+        moved = ext Rtf.rtfCaretRight (ext Rtf.rtfCaretRight doc)
+    checkEq "shift+movement starts a selection from the caret"
+      (Rtf.rtfSelText moved) (T.pack "al")
+    checkEq "extending again grows the same selection"
+      (Rtf.rtfSelText (ext Rtf.rtfCaretRight moved)) (T.pack "alp")
+    checkEq "shift+end takes to the end of the line"
+      (Rtf.rtfSelText (ext Rtf.rtfCaretEnd doc)) (T.pack "alpha beta")
+    checkEq "shift+ctrl+end takes to the end of the document"
+      (Rtf.rtfSelText (ext Rtf.rtfCaretBottom doc))
+      (T.pack "alpha beta\ngamma delta\nepsilon")
+    -- Caret movement wraps between lines, as in the text view.
+    checkEq "the caret moves down a line"
+      (rdCaret (Rtf.rtfCaretDown doc)) (at 1 0)
+    checkEq "the caret at a line's end steps to the next"
+      (rdCaret (Rtf.rtfCaretRight (Rtf.rtfCaretEnd doc))) (at 1 0)
+    checkEq "the caret at a line's start steps back to the previous"
+      (rdCaret (Rtf.rtfCaretLeft (Rtf.rtfSelectRange (at 1 0) (at 1 0) doc))) (at 0 10)
+
+    -- Mouse mapping. A line's leading pad is indent and alignment, not text,
+    -- so a click inside it lands at the start of the line rather than partway
+    -- into it.
+    let indented = Rtf.rtfRelayout 4 40 3
+          (Rtf.mkRtfDocFrom RtfFromBuffer Seq.empty T.empty
+             (Seq.fromList [ (mkPar "indented text") { Rtf.rpLeft = 720 } ]))
+    check "the laid-out line carries its pad"
+      (maybe False ((> 0) . Rtf.rlPad) (Seq.lookup 0 (Rtf.rtfLines indented)))
+    checkEq "a click in a line's indent lands at its first character"
+      (Rtf.rtfPosAtCell 4 0 1 indented) (at 0 0)
+    checkEq "a click past the pad lands on the character under it"
+      (Rtf.rtfPosAtCell 4 0 (6 + 3) indented) (at 0 3)
+    checkEq "the cell of a position undoes the mapping"
+      (Rtf.rtfCellOfPos 4 (at 0 3) indented) (6 + 3)
+
+    -- A re-wrap replaces every laid-out line, so the selection has to go
+    -- rather than point at whatever now sits at those indices.
+    checkEq "a re-wrap drops the selection"
+      (Rtf.rtfSelection (Rtf.rtfRelayout 4 20 3 (Rtf.rtfSelectAll doc))) Nothing
+    -- Re-laying out to the *same* width is a no-op and must keep it.
+    checkEq "re-laying out to the same width keeps the selection"
+      (Rtf.rtfSelText (Rtf.rtfRelayout 4 40 3 (Rtf.rtfSelectAll doc)))
+      (T.pack "alpha beta\ngamma delta\nepsilon")
+
+    -- Scrolling to the caret moves as little as it can.
+    let tall = Rtf.rtfRelayout 4 40 1 doc
+    checkEq "scrolling to a caret below the window brings it on"
+      (rdTop (Rtf.rtfScrollToCaret 1 (Rtf.rtfSelectRange (at 2 0) (at 2 3) tall))) 2
+    checkEq "scrolling to a caret already on the window does nothing"
+      (rdTop (Rtf.rtfScrollToCaret 1 (Rtf.rtfSelectRange (at 0 0) (at 0 3) tall))) 0
+
+    -- Through the editor. The view has to be laid out for the editor's own
+    -- width first: a re-wrap drops the selection, so selecting against a
+    -- differently-laid-out copy would assert on something the first repaint
+    -- throws away.
+    let edLaid = refreshRtf ((newEditor (24, 80) defaultConfig) { edRtf = Just doc0 })
+        laid   = maybe doc0 id (edRtf edLaid)
+        edSel  = edLaid { edRtf = Just (Rtf.rtfSelectRange (at 0 6) (at 0 10) laid) }
+        (edC, effs) = runAction MACopy edSel
+    checkEq "Ctrl+C copies the formatted view's selection"
+      [ t | EffCopy t <- effs ] [T.pack "beta"]
+    checkEq "the copied text is on the editor's clipboard" (edClipboard edC) (T.pack "beta")
+    let edNone = edLaid
+        (edN, effsN) = runAction MACopy edNone
+    check "copying nothing says so rather than copying"
+      (null [ () | EffCopy _ <- effsN ] && T.pack "Nothing selected" `T.isInfixOf` edStatus edN)
+    checkEq "Select All works in the formatted view"
+      (fmap Rtf.rtfSelText (edRtf (fst (runAction MASelectAll edNone))))
+      (Just (T.pack "alpha beta\ngamma delta\nepsilon"))
+    -- Copy and Select All are the two actions the view deliberately keeps, so
+    -- they survive into the Edit menu while Cut, Paste and Delete do not.
+    let editItems e = [ act | MEItem _ _ act <- entriesFor e 1 ]
+    check "the formatted view offers Copy and Select All"
+      (MACopy `elem` editItems edNone && MASelectAll `elem` editItems edNone)
+    check "the formatted view still offers nothing that writes"
+      (all (`notElem` editItems edNone) [MACut, MAPaste])
+    -- The renderer paints it. Asserted on the cell grid rather than on a
+    -- terminal round trip, since the selection is a *style* and the diff would
+    -- not tell us which cells carried it.
+    let scrSel = renderEditor edSel
+        cellAtRC scr r c = scrCells scr A.! (r * scrW scr + c)
+        -- "alpha beta" is laid out on the first text row; columns 6..9 are the
+        -- selected "beta".
+        row0 = 1
+        selStyle = cellStyle (cellAtRC scrSel row0 6)
+        unselStyle = cellStyle (cellAtRC scrSel row0 2)
+    checkEq "the selected cell holds the selected character"
+      (cellChar (cellAtRC scrSel row0 6)) 'b'
+    check "the selection is painted" (selStyle /= unselStyle)
+    check "the character before it is not" (unselStyle == cellStyle (cellAtRC scrSel row0 0))
+    check "the character after it is not"
+      (cellStyle (cellAtRC scrSel row0 10) == unselStyle)
+    -- The caret is shown only while a selection is being made; an untouched
+    -- document still has no cursor at all.
+    check "the formatted view shows a caret while selecting"
+      (scrCursor scrSel /= Nothing)
+    check "an untouched formatted view shows no cursor"
+      (scrCursor (renderEditor edLaid) == Nothing)
+
+    -- Esc clears; plain arrows scroll and leave the selection alone, because
+    -- scrolling to see the rest of what you highlighted must not destroy it.
+    let edWithSel = edSel
+    checkEq "Esc clears the formatted view's selection"
+      (fmap Rtf.rtfSelection (edRtf (fst (update KEsc edWithSel)))) (Just Nothing)
+    check "a plain arrow scrolls without disturbing the selection"
+      (case edRtf (fst (update (KArrow DDown noMods) edWithSel)) of
+         Just rd -> Rtf.rtfSelText rd == T.pack "beta"
+         Nothing -> False)
+
+  -- Formula evaluation (Cmedit.Formula) ---------------------------------------
+  -- The whole point of this module is the case a workbook does *not* answer
+  -- for itself, so the first thing pinned is that it never touches the case a
+  -- workbook does.
+  do
+    let row vs = Seq.fromList (map T.pack vs ++ replicate (10 - length vs) T.empty)
+        grid = Seq.fromList
+          [ row ["10", "row1"], row ["20", "row2"], row ["30", "row3"]
+          , row ["40", "row4"], row ["5",  "row5"], row [] ]
+        other = Seq.fromList [ row ["99"] ]
+        -- Evaluate one formula, placed in a scratch cell (J6) out of the way
+        -- of everything the fixtures reference — including the whole-row and
+        -- whole-column ranges, which would otherwise take it in and be
+        -- correctly reported as circular.
+        run src =
+          let sheets = [ Fm.SheetIn (T.pack "Calc") grid (M.singleton (5, 9) (T.pack src))
+                       , Fm.SheetIn (T.pack "Other") other M.empty ]
+              (out, comp, unsup) = Fm.evalWorkbook sheets
+              cell = case out of
+                ((_, g) : _) -> maybe T.empty id (Seq.lookup 5 g >>= Seq.lookup 9)
+                []           -> T.empty
+          in (T.unpack cell, comp, unsup)
+        calc src = let (t, _, _) = run src in t
+        cellOf g r c = maybe T.empty id (Seq.lookup r g >>= Seq.lookup c)
+        eq name src want = checkEq (name ++ " (" ++ src ++ ")") (calc src) want
+
+    -- Arithmetic, precedence and coercion.
+    eq "sum of a range"      "=SUM(A1:A5)"        "105"
+    eq "precedence"          "=(2+3)*4^2-10/4"    "77.5"
+    eq "left-associative ^"  "=2^3^2"             "64"
+    eq "unary minus"         "=-A1+5"             "-5"
+    eq "percent"             "=50%*A2"            "10"
+    eq "concatenation"       "=\"a\"&1&TRUE"      "a1TRUE"
+    eq "comparison"          "=A1<A2"             "TRUE"
+    eq "text compares case-insensitively" "=\"AB\"=\"ab\"" "TRUE"
+    eq "a blank is zero"     "=J5+1"              "1"
+    eq "text that looks like a number coerces" "=\"3\"+1" "4"
+    eq "text that does not is an error" "=\"three\"+1" "#VALUE!"
+
+    -- Aggregates. Text and blanks inside a range are skipped, as in Excel.
+    eq "average"    "=AVERAGE(A1:A5)"   "21"
+    eq "min and max" "=MIN(A1:A5)&\"/\"&MAX(A1:A5)" "5/40"
+    eq "count is numbers only"  "=COUNT(A1:B5)"  "5"
+    eq "counta is non-blank"    "=COUNTA(A1:B5)" "10"
+    eq "median"     "=MEDIAN(A1:A5)"    "20"
+    eq "product"    "=PRODUCT(A1:A3)"   "6000"
+    eq "a range skips text"     "=SUM(A1:B5)"    "105"
+    eq "sumproduct" "=SUMPRODUCT(A1:A3,A1:A3)"   "1400"
+
+    -- Conditionals.
+    eq "if true"    "=IF(A1>5,\"yes\",\"no\")"  "yes"
+    eq "if false"   "=IF(A1>50,\"yes\",\"no\")" "no"
+    eq "if with no else" "=IF(A1>50,\"yes\")"   "FALSE"
+    eq "nested if"  "=IF(SUM(A1:A5)>100,ROUND(AVERAGE(A1:A5),1),0)" "21"
+    eq "and/or"     "=AND(A1>5,A2>5)&\"|\"&OR(A1>500,A2>500)" "TRUE|FALSE"
+    eq "not"        "=NOT(A1>5)"        "FALSE"
+    eq "iferror catches" "=IFERROR(A1/0,\"oops\")" "oops"
+    eq "iferror passes through" "=IFERROR(A1+1,\"oops\")" "11"
+    -- IF must not evaluate the branch it does not take, or a guard against
+    -- division by zero would still divide by zero.
+    eq "if short-circuits" "=IF(A1=0,A2/A1,\"safe\")" "safe"
+
+    -- Criteria: comparisons, exact text and wildcards.
+    eq "sumif"      "=SUMIF(A1:A5,\">=20\")"  "90"
+    eq "countif"    "=COUNTIF(A1:A5,\">15\")" "3"
+    eq "countif on text" "=COUNTIF(B1:B5,\"row3\")" "1"
+    eq "countif wildcard" "=COUNTIF(B1:B5,\"row*\")" "5"
+    eq "sumif with a separate sum range" "=SUMIF(B1:B5,\"row3\",A1:A5)" "30"
+    eq "averageif" "=AVERAGEIF(A1:A5,\">=20\")" "30"
+
+    -- Maths and rounding. Excel rounds half away from zero, not to even.
+    eq "round"      "=ROUND(10/3,2)"    "3.33"
+    eq "round half away from zero" "=ROUND(2.5,0)" "3"
+    eq "round negative half away"  "=ROUND(-2.5,0)" "-3"
+    eq "roundup"    "=ROUNDUP(3.01,1)"  "3.1"
+    eq "rounddown"  "=ROUNDDOWN(3.99,1)" "3.9"
+    eq "round to tens" "=ROUND(1234,-2)" "1200"
+    eq "abs and mod" "=MOD(17,5)&\"|\"&ABS(-4.5)" "2|4.5"
+    eq "int truncates downward" "=INT(-1.5)" "-2"
+    eq "power and sqrt" "=POWER(2,10)&\"|\"&SQRT(16)" "1024|4"
+    eq "mod by zero"    "=MOD(1,0)"     "#DIV/0!"
+    eq "sqrt of a negative" "=SQRT(-1)" "#NUM!"
+
+    -- Text.
+    eq "upper/left/len" "=UPPER(LEFT(\"hello world\",5))&\"-\"&LEN(\"abc\")" "HELLO-3"
+    eq "right and mid"  "=RIGHT(\"abcdef\",2)&MID(\"abcdef\",2,3)" "efbcd"
+    eq "trim collapses" "=TRIM(\"  a   b  \")" "a b"
+    eq "concatenate"    "=CONCATENATE(\"a\",1,\"b\")" "a1b"
+    eq "substitute"     "=SUBSTITUTE(\"a-b-c\",\"-\",\"+\")" "a+b+c"
+    eq "textjoin skips blanks" "=TEXTJOIN(\",\",TRUE,B1:B3)" "row1,row2,row3"
+
+    -- Lookups.
+    eq "vlookup exact"  "=VLOOKUP(30,A1:B5,2,FALSE)" "row3"
+    eq "vlookup missing" "=VLOOKUP(31,A1:B5,2,FALSE)" "#N/A"
+    eq "match"          "=MATCH(30,A1:A5,0)" "3"
+    eq "index"          "=INDEX(B1:B5,2)"    "row2"
+    eq "is-functions"   "=ISNUMBER(A1)&ISTEXT(B1)&ISBLANK(J5)" "TRUETRUETRUE"
+
+    -- References: cell to cell, whole columns, other sheets.
+    eq "a whole-column range" "=SUM(A:A)" "105"
+    eq "a whole-row range"    "=SUM(1:1)" "10"
+    eq "a cross-sheet reference" "=Other!A1+1" "100"
+    eq "an unknown sheet"     "=Nope!A1"  "#REF!"
+    eq "dollar signs are ignored" "=$A$1+1" "11"
+
+    -- Errors are answers, and are shown.
+    eq "division by zero" "=A1/0" "#DIV/0!"
+    eq "an error propagates through arithmetic" "=A1/0+1" "#DIV/0!"
+    eq "an error literal in the source" "=NA()+1" ""     -- NA() is not implemented
+
+    -- A formula this reader does not understand leaves the cell exactly as it
+    -- was and is counted, rather than showing a guess.
+    let (t1, c1, u1) = run "=XIRR(A1:A5,A1:A5)"
+    checkEq "an unsupported function leaves the cell blank" t1 ""
+    checkEq "an unsupported function is not counted as computed" c1 0
+    checkEq "an unsupported function is counted as unsupported" u1 1
+    let (t2, c2, u2) = run "=SUM(A1:A5"           -- unbalanced
+    checkEq "a formula that does not parse leaves the cell blank" t2 ""
+    checkEq "a formula that does not parse is counted" (c2, u2) (0, 1)
+    let (_, c3, u3) = run "=SUM(A1:A5)"
+    checkEq "a formula that works is counted as computed" (c3, u3) (1, 0)
+    check "the supported set covers what generated workbooks use"
+      (all (`elem` Fm.supportedFunctions)
+           (map T.pack ["SUM", "AVERAGE", "IF", "COUNT", "MIN", "MAX", "ROUND"
+                       ,"SUMIF", "COUNTIF", "VLOOKUP", "CONCATENATE", "IFERROR"]))
+    -- Volatile and date functions are deliberately absent: this module is pure
+    -- and has no clock, and a wrong date is worse than a blank.
+    check "no clock-dependent functions are claimed"
+      (all (`notElem` Fm.supportedFunctions) (map T.pack ["TODAY", "NOW", "RAND"]))
+
+    -- Chains, cycles and depth. A cycle must be reported, not followed.
+    let chain = [ Fm.SheetIn (T.pack "Calc") grid
+                    (M.fromList [ ((0, 9), T.pack "=SUM(A1:A5)")
+                                , ((1, 9), T.pack "=J1*2") ])
+                , Fm.SheetIn (T.pack "Other") other M.empty ]
+        (chainOut, _, _) = Fm.evalWorkbook chain
+    checkEq "a formula that reads another formula's cell"
+      (case chainOut of ((_, g) : _) -> cellOf g 1 9; _ -> T.empty) (T.pack "210")
+    let cyc = [ Fm.SheetIn (T.pack "Calc") grid
+                  (M.fromList [ ((0, 9), T.pack "=J2"), ((1, 9), T.pack "=J1") ])
+              , Fm.SheetIn (T.pack "Other") other M.empty ]
+        (cycOut, _, _) = Fm.evalWorkbook cyc
+    checkEq "a circular reference is reported, not followed"
+      (case cycOut of ((_, g) : _) -> cellOf g 0 9; _ -> T.empty) (T.pack "#CYCLE!")
+    -- A long chain is not a cycle, and the two must not be confused: a running
+    -- total written upward (each row reading the one below) cannot be resolved
+    -- by evaluation order and really does recurse the length of the column.
+    let deep n =
+          [ Fm.SheetIn (T.pack "Up")
+              (Seq.fromList (replicate n (Seq.fromList [T.pack "1", T.empty])))
+              (M.fromList [ ((r, 1), T.pack (if r == n - 1 then "A" ++ show (r + 1)
+                                             else "B" ++ show (r + 2) ++ "+A" ++ show (r + 1)))
+                          | r <- [0 .. n - 1] ]) ]
+        (deepOut, deepC, _) = Fm.evalWorkbook (deep 500)
+    checkEq "a 500-deep reference chain resolves"
+      (case deepOut of ((_, g) : _) -> cellOf g 0 1; _ -> T.empty) (T.pack "500")
+    checkEq "every link of it is computed" deepC 500
+
+    checkEq "a cell that refers to itself is circular too"
+      (calc "=J6") "#CYCLE!"
+    -- ...and so is a range that quietly contains the formula.
+    checkEq "a range that includes the formula's own cell is circular"
+      (calc "=SUM(J1:J6)") "#CYCLE!"
+
+    -- Number rendering matches how the file writes its own cached values:
+    -- plain, no separators, no format applied.
+    checkEq "an integer result has no decimal point" (Fm.showNumber 30) (T.pack "30")
+    checkEq "a fraction keeps its digits" (Fm.showNumber 3.25) (T.pack "3.25")
+    checkEq "float noise is not shown" (Fm.showNumber (0.1 + 0.2)) (T.pack "0.3")
+    checkEq "zero" (Fm.showNumber 0) (T.pack "0")
+    checkEq "a negative" (Fm.showNumber (-1.5)) (T.pack "-1.5")
+
+    -- The parser, on its own.
+    check "a formula parses with or without a leading ="
+      (Fm.parseFormula (T.pack "SUM(A1)") == Fm.parseFormula (T.pack "=SUM(A1)"))
+    checkEq "an unknown function makes the whole formula unsupported"
+      (Fm.parseFormula (T.pack "=1+XIRR(A1)")) Nothing
+    checkEq "a bare short name is not a cell reference"
+      (Fm.parseFormula (T.pack "=VAT*2")) Nothing
+    check "a range parses as an area"
+      (case Fm.parseFormula (T.pack "=A1:B2") of Just Fm.EArea{} -> True; _ -> False)
+
+  -- Formulas through the workbook reader (Cmedit.Xlsx) --------------------------
+  do
+    let sheet body = TE.encodeUtf8 (T.pack ("<worksheet><sheetData>" ++ body ++ "</sheetData></worksheet>"))
+        readSheet body = let (g, fs, _) = Xlsx.sheetGrid Seq.empty (sheet body)
+                         in (fmap toList (toList g), M.toList fs)
+
+    -- THE invariant: a formula that came with its value is not recorded for
+    -- evaluation at all, so nothing this editor computes can ever contradict
+    -- the program that wrote the file.
+    checkEq "a formula with a cached value is shown and never recomputed"
+      (readSheet "<row r=\"1\"><c r=\"A1\"><f>SUM(B1:C1)</f><v>999</v></c></row>")
+      ([[T.pack "999"]], [])
+    -- ...and one without is recorded, which is the only case that is computed.
+    checkEq "a formula with no cached value is recorded for evaluation"
+      (readSheet "<row r=\"1\"><c r=\"A1\"><f>SUM(B1:C1)</f></c></row>")
+      ([[T.empty]], [((0, 0), T.pack "SUM(B1:C1)")])
+    -- A shared formula's followers carry an empty <f>; they cannot be computed
+    -- and are recorded so the count says so rather than staying silent.
+    checkEq "an empty formula element is still recorded"
+      (readSheet "<row r=\"1\"><c r=\"A1\"><f t=\"shared\" si=\"0\"/></c></row>")
+      ([[T.empty]], [((0, 0), T.empty)])
+    -- The formula source must never leak into the cell.
+    checkEq "the formula source is never displayed"
+      (fst (readSheet "<row r=\"1\"><c r=\"A1\"><f>SUM(B1:C1)</f><v>7</v></c></row>"))
+      [[T.pack "7"]]
+
+    -- End to end through the workbook: cached wins, uncached is computed.
+    let both = [ (T.pack "S", Seq.fromList [Seq.fromList (map T.pack ["10", "20", "999", ""])]
+                 , M.fromList [ ((0, 2), T.pack "SUM(A1:B1)")     -- has a cached 999 alongside
+                              , ((0, 3), T.pack "SUM(A1:B1)") ]) ]
+        (outSheets, nComp, nUn) = Xlsx.resolveFormulas both
+        firstRow = case outSheets of
+          ((_, g) : _) -> maybe [] toList (Seq.lookup 0 g)
+          []           -> []
+    -- (Both are in the formula map here only because the fixture puts them
+    -- there; the reader would not have recorded the first.)
+    checkEq "resolveFormulas fills the cells it is given"
+      firstRow (map T.pack ["10", "20", "30", "30"])
+    checkEq "resolveFormulas counts what it did" (nComp, nUn) (2, 0)
+    checkEq "a workbook with no uncached formulas is untouched"
+      (Xlsx.resolveFormulas [(T.pack "S", Seq.fromList [Seq.fromList [T.pack "a"]], M.empty)])
+      ([(T.pack "S", Seq.fromList [Seq.fromList [T.pack "a"]])], 0, 0)
+
+  -- Save As in a view with no buffer: export, not save --------------------------
+  -- These views are read-only because nothing can write their format back.
+  -- That is an argument against writing an .xlsx, not against writing
+  -- anything, so Save As exports what is on screen — and, crucially, leaves
+  -- the open document exactly where it was.
+  do
+    let ed0 = newEditor (24, 80) defaultConfig
+        wb  = Xlsx.mkWorkbook
+                [ (T.pack "Data",  Seq.fromList [Seq.fromList (map T.pack ["a", "b,c"])])
+                , (T.pack "Q1/Q2", Seq.fromList [Seq.fromList [T.pack "z"]]) ] T.empty
+        edWb = workbookLoaded "/tmp/book.xlsx" wb ed0
+        mkPar t = Rtf.defaultPar { Rtf.rpRuns = [Rtf.RtfRun (T.pack t) Rtf.defaultFmt]
+                                 , Rtf.rpSpace = True }
+        rdDoc = Rtf.mkRtfDocFrom (RtfFromContainer (T.pack "DOCX")) Seq.empty T.empty
+                  (Seq.fromList (map mkPar ["First para", "Second para"]))
+        edDoc = containerDocLoaded "/tmp/report.docx" rdDoc ed0
+
+    -- A workbook exports the *showing* sheet, and says which one in the name.
+    checkEq "a workbook exports the showing sheet as CSV"
+      (fmap fst (exportSuggestion edWb)) (Just "/tmp/book-Data.csv")
+    checkEq "the exported text is the sheet, quoted as CSV"
+      (fmap snd (exportSuggestion edWb)) (Just (T.pack "a,\"b,c\""))
+    -- Turning to another sheet exports that one instead.
+    checkEq "turning the sheet changes what is exported"
+      (fmap fst (exportSuggestion (goToSheetIn 1 edWb))) (Just "/tmp/book-Q1_Q2.csv")
+    checkEq "a sheet name that is not a filename is sanitised"
+      (fmap snd (exportSuggestion (goToSheetIn 1 edWb))) (Just (T.pack "z"))
+
+    -- A container document exports its paragraphs, unwrapped: a file wrapped
+    -- to whatever width the terminal happened to be is a poor artifact.
+    checkEq "a docx exports as text"
+      (fmap fst (exportSuggestion edDoc)) (Just "/tmp/report.txt")
+    checkEq "the exported text is the paragraphs, not the laid-out lines"
+      (fmap snd (exportSuggestion edDoc))
+      (Just (T.pack "First para\n\nSecond para\n\n"))
+
+    -- A plain .rtf has a real buffer, so Save As stays an ordinary save of it.
+    let edRtfPlain = enterRtf (setLoaded "/tmp/x.rtf"
+          (emptyLoadResult { lrBuffer = fromText (T.pack "{\\rtf1 hi}") }) ed0)
+    checkEq "a plain rtf file is saved, not exported" (exportSuggestion edRtfPlain) Nothing
+    checkEq "an ordinary document is saved, not exported"
+      (exportSuggestion (setLoadedText (T.pack "hello") ed0)) Nothing
+
+    -- Views with no text refuse rather than writing an empty file, which is
+    -- what Save As did before this existed.
+    let edImg = imageLoaded "/tmp/x.png"
+                  [(Image 1 1 "PNG" (listArray (0, 3) [0, 0, 0, 255]), 0)] ed0
+    checkEq "an image has nothing to export" (exportSuggestion edImg) Nothing
+    check "and says so rather than offering a dialog"
+      (case saveAsRefusal edImg of Just m -> "no text" `isInfixOf` m; Nothing -> False)
+    check "Save As on an image opens no dialog"
+      (edDialog (saveAsDialogFlow edImg) == Nothing)
+
+    -- The dialog, and the effect it produces.
+    let edDlg = saveAsDialogFlow edWb
+    check "the export dialog says it is an export"
+      (case edDialog edDlg of
+         Just d  -> T.pack "Export" `T.isInfixOf` dlgTitle d
+         Nothing -> False)
+    let (edAfter, effs) = update KEnter edDlg
+    checkEq "confirming exports rather than saving"
+      [ (p, t) | EffExportTo p t <- effs ] [("/tmp/book-Data.csv", T.pack "a,\"b,c\"")]
+    checkEq "an export emits no save" (length [ () | EffSaveTo _ <- effs ]) 0
+    -- The point of the whole distinction: the document is still the workbook.
+    checkEq "the open document keeps its own path" (edPath edAfter) (Just "/tmp/book.xlsx")
+    check "and is still the workbook view" (maybe False (const True) (edSheets edAfter))
+    -- An ordinary document's Save As is unchanged: it writes and retitles.
+    let edTxt = setLoaded "/tmp/a.txt" (emptyLoadResult { lrBuffer = fromText (T.pack "hi") }) ed0
+        (edTxt2, effsTxt) = update KEnter (saveAsDialogFlow edTxt)
+    checkEq "an ordinary Save As still saves" (length [ () | EffSaveTo _ <- effsTxt ]) 1
+    checkEq "an ordinary Save As still retitles" (edPath edTxt2) (Just "/tmp/a.txt")
+
+    -- Exporting over the file the view came from would destroy it, and Save As
+    -- does not confirm before overwriting.
+    let edSelf = case edDialog edDlg of
+          Just d  -> edDlg { edDialog = Just d
+                       { dlgFields = [ fl { fText = T.pack "/tmp/book.xlsx" }
+                                     | fl <- dlgFields d ] } }
+          Nothing -> edDlg
+        (edSelfAfter, effsSelf) = update KEnter edSelf
+    checkEq "exporting over the source archive is refused" (length effsSelf) 0
+    check "and says why" (T.pack "came from" `T.isInfixOf` edStatus edSelfAfter)
+
+    -- The menu entry says which of the two it is.
+    let fileItems e = [ lbl | MEItem lbl _ MASaveAs <- entriesFor e 0 ]
+    check "the workbook's File menu offers a CSV export"
+      (any (T.isInfixOf (T.pack "CSV")) (fileItems edWb))
+    check "the document's File menu offers a text export"
+      (any (T.isInfixOf (T.pack "Text")) (fileItems edDoc))
+    check "an ordinary document's File menu still says Save As"
+      (any (T.isInfixOf (T.pack "Save")) (fileItems edTxt))
+
+  -- OpenDocument (Cmedit.Odf) ---------------------------------------------------
+  -- The third container format, onto the same two targets. What is asserted
+  -- here is what makes ODF different from OOXML rather than what they share:
+  -- formatting comes from a style table, lengths are CSS lengths, and a
+  -- spreadsheet is padded out to its full width with repeat counts.
+  do
+    let bytes = TE.encodeUtf8 . T.pack
+        content styles body = bytes (concat
+          [ "<office:document-content>"
+          , "<office:automatic-styles>", styles, "</office:automatic-styles>"
+          , "<office:body>", body, "</office:body></office:document-content>" ])
+        doc styles body = content styles ("<office:text>" ++ body ++ "</office:text>")
+        sheet body = content "" ("<office:spreadsheet>" ++ body ++ "</office:spreadsheet>")
+        pars styles body = toList (fst (Odf.odfPars (doc styles body)))
+        texts styles body = map (T.concat . map Rtf.rrText . Rtf.rpRuns) (pars styles body)
+        fmts styles body = map Rtf.rrFmt (concatMap Rtf.rpRuns (pars styles body))
+
+    -- Detection: the manifest says it is ODF, the body says which kind.
+    checkEq "odf is detected by content and manifest"
+      (Odf.isOdf (map T.pack ["content.xml", "META-INF/manifest.xml", "styles.xml"])) True
+    checkEq "an archive with no manifest is not odf"
+      (Odf.isOdf (map T.pack ["content.xml"])) False
+    checkEq "a text body is a document"
+      (Odf.odfKind (doc "" "<text:p>x</text:p>")) (Just Odf.OdfText)
+    checkEq "a spreadsheet body is a spreadsheet"
+      (Odf.odfKind (sheet "<table:table/>")) (Just Odf.OdfSheet)
+    -- A presentation is neither, and falls back to the archive listing rather
+    -- than being rendered as something it is not.
+    checkEq "a presentation has no reading view"
+      (Odf.odfKind (content "" "<office:presentation/>")) Nothing
+
+    -- CSS lengths, which OOXML did not need: it writes bare twips.
+    checkEq "an inch is 1440 twips" (Odf.lengthToTwips (T.pack "1in")) (Just 1440)
+    checkEq "half an inch" (Odf.lengthToTwips (T.pack "0.5in")) (Just 720)
+    checkEq "a centimetre" (Odf.lengthToTwips (T.pack "1cm")) (Just 567)
+    checkEq "a point" (Odf.lengthToTwips (T.pack "12pt")) (Just 240)
+    checkEq "a negative length" (Odf.lengthToTwips (T.pack "-0.25in")) (Just (-360))
+    checkEq "not a length" (Odf.lengthToTwips (T.pack "auto")) Nothing
+
+    -- The style table. This is the whole difference from a .docx: matching on
+    -- elements alone would see no formatting at all.
+    let st1 = "<style:style style:name=\"T1\" style:family=\"text\">"
+              ++ "<style:text-properties fo:font-weight=\"bold\"/></style:style>"
+              ++ "<style:style style:name=\"T2\" style:family=\"text\" style:parent-style-name=\"T1\">"
+              ++ "<style:text-properties fo:font-style=\"italic\" fo:color=\"#cc0000\"/></style:style>"
+              ++ "<style:style style:name=\"T3\" style:family=\"text\">"
+              ++ "<style:text-properties style:text-underline-style=\"solid\""
+              ++ " style:text-line-through-style=\"solid\" fo:font-size=\"14pt\"/></style:style>"
+              ++ "<style:style style:name=\"P1\" style:family=\"paragraph\">"
+              ++ "<style:paragraph-properties fo:text-align=\"center\""
+              ++ " fo:margin-left=\"0.5in\" fo:text-indent=\"-0.25in\"/></style:style>"
+    check "a span's style makes it bold"
+      (all Rtf.rfBold (fmts st1 "<text:p><text:span text:style-name=\"T1\">x</text:span></text:p>"))
+    -- Style inheritance: T2's parent is T1, so it is bold *and* italic.
+    check "a style inherits from its parent"
+      (case fmts st1 "<text:p><text:span text:style-name=\"T2\">x</text:span></text:p>" of
+         (f : _) -> Rtf.rfBold f && Rtf.rfItalic f && Rtf.rfColor f == Just (ColorRGB 0xCC 0 0)
+         _       -> False)
+    -- ODF spells underline and strike as *line styles*, so anything but "none"
+    -- is on — a reader looking for a boolean sees nothing.
+    check "underline and strike are line styles"
+      (case fmts st1 "<text:p><text:span text:style-name=\"T3\">x</text:span></text:p>" of
+         (f : _) -> Rtf.rfUnder f && Rtf.rfStrike f && Rtf.rfSize f == 28
+         _       -> False)
+    check "an unknown style name changes nothing"
+      (fmts st1 "<text:p><text:span text:style-name=\"NOPE\">x</text:span></text:p>"
+         == [Rtf.defaultFmt])
+    -- Spans nest, and formatting does not leak past the one it applies to.
+    check "spans nest"
+      (case fmts st1 ("<text:p>a<text:span text:style-name=\"T1\">b"
+                      ++ "<text:span text:style-name=\"T2\">c</text:span>d</text:span>e</text:p>") of
+         [a, b, c, d, e] -> not (Rtf.rfBold a) && Rtf.rfBold b
+                          && Rtf.rfBold c && Rtf.rfItalic c
+                          && Rtf.rfBold d && not (Rtf.rfItalic d)
+                          && not (Rtf.rfBold e)
+         _ -> False)
+    -- A paragraph style carries block properties, in CSS lengths.
+    checkEq "a paragraph style sets alignment and indents"
+      (map (\p -> (Rtf.rpAlign p, Rtf.rpLeft p, Rtf.rpFirst p))
+           (pars st1 "<text:p text:style-name=\"P1\">x</text:p>"))
+      [(Rtf.AlignCenter, 720, -360)]
+
+    -- Text content.
+    checkEq "paragraphs" (texts "" "<text:p>one</text:p><text:p>two</text:p>")
+      [T.pack "one", T.pack "two"]
+    -- A heading names its own level, which is why styles.xml never has to be
+    -- read to recognise one.
+    check "a heading gets a heading size"
+      (case fmts "" "<text:h text:outline-level=\"1\">Title</text:h>" of
+         (f : _) -> Rtf.rfSize f >= 28
+         _       -> False)
+    checkEq "empty paragraphs are dropped and the rest are spaced"
+      (texts "" "<text:p>a</text:p><text:p/><text:p>b</text:p>") [T.pack "a", T.pack "b"]
+    check "paragraphs are spaced" (all Rtf.rpSpace (pars "" "<text:p>a</text:p>"))
+    -- ODF collapses whitespace like HTML and writes real runs of spaces as
+    -- <text:s>, so both halves have to be handled or the document loses them.
+    checkEq "whitespace collapses" (texts "" "<text:p>a\n   b</text:p>") [T.pack "a b"]
+    checkEq "text:s is a run of real spaces"
+      (texts "" "<text:p>a<text:s text:c=\"4\"/>b</text:p>") [T.pack "a    b"]
+    checkEq "tabs and line breaks"
+      (texts "" "<text:p>a<text:tab/>b<text:line-break/>c</text:p>") [T.pack "a\tb\nc"]
+    checkEq "entities are resolved" (texts "" "<text:p>a &amp; b</text:p>") [T.pack "a & b"]
+    -- A list item's content *is* a text:p, so the item's bullet and indent
+    -- have to survive that paragraph starting.
+    checkEq "list items are bulleted"
+      (texts "" ("<text:list><text:list-item><text:p>one</text:p></text:list-item>"
+                 ++ "<text:list-item><text:p>two</text:p></text:list-item></text:list>"))
+      [T.pack "\x2022 one", T.pack "\x2022 two"]
+    check "and indented, and set tight"
+      (case pars "" "<text:list><text:list-item><text:p>one</text:p></text:list-item></text:list>" of
+         (p : _) -> Rtf.rpLeft p > 0 && Rtf.rpFirst p < 0 && not (Rtf.rpSpace p)
+         _       -> False)
+    -- A table row is one paragraph and its cells are tab stops, as in a .docx.
+    checkEq "a table row lays out on tab stops"
+      (texts "" ("<table:table><table:table-row>"
+                 ++ "<table:table-cell><text:p>a</text:p></table:table-cell>"
+                 ++ "<table:table-cell><text:p>b</text:p></table:table-cell>"
+                 ++ "</table:table-row></table:table>"))
+      [T.pack "a\tb"]
+    -- Marginalia is not body text.
+    checkEq "footnotes and annotations are skipped"
+      (texts "" ("<text:p>keep<text:note><text:note-body><text:p>gone</text:p>"
+                 ++ "</text:note-body></text:note></text:p>"))
+      [T.pack "keep"]
+    checkEq "an odt with no text yields nothing"
+      (Seq.length (fst (Odf.odfPars (doc "" "")))) 0
+
+    -- Spreadsheets.
+    let cell v t = "<table:table-cell office:value=\"" ++ v ++ "\"><text:p>" ++ t
+                   ++ "</text:p></table:table-cell>"
+        table nm rows = "<table:table table:name=\"" ++ nm ++ "\">" ++ rows ++ "</table:table>"
+        rowOf cs = "<table:table-row>" ++ cs ++ "</table:table-row>"
+        sheets body = let (ss, _) = Odf.odfSheets (sheet body)
+                      in [ (n, fmap toList (toList g), M.toList f) | (n, g, f) <- ss ]
+
+    -- The display text wins over the raw value: this is where an .ods reads
+    -- better than an .xlsx, because the number format is already applied.
+    checkEq "a cell shows its displayed text, not its raw value"
+      (map (\(_, g, _) -> g) (sheets (table "S" (rowOf (cell "1234.5" "$1,234.50")))))
+      [[[T.pack "$1,234.50"]]]
+    checkEq "a cell with no displayed text falls back to its value"
+      (map (\(_, g, _) -> g)
+           (sheets (table "S" (rowOf "<table:table-cell office:value=\"7\"/>"))))
+      [[[T.pack "7"]]]
+    checkEq "sheets are named" (map (\(n, _, _) -> n) (sheets (table "Sales" "" ++ table "Costs" "")))
+      (map T.pack ["Sales", "Costs"])
+
+    -- The repeat counts, which are not optional to handle: LibreOffice pads
+    -- every row out to 1024 columns and every sheet to 1048576 rows.
+    checkEq "a repeated cell is expanded"
+      (map (\(_, g, _) -> g)
+        (sheets (table "S" (rowOf (cell "1" "a"
+                 ++ "<table:table-cell table:number-columns-repeated=\"3\""
+                 ++ " office:value=\"2\"><text:p>b</text:p></table:table-cell>"
+                 ++ cell "3" "c")))))
+      [[map T.pack ["a", "b", "b", "b", "c"]]]
+    checkEq "a trailing run of empty cells is dropped, not materialised"
+      (map (\(_, g, _) -> map length g)
+        (sheets (table "S" (rowOf (cell "1" "a"
+                 ++ "<table:table-cell table:number-columns-repeated=\"1023\"/>")))))
+      [[1]]
+    checkEq "and so is a trailing run of empty rows"
+      (map (\(_, g, _) -> length g)
+        (sheets (table "S" (rowOf (cell "1" "a")
+                 ++ "<table:table-row table:number-rows-repeated=\"1048575\">"
+                 ++ "<table:table-cell table:number-columns-repeated=\"1024\"/>"
+                 ++ "</table:table-row>"))))
+      [1]
+    checkEq "a repeated row with content is expanded"
+      (map (\(_, g, _) -> length g)
+        (sheets (table "S" ("<table:table-row table:number-rows-repeated=\"3\">"
+                 ++ cell "1" "x" ++ "</table:table-row>"))))
+      [3]
+
+    -- Formulas: recorded only where the file gave no displayed value, which
+    -- for an .ods is rare — and a formula cell must survive the trailing trim
+    -- precisely because it looks empty.
+    checkEq "a calculated cell records no formula"
+      (map (\(_, _, f) -> f)
+        (sheets (table "S" (rowOf ("<table:table-cell table:formula=\"of:=SUM([.A1:.B1])\""
+                 ++ " office:value=\"3\"><text:p>3</text:p></table:table-cell>")))))
+      [[]]
+    checkEq "an uncalculated one is recorded, and is not trimmed away"
+      (map (\(_, g, f) -> (map length g, f))
+        (sheets (table "S" (rowOf (cell "1" "a"
+                 ++ "<table:table-cell table:formula=\"of:=SUM([.A1:.B1])\"/>")))))
+      [([2], [((0, 1), T.pack "SUM(A1:B1)")])]
+
+    -- ODF's formula syntax is not Excel's: every reference is bracketed and a
+    -- same-sheet one is prefixed with a dot.
+    checkEq "a same-sheet reference loses its brackets and dot"
+      (Odf.odfFormula (T.pack "of:=SUM([.A1:.B9])")) (T.pack "SUM(A1:B9)")
+    checkEq "a cross-sheet reference becomes an Excel one"
+      (Odf.odfFormula (T.pack "of:=[Sheet2.A1]*2")) (T.pack "Sheet2!A1*2")
+    checkEq "the oooc namespace is handled too"
+      (Odf.odfFormula (T.pack "oooc:=[.A1]+1")) (T.pack "A1+1")
+    checkEq "a bare = is handled" (Odf.odfFormula (T.pack "=[.A1]")) (T.pack "A1")
+    checkEq "nothing at all is nothing" (Odf.odfFormula T.empty) T.empty
+    -- And the translation feeds straight into the evaluator.
+    checkEq "a translated formula evaluates"
+      (let g = Seq.fromList [Seq.fromList (map T.pack ["7", "6", ""])]
+           (out, c, _) = Fm.evalWorkbook
+             [ Fm.SheetIn (T.pack "S") g
+                 (M.singleton (0, 2) (Odf.odfFormula (T.pack "of:=SUM([.A1:.B1])"))) ]
+       in (case out of ((_, g') : _) -> maybe T.empty id (Seq.lookup 0 g' >>= Seq.lookup 2)
+                       _ -> T.empty, c))
+      (T.pack "13", 1)
+
+  -- Command-line conversion (cmedit FILE > out.txt) ---------------------------
+  -- Every reading view already turns an awkward format into text, so this
+  -- asserts the decision layer on top: what each format converts *to*, and the
+  -- cases that refuse rather than emitting something useless.
+  do
+    tmpDir <- getTemporaryDirectory
+    let cfg = defaultConfig
+        write name t = do
+          let p = tmpDir </> name
+          BS.writeFile p t
+          pure p
+        le16, le32 :: Int -> BS.ByteString
+        le16 n = BS.pack [fromIntegral (n .&. 0xff), fromIntegral ((n `shiftR` 8) .&. 0xff)]
+        le32 n = le16 (n .&. 0xffff) <> le16 ((n `shiftR` 16) .&. 0xffff)
+        u8t = TE.encodeUtf8 . T.pack
+        -- A minimal stored-member ZIP, as the archive tests build one.
+        zipOf items =
+          let local (nm, dat) =
+                BS.concat [ le32 0x04034b50, le16 20, le16 0x800, le16 0, le16 0, le16 0
+                          , le32 0, le32 (BS.length dat), le32 (BS.length dat)
+                          , le16 (BS.length nm), le16 0, nm, dat ]
+              locals = map local items
+              offs = scanl (+) 0 (map BS.length locals)
+              central (off, (nm, dat)) =
+                BS.concat [ le32 0x02014b50, le16 20, le16 20, le16 0x800, le16 0
+                          , le16 0, le16 0, le32 0
+                          , le32 (BS.length dat), le32 (BS.length dat)
+                          , le16 (BS.length nm), le16 0, le16 0, le16 0, le16 0
+                          , le32 0, le32 off, nm ]
+              cds = map central (zip offs items)
+          in BS.concat (locals ++ cds ++
+               [ BS.concat [ le32 0x06054b50, le16 0, le16 0
+                           , le16 (length items), le16 (length items)
+                           , le32 (sum (map BS.length cds))
+                           , le32 (sum (map BS.length locals)), le16 0 ] ])
+
+    -- An .rtf is text on disk, so it arrives as a buffer of *markup* — and
+    -- markup is the one thing nobody redirecting this wants.
+    rtfP <- write "cmedit-conv.rtf" (u8t "{\\rtf1\\ansi Hello \\b there\\b0 .\\par Second.\\par}")
+    rc <- convertPath cfg 1 rtfP
+    checkEq "an rtf converts to its document text, not its markup"
+      (fmap fst rc) (Right (T.pack "Hello there.\nSecond.\n"))
+    check "and the description says what it read"
+      (case rc of Right (_, d) -> "RTF document" `isInfixOf` d; _ -> False)
+
+    -- A workbook converts one sheet, because a CSV holds one table.
+    let sheetXml n = u8t ("<worksheet><sheetData><row r=\"1\">"
+                          ++ "<c r=\"A1\" t=\"inlineStr\"><is><t>" ++ n ++ "</t></is></c>"
+                          ++ "<c r=\"B1\"><v>1</v></c></row></sheetData></worksheet>")
+    xlsxP <- write "cmedit-conv.xlsx" (zipOf
+      [ (u8t "xl/workbook.xml", u8t ("<workbook xmlns:r=\"x\"><sheets>"
+          ++ "<sheet name=\"One\" r:id=\"rId1\"/><sheet name=\"Two\" r:id=\"rId2\"/>"
+          ++ "</sheets></workbook>"))
+      , (u8t "xl/_rels/workbook.xml.rels", u8t ("<Relationships>"
+          ++ "<Relationship Id=\"rId1\" Target=\"worksheets/a.xml\"/>"
+          ++ "<Relationship Id=\"rId2\" Target=\"worksheets/b.xml\"/></Relationships>"))
+      , (u8t "xl/worksheets/a.xml", sheetXml "first")
+      , (u8t "xl/worksheets/b.xml", sheetXml "second") ])
+    wc <- convertPath cfg 1 xlsxP
+    checkEq "a workbook converts to CSV" (fmap fst wc) (Right (T.pack "first,1"))
+    check "and says which sheet, and that there are others"
+      (case wc of Right (_, d) -> "sheet 1" `isInfixOf` d && "--sheet" `isInfixOf` d
+                  _            -> False)
+    wc2 <- convertPath cfg 2 xlsxP
+    checkEq "--sheet picks another one" (fmap fst wc2) (Right (T.pack "second,1"))
+    -- Out of range clamps rather than failing: the file is still convertible.
+    wc9 <- convertPath cfg 9 xlsxP
+    checkEq "a sheet number past the end clamps" (fmap fst wc9) (Right (T.pack "second,1"))
+
+    -- An archive with nothing recognisable inside converts to its listing.
+    zipP <- write "cmedit-conv.zip" (zipOf [(u8t "readme.txt", u8t "hi")])
+    zc <- convertPath cfg 1 zipP
+    check "an archive converts to its listing"
+      (case zc of Right (t, d) -> T.pack "readme.txt" `T.isInfixOf` t
+                                  && "archive listing" `isInfixOf` d
+                  _ -> False)
+
+    -- Plain text converts to itself, which is what makes the rule "everything
+    -- it can open, it can convert" true without exceptions.
+    txtP <- write "cmedit-conv.txt" (u8t "one\ntwo\n")
+    tc <- convertPath cfg 1 txtP
+    checkEq "plain text converts to itself" (fmap fst tc) (Right (T.pack "one\ntwo\n"))
+
+    -- The refusals. Each one exists because the alternative is emitting
+    -- something useless into whatever the user redirected into.
+    imgP <- write "cmedit-conv.bmp" (mkBMP 1 1 [(255, 0, 0)])
+    ic <- convertPath cfg 1 imgP
+    check "an image refuses, rather than converting to nothing"
+      (case ic of Left m -> "image" `isInfixOf` m; _ -> False)
+    -- A missing path is a *new buffer* to the editor and an error here.
+    mc <- convertPath cfg 1 (tmpDir </> "cmedit-conv-does-not-exist.pdf")
+    check "a missing file refuses rather than converting an empty buffer"
+      (case mc of Left m -> "no such file" `isInfixOf` m; _ -> False)
+    dc <- convertPath cfg 1 tmpDir
+    check "a directory refuses" (case dc of Left m -> "directory" `isInfixOf` m; _ -> False)
+
+    forM_ ["cmedit-conv.rtf", "cmedit-conv.xlsx", "cmedit-conv.zip"
+          , "cmedit-conv.txt", "cmedit-conv.bmp"] $ \f -> void
+      (try (removeFile (tmpDir </> f)) :: IO (Either SomeException ()))
+
+  -- Plain-text export of the reading views (shared with Save As) --------------
+  do
+    let mkPar t = Rtf.defaultPar { Rtf.rpRuns = [Rtf.RtfRun (T.pack t) Rtf.defaultFmt]
+                                 , Rtf.rpSpace = True }
+        rd = Rtf.mkRtfDocFrom RtfFromBuffer Seq.empty T.empty
+               (Seq.fromList [mkPar "First", mkPar "Second"])
+    -- The paragraphs, not the laid-out lines: a file wrapped to whatever width
+    -- the terminal happened to be is a poor artifact, and this one has not
+    -- even been laid out.
+    checkEq "the document exports as unwrapped paragraphs"
+      (Rtf.rtfPlainText rd) (T.pack "First\n\nSecond\n\n")
+    checkEq "an empty document exports as nothing"
+      (Rtf.rtfPlainText (Rtf.mkRtfDocFrom RtfFromBuffer Seq.empty T.empty Seq.empty))
+      T.empty
+
+  -- Find in the table view -----------------------------------------------------
+  -- Ctrl+F searches *cells* and moves the cell cursor, which is what a grid
+  -- can do with a hit; the text view's character ranges have nowhere to go.
+  do
+    let csvText = T.pack "name,city,note\nAlice,Paris,red\nBob,Rome,green\nCarol,Paris,blue\n"
+        ed0 = setLoaded "/tmp/find.csv"
+                (emptyLoadResult { lrBuffer = fromText csvText })
+                (newEditor (24, 80) defaultConfig)
+        cellOfCur e = case edCsv e of
+          Just v  -> (csvCurRow v, csvCurCol v)
+          Nothing -> (-1, -1)
+        findFor t e = doFind e { edSearchTerm = T.pack t }
+        nextIn e = findAgain True e
+        prevIn e = findAgain False e
+
+    check "a .csv opens in the table view" (isJust' (edCsv ed0))
+    -- The hit becomes the cell cursor, so Find and \"look at it\" are one step.
+    let f1 = findFor "Paris" ed0
+    checkEq "find moves the cell cursor to the matching cell" (cellOfCur f1) (1, 1)
+    checkEq "and says which cell, and which match" (edStatus f1) (T.pack "Match 1 of 2 in B2")
+    let f2 = nextIn f1
+    checkEq "find next advances to the next matching cell" (cellOfCur f2) (3, 1)
+    checkEq "and counts up" (edStatus f2) (T.pack "Match 2 of 2 in B4")
+    -- Wrapping, in both directions.
+    checkEq "find next wraps at the end" (cellOfCur (nextIn f2)) (1, 1)
+    checkEq "find previous goes back" (cellOfCur (prevIn f2)) (1, 1)
+    checkEq "find previous wraps at the start" (cellOfCur (prevIn f1)) (3, 1)
+    -- A substring of a cell counts: cells are not matched whole.
+    checkEq "a substring matches" (cellOfCur (findFor "rol" ed0)) (3, 0)   -- "Carol"
+    checkEq "a miss says so and moves nothing"
+      (let e = findFor "zzz" ed0 in (cellOfCur e, T.pack "Not found" `T.isPrefixOf` edStatus e))
+      ((0, 0), True)
+    -- Case folding follows the dialog's option, as everywhere else.
+    checkEq "find is case-insensitive by default" (cellOfCur (findFor "paris" ed0)) (1, 1)
+    checkEq "and case-sensitive when asked"
+      (let e = doFind ed0 { edSearchTerm = T.pack "paris", edSearchCase = True }
+       in T.pack "Not found" `T.isPrefixOf` edStatus e) True
+
+    -- The live count in the dialog, which the grid counts in *cells* because a
+    -- cell is what Find Next steps through.
+    let dlgOf e = openFind e { edSearchTerm = T.pack "Paris" }
+    check "the dialog shows a live count of matching cells"
+      (case edDialog (dlgOf ed0) of
+         Just d  -> dlgMessage d == T.pack "2 matching cells"
+         Nothing -> False)
+    check "and says so in the singular"
+      (case edDialog (openFind ed0 { edSearchTerm = T.pack "Rome" }) of
+         Just d  -> dlgMessage d == T.pack "1 matching cell"
+         Nothing -> False)
+    check "and reports no matches"
+      (case edDialog (openFind ed0 { edSearchTerm = T.pack "zzz" }) of
+         Just d  -> dlgMessage d == T.pack "No matches"
+         Nothing -> False)
+
+    -- The live highlight: every matching cell is lit while the dialog is open,
+    -- below the cursor and above the selection. Asserted on the cell grid,
+    -- since it is a style and the frame diff would not say which cells got it.
+    let lit e = let scr = renderEditor e
+                    fm = thFindMatch (themeFor (resolvedTheme e))
+                in length [ () | i <- [0 .. scrW scr * scrH scr - 1]
+                          , cellStyle (scrCells scr A.! i) == fm ]
+    -- "Paris" is five cells wide and appears in two cells of the grid.
+    check "matching cells are lit while the Find dialog is open"
+      (lit (openFind ed0 { edSearchTerm = T.pack "Paris" }) >= 10)
+    check "a grid with no matches lights nothing"
+      (lit (openFind ed0 { edSearchTerm = T.pack "zzz" }) == 0)
+    check "and nothing is lit with no dialog open" (lit ed0 == 0)
+
+    -- Both bounds exist because the count is a full scan whenever the matches
+    -- are sparse, and it runs on every keystroke in the dialog. Past the bound
+    -- the count goes; *finding* never does.
+    let bigGrid = Seq.fromList [ Seq.fromList [ T.pack (show (r * c))
+                                              | c <- [0 .. 19 :: Int] ]
+                               | r <- [0 .. 2000 :: Int] ]
+        edBig = ed0 { edCsv = Just (mkCsvGrid ',' bigGrid) }
+    check "a grid past the live-count bound shows no count"
+      (case edDialog (openFind edBig { edSearchTerm = T.pack "1" }) of
+         Just d  -> dlgMessage d == T.empty
+         Nothing -> False)
+    check "but still finds, and still says where"
+      (let e = doFind edBig { edSearchTerm = T.pack "3999" }
+       in T.pack "Found in " `T.isPrefixOf` edStatus e)
 
   -- Save/load round-trip matrix (plan 0013) ----------------------------------
   -- Saving is the one operation where a bug silently corrupts the user's file,
@@ -2582,12 +4118,153 @@ main = do
     in checkEq ("csv text is stable after one normalisation (" ++ show src ++ ")")
                (csvToText (mkCsvView ',' twice)) twice
 
+  -- CSV parser: the line parser and the text parser are one engine (0026) ------
+  -- The load path parses a buffer's *lines* ('csvParseLines') rather than
+  -- re-joining them into one Text first, so the two must agree exactly — and
+  -- both must agree with the parser that shipped before, kept below as
+  -- 'csvParsePrev'. Randomised over tokens picked to hit every quirk: bare and
+  -- doubled quotes, stray text after a closing quote, lone CR, CRLF, embedded
+  -- newlines in quoted cells, ragged rows and multi-byte characters.
+  let csvTok r = T.pack (case r `mod` 16 of
+        0 -> "a"     ; 1  -> "bb,cc"      ; 2  -> ","      ; 3  -> "\""
+        4 -> "\n"    ; 5  -> "\r\n"       ; 6  -> "\r"     ; 7  -> "\"q\""
+        8 -> "\"a,b\""; 9 -> "\"x\ny\""   ; 10 -> "\"\"\"\""
+        11 -> "z\"stray\"t"               ; 12 -> " "      ; 13 -> "\t"
+        14 -> "\233"                      ; _  -> "\26085")
+      csvGen s = T.concat [ csvTok r | r <- take (1 + s `mod` 14) (iterate lcg (lcg s)) ]
+      csvSrcs = [ csvGen s | s <- take 400 (iterate lcg 991) ]
+      -- The production equivalence: what the editor loads (a buffer's lines,
+      -- CR already normalised by 'fromText') against what it used to load (the
+      -- same buffer serialised back into one Text).
+      lineBad = [ src | src <- csvSrcs
+                , let buf = fromText src
+                , csvParseLines ',' (bufLines buf)
+                    /= csvParse ',' (bufferToText LF False buf) ]
+      prevBad = [ (d, src) | d <- ",;\t|" :: String, src <- csvSrcs
+                , csvParse d src /= csvParsePrev d src ]
+      viewBad = [ src | src <- csvSrcs
+                , let buf = fromText src
+                      va  = mkCsvLines ',' (bufLines buf)
+                      vb  = mkCsvView ',' (bufferToText LF False buf)
+                , csvRows va /= csvRows vb || columnWidths va /= columnWidths vb ]
+  checkEq "csvParseLines agrees with csvParse over 400 random inputs"
+          (take 1 lineBad) []
+  checkEq "csvParse agrees with the pre-0026 parser, 4 delimiters x 400 inputs"
+          (take 1 prevBad) []
+  checkEq "mkCsvLines agrees with mkCsvView (grid and widths)" (take 1 viewBad) []
+  -- Edge cases of the line cursor, pinned by hand: the implicit newline
+  -- between lines is where every one of them lives.
+  let pl = Seq.fromList . map T.pack
+      grid rs = Seq.fromList [ Seq.fromList (map T.pack r) | r <- rs ]
+  checkEq "csvParseLines: an empty buffer is an empty grid"
+          (csvParseLines ',' (pl [""])) Seq.empty
+  checkEq "csvParseLines: two empty lines are one empty record"
+          (csvParseLines ',' (pl ["", ""])) (grid [[""]])
+  checkEq "csvParseLines: a trailing empty line is not a record"
+          (csvParseLines ',' (pl ["a,b", ""])) (grid [["a", "b"]])
+  checkEq "csvParseLines: a quoted cell spanning three lines"
+          (csvParseLines ',' (pl ["a,\"x", "y", "z\",b"]))
+          (grid [["a", "x\ny\nz", "b"]])
+  checkEq "csvParseLines: an unterminated quote swallows the rest of the file"
+          (csvParseLines ',' (pl ["a,\"x", "y"])) (grid [["a", "x\ny"]])
+  checkEq "csvParseLines: doubled quotes inside a spanning cell"
+          (csvParseLines ',' (pl ["\"a\"\"b", "c\""])) (grid [["a\"b\nc"]])
+  checkEq "csvParseLines: ragged rows keep their own lengths"
+          (csvParseLines ',' (pl ["a,b,c", "d", "e,f"]))
+          (grid [["a", "b", "c"], ["d"], ["e", "f"]])
+  checkEq "csvParseLines: stray text after a closing quote is appended"
+          (csvParseLines ',' (pl ["\"stray\"tail,b"])) (grid [["straytail", "b"]])
+  -- A CR inside a line ends the record mid-line (only reachable by editing —
+  -- 'fromText' normalises the CRs a file arrives with — but the text parser
+  -- has always done it, so the line parser must too).
+  checkEq "csvParseLines: a lone CR ends the record mid-line"
+          (csvParseLines ',' (pl ["a\rb,c"])) (grid [["a"], ["b", "c"]])
+  checkEq "csvParseLines: a CR at the end of a line eats the line break"
+          (csvParseLines ',' (pl ["a\r", "b"])) (grid [["a"], ["b"]])
+  -- Cell width: the strict fold must equal the splitOn/unpack version it
+  -- replaced, including multi-line cells, wide glyphs, variation selectors and
+  -- truly invisible formatting characters.
+  let widthSrcs = csvSrcs ++ map T.pack
+        [ "", "abc", "ab\ncdef\ng", "\n", "ab\n", "\nabc", "\26085\26412"
+        , "\8505\65039", "a\8203b", "\9888\65039x", "\t", "\1", "e\769" ]
+      cwBad = [ t | t <- widthSrcs, cellWidth t /= cellWidthRef t ]
+  checkEq "cellWidth agrees with the splitOn/unpack reference" (take 1 cwBad) []
+  checkEq "cellWidth of a multi-line cell is its widest line"
+          (cellWidth (T.pack "ab\ncdef\ng")) 4
+  checkEq "cellWidth counts a wide glyph as two cells"
+          (cellWidth (T.pack "\26085\26412")) 4
+  checkEq "cellWidth ignores an invisible format character"
+          (cellWidth (T.pack "a\8203b")) 2
+
   -- CSV column-width cache ------------------------------------------------------
   -- The cache maintained by withRows/undo/redo must always equal a fresh
   -- recomputation (serialise -> reparse is the ground truth), across cell
   -- edits, multi-line cells, row/column inserts/deletes and undo/redo.
   let widthsOk v = columnWidths v == columnWidths (mkCsvView (csvDelim v) (csvToText v))
-      csvOp r v = case r `mod` 13 of
+      -- The dirty state from outside the module: plain structural comparison,
+      -- no pointer tricks and no incremental anything (plan 0028).
+      shapeRef g = map Seq.length (toList g)
+      dirtyRef v
+        | shapeRef (csvRows v) /= shapeRef (csvSaved v) = DirtyShape
+        | otherwise = DirtyCells (length
+            [ () | (r, s) <- zip (toList (csvRows v)) (toList (csvSaved v))
+                 , (a, b) <- zip (toList r) (toList s), a /= b ])
+      -- The embedded-newline map from outside the module (plan 0029), built
+      -- only out of 'csvToText' — the serialisation 'cellTextPos' mirrors — so
+      -- it shares no code at all with the cache it checks. One row through
+      -- 'mkCsvGrid'/'csvToText' *is* that row's serialised form.
+      nlT = T.pack "\n"
+      serRow v row = csvToText (mkCsvGrid (csvDelim v) (Seq.singleton row))
+      nlRef v = M.fromList
+        [ (i, k)
+        | (i, row) <- zip [0 ..] (toList (csvRows v))
+        , let k = T.count nlT (serRow v row), k > 0 ]
+      -- 'cellTextPos' as it was written before the cache: re-serialise every
+      -- row above the target. This is the definition; the cache is the claim.
+      cellTextPosRef v r c =
+        let dl   = T.singleton (csvDelim v)
+            row  = Seq.index (csvRows v) r
+            base = r + sum [ T.count nlT (serRow v (Seq.index (csvRows v) i))
+                           | i <- [0 .. r - 1] ]
+            pre0 = serRow v (Seq.take c row)
+            pre  = if c > 0 then pre0 <> dl else pre0
+        in (base + T.count nlT pre, T.length (last (T.splitOn nlT pre)))
+      -- ...and 'textPosCell' as it was: a running scan for the row whose
+      -- serialised text contains the target line. The binary search that
+      -- replaced it must answer identically, including off both ends. Note the
+      -- fields have to come from the serialiser, not from splitting the row's
+      -- serialised text on the delimiter: a quoted field may contain one.
+      textPosCellRef v line col =
+        let n      = nRows v
+            starts = scanl (\acc i -> acc + 1 + T.count nlT
+                                        (serRow v (Seq.index (csvRows v) i))) 0 [0 .. n - 1]
+            r      = clampT 0 (n - 1) (length (takeWhile (<= line) starts) - 1)
+            dl     = T.singleton (csvDelim v)
+            fs     = [ serRow v (Seq.singleton f)
+                     | f <- toList (Seq.index (csvRows v) r) ]
+            colSt  = scanl (\acc f -> acc + T.length f + 1) 0 fs
+            c      = clampT 0 (max 0 (length fs - 1))
+                            (length (takeWhile (<= col) (initSafe colSt)) - 1)
+        in dl `seq` (r, c)
+      clampT lo hi = max lo . min hi
+      initSafe [] = []
+      initSafe xs = init xs
+      -- Both mappings, at seeded positions plus each end of the grid. Sampled
+      -- rather than exhaustive because the *reference* is O(rows) per call and
+      -- the fuzz grid grows; every cell of a small multi-line grid is checked
+      -- exhaustively in the 0029 block below.
+      posMapsOk s v =
+        let n  = nRows v
+            rs = nub [0, n - 1, s `mod` n]
+            wide row = [0 .. Seq.length row]
+        in and [ cellTextPos v r c == cellTextPosRef v r c
+               | r <- rs, c <- wide (Seq.index (csvRows v) r) ]
+           && and [ textPosCell v l c == textPosCellRef v l c
+                  | l <- nub [-1, 0, n - 1, n, n + 2, s `mod` (n + 4)]
+                  , c <- [-1, 0, 3, 9] ]
+      -- Every mutating operation in the module, so a site that moves csvRows
+      -- or csvSaved without carrying the caches gets caught here.
+      csvOp r v = case r `mod` 21 of
         0 -> setCurrentCell (T.pack (replicate (1 + r `mod` 40) 'x')) v
         1 -> setCurrentCell (T.pack "s") v
         2 -> insertRowBelow v
@@ -2604,17 +4281,247 @@ main = do
         -- case where the cache cannot be updated in O(1).
         10 -> commitEdit (editBackspace (editBackspace (beginEdit v)))
         11 -> cancelEdit (editInsert 'z' (beginEdit v))
+        12 -> insertRowAbove v
+        13 -> insertColLeft v
+        -- Wholesale rewrites and the shape-preserving permutation (sort), the
+        -- three grid changes that cannot be described as "one row moved".
+        14 -> mapCells (\t -> if T.null t then T.pack "f" else T.init t) v
+        15 -> sortByColumn (r `mod` max 1 (nCols v)) (even r) (odd r) v
+        16 -> clearSelCells (withSel (moveCursor DDown) (withSel (moveCursor DRight) v))
+        17 -> fst (pasteClip (T.pack "P,Q\nR,S") v)
+        18 -> fst (pasteClip (T.pack "one") (withSel (moveCursor DRight) v))
+        -- A new saved point mid-history: everything above must re-baseline.
+        19 -> markSaved v
         _ -> setCursor (r `mod` (nRows v + 1)) ((r `div` 7) `mod` (nCols v + 1)) v
-      csvFuzzStep (v, s, ok) _ =
+      csvFuzzStep (v, s, ok, nlOk) _ =
         let s' = lcg s
             v' = csvOp s' v
-        in (v', s', ok && widthsOk v'
-                       -- pointer-accelerated modified flag == plain equality
-                       && Cmedit.Csv.isModified v' == (csvRows v' /= csvSaved v'))
+        in (v', s'
+           , ok && widthsOk v'
+                       -- the maintained modified flag == plain equality
+                       && Cmedit.Csv.isModified v' == (csvRows v' /= csvSaved v')
+                       -- ...and the state behind it is exact, not merely
+                       -- right-about-zero: a sign error that keeps the boolean
+                       -- correct today would drift on the next edit.
+                       && csvDirty v' == dirtyRef v'
+                       -- the from-scratch path agrees with the incremental one
+                       && dirtyFrom (csvSaved v') (csvRows v') == dirtyRef v'
+             -- ...and, tracked separately so a failure names itself, the
+             -- embedded-newline map (plan 0029): against the module's own
+             -- recompute, against an oracle built only out of 'csvToText',
+             -- and through the two mappings it exists to make cheap.
+           , nlOk && csvNl v' == computeNl (csvDelim v') (csvRows v')
+                  && csvNl v' == nlRef v'
+                  && posMapsOk s' v')
       vw0 = mkCsvView ',' (T.pack "a,bb,ccc\ndddd,e,f\ng,hh,i")
-      (_, _, csvWidthsOk) = foldl csvFuzzStep (vw0, 7, True) [1 .. 600 :: Int]
+      (_, _, csvWidthsOk, csvNlOk0) = foldl csvFuzzStep (vw0, 7, True, True) [1 .. 600 :: Int]
+      -- A second run over a wider table with a different seed: more columns
+      -- means more shape-preserving states, which is where the count lives.
+      vw1 = mkCsvView ',' (T.pack "k,a,bb,3,x\n1,2,3,4,5\nz,,q,,w\nm,n,o,p,q")
+      (_, _, csvDirtyOk, csvNlOk1) = foldl csvFuzzStep (vw1, 1234567, True, True) [1 .. 600 :: Int]
+      -- A third, for 0029 specifically: a table that *starts* full of embedded
+      -- newlines, so the map is non-empty from the first operation rather than
+      -- only once the script happens to type one.
+      vw2 = mkCsvView ',' (T.pack "a,\"b\nc\"\n\"d\ne\nf\",g\nh,i\n\"j\nk\",\"l\nm\"")
+      (_, _, csvWidthsOk2, csvNlOk2) = foldl csvFuzzStep (vw2, 99, True, True) [1 .. 600 :: Int]
   check "csv width cache correct at load" (widthsOk vw0)
   check "csv width cache survives 600 random ops" csvWidthsOk
+  check "csv dirty state survives 600 random ops on a wider table" csvDirtyOk
+  check "csv width/dirty caches survive 600 ops on a multi-line table" csvWidthsOk2
+  check "0029: csv newline map and text mappings survive 600 random ops" csvNlOk0
+  check "0029: ...and 600 more on a wider table" csvNlOk1
+  check "0029: ...and 600 more on a table full of multi-line cells" csvNlOk2
+  checkEq "csv dirty state at load" (csvDirty vw0) (DirtyCells 0)
+
+  -- The CSV modified flag as maintained state (plan 0028) -----------------------
+  -- isModified is O(1) and exact: 'csvDirty' says whether the grid's shape
+  -- differs from the saved grid's, and if not, how many cells do. Everything
+  -- here is a way for that count to go wrong while the boolean still looks
+  -- plausible on the next keystroke.
+  let vm0 = mkCsvView ',' (T.pack "a,b,c\nd,e,f\ng,h,i")
+      cellTo r c t = setCurrentCell (T.pack t) (setCursor r c vm0)
+  checkEq "0028: a loaded table is clean" (csvDirty vm0) (DirtyCells 0)
+  check "0028: a loaded table is not modified" (not (isModified vm0))
+  -- Edit a cell, then edit it back to the value it was saved with: the count
+  -- must come back to zero, not merely stop growing.
+  let vmEdit = cellTo 1 1 "E"
+      vmBack = setCurrentCell (T.pack "e") vmEdit
+  checkEq "0028: one changed cell is one dirty cell" (csvDirty vmEdit) (DirtyCells 1)
+  check "0028: one changed cell is modified" (isModified vmEdit)
+  checkEq "0028: editing a cell back to its saved value is clean again"
+          (csvDirty vmBack) (DirtyCells 0)
+  check "0028: editing a cell back to its saved value clears the flag"
+          (not (isModified vmBack))
+  -- Two cells dirty, one put back: still modified. (A count that saturated at
+  -- one, or a boolean that latched, would pass the case above and fail here.)
+  let vmTwo  = setCurrentCell (T.pack "C") (setCursor 2 2 vmEdit)
+      vmOne  = setCurrentCell (T.pack "i") (setCursor 2 2 vmTwo)
+  checkEq "0028: two changed cells" (csvDirty vmTwo) (DirtyCells 2)
+  checkEq "0028: one of two put back" (csvDirty vmOne) (DirtyCells 1)
+  check "0028: still modified with one cell outstanding" (isModified vmOne)
+  -- Typing character by character inside one cell, without committing: the
+  -- per-keystroke path, which must not re-derive the count from the grid.
+  let vmTyped = foldl (\acc ch -> editInsert ch acc) (beginEdit (setCursor 0 0 vm0)) ("bc" :: String)
+  checkEq "0028: uncommitted typing is one dirty cell" (csvDirty vmTyped) (DirtyCells 1)
+  checkEq "0028: cancelling that edit is clean again"
+          (csvDirty (cancelEdit vmTyped)) (DirtyCells 0)
+  -- Shape changes: modified with no cell comparison at all, and — the case an
+  -- index-keyed design gets wrong — restoring the shape must re-derive the
+  -- count rather than trust whatever the indices used to mean.
+  let vmIns    = insertRowBelow vm0
+      vmInsDel = deleteRow (setCursor 1 0 vmIns)
+      vmCol    = insertColRight vm0
+      vmColDel = deleteCol vmCol
+  checkEq "0028: an inserted row is a shape change" (csvDirty vmIns) DirtyShape
+  check "0028: an inserted row is modified" (isModified vmIns)
+  checkEq "0028: deleting it again restores the shape and the count"
+          (csvDirty vmInsDel) (DirtyCells 0)
+  check "0028: shape change then revert is not modified" (not (isModified vmInsDel))
+  checkEq "0028: an inserted column is a shape change" (csvDirty vmCol) DirtyShape
+  checkEq "0028: deleting it again restores the shape and the count"
+          (csvDirty vmColDel) (DirtyCells 0)
+  -- A shape change on top of a dirty cell: reverting the shape must leave the
+  -- cell still counted.
+  let vmBoth = deleteRow (setCursor 3 0 (insertRowBelow (setCursor 2 0 vmEdit)))
+  checkEq "0028: shape reverted over an outstanding cell edit"
+          (csvDirty vmBoth) (DirtyCells 1)
+  check "0028: still modified after the shape reverts" (isModified vmBoth)
+  -- Undo back to clean is what the journal sweep relies on to drop a journal:
+  -- an editor that stayed "modified" after undoing to the saved grid would keep
+  -- offering to recover a file the user has not changed.
+  let vmU = Cmedit.Csv.undo (commitEdit (beginEditFresh 'Z' (setCursor 1 1 vm0)))
+  checkEq "0028: undo to the saved grid is clean" (csvDirty vmU) (DirtyCells 0)
+  check "0028: undo to the saved grid is not modified" (not (isModified vmU))
+  check "0028: redo is modified again" (isModified (Cmedit.Csv.redo vmU))
+  -- Undo across a structural edit, both ways.
+  let vmSU = Cmedit.Csv.undo (deleteRow (setCursor 1 0 vm0))
+  checkEq "0028: undo of a row delete is clean" (csvDirty vmSU) (DirtyCells 0)
+  checkEq "0028: redo of a row delete is a shape change"
+          (csvDirty (Cmedit.Csv.redo vmSU)) DirtyShape
+  -- Saving re-baselines: the grid on screen becomes the saved grid, and an
+  -- edit after that counts from there.
+  let vmSaved = markSaved vmTwo
+  checkEq "0028: markSaved is clean" (csvDirty vmSaved) (DirtyCells 0)
+  checkEq "0028: an edit after saving counts from the new baseline"
+          (csvDirty (setCurrentCell (T.pack "q") (setCursor 0 0 vmSaved))) (DirtyCells 1)
+  checkEq "0028: undoing past a save is dirty again"
+          (csvDirty (Cmedit.Csv.undo vmSaved)) (DirtyCells 1)
+  -- Replace-all over every cell, and back.
+  let vmAll = mapCells T.toUpper vm0
+  checkEq "0028: replace-all dirties every non-empty cell" (csvDirty vmAll) (DirtyCells 9)
+  checkEq "0028: undoing replace-all is clean"
+          (csvDirty (Cmedit.Csv.undo vmAll)) (DirtyCells 0)
+  -- Sort: a shape-preserving permutation, so the count is the number of cells
+  -- that ended up somewhere else.
+  let vmSort = sortByColumn 0 False False vm0
+  checkEq "0028: a descending sort of 3 distinct rows moves 6 cells"
+          (csvDirty vmSort) (DirtyCells 6)
+  checkEq "0028: sorting back is clean"
+          (csvDirty (sortByColumn 0 True False vmSort)) (DirtyCells 0)
+  -- Paste: a same-shaped overwrite, and the ragged case where a paste grows
+  -- the grid (which is a shape change, not a count).
+  let vmPaste = fst (pasteClip (T.pack "X,Y\nZ,W")
+                      (withSel (moveCursor DDown) (withSel (moveCursor DRight) vm0)))
+  checkEq "0028: a 2x2 paste over a 2x2 selection dirties four cells"
+          (csvDirty vmPaste) (DirtyCells 4)
+  let vmGrow = fst (pasteClip (T.pack "X,Y\nZ,W") (setCursor 2 2 vm0))
+  checkEq "0028: a paste that grows the grid is a shape change"
+          (csvDirty vmGrow) DirtyShape
+  -- The grid a mode toggle rebases onto keeps the old saved point, so its dirty
+  -- state has to be derived from scratch against it.
+  let vmReb = rebaseHistory vmEdit (mkCsvView ',' (csvToText vmEdit))
+  check "0028: a rebased view is modified against the old saved point"
+        (isModified vmReb)
+  checkEq "0028: a rebased view's count is exact" (csvDirty vmReb) (dirtyRef vmReb)
+  let vmReb0 = rebaseHistory vm0 (mkCsvView ',' (csvToText vm0))
+  check "0028: a rebased view with no text edit is clean" (not (isModified vmReb0))
+
+  -- The embedded-newline map (plan 0029) ---------------------------------------
+  -- 'cellTextPos' answers "which line of the serialised file does this cell
+  -- start on?", which the recents, the session file, the crash journal and the
+  -- nav history all ask. It used to re-serialise every row above the cursor —
+  -- 383 ms and 1 651 MB at the last row of a 223 209-row table — and the
+  -- session-shape check reached it from every keystroke. 'csvNl' is the sparse
+  -- row -> embedded-newline-count map that replaces the walk; the invariant is
+  --   Map.findWithDefault 0 i (csvNl v) == (newlines in row i's serialised form)
+  -- and everything here is a way for it to drift while still looking plausible.
+  let vnl0 = mkCsvView ',' (T.pack "a,b\nc,d\ne,f")
+      -- A grid whose row 1 holds a two-line cell and row 3 a three-line one.
+      vnlM = mkCsvView ',' (T.pack "a,b\n\"x\ny\",c\nd,e\n\"p\nq\nr\",s\nt,u")
+  checkEq "0029: a table with no embedded newline has an empty map"
+          (csvNl vnl0) M.empty
+  checkEq "0029: rows with embedded newlines, and only those, are in the map"
+          (csvNl vnlM) (M.fromList [(1, 1), (3, 2)])
+  checkEq "0029: the map at load equals a from-scratch recompute"
+          (csvNl vnlM) (computeNl ',' (csvRows vnlM))
+  checkEq "0029: rowNl counts a row's newlines"
+          (map (rowNl ',') (toList (csvRows vnlM))) [0, 1, 0, 2, 0]
+  checkEq "0029: linesBefore is the running total, and 0 above row 0"
+          (map (linesBefore vnlM) [0, 1, 2, 3, 4, 5]) [0, 0, 1, 1, 3, 3]
+  -- The point of the whole cache: the line a row starts on.
+  checkEq "0029: cellTextPos skips the lines an earlier cell added"
+          (map (\r -> fst (cellTextPos vnlM r 0)) [0 .. 4]) [0, 1, 3, 4, 7]
+  checkEq "0029: cellTextPos of a later field is offset by the earlier ones"
+          (cellTextPos vnlM 0 1) (0, 2)
+  -- ...and within a multi-line cell, the field after it starts on a later line.
+  checkEq "0029: a field after a multi-line cell lands on that cell's last line"
+          (cellTextPos vnlM 1 1) (2, 3)   -- "x\ny" serialises as "x NL y" over 2 lines
+  -- Exhaustive both-ways check on the multi-line grid: every cell's position
+  -- against the pre-cache definition, and every line back to its row.
+  checkEq "0029: cellTextPos agrees with the pre-cache definition everywhere"
+          [ (r, c) | r <- [0 .. nRows vnlM - 1]
+                   , c <- [0 .. Seq.length (Seq.index (csvRows vnlM) r)]
+                   , cellTextPos vnlM r c /= cellTextPosRef vnlM r c ] []
+  checkEq "0029: textPosCell agrees with the scan it replaced, on and off the ends"
+          [ (l, c) | l <- [-2 .. nRows vnlM + 4], c <- [-1, 0, 1, 2, 3, 7, 40]
+                   , textPosCell vnlM l c /= textPosCellRef vnlM l c ] []
+  -- Typing a newline into a cell and taking it out again: the O(log rows)
+  -- incremental path in 'withCell', including the "back to zero drops the
+  -- entry" direction that a saturating counter would pass without.
+  let vnlT = commitEdit (editInsert 'z' (editInsert '\n' (beginEditFresh 'w' (setCursor 2 0 vnl0))))
+  checkEq "0029: typing a newline into a cell adds its row"
+          (csvNl vnlT) (M.fromList [(2, 1)])
+  checkEq "0029: and the row below moves down a line"
+          (fst (cellTextPos vnlT 2 0)) 2
+  let vnlT2 = setCurrentCell (T.pack "plain") (setCursor 2 0 vnlT)
+  checkEq "0029: removing it again empties the map (sparse, not zero-valued)"
+          (csvNl vnlT2) M.empty
+  checkEq "0029: two newlines in one cell count twice"
+          (csvNl (setCurrentCell (T.pack "a\nb\nc") (setCursor 0 1 vnl0)))
+          (M.fromList [(0, 2)])
+  -- Structural edits move the indices, so they recompute rather than shift.
+  checkEq "0029: inserting a row above shifts the entries"
+          (csvNl (insertRowAbove (setCursor 0 0 vnlM))) (M.fromList [(2, 1), (4, 2)])
+  checkEq "0029: deleting a row above shifts them back"
+          (csvNl (deleteRow (setCursor 0 0 vnlM))) (M.fromList [(0, 1), (2, 2)])
+  checkEq "0029: deleting the multi-line row itself drops its entry"
+          (csvNl (deleteRow (setCursor 1 0 vnlM))) (M.fromList [(2, 2)])
+  checkEq "0029: deleting a column drops what that column contributed"
+          (csvNl (deleteCol (setCursor 0 0 vnlM))) M.empty
+  -- Undo and redo restore whole grids, so the map is carried across them.
+  let vnlU = Cmedit.Csv.undo (deleteRow (setCursor 1 0 vnlM))
+  checkEq "0029: undo restores the map" (csvNl vnlU) (csvNl vnlM)
+  checkEq "0029: redo restores it again"
+          (csvNl (Cmedit.Csv.redo vnlU)) (M.fromList [(2, 2)])
+  -- A sort permutes the rows, so the entries have to move with them.
+  checkEq "0029: a sort moves the entries with their rows"
+          (csvNl (sortByColumn 0 False False vnlM))
+          (computeNl ',' (csvRows (sortByColumn 0 False False vnlM)))
+  -- A paste that grows the grid changes every later index.
+  checkEq "0029: a paste that grows the grid recomputes"
+          (csvNl (fst (pasteClip (T.pack "X,Y\nZ,W") (setCursor 4 1 vnlM))))
+          (computeNl ',' (csvRows (fst (pasteClip (T.pack "X,Y\nZ,W") (setCursor 4 1 vnlM)))))
+  -- A grid handed in by a non-CSV producer (Xlsx/Odf go through mkCsvGrid).
+  checkEq "0029: mkCsvGrid builds the map for a grid it was handed"
+          (csvNl (mkCsvGrid ',' (Seq.fromList
+                    [ Seq.fromList [T.pack "a", T.pack "b\nc"]
+                    , Seq.fromList [T.pack "d", T.pack "e"] ])))
+          (M.fromList [(0, 1)])
+  -- A tab-delimited table: the delimiter is not a newline, so it contributes
+  -- nothing, and the counts are the cells' own.
+  checkEq "0029: the map is delimiter-independent for ordinary delimiters"
+          (csvNl (mkCsvView '\t' (T.pack "a\tb\n\"x\ny\"\tc")))
+          (M.fromList [(1, 1)])
   -- scrollLeft agrees with the (cubic) reference it replaced.
   let scrollLeftRef width v =
         let ws = columnWidths v
@@ -3035,8 +4942,8 @@ main = do
   checkEq "picker seeded from the open buffer"
           (maybe [] (map diLine . dpItems) (edDefPick edDp)) [0]
   let gen2 = maybe 0 dpGen (edDefPick edDp)
-      frSql = FileResult "/proj/pl-helper.sql"
-                [Match 12 [(27,6)] (T.pack "CREATE OR REPLACE FUNCTION helper()")] False False
+      frSql = S.plainResult "/proj/pl-helper.sql"
+                [S.plainMatch 12 [(27,6)] (T.pack "CREATE OR REPLACE FUNCTION helper()")] False False
       edDp2 = defFound gen2 frSql edDp
   checkEq "streamed definition appended"
           (maybe [] (map diPath . dpItems) (edDefPick edDp2)) ["/proj/util.py", "/proj/pl-helper.sql"]
@@ -3145,7 +5052,7 @@ main = do
 
   -- Streaming disk results in, then finishing.
   let gen1 = maybe 0 ssGen (edSearch edRun)
-      fr1  = FileResult "/proj/b.hs" [Match 4 [(0,5)] (T.pack "hello there")] False False
+      fr1  = S.plainResult "/proj/b.hs" [S.plainMatch 4 [(0,5)] (T.pack "hello there")] False False
       edGot = searchFileFound gen1 fr1 edRun
       edDoneS = searchDone gen1 False edGot
   checkEq "streamed result inserted" (maybe [] S.resultPaths (edSearch edGot)) ["/proj/b.hs"]
@@ -3180,8 +5087,8 @@ main = do
               { ssFind = S.mkField (T.pack "foo"), ssReplace = S.mkField (T.pack "X")
               , ssShowReplace = True
               , ssResults = Seq.fromList
-                            [ FileResult "/proj/a.txt" [Match 0 [(0,3),(8,3)] (T.pack "foo bar foo")] False False
-                            , FileResult "/proj/closed.txt" [Match 0 [(0,3)] (T.pack "foo")] False False ] }
+                            [ S.plainResult "/proj/a.txt" [S.plainMatch 0 [(0,3),(8,3)] (T.pack "foo bar foo")] False False
+                            , S.plainResult "/proj/closed.txt" [S.plainMatch 0 [(0,3)] (T.pack "foo")] False False ] }
       edReplReady = edRepl0 { edSearch = Just ssR, edFocus = FSearch }
       (edRepld, replEffs) = update (KAltChar 'r') edReplReady   -- Alt+R = Replace All
       -- A small replace (<= 50 files) stages the closed files as unsaved tabs.
@@ -3253,7 +5160,7 @@ main = do
 
   -- Replace All over more than 10 files asks for confirmation first (no immediate
   -- on-disk effect); confirming it then performs the replace.
-  let manyR = [ FileResult ("/proj/f" ++ show i ++ ".txt") [Match 0 [(0,3)] (T.pack "foo")] False False
+  let manyR = [ S.plainResult ("/proj/f" ++ show i ++ ".txt") [S.plainMatch 0 [(0,3)] (T.pack "foo")] False False
               | i <- [1 .. 11 :: Int] ]
       ssMany = (S.newSearchState "/proj") { ssFind = S.mkField (T.pack "foo")
                  , ssReplace = S.mkField (T.pack "X"), ssShowReplace = True, ssResults = Seq.fromList manyR }
@@ -3266,7 +5173,7 @@ main = do
   checkEq "confirming stages all 11 files" (length [ rrPaths r | EffStageReplace r <- cfmDo, length (rrPaths r) == 11 ]) 1
 
   -- A very large replace (> 50 files) falls back to a direct on-disk rewrite.
-  let bigR = [ FileResult ("/proj/g" ++ show i ++ ".txt") [Match 0 [(0,3)] (T.pack "foo")] False False
+  let bigR = [ S.plainResult ("/proj/g" ++ show i ++ ".txt") [S.plainMatch 0 [(0,3)] (T.pack "foo")] False False
              | i <- [1 .. 60 :: Int] ]
       ssBig = (S.newSearchState "/proj") { ssFind = S.mkField (T.pack "foo")
                 , ssReplace = S.mkField (T.pack "X"), ssShowReplace = True, ssResults = Seq.fromList bigR }
@@ -3289,6 +5196,32 @@ main = do
   check "Save All clears the staged doc's modified flag" (not (any docModified (edAfter edSavedAll)))
   checkEq "modifiedDocsToSave lists dirty titled docs"
           (map (\(p,_,_,_,_) -> p) (modifiedDocsToSave edStg)) ["/proj/new.txt"]
+
+  -- A staged replace in a .csv opens with no table view and no stash, so
+  -- Alt+T builds the table's saved baseline from the buffer — which is dirty.
+  -- Adopting it as the baseline made the next recompute through 'csvMod'
+  -- (a bare Ctrl+Z will do) call the document clean, drop its journal and let
+  -- Ctrl+Q leave without asking: the staged change lost, silently. The table
+  -- carries its own baseline, so the dirtiness has to be said twice.
+  -- (Review of plan 0028; same guard as the crash-recovery installer.)
+  let (edCsvStg, _) = addStagedDoc "/proj/t.csv" (mkLR2 "a,foo\nc,d") substFooBar ed0
+      edCsvAct = fst (update (KAltChar '2') edCsvStg)      -- make it active
+      edCsvTab = fst (update (KAltChar 't') edCsvAct)      -- plain -> table
+      edCsvUz  = fst (update (KCtrlChar 'z') edCsvTab)     -- recompute via csvMod
+  check "a staged .csv replace starts modified with no table view"
+        (edModified edCsvAct && null (fmap (const ()) (edCsv edCsvAct)))
+  check "the table view of a staged replace is itself modified"
+        (fmap isModified (edCsv edCsvTab) == Just True)
+  check "a staged .csv replace stays modified across a no-op undo"
+        (edModified edCsvUz)
+  checkEq "a staged .csv replace keeps its journal across a no-op undo"
+          (journalLiveKeys edCsvUz) (journalLiveKeys edCsvTab)
+  -- The guard must not latch: a clean .csv toggled into the table is clean.
+  let edCleanCsv = setLoaded "/proj/u.csv"
+                     (LoadResult (fromText (T.pack "a,b\nc,d")) LF Utf8 True False Nothing) ed0
+      edCleanTab = fst (update (KCtrlChar 'z') edCleanCsv)
+  check "a clean .csv in the table view is not modified"
+        (not (edModified edCleanTab) && fmap isModified (edCsv edCleanTab) == Just False)
 
   -- Informational (single-button) dialogs dismiss on a click off the box; a
   -- multi-button confirm stays modal.
@@ -4939,10 +6872,19 @@ main = do
 
     -- settingsSpec / applySettingRow position sync (extends the settings tests).
     checkEq "settingsSpec has editing + master + per-linter rows"
-      (length settingsSpec) (13 + length linters)
+      (length settingsSpec) (15 + length linters)
     check "applySettingRow round-trips every spec row to its default"
       (and [ edConfig (applySettingRow k (ixOf defaultConfig) ed0) == defaultConfig
            | (k, (_, _, _, ixOf, _)) <- zip [0 ..] settingsSpec ])
+    -- Row 12 = the crash-recovery journal: config only (journalling is
+    -- driver-side, so there is no session mirror to check).
+    check "applySettingRow 12 toggles cfgJournal"
+      (not (cfgJournal (edConfig (applySettingRow 12 0 ed0)))
+       && cfgJournal (edConfig (applySettingRow 12 1 ed0)))
+    -- Row 13 = restore session: likewise config-only (it is read at startup).
+    check "applySettingRow 13 toggles cfgRestoreSession"
+      (cfgRestoreSession (edConfig (applySettingRow 13 1 ed0))
+       && not (cfgRestoreSession (edConfig (applySettingRow 13 0 ed0))))
 
     -- Config: parsing, per-linter keys, unknown-key warning, round-trip.
     let (cl, wl) = parseConfigText (T.pack "lint-pyright = on\nlint = off\n") defaultConfig
@@ -5044,16 +6986,16 @@ main = do
 
     -- Master toggle off clears diagnostics everywhere (no future pass will).
     let edDirty = edLR { edDiags = [d0] }                 -- active + zipper both carry diags
-        edMOff  = applySettingRow 12 0 edDirty            -- row 12 = Linting master, 0 = off
+        edMOff  = applySettingRow 14 0 edDirty            -- row 14 = Linting master, 0 = off
     check "master lint off clears active diags" (null (edDiags edMOff))
     check "master lint off clears zipper diags"
       (all (null . docDiags) (edBefore edMOff ++ edAfter edMOff))
-    check "master lint on keeps diags" (edDiags (applySettingRow 12 1 edDirty) == [d0])
+    check "master lint on keeps diags" (edDiags (applySettingRow 14 1 edDirty) == [d0])
 
     -- lintersDetected refreshes an open Settings dialog's per-linter notes.
     let edSettingsNone = openSettings ed0                 -- edLintAvail all Nothing
         edSettingsAv = lintersDetected availAll edSettingsNone
-        ruffRow d = dlgChoices d !! 13                     -- master at 12, ruff (linters!!0) at 13
+        ruffRow d = dlgChoices d !! 15                     -- master at 14, ruff (linters!!0) at 15
     check "settings shows not-installed note before detection"
       (maybe False (\d -> maybe False (T.isInfixOf (T.pack "\x2717")) (chNote (ruffRow d)))
              (edDialog edSettingsNone))
@@ -5135,6 +7077,735 @@ main = do
     checkEq "wide glyph continuation shares underline colour"
       (styleUl (cellStyle contC)) Green
 
+
+  -- Search in documents ------------------------------------------------------
+  --
+  -- The engine half: a reading-view model flattened to searchable text, and
+  -- each match addressed by the unit its view can navigate to rather than by a
+  -- line number, which in a reflowed view depends on the terminal width.
+  do
+    let mkPar t = Rtf.defaultPar { Rtf.rpRuns = [Rtf.RtfRun (T.pack t) Rtf.defaultFmt] }
+        pars = Seq.fromList (map mkPar
+                 ["Chapter one text", "alpha here", "Chapter two text", "alpha again"])
+        sects = Seq.fromList [(0, T.pack "One"), (2, T.pack "Two")]
+        rdBook = Rtf.mkRtfDocFrom (RtfFromContainer (T.pack "EPUB")) sects T.empty pars
+        rdDoc  = Rtf.mkRtfDocFrom (RtfFromContainer (T.pack "DOCX")) Seq.empty T.empty pars
+        lit t = S.matcherLine (either (error "bad matcher") id
+                                (S.compileMatcher False False False (T.pack t)))
+
+    -- An e-book is addressed by chapter; a document with no sections falls
+    -- back to its paragraph index, which is the remaining intrinsic address.
+    let (bookMs, _, _) = DT.docMatches (lit "alpha") (DT.extractRtf S.DKBook rdBook)
+    checkEq "epub search finds both" (length bookMs) 2
+    checkEq "epub match 1 is in chapter 1" (fmap fst (mUnit (head bookMs))) (Just 1)
+    checkEq "epub match 1 label"           (fmap snd (mUnit (head bookMs))) (Just (T.pack "ch.1"))
+    checkEq "epub match 2 is in chapter 2" (fmap fst (mUnit (bookMs !! 1))) (Just 2)
+
+    let (docMs, _, _) = DT.docMatches (lit "alpha") (DT.extractRtf S.DKWord rdDoc)
+    checkEq "docx match 1 is paragraph 2" (fmap fst (mUnit (head docMs))) (Just 2)
+    checkEq "docx match 2 is paragraph 4" (fmap fst (mUnit (docMs !! 1))) (Just 4)
+    checkEq "docx label is a paragraph mark"
+      (fmap snd (mUnit (head docMs))) (Just (T.pack "\x00b6\&2"))
+
+    -- A workbook is addressed by sheet, and labelled by cell: one extracted
+    -- line per non-empty cell, because a cell is what the grid can put a
+    -- cursor on.
+    let wb = Xlsx.mkWorkbook
+               [ (T.pack "S1", Seq.fromList [ Seq.fromList [T.pack "x", T.pack "find me"]
+                                            , Seq.fromList [T.pack "", T.pack "y"] ])
+               , (T.pack "S2", Seq.fromList [ Seq.fromList [T.pack "find me too"] ]) ]
+               T.empty
+        (wbMs, _, _) = DT.docMatches (lit "find me") (DT.extractBook wb)
+    checkEq "workbook finds both sheets" (length wbMs) 2
+    checkEq "workbook match 1 sheet"  (fmap fst (mUnit (head wbMs))) (Just 1)
+    checkEq "workbook match 1 cell"   (fmap snd (mUnit (head wbMs))) (Just (T.pack "B1"))
+    checkEq "workbook match 2 sheet"  (fmap fst (mUnit (wbMs !! 1))) (Just 2)
+    checkEq "workbook match 2 cell"   (fmap snd (mUnit (wbMs !! 1))) (Just (T.pack "A1"))
+
+    -- A term spanning two columns is deliberately not found: those are two
+    -- values that happen to be adjacent, not a phrase.
+    let (spanMs, _, _) = DT.docMatches (lit "x find") (DT.extractBook wb)
+    checkEq "workbook does not match across cells" (length spanMs) 0
+
+    -- cellName is the inverse of cellRef, bijective base-26 and all.
+    checkEq "cellName A1"   (Xlsx.cellName 0 0)    (T.pack "A1")
+    checkEq "cellName Z1"   (Xlsx.cellName 0 25)   (T.pack "Z1")
+    checkEq "cellName AA1"  (Xlsx.cellName 0 26)   (T.pack "AA1")
+    checkEq "cellName AB12" (Xlsx.cellName 11 27)  (T.pack "AB12")
+    check "cellName round-trips through cellRef"
+      (and [ Xlsx.cellRef (Xlsx.cellName r c) == Just (c, r)
+           | (r, c) <- [(0,0), (0,25), (0,26), (11,27), (999,701), (5,702)] ])
+
+    -- Only the document extensions are decoded, and they are exactly the ones
+    -- that would otherwise be skipped as binary.
+    check "documentExtension accepts a pdf"  (S.documentExtension "paper.pdf")
+    check "documentExtension accepts a docx" (S.documentExtension "/a/b/Report.DOCX")
+    check "documentExtension rejects source" (not (S.documentExtension "Main.hs"))
+    check "documentExtension rejects a zip"  (not (S.documentExtension "x.zip"))
+    check "documents are binary without the option"
+      (all S.binaryExtension ["a.pdf", "a.docx", "a.xlsx", "a.epub", "a.ods", "a.odt"])
+    -- .rtf is the exception, and deliberately: it is text on disk, so with the
+    -- option off it is searched as the markup it is.
+    check "rtf stays searchable as text" (not (S.binaryExtension "a.rtf"))
+
+    -- Replace can never reach a document result, and the panel can say how
+    -- many it is leaving alone.
+    let docFr = (S.plainResult "/p/a.pdf" [S.plainMatch 0 [(0,3)] (T.pack "foo")] False False)
+                  { frDoc = Just S.DKPdf }
+        txtFr = S.plainResult "/p/b.txt" [S.plainMatch 0 [(0,3)] (T.pack "foo")] False False
+        ssMix = (S.newSearchState "/p") { ssResults = Seq.fromList [docFr, txtFr] }
+    checkEq "resultPaths lists everything"
+      (S.resultPaths ssMix) ["/p/a.pdf", "/p/b.txt"]
+    checkEq "replaceablePaths excludes documents"
+      (S.replaceablePaths ssMix) ["/p/b.txt"]
+    checkEq "docResultCount counts them" (S.docResultCount ssMix) 1
+    check "a document result is not replaceable" (not (S.replaceable docFr))
+    check "a text result is replaceable"         (S.replaceable txtFr)
+
+    -- A search whose every hit is in a document has nothing to replace, and
+    -- says why rather than reporting an empty result.
+    let ssAllDocs = (S.newSearchState "/p") { ssResults = Seq.fromList [docFr]
+                                            , ssFind = S.mkField (T.pack "foo")
+                                            , ssShowReplace = True }
+        edAllDocs = (newEditor (24, 80) defaultConfig) { edSearch = Just ssAllDocs }
+        (edNo, effNo) = runReplaceAll edAllDocs
+    checkEq "all-document replace emits no effect" (length effNo) 0
+    check "all-document replace explains itself"
+      (maybe False (T.isInfixOf (T.pack "cannot write") . ssMessage) (edSearch edNo))
+
+  -- In-file Find inside the formatted reading view --------------------------
+  --
+  -- Enabled when the workspace search learned to look inside documents: a hit
+  -- you cannot then open in the document is worth much less.
+  do
+    let mkPar t = Rtf.defaultPar { Rtf.rpRuns = [Rtf.RtfRun (T.pack t) Rtf.defaultFmt] }
+        pars = Seq.fromList (map mkPar ["alpha beta", "gamma delta", "beta again"])
+        rd0  = Rtf.mkRtfDocFrom (RtfFromContainer (T.pack "DOCX")) Seq.empty T.empty pars
+        edD  = containerDocLoaded "/tmp/f.docx" rd0 (newEditor (24, 80) defaultConfig)
+        edT  = edD { edSearchTerm = T.pack "beta" }
+
+    check "the formatted view no longer disables Find"
+      (MAFind `notElem` rtfDisabledActions)
+    check "the formatted view still disables Replace"
+      (MAReplace `elem` rtfDisabledActions)
+
+    let edFound = doFind (refreshRtf edT)
+    check "find in a formatted document selects the match"
+      (maybe False (not . T.null . Rtf.rtfSelText) (edRtf edFound))
+    checkEq "find in a formatted document selects the term"
+      (maybe T.empty Rtf.rtfSelText (edRtf edFound)) (T.pack "beta")
+
+    -- Find Next advances rather than re-finding the match it is sitting on.
+    let edNext = findAgain True edFound
+    check "find next advances"
+      (maybe False (\rd -> Rtf.rtfSelection rd /= maybe Nothing Rtf.rtfSelection (edRtf edFound))
+        (edRtf edNext))
+
+    -- Landing on a workspace hit: go to the unit, then find the term there.
+    let edLand = applyPendingDoc
+                   edD { edPendingDoc = Just ("/tmp/f.docx", 3, T.pack "beta") }
+    checkEq "landing clears the pending jump" (edPendingDoc edLand) Nothing
+    checkEq "landing selects the term in that paragraph"
+      (maybe T.empty Rtf.rtfSelText (edRtf edLand)) (T.pack "beta")
+    -- Unit 3 is the paragraph "beta again", so landing must select *that*
+    -- "beta" and not the one in paragraph 1 that a search from the top would
+    -- have hit first. (The window is taller than this three-line document, so
+    -- rdTop legitimately stays 0 — the selection is the assertion that bites.)
+    checkEq "landing selects the match in the named unit"
+      (fmap (posLine . fst) (edRtf edLand >>= Rtf.rtfSelection)) (Just 2)
+
+  -- Crash-safe edit journal (plan 0011) ---------------------------------------
+  --
+  -- Everything that can go wrong with a journal is either "it did not survive
+  -- the round trip" or "recovery drew the wrong conclusion", and both are pure.
+  -- The format is deliberately conservative: exact text, exact baseline,
+  -- forward-compatible headers, and nothing that could reach the real file.
+  do
+    let jMt   = posixSecondsToUTCTime 1721890123.456789
+        jBase = Journal { jPath         = Just "/home/ben/work/x.py"
+                        , jMtime        = Just jMt
+                        , jEol          = LF
+                        , jEnc          = Utf8
+                        , jFinalNewline = True
+                        , jReadOnly     = False
+                        , jCursor       = Pos 412 7
+                        , jText         = T.pack "alpha\nbeta" }
+        roundTrips lbl j = checkEq ("journal round-trip: " ++ lbl)
+                             (J.parseJournal (J.serializeJournal j)) (Just j)
+        rawJournal = TE.encodeUtf8 . T.pack
+
+    roundTrips "plain" jBase
+    roundTrips "crlf + BOM + no final newline"
+      jBase { jEol = CRLF, jEnc = Utf8Bom, jFinalNewline = False }
+    roundTrips "untitled buffer" jBase { jPath = Nothing, jMtime = Nothing }
+    roundTrips "read-only document" jBase { jReadOnly = True }
+    roundTrips "named file that does not exist yet" jBase { jMtime = Nothing }
+    roundTrips "empty buffer" jBase { jText = T.empty }
+    -- A buffer whose last line is blank is exactly the case a courtesy
+    -- trailing newline in the body would erase.
+    roundTrips "buffer ending in a blank line" jBase { jText = T.pack "a\n" }
+    roundTrips "buffer of only blank lines" jBase { jText = T.pack "\n\n" }
+    -- A CR inside a line must stay a character, not become a line break.
+    roundTrips "CR embedded in a line" jBase { jText = T.pack "a\rb\r\nc" }
+    roundTrips "very long line"
+      jBase { jText = T.replicate 200000 (T.pack "x") }
+    roundTrips "non-ASCII text" jBase { jText = T.pack "caf\233 \12354 \128169" }
+    -- A POSIX filename may contain a newline; unescaped it would split the
+    -- header block and desynchronise the parse.
+    roundTrips "path containing a newline and quotes"
+      jBase { jPath = Just "/tmp/we\nird \"name\".txt" }
+
+    -- Format guard: the first line is what identifies the file and governs the
+    -- meaning of everything after it.
+    check "journal starts with its version line"
+      (BS.pack (map (fromIntegral . fromEnum) "cmedit-journal 1\n")
+         `BS.isPrefixOf` J.serializeJournal jBase)
+
+    -- The baseline must compare EQUAL after a round trip, or the clean-recovery
+    -- case never fires on a filesystem with sub-second timestamps.
+    checkEq "journal mtime survives exactly"
+      (J.parseJournal (J.serializeJournal jBase) >>= jMtime) (Just jMt)
+    checkEq "picosecond timestamp round-trips"
+      (J.picosToDiskTime (J.diskTimeToPicos jMt)) jMt
+
+    -- Rejections.
+    check "a journal with a NUL in the body is rejected"
+      (J.parseJournal (BS.concat [J.serializeJournal jBase, BS.pack [0]]) == Nothing)
+    check "an unknown journal version is rejected"
+      (J.parseJournal (rawJournal "cmedit-journal 2\neol: lf\n--\nhi\n") == Nothing)
+    check "a file that is not a journal is rejected"
+      (J.parseJournal (rawJournal "hello there\n") == Nothing)
+    check "a journal with no separator is rejected"
+      (J.parseJournal (rawJournal "cmedit-journal 1\neol: lf\n") == Nothing)
+
+    -- Forward compatibility: a key this version has never heard of must not
+    -- make the journal unreadable, and absent keys take their defaults.
+    let fwd = J.parseJournal (rawJournal "cmedit-journal 1\nfuture-key: 9\neol: cr\n--\nhi")
+    checkEq "unknown header keys are ignored" (fmap jText fwd) (Just (T.pack "hi"))
+    checkEq "known keys still read" (fmap jEol fwd) (Just CR)
+    checkEq "absent keys default" (fmap jFinalNewline fwd) (Just True)
+    checkEq "absent path means untitled" (fmap jPath fwd) (Just Nothing)
+
+    -- Malformed UTF-8 in the body decodes leniently rather than throwing.
+    let malformed = BS.concat [ rawJournal "cmedit-journal 1\n--\n"
+                              , BS.pack [0x61, 0xff, 0xfe, 0x62] ]
+    checkEq "malformed UTF-8 in the body becomes replacement chars"
+      (fmap jText (J.parseJournal malformed)) (Just (T.pack "a\65533\65533b"))
+
+    -- Buffer <-> body. The interesting cases are the ones where a line count is
+    -- ambiguous unless the body is treated as "lines joined with LF".
+    forM_ ["", "a", "a\n", "a\n\n", "a\nb", "\n"] $ \s -> do
+      let b = fromText (T.pack s)
+          j = jBase { jText = J.bufferJournalText b }
+      checkEq ("journal buffer round-trip " ++ show s)
+        (toList (bufLines (J.journalBuffer j))) (toList (bufLines b))
+
+    -- Naming. The hash identifies the file; the basename is only there so a
+    -- human can tell the journals apart in ~/.cache.
+    checkEq "journal name for the same path is stable"
+      (J.journalFileName (Just "/home/ben/work/x.py") 0)
+      (J.journalFileName (Just "/home/ben/work/x.py") 7)
+    check "journal names differ per path"
+      (J.journalFileName (Just "/a/x.py") 0 /= J.journalFileName (Just "/b/x.py") 0)
+    check "journal name ends in the journal extension"
+      (J.isJournalFileName (J.journalFileName (Just "/home/ben/work/x.py") 0))
+    check "journal name keeps a readable basename"
+      ("-x.py.cmj" `isSuffixOf` J.journalFileName (Just "/home/ben/work/x.py") 0)
+    check "journal name sanitises the basename"
+      (all (\c -> isAlphaNum c || c `elem` (".-_" :: String))
+           (J.journalFileName (Just "/tmp/we ird*na/me?.txt") 0))
+    checkEq "untitled journals are numbered"
+      (J.journalFileName Nothing 3) "untitled-3.cmj"
+    check "an unrelated cache file is not a journal"
+      (not (J.isJournalFileName "recent"))
+
+    -- The recovery decision, as a table over (has a path?, had a baseline?,
+    -- is there a file now?).
+    let tNow   = posixSecondsToUTCTime 200
+        untit  = jBase { jPath = Nothing, jMtime = Nothing }
+        nobase = jBase { jMtime = Nothing }
+        recCases =
+          [ ("untitled buffer",              untit,  Just tNow, RecoverUntitled)
+          , ("untitled, nothing on disk",    untit,  Nothing,   RecoverUntitled)
+          , ("baseline matches",             jBase,  Just jMt,  RecoverClean)
+          , ("file changed on disk",         jBase,  Just tNow, RecoverChanged)
+          , ("file is gone",                 jBase,  Nothing,   RecoverMissing)
+          -- A file that never existed and still does not is not "missing".
+          , ("never created, still absent",  nobase, Nothing,   RecoverClean)
+          , ("never created, appeared since", nobase, Just tNow, RecoverChanged)
+          ]
+    forM_ recCases $ \(lbl, j, now, want) ->
+      checkEq ("classifyJournal: " ++ lbl) (J.classifyJournal j now) want
+
+    -- Recovery must never offer to write back where the session could not.
+    check "recovery may write back a writable named file" (J.canWriteBack jBase)
+    check "recovery must not write back a read-only file"
+      (not (J.canWriteBack jBase { jReadOnly = True }))
+    check "recovery must not write back an untitled buffer"
+      (not (J.canWriteBack untit))
+    check "a clean recovery carries no caveat"
+      (J.recoveryNote RecoverClean == Nothing)
+    check "a changed or missing file is flagged"
+      (J.recoveryNote RecoverChanged /= Nothing && J.recoveryNote RecoverMissing /= Nothing)
+
+    -- The untitled index has to survive the round trip through the filename,
+    -- or a recovered untitled buffer would write itself to a second journal
+    -- and leave the first for the next startup to offer again.
+    checkEq "untitled journal names round-trip their index"
+      (J.untitledIndexOf (J.journalFileName Nothing 7)) (Just 7)
+    checkEq "a titled journal name has no untitled index"
+      (J.untitledIndexOf (J.journalFileName (Just "/a/x.py") 7)) Nothing
+    checkEq "a non-journal name has no untitled index"
+      (J.untitledIndexOf "untitled-3.txt") Nothing
+
+  -- The journal write-behind's selection rule, over the open-files zipper.
+  -- Everything here is "which documents would a crash lose, and has each one
+  -- moved since its journal was written".
+  do
+    let jcfg  = defaultConfig
+        edJ0  = newEditor (24, 80) jcfg
+        mkLRj t = LoadResult (fromText (T.pack t)) LF Utf8 True False Nothing
+        keysOf = map (\(k, _, _) -> k) . journalRequests
+        -- What the driver hands back when a pass completes: the journal key
+        -- with the edit counter that write captured.
+        wroteOf = map (\(k, s, _) -> (k, s)) . journalRequests
+        typed e = fst (update (KChar 'x') e)
+        edTxt  = setLoaded "/w/a.txt" (mkLRj "aaa") edJ0
+
+    check "an unmodified document is not journalled"
+      (null (journalRequests edTxt))
+    check "an edited document is journalled"
+      (length (journalRequests (typed edTxt)) == 1)
+    check "journalling off writes nothing"
+      (null (journalRequests (typed edTxt) { edConfig = jcfg { cfgJournal = False } }))
+    -- Turning the key off must also take away what was already written: the
+    -- point of journal = off is that no copy is left lying in the cache.
+    check "journalling off drops the existing journals"
+      (null (journalLiveKeys (typed edTxt) { edConfig = jcfg { cfgJournal = False } }))
+
+    -- The whole point of the per-document counter: recording the write must
+    -- settle it, and typing in one file must not re-stale another's.
+    let edDirty  = typed edTxt
+        edNoted  = journalsWritten (wroteOf edDirty) edDirty
+    check "a written journal is not written again"
+      (null (journalRequests edNoted))
+    check "a further edit makes it stale again"
+      (length (journalRequests (typed edNoted)) == 1)
+    let edTwo    = typed (setLoadedNew "/w/b.txt" (mkLRj "bbb") edNoted)
+        edTwoOk  = journalsWritten (wroteOf edTwo) edTwo
+        edTypeB  = typed edTwoOk
+    checkEq "editing one file does not restale another's journal"
+      (keysOf edTypeB) [journalKeyOf (captureDoc edTypeB)]
+
+    -- The buffer under a CSV table is stale by construction, so journalling it
+    -- would journal the pre-table text. (Alt+T is the same serialisation.)
+    let edCsvJ = fst (update (KChar 'Z')
+                   (setLoaded "/w/t.csv" (mkLRj "a,b\n1,2") edJ0))
+    check "a CSV table edit is journalled" (length (journalRequests edCsvJ) == 1)
+    check "a journalled CSV holds the table, not the stale line buffer"
+      (case journalRequests edCsvJ of
+         [(_, _, j)] -> T.pack "Z" `T.isInfixOf` jText j
+         _        -> False)
+
+    -- Views with no buffer under them, and things that are not files.
+    let pix1 = Image 1 1 "png" (listArray (0, 3) [0, 0, 0, 255])
+        edImg = imageLoaded "/w/p.png" [(pix1, 0)] edJ0
+    check "an image document is never journalled"
+      (null (journalRequests (edImg { edModified = True })))
+    check "the manual is never journalled"
+      (null (journalRequests (openManual edJ0) { edModified = True }))
+    check "a read-only ZIP listing is not journalled"
+      (null (journalRequests
+               (setLoaded "/w/x.zip" (mkLRj "listing") edJ0) { edModified = True }))
+
+    -- The live-key set is what the driver deletes against: a saved or closed
+    -- document must drop out of it, with no save/close path saying so.
+    let keyA = journalKeyOf (captureDoc edDirty)
+    check "a modified document is a live journal key"
+      (keyA `elem` journalLiveKeys edDirty)
+    check "saving drops the journal key"
+      (keyA `notElem` journalLiveKeys (fst (onSaved 3 Nothing edDirty)))
+    check "closing drops the journal key"
+      (keyA `notElem` journalLiveKeys (doClose edDirty))
+    check "Save All drops every journal key"
+      (null (journalLiveKeys
+               (fst (savedAll [ (p, Nothing) | p <- modifiedDocPaths edTwo ] edTwo))))
+    -- Undo back to the original content is a drop too, and nothing announces it.
+    check "undoing back to unmodified drops the journal key"
+      (null (journalLiveKeys (fst (update (KCtrlChar 'z') edDirty))))
+
+    -- Two untitled buffers must not share a journal name, however the zipper
+    -- is arranged — which is what the per-document id is for.
+    let edU1 = typed edJ0
+        edU2 = typed (fst (runAction MANew edU1))
+    check "two untitled buffers get distinct journal names"
+      (length (journalLiveKeys edU2) == 2
+         && length (nub (journalLiveKeys edU2)) == 2)
+    check "a kept untitled journal cannot be renumbered over"
+      (journalKeyOf (captureDoc (typed (fst (runAction MANew (seedJournalIds [9] edJ0)))))
+         /= J.journalFileName Nothing 9)
+
+  ---------------------------------------------------------------------------
+  -- BEGIN adaptive journal write-behind (plan 0027)
+  --
+  -- The interval the driver spaces write-behind passes by, and the size
+  -- estimate that drives it. A journal is a whole buffer, so the traffic a
+  -- session generates is (buffer size / interval); a fixed 2 s meant ~10 MB/s
+  -- for a 40 MB buffer under editing (measured through a PTY). These pin the
+  -- shape of the curve rather than any one number, plus the two ends, which
+  -- are promises: never slower than 2 s for anything ordinary, and never
+  -- slower than 30 s for anything at all.
+  do
+    let mb n = n * 1024 * 1024
+        sizes = [0, 1, 100, mb 1, mb 4, mb 10, mb 40, mb 100, mb 1000]
+
+    checkEq "journalDelayUs: the floor is the shipped 2 s debounce"
+      (journalDelayUs 0) 2000000
+    check "journalDelayUs: an ordinary file is untouched by any of this"
+      (all (\n -> journalDelayUs n == journalMinDelayUs)
+           [0, 1, 1000, 100 * 1024, mb 1, mb 2, mb 4])
+    check "journalDelayUs: monotonic in the bytes to write"
+      (and [ journalDelayUs a <= journalDelayUs b
+           | (a, b) <- zip sizes (tail sizes) ])
+    -- Including sizes no buffer can reach: the arithmetic must not overflow
+    -- into a *short* interval, which is the failure that would matter.
+    check "journalDelayUs: never below the floor, never above the ceiling"
+      (all (\n -> journalDelayUs n >= journalMinDelayUs
+                    && journalDelayUs n <= journalMaxDelayUs)
+           (sizes ++ [-1, maxBound `div` 2, maxBound]))
+    check "journalDelayUs: an absurd size still lands on the ceiling"
+      (journalDelayUs maxBound == journalMaxDelayUs
+         && journalDelayUs (mb 1000) == journalMaxDelayUs)
+    -- The band a big buffer must land in: 40 MB at the 2 MB/s budget is 20 s,
+    -- which is what turns ~10 MB/s of write traffic into ~2.
+    check "journalDelayUs: a 40 MB buffer lands at ~20 s"
+      (journalDelayUs (mb 40) >= 18000000 && journalDelayUs (mb 40) <= 22000000)
+    -- The budget is what the interval *means*, so state it as traffic: no size
+    -- may exceed the budget except by the deliberate ceiling, and at the
+    -- ceiling the overshoot is bounded (100 MB is the largest file that opens
+    -- as text at all — see maxOpenBytes).
+    check "journalDelayUs: traffic stays within the budget until the ceiling"
+      (all (\n -> journalDelayUs n == journalMaxDelayUs
+                    || n * 1000000 `div` journalDelayUs n <= journalBudgetBps)
+           [mb 5, mb 10, mb 40, mb 60])
+    check "journalDelayUs: at the ceiling a 100 MB buffer still costs < 4 MB/s"
+      (mb 100 * 1000000 `div` journalDelayUs (mb 100) < 4 * 1024 * 1024)
+
+    -- The size the interval is computed from is the *stale* journals' size:
+    -- what a pass would actually write, not what is open.
+    let jcfg2 = defaultConfig
+        edB0  = newEditor (24, 80) jcfg2
+        big n = T.replicate n (T.pack "abcdefghij\n")
+        mkLR2 t = LoadResult (fromText t) LF Utf8 True False Nothing
+        edBig = setLoaded "/w/big.txt" (mkLR2 (big 100000)) edB0
+        typed2 e = fst (update (KChar 'x') e)
+    checkEq "journalPendingBytes: nothing modified, nothing pending"
+      (journalPendingBytes edBig) 0
+    check "journalPendingBytes: an edited buffer is measured, cheaply"
+      (let n = journalPendingBytes (typed2 edBig)
+       in n > 1000000 && n < 1300000)
+    check "journalPendingBytes: a 1 MB buffer still journals on the 2 s floor"
+      (journalDelayUs (journalPendingBytes (typed2 edBig)) == journalMinDelayUs)
+    check "journalPendingBytes: journalling off means no pending bytes"
+      (journalPendingBytes (typed2 edBig) { edConfig = jcfg2 { cfgJournal = False } } == 0)
+    -- Two stale documents cost one pass between them, so the interval is
+    -- driven by their sum.
+    let edBig2 = typed2 (setLoadedNew "/w/big2.txt" (mkLR2 (big 100000)) (typed2 edBig))
+    check "journalPendingBytes: sums the documents a pass would write"
+      (journalPendingBytes edBig2 >= 2 * journalPendingBytes (typed2 edBig) - 4)
+
+    -- The counter that travels with an asynchronous write. Recording the
+    -- version that was *written* (not the document's version now) is what
+    -- keeps an edit made while the write was in flight from being lost: the
+    -- document stays stale and the next pass writes it.
+    let edW    = typed2 edBig
+        pass   = journalRequests edW          -- what a pass captures
+        edW2   = typed2 edW                   -- ...and an edit that lands mid-write
+        edDone = journalsWritten [ (k, s) | (k, s, _) <- pass ] edW2
+    check "journalsWritten: an edit during the write leaves the journal stale"
+      (length (journalRequests edDone) == 1)
+    check "journalsWritten: recording the current version settles it"
+      (null (journalRequests
+               (journalsWritten [ (k, s) | (k, s, _) <- journalRequests edW2 ] edW2)))
+    check "journalsWritten: a key nobody wrote is left alone"
+      (length (journalRequests (journalsWritten [("no-such.cmj", 99)] edW)) == 1)
+  -- END adaptive journal write-behind (plan 0027)
+  ---------------------------------------------------------------------------
+
+  -- Recovery: what the dialog installs. Nothing here writes to disk — a
+  -- recovered document is an unsaved buffer, which is what makes recovering
+  -- always safe to try.
+  do
+    let recMt  = posixSecondsToUTCTime 500
+        recJ p = Journal { jPath = p, jMtime = Just recMt, jEol = CRLF
+                         , jEnc = Utf8Bom, jFinalNewline = False
+                         , jReadOnly = False, jCursor = Pos 1 2
+                         , jText = T.pack "recovered\ntext" }
+        -- The key is the name the journal file really has on disk, which for
+        -- a titled document is derived from its path.
+        item c p = RecoverItem (J.journalFileName p 0) c (recJ p)
+        keyFor p = J.journalFileName p (0 :: Int)
+        edR0 = newEditor (24, 80) defaultConfig
+        edOffer = openRecoverDialog
+                    [item RecoverChanged (Just "/w/a.txt")] edR0
+        edRec = recoverJournals edOffer
+
+    check "found journals open the recovery prompt"
+      (fmap dlgKind (edDialog edOffer) == Just DKRecover)
+    checkEq "the prompt offers Recover / Discard / Keep for later"
+      (maybe [] dlgButtons (edDialog edOffer))
+      [T.pack "Recover", T.pack "Discard", T.pack "Keep for later"]
+    check "the prompt names the affected file and its caveat"
+      (case edDialog edOffer of
+         Just d -> T.pack "a.txt" `T.isInfixOf` dlgMessage d
+                     && T.pack "changed on disk" `T.isInfixOf` dlgMessage d
+         Nothing -> False)
+
+    checkEq "a recovered document holds the journalled text"
+      (bufferToText LF False (edBuffer edRec)) (T.pack "recovered\ntext")
+    check "a recovered document is modified" (edModified edRec)
+    checkEq "a recovered document restores its path"
+      (edPath edRec) (Just "/w/a.txt")
+    checkEq "a recovered document restores its line ending" (edLineEnding edRec) CRLF
+    checkEq "a recovered document restores its BOM" (edEncoding edRec) Utf8Bom
+    check "a recovered document restores its final-newline setting"
+      (not (edFinalNewline edRec))
+    checkEq "a recovered document restores the cursor" (edCursor edRec) (Pos 1 2)
+    checkEq "a recovered document keeps the journal's disk baseline"
+      (edDiskMtime edRec) (Just recMt)
+    check "a recovered file that changed on disk says so" (edDiskChanged edRec)
+    check "recovery closes the prompt and empties the offer"
+      (edDialog edRec == Nothing && null (edRecover edRec))
+    -- The recovered document keeps the journal's own name, or the write-behind
+    -- would write a second file and leave the first behind.
+    checkEq "a recovered document adopts its journal's key"
+      (journalLiveKeys edRec) [keyFor (Just "/w/a.txt")]
+    check "a recovered document does not immediately rewrite its journal"
+      (null (journalRequests edRec))
+    -- Editing it must still be journalled, against the same key.
+    checkEq "editing a recovered document restales its own journal"
+      (map (\(k, _, _) -> k) (journalRequests (fst (update (KChar 'x') edRec))))
+      [keyFor (Just "/w/a.txt")]
+
+    -- An untitled journal comes back as an untitled buffer under its own name.
+    let edU = recoverJournals (openRecoverDialog
+                [RecoverItem "untitled-4.cmj" RecoverUntitled (recJ Nothing)] edR0)
+    check "an untitled journal recovers as an untitled buffer"
+      (edPath edU == Nothing && edModified edU)
+    checkEq "an untitled recovery keeps its journal number"
+      (journalLiveKeys edU) ["untitled-4.cmj"]
+
+    -- A journal for a file that is already open must patch that document
+    -- rather than open a second copy of it.
+    let edOpen = setLoaded "/w/a.txt"
+                   (LoadResult (fromText (T.pack "on disk")) LF Utf8 True False Nothing) edR0
+        edPatched = recoverJournals (openRecoverDialog
+                      [item RecoverClean (Just "/w/a.txt")] edOpen)
+    checkEq "recovering an already-open file does not open it twice"
+      (fileCount edPatched) 1
+    checkEq "recovering an already-open file applies the journal"
+      (bufferToText LF False (edBuffer edPatched)) (T.pack "recovered\ntext")
+
+    -- Recovery must never propose writing back where the session could not.
+    check "a read-only recovery is still offered but not writable"
+      (not (J.canWriteBack (recJ (Just "/w/a.txt")) { jReadOnly = True }))
+
+    -- A recovered .csv lands in the table view, which carries its *own* saved
+    -- baseline — so the empty 'docSavedBuffer' above does not protect it. If
+    -- the table adopted the recovered grid as its saved point, recomputing the
+    -- flag through 'csvMod' would call the document clean, and since 0028 that
+    -- recomputation is exact and instant: one Ctrl+Z, with no undo step to pop,
+    -- sweeps away the journal that is the only copy of the work and lets the
+    -- next Ctrl+Q leave without asking. (Review of plan 0028.)
+    let csvJ = (recJ (Just "/w/a.csv")) { jText = T.pack "a,b\nc,RECOVERED" }
+        edCsvRec = recoverJournals (openRecoverDialog
+                     [RecoverItem (keyFor (Just "/w/a.csv")) RecoverChanged csvJ] edR0)
+        edCsvZ = fst (update (KCtrlChar 'z') edCsvRec)
+    check "a recovered .csv opens in the table view"
+      (fmap csvToText (edCsv edCsvRec) == Just (T.pack "a,b\nc,RECOVERED"))
+    check "a recovered table is modified" (edModified edCsvRec)
+    check "a recovered table's grid is itself modified"
+      (fmap isModified (edCsv edCsvRec) == Just True)
+    check "a recovered table stays modified across a no-op undo" (edModified edCsvZ)
+    checkEq "a recovered table keeps its journal across a no-op undo"
+      (journalLiveKeys edCsvZ) [keyFor (Just "/w/a.csv")]
+    -- ...and an edit-then-undo cycle, which does have a step to pop.
+    let edCsvEdit = fst (update (KChar 'q') edCsvRec)
+        edCsvUndo = fst (update (KCtrlChar 'z') edCsvEdit)
+    check "a recovered table stays modified after editing and undoing"
+      (edModified edCsvUndo)
+    checkEq "a recovered table keeps its journal after editing and undoing"
+      (journalLiveKeys edCsvUndo) [keyFor (Just "/w/a.csv")]
+    -- Saving is what resolves a recovery: the baseline moves to the grid on
+    -- screen and the flag clears normally, so the guard is not a latch.
+    check "saving a recovered table clears the flag normally"
+      (case edCsv edCsvRec of
+         Just v  -> not (isModified (markSaved v))
+         Nothing -> False)
+
+  -- Full session restore (plan 0011 section 6) --------------------------------
+  --
+  -- The file format is the recents' own encoding under a version line, so the
+  -- part that can actually be wrong is the arithmetic: which document is active
+  -- once the files that have since vanished are dropped, and which documents
+  -- are worth recording at all.
+  do
+    let sess = Session (Just "/home/ben/my work")
+                 [ RecentEntry "/w/a.txt" 0 0
+                 , RecentEntry "/w/b:c:d.txt" 11 4        -- colons belong to the path
+                 , RecentEntry "/w/spaced name.md" 3 7 ] 1
+        roundTrips lbl s = checkEq ("session round-trip: " ++ lbl)
+                             (parseSessionText (renderSessionText s)) (Just s)
+    roundTrips "folder, files, active" sess
+    roundTrips "no folder" sess { seFolder = Nothing }
+    roundTrips "no files" (Session (Just "/w") [] 0)
+    roundTrips "nothing at all" (Session Nothing [] 0)
+
+    -- A version we do not know is "no session", not a guess: a later format's
+    -- lines would arrive here looking exactly like malformed ones.
+    check "an unknown session version is no session"
+      (parseSessionText (T.pack "cmedit-session 2\nactive: 0\n1:1:/w/a.txt\n") == Nothing)
+    check "a file that is not a session is rejected"
+      (parseSessionText (T.pack "1:1:/w/a.txt\n") == Nothing)
+    check "an empty session file is no session"
+      (parseSessionText T.empty == Nothing)
+
+    -- Tolerance: CRLF line endings, blank lines and lines from a future
+    -- version are all skipped rather than taking the session down with them.
+    checkEq "CRLF, blanks and unknown keys are tolerated"
+      (parseSessionText (T.pack ("cmedit-session 1\r\nfolder: /w\r\nactive: 1\r\n"
+                                 ++ "1:1:/w/a.txt\r\n\r\nlayout: split\r\n12:5:/w/b.txt\r\n")))
+      (Just (Session (Just "/w")
+               [RecentEntry "/w/a.txt" 0 0, RecentEntry "/w/b.txt" 11 4] 1))
+    checkEq "an absent active line reads as the first file"
+      (fmap seActive (parseSessionText (T.pack "cmedit-session 1\n1:1:/w/a.txt\n"))) (Just 0)
+    checkEq "an empty folder value is no folder"
+      (fmap seFolder (parseSessionText (T.pack "cmedit-session 1\nfolder:\n"))) (Just Nothing)
+
+    -- planRestore: the index arithmetic, which is the whole of the risk.
+    let s3 = Session Nothing [ RecentEntry "/w/a" 0 0
+                             , RecentEntry "/w/b" 1 0
+                             , RecentEntry "/w/c" 2 0 ] 2
+        plan fs s = planRestore fs s
+    checkEq "restore keeps the session's order"
+      (map rePath (rpFiles (plan [True, True, True] s3))) ["/w/a", "/w/b", "/w/c"]
+    checkEq "restore keeps the recorded active file"
+      (rpActive (plan [True, True, True] s3)) 2
+    checkEq "restore skips the files that are gone"
+      (map rePath (rpFiles (plan [True, False, True] s3))) ["/w/a", "/w/c"]
+    checkEq "a missing file ahead of the active one shifts it down"
+      (rpActive (plan [True, False, True] s3)) 1
+    checkEq "two missing files ahead of it shift it twice"
+      (rpActive (plan [False, False, True] s3)) 0
+    checkEq "a missing active file lands on the next survivor"
+      (rpActive (plan [True, False, True] s3 { seActive = 1 })) 1
+    checkEq "a missing active file at the end clamps to the last survivor"
+      (rpActive (plan [True, False, False] s3)) 0
+    checkEq "an out-of-range active index is clamped"
+      (rpActive (plan [True, True, True] s3 { seActive = 99 })) 2
+    checkEq "the recorded count is reported for the 'N of M' note"
+      (rpRecorded (plan [True, False, True] s3)) 3
+    check "nothing surviving is an empty plan"
+      (null (rpFiles (plan [False, False, False] s3))
+       && rpActive (plan [False, False, False] s3) == 0)
+    check "a short existence list means the rest are gone"
+      (map rePath (rpFiles (plan [True] s3)) == ["/w/a"])
+
+    -- What the editor records. Untitled buffers are absent by construction:
+    -- there is no path to reopen, and their content is the journal's job.
+    let mkLRs t = LoadResult (fromText (T.pack t)) LF Utf8 True False Nothing
+        edS0 = newEditor (24, 80) defaultConfig
+        edSa = setLoaded "/w/a.txt" (mkLRs "aaa") edS0
+        edSab = setLoadedNew "/w/b.txt" (mkLRs "bbb\nbbb") edSa   -- a backgrounded, b active
+        edSabU = fst (update (KCtrlChar 'n') edSab)               -- + an untitled buffer, active
+    checkEq "the session records open files in order"
+      (map rePath (seFiles (sessionForPersist edSab))) ["/w/a.txt", "/w/b.txt"]
+    checkEq "the session records which file is active"
+      (seActive (sessionForPersist edSab)) 1
+    checkEq "an untitled buffer is not recorded"
+      (map rePath (seFiles (sessionForPersist edSabU))) ["/w/a.txt", "/w/b.txt"]
+    checkEq "an untitled active buffer records the nearest recorded document"
+      (seActive (sessionForPersist edSabU)) 1
+    checkEq "the manual's pseudo-path is not recorded"
+      (map rePath (seFiles (sessionForPersist (openManual edSab)))) ["/w/a.txt", "/w/b.txt"]
+    checkEq "the session records the open folder"
+      (seFolder (sessionForPersist (explorerStart "/w" [("/w/a.txt", False, Just 3)] edSab)))
+      (Just "/w")
+    checkEq "the session records live cursor positions"
+      (seFiles (sessionForPersist edSab { edCursor = Pos 1 2 }))
+      [RecentEntry "/w/a.txt" 0 0, RecentEntry "/w/b.txt" 1 2]
+    -- ...but a cursor move is not a change of *shape*, so it must not make the
+    -- driver rewrite the file (the recents' rule, for the recents' reason).
+    checkEq "a cursor move is not a session change"
+      (sessionShape edSab) (sessionShape edSab { edCursor = Pos 1 2 })
+    check "opening a file is a session change"
+      (sessionShape edSa /= sessionShape edSab)
+    check "switching files is a session change"
+      (sessionShape edSab /= sessionShape (switchToFile 0 edSab))
+    -- The shape must still be exactly what the persisted session says, or the
+    -- driver would decide to rewrite (or not) on a different question from the
+    -- one the file answers.
+    checkEq "the shape is the persisted session's folder, paths and active index"
+      (sessionShape (explorerStart "/w" [("/w/a.txt", False, Just 3)] edSab))
+      (let s = sessionForPersist (explorerStart "/w" [("/w/a.txt", False, Just 3)] edSab)
+       in (seFolder s, map rePath (seFiles s), seActive s))
+
+    -- 0029: the driver evaluates 'sessionShape' after *every* key batch, so it
+    -- must never ask a document where its cursor is. For a table document that
+    -- question is 'Csv.cellTextPos', and it used to be forced anyway: the shape
+    -- was projected out of a whole 'sessionForPersist', and 'RecentEntry' has
+    -- strict fields, so building one evaluated the position the projection was
+    -- about to drop. That put a walk over every row above the cursor on each
+    -- keystroke -- 390 ms at the last row of a 223 209-row CSV.
+    --
+    -- Pinned with a grid whose rows are bottom: 'Seq' is spine-strict but
+    -- element-lazy, so the view is perfectly well-formed until something
+    -- reaches for a row. Nothing structural can see this property; only the
+    -- bomb can.
+    let boom = error "0029: sessionShape forced a table cursor position"
+        vBomb = (Cmedit.Csv.mkCsvView ',' (T.pack "a,b\nc,d\ne,f"))
+                  { csvRows = Seq.fromList [Seq.fromList [T.pack "a", T.pack "b"], boom, boom]
+                  , csvCurRow = 2, csvCurCol = 1 }
+        edBomb = (setLoaded "/w/t.csv" (mkLRs "a,b\nc,d\ne,f") edS0)
+                   { edCsv = Just vBomb }
+    shapeOk <- try (evaluate (length (concat (let (_, ps, _) = sessionShape edBomb in ps))))
+                 :: IO (Either SomeException Int)
+    check "0029: sessionShape does not force a table document's cursor position"
+      (either (const False) (> 0) shapeOk)
+    posBoom <- try (evaluate (length (concatMap rePath
+                                (seFiles (sessionForPersist edBomb)))))
+                 :: IO (Either SomeException Int)
+    check "0029: ...and the bomb is armed (sessionForPersist does force it)"
+      (either (const True) (const False) posBoom)
+
+    -- Seeding a restored cursor: clamped, because the file may have shrunk
+    -- since the session was written, and reachable in the zipper, because a
+    -- restore opens several files before any of them is looked at.
+    let edLong = setLoaded "/w/long.txt" (mkLRs "one\ntwo\nthree\n") edS0
+    checkEq "a restored cursor is seeded from the session"
+      (edCursor (seedSessionPos "/w/long.txt" (Pos 2 3) edLong)) (Pos 2 3)
+    checkEq "a restored cursor is clamped to the file as it is now"
+      (edCursor (seedSessionPos "/w/long.txt" (Pos 900 900) edLong))
+      (clampPos (Pos 900 900) (edBuffer edLong))
+    let edZ  = setLoadedNew "/w/other.txt" (mkLRs "x") edLong
+        edZS = seedSessionPos "/w/long.txt" (Pos 1 1) edZ
+    check "a backgrounded document's cursor is seeded too"
+      (any (\d -> docPath d == Just "/w/long.txt" && docCursor d == Pos 1 1)
+           (edBefore edZS ++ edAfter edZS))
+    let edZN = seedSessionPos "/w/nope.txt" (Pos 1 1) edZ
+    check "seeding a path that is not open moves no cursor"
+      (edCursor edZN == edCursor edZ
+       && map docCursor (edBefore edZN ++ edAfter edZN)
+            == map docCursor (edBefore edZ ++ edAfter edZ))
+
+    -- The config key behind the Settings row (row 13, pinned above).
+    let (cR, wR) = parseConfigText (T.pack "restore-session = on\n") defaultConfig
+    checkEq "restore-session = on parses" (cfgRestoreSession cR) True
+    checkEq "restore-session parses without warnings" wR []
+    checkEq "restore-session round-trips through updateConfigText"
+      (fst (parseConfigText (updateConfigText cR T.empty) defaultConfig)) cR
+    checkEq "restore-session is off by default" (cfgRestoreSession defaultConfig) False
+
   -- Report -------------------------------------------------------------------
   (passed, failed) <- readIORef results
   putStrLn ("Passed " ++ show passed ++ ", failed " ++ show failed)
@@ -5198,6 +7869,68 @@ chunkedSource k ws0 = do
         pure (BS.pack a)
       pushBack bs = modifyIORef' ref (BS.unpack bs ++)
   pure (ByteSource next (const next) chunk pushBack)
+
+-- | The CSV parser as it stood between plans 0016 and 0026 — a 'Text' parser
+-- over the whole file at once — kept as the oracle for the line-cursor parser
+-- that replaced it. The engine is shared now ('csvParse' splits and calls
+-- 'csvParseLines'), so this is the only thing standing between a rewrite of it
+-- and a silent change of dialect.
+csvParsePrev :: Char -> T.Text -> Seq.Seq (Seq.Seq T.Text)
+csvParsePrev delim = Seq.fromList . rows
+  where
+    rows t
+      | T.null t = []
+      | otherwise = let (row, rest, more) = oneRow t
+                    in row : if more then rows rest else []
+    oneRow t = collect t []
+    collect t acc =
+      let (f, rest, term) = field t
+      in case term of
+           0 -> collect rest (f : acc)
+           1 -> (Seq.fromList (reverse (f : acc)), rest, not (T.null rest))
+           _ -> (Seq.fromList (reverse (f : acc)), rest, False)
+    isSep c = c == delim || c == '\n' || c == '\r'
+    field t = case T.uncons t of
+      Just ('"', cs) -> quoted cs []
+      _              -> unquoted t
+    unquoted t =
+      let (val, rest) = T.break isSep t
+      in case T.uncons rest of
+           Nothing -> (val, T.empty, 2 :: Int)
+           Just (c, cs)
+             | c == delim -> (val, cs, 0)
+             | c == '\n'  -> (val, cs, 1)
+             | otherwise  -> (val, dropLF cs, 1)
+    quoted t acc =
+      let (seg, rest) = T.break (== '"') t
+      in case T.uncons rest of
+           Nothing -> (joinSegs (seg : acc), T.empty, 2)
+           Just (_, r2) -> case T.uncons r2 of
+             Just ('"', r3) -> quoted r3 (T.singleton '"' : seg : acc)
+             _              -> close r2 (joinSegs (seg : acc))
+    joinSegs [seg] = seg
+    joinSegs segs  = T.concat (reverse segs)
+    close r val = case T.uncons r of
+      Nothing -> (val, T.empty, 2)
+      Just (c, cs)
+        | c == delim -> (val, cs, 0)
+        | c == '\n'  -> (val, cs, 1)
+        | c == '\r'  -> (val, dropLF cs, 1)
+        | otherwise  -> let (v2, rest2, term2) = unquoted cs
+                        in (val <> T.singleton c <> v2, rest2, term2)
+    dropLF t = case T.uncons t of
+      Just ('\n', cs) -> cs
+      _               -> t
+
+-- | 'Cmedit.Csv.cellWidth' as it was before plan 0026 made it a strict fold:
+-- the widest of the cell's newline-separated lines, via 'T.splitOn' and
+-- 'T.unpack'. Kept as the oracle for the fold.
+cellWidthRef :: T.Text -> Int
+cellWidthRef = maximum . (0 :) . map lineW . T.splitOn (T.pack "\n")
+  where
+    lineW = sum . map effW . T.unpack
+    effW c | isInvisibleFormat c = 0
+           | otherwise           = max 1 (charWidth c)
 
 -- | The CSV parser as it was before plan 0016 replaced it (String-based), kept
 -- as an oracle so the Text version can be proved identical on a corpus.

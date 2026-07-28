@@ -29,6 +29,17 @@
 -- alone. A 10 GB archive costs the same two short reads as a 10 KB one; the
 -- driver never slurps the file, and 'Cmedit.EditorState.maxOpenBytes' does not
 -- apply.
+--
+-- __One member at a time, on request.__ The listing still decompresses
+-- nothing; but the office and e-book reading views ("Cmedit.Docx",
+-- "Cmedit.Xlsx", "Cmedit.Epub") are containers whose /content/ is a handful of
+-- XML members inside the archive, so 'localDataOffset' and 'memberBytes' add
+-- the ability to extract one named member without touching the rest. That
+-- keeps the size-independence: a 1 GB @.docx@ full of photographs still costs
+-- only the members actually parsed. Everything extraction cannot do —
+-- encrypted members, compression methods other than stored and deflate, a
+-- member larger than 'maxMemberBytes' — comes back as a @Left@, and the
+-- driver's answer to any of those is the plain listing.
 module Cmedit.Zip
   ( -- * Sniffing
     zipMagic
@@ -40,6 +51,14 @@ module Cmedit.Zip
   , maxCentralBytes
   , findEocd
   , parseCentral
+    -- * Extracting one member
+  , maxMemberBytes
+  , localHeaderBytes
+  , localDataOffset
+  , memberBytes
+  , findEntry
+  , hasEntry
+  , methodName
     -- * The listing
   , zipListing
   ) where
@@ -47,7 +66,7 @@ module Cmedit.Zip
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import qualified Data.ByteString as BS
 import Data.Char (chr, isControl)
-import Data.List (sortBy)
+import Data.List (find, sortBy)
 import qualified Data.Map.Strict as M
 import Data.Maybe (isJust, mapMaybe)
 import Data.Ord (comparing)
@@ -56,6 +75,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Encoding.Error as TEE
 
+import Cmedit.Inflate (inflateDyn)
 import Cmedit.Width (lineDisplayWidth)
 
 ------------------------------------------------------------------------------
@@ -114,6 +134,7 @@ data ZipEntry = ZipEntry
   , zeEncrypted :: !Bool              -- ^ General-purpose bit 0: the /contents/ are encrypted (the name and sizes never are).
   , zeDir       :: !Bool              -- ^ An explicit directory member.
   , zeTime      :: !(Maybe (Int, Int, Int, Int, Int))  -- ^ MS-DOS modification stamp as @(year, month, day, hour, minute)@; 'Nothing' when unset.
+  , zeOffset    :: !Integer           -- ^ Absolute file offset of this member's /local/ header — where 'localDataOffset' starts from. Already corrected for a self-extracting stub ('ecPrefix').
   } deriving (Eq, Show)
 
 -- | The end-of-central-directory record: where the table of contents is and
@@ -123,13 +144,19 @@ data Eocd = Eocd
   , ecCdSize  :: !Integer  -- ^ Byte length of the central directory.
   , ecCdOff   :: !Integer  -- ^ Byte offset of the central directory from the start of the file.
   , ecComment :: !Text     -- ^ The archive comment, or empty.
+  , ecPrefix  :: !Integer
+    -- ^ Bytes of non-ZIP data before the archive proper (a self-extracting
+    -- stub). Member offsets in the central directory are relative to the
+    -- archive, so this has to be added to each of them to get a file offset;
+    -- 'parseCentral' takes it and does that.
   } deriving (Eq, Show)
 
-sigEocd, sigEocd64, sigLoc64, sigCentral :: Integer
+sigEocd, sigEocd64, sigLoc64, sigCentral, sigLocal :: Integer
 sigEocd    = 0x06054b50
 sigEocd64  = 0x06064b50
 sigLoc64   = 0x07064b50
 sigCentral = 0x02014b50
+sigLocal   = 0x04034b50
 
 -- Little-endian readers. Out-of-range reads yield 0 rather than throwing: the
 -- input is a file we did not write, and every caller below re-checks the field
@@ -180,8 +207,8 @@ findEocd bs base
         -- ZIP64 supersedes the 32-bit fields wholesale; its offsets are
         -- already absolute and its directory is preceded by the two ZIP64
         -- records, so the prefix correction below must not be applied to it.
-        Just (n, sz, off) -> Eocd n sz off comment
-        Nothing           -> Eocd count cdSize cdOff comment
+        Just (n, sz, off) -> Eocd n sz off comment 0
+        Nothing           -> Eocd count cdSize cdOff comment (cdOff - recorded)
       where
         count  = u16 bs (p + 10)
         cdSize = u32 bs (p + 12)
@@ -208,13 +235,15 @@ findEocd bs base
       | otherwise = Nothing
 
 -- | Parse the central directory block into one 'ZipEntry' per member.
+-- @prefix@ is 'ecPrefix', added to every member's recorded local-header offset
+-- so 'zeOffset' is a file offset rather than an archive-relative one.
 --
 -- The block is walked to exhaustion rather than to the end record's claimed
 -- count: that count is 16-bit, so a ZIP64 archive without a locator reports
 -- 65535 regardless, and a truncated directory would otherwise be a hang
 -- waiting for entries that are not there.
-parseCentral :: BS.ByteString -> Either String [ZipEntry]
-parseCentral bs
+parseCentral :: Integer -> BS.ByteString -> Either String [ZipEntry]
+parseCentral prefix bs
   | BS.null bs                 = Right []      -- an archive with no members
   | u32 bs 0 /= sigCentral     = Left "the zip central directory is not where the archive says it is"
   | otherwise                  = Right (go 0)
@@ -242,7 +271,27 @@ parseCentral bs
             -- attribute is a fallback for archivers that omit it.
           , zeDir       = "/" `T.isSuffixOf` name || (attrs .&. 0x10 /= 0 && usz == 0)
           , zeTime      = dosTime (u16 bs (i + 14)) (u16 bs (i + 12))
+          , zeOffset    = prefix
+                          + zip64Offset extra (u32 bs (i + 24)) (u32 bs (i + 20)) (u32 bs (i + 42))
           }
+
+-- The local-header offset has the same 0xFFFFFFFF sentinel treatment as the
+-- sizes, and sits after them in the ZIP64 extra field — present only when its
+-- own 32-bit field held the sentinel, and preceded by however many of the two
+-- sizes were promoted. So the slot it occupies has to be counted, not assumed.
+zip64Offset :: BS.ByteString -> Integer -> Integer -> Integer -> Integer
+zip64Offset extra usz csz off
+  | off /= mask32 = off
+  | otherwise     = walk 0
+  where
+    walk j
+      | j + 4 > BS.length extra = off
+      | u16 extra j == 0x0001   = at (j + 4 + 8 * before)
+      | otherwise               = walk (j + 4 + u16 extra (j + 2))
+    before = length (filter (== mask32) [usz, csz])
+    at p | p + 8 <= BS.length extra = u64 extra p
+         | otherwise                = off
+    mask32 = 0xFFFFFFFF
 
 -- Both 32-bit size fields are 0xFFFFFFFF sentinels when the real values live
 -- in the ZIP64 extra field, where they appear in a fixed order and only when
@@ -269,6 +318,74 @@ dosTime date time
   | otherwise = Just (1980 + (date `shiftR` 9), mon, day, time `shiftR` 11, (time `shiftR` 5) .&. 0x3f)
   where mon = (date `shiftR` 5) .&. 0xf
         day = date .&. 0x1f
+
+------------------------------------------------------------------------------
+-- Extracting one member
+
+-- | Ceiling on a single extracted member, uncompressed.
+--
+-- Generous for what the reading views parse — @word\/document.xml@ for a
+-- 400-page manuscript is around 2 MB — and a bound on what a corrupt or
+-- hostile archive can make the driver allocate from a few kilobytes of
+-- compressed input. Nothing about the /archive's/ size is bounded here,
+-- because nothing needs to be: only named members are ever read.
+maxMemberBytes :: Integer
+maxMemberBytes = 16 * 1024 * 1024
+
+-- | How many bytes of a local file header to read before 'localDataOffset' can
+-- say where the data starts. The fixed part is 30 bytes; the name and extra
+-- lengths live inside it.
+localHeaderBytes :: Int
+localHeaderBytes = 30
+
+-- | Given the first 'localHeaderBytes' of a member's local header, how far
+-- past 'zeOffset' its data begins.
+--
+-- The local header repeats the member's name and extra field, and their
+-- lengths are /not/ the central directory's: archivers routinely write a
+-- ZIP64 or timestamp extra in one and not the other. Reading them is the only
+-- way to find the data, which is why extraction costs a second seek.
+localDataOffset :: BS.ByteString -> Either String Int
+localDataOffset hdr
+  | BS.length hdr < localHeaderBytes = Left "truncated zip local file header"
+  | u32 hdr 0 /= sigLocal            = Left "the zip member is not where the archive says it is"
+  | otherwise                        = Right (localHeaderBytes + u16 hdr 26 + u16 hdr 28)
+
+-- | Decompress a member from its raw (compressed) bytes.
+--
+-- Everything this cannot do is a @Left@ naming the reason, and the driver's
+-- answer to any of them is the same: show the archive listing and say so.
+-- That is the graceful floor the reading views are built on — a @.docx@ whose
+-- body member is LZMA-compressed or encrypted still opens, as its table of
+-- contents.
+memberBytes :: ZipEntry -> BS.ByteString -> Either String BS.ByteString
+memberBytes e raw
+  | zeEncrypted e = Left ("\"" ++ T.unpack (zeName e) ++ "\" is encrypted")
+  | zeSize e > maxMemberBytes =
+      Left ("\"" ++ T.unpack (zeName e) ++ "\" is too large to read ("
+            ++ humanBytes (zeSize e) ++ ")")
+  | otherwise = case zeMethod e of
+      0 -> Right (BS.take want raw)
+      8 -> case inflateDyn raw 0 want of
+             -- A stream that produced bytes before going wrong is worth what
+             -- it produced (a truncated document still reads); one that
+             -- produced none is a failure, and inflateDyn reports it as such.
+             Left err -> Left ("\"" ++ T.unpack (zeName e) ++ "\": " ++ err)
+             Right bs -> Right bs
+      m -> Left ("\"" ++ T.unpack (zeName e) ++ "\" uses " ++ methodName m
+                 ++ " compression, which cmedit cannot read")
+  where
+    -- A member written with a data descriptor can have a zeroed size in the
+    -- central directory; falling back to the cap is what lets it still read.
+    want | zeSize e > 0 = fromInteger (min maxMemberBytes (zeSize e))
+         | otherwise    = fromInteger maxMemberBytes
+
+-- | Find a member by its exact archive path.
+findEntry :: Text -> [ZipEntry] -> Maybe ZipEntry
+findEntry nm = find ((== nm) . zeName)
+
+hasEntry :: Text -> [ZipEntry] -> Bool
+hasEntry nm = isJust . findEntry nm
 
 ------------------------------------------------------------------------------
 -- Text decoding
@@ -434,6 +551,7 @@ stamp (Just (y, mo, d, h, mi)) =
   T.pack (show y ++ "-" ++ pad2 mo ++ "-" ++ pad2 d ++ " " ++ pad2 h ++ ":" ++ pad2 mi)
   where pad2 v = let s = show v in if length s < 2 then '0' : s else s
 
+-- | Human name for a compression method code.
 methodName :: Int -> String
 methodName m = case m of
   0  -> "stored"
