@@ -57,10 +57,93 @@ buildHuff lens =
       nsym   = length syms
   in Huff counts (A.listArray (0, max 0 (nsym-1)) (syms ++ [0])) maxLen
 
+-- DEFLATE alone uses a bounded 9-bit prefix table. Keep the shared JPEG Huff
+-- representation unchanged. Longer/incomplete codes use the canonical walk.
+data InflateHuff = InflateHuff !Huff !(UArray Int Int)
+
+buildInflateHuff :: [Int] -> InflateHuff
+buildInflateHuff lens =
+  let hf@(Huff counts syms maxLen) = buildHuff lens
+      entries len first index
+        | len > min 9 maxLen = []
+        | otherwise =
+            let cnt = counts A.! len
+                reverseCode code = foldl (\a i -> (a `shiftL` 1) .|. ((code `shiftR` i) .&. 1)) 0 [0..len-1]
+            in [ (reverseCode (first+j) .|. (extra `shiftL` len),
+                   ((syms A.! (index+j)) `shiftL` 4) .|. len)
+               | j <- [0..cnt-1], extra <- [0..(1 `shiftL` (9-len))-1] ]
+               ++ entries (len+1) ((first+cnt) `shiftL` 1) (index+cnt)
+      -- Do not introduce out-of-bounds table writes for malformed trees.
+      valid len slots
+        | len > maxLen = True
+        | otherwise = let next = slots*2 - counts A.! len
+                      in next >= 0 && valid (len+1) next
+      table = U.accumArray (\_ v -> v) 0 (0,511)
+                (if valid 1 1 then entries 1 0 0 else [])
+  in InflateHuff hf table
+
 -- Slots of the inflate reader's unboxed state array.
 iBit, iOut :: Int
 iBit = 0   -- bit position in the compressed stream
 iOut = 1   -- next output byte index
+
+-- Inline the bit operations into their callers: a local ST action otherwise
+-- allocates at every bit boundary in this shared PNG/PDF/archive decoder.
+{-# INLINE getBitI #-}
+getBitI :: BS.ByteString -> STUArray s Int Int -> ST s Int
+getBitI dat st = do
+  p <- readArray st iBit
+  let i    = p `shiftR` 3
+      byte = if i >= 0 && i < BS.length dat then fromIntegral (BS.index dat i) else 0
+      b    = (byte `shiftR` (p .&. 7)) .&. 1
+  writeArray st iBit (p+1)
+  pure b
+
+{-# INLINE getBitsI #-}
+getBitsI :: BS.ByteString -> STUArray s Int Int -> Int -> ST s Int
+getBitsI dat st n = do
+  p <- readArray st iBit
+  -- All callers request at most 16 bits. Consume the available part of each
+  -- byte, without prefetching past the requested bits or changing EOF padding.
+  let go !i !acc
+        | i >= n = acc
+        | otherwise =
+            let pos = p + i
+                off = pos .&. 7
+                k = min (n-i) (8-off)
+                byteI = pos `shiftR` 3
+                byte = if byteI >= 0 && byteI < BS.length dat
+                         then fromIntegral (BS.index dat byteI) else 0
+                bits = (byte `shiftR` off) .&. ((1 `shiftL` k) - 1)
+            in go (i+k) (acc .|. (bits `shiftL` i))
+      !v = go 0 0
+  writeArray st iBit (p + max 0 n)
+  pure v
+
+{-# INLINE decodeSymI #-}
+decodeSymI :: BS.ByteString -> STUArray s Int Int -> InflateHuff -> ST s Int
+decodeSymI dat st (InflateHuff hf table) = do
+  p <- readArray st iBit
+  let i = p `shiftR` 3
+      byte j = if j >= 0 && j < BS.length dat then fromIntegral (BS.index dat j) else 0
+      prefix = ((byte i .|. (byte (i+1) `shiftL` 8)) `shiftR` (p .&. 7)) .&. 511
+      entry = table ! prefix
+      len = entry .&. 15
+  if len == 0 then decodeSymSlow dat st hf
+  else writeArray st iBit (p+len) >> pure (entry `shiftR` 4)
+
+{-# INLINE decodeSymSlow #-}
+decodeSymSlow :: BS.ByteString -> STUArray s Int Int -> Huff -> ST s Int
+decodeSymSlow dat st (Huff counts syms maxLen) = go 1 0 0 0
+  where go !len !code !first !index
+          | len > maxLen = pure (-1)
+          | otherwise = do
+              b <- getBitI dat st
+              let code1 = code .|. b
+                  cnt   = counts A.! len
+              if code1 - first < cnt
+                then pure (syms A.! (index + (code1 - first)))
+                else go (len+1) (code1 `shiftL` 1) ((first+cnt) `shiftL` 1) (index+cnt)
 
 -- | Inflate a raw DEFLATE stream starting at byte @startByte@, producing up to
 -- @outSize@ bytes (the caller knows the size; PNG does). A hard error (invalid
@@ -116,20 +199,6 @@ inflateWith dat startByte limit grow = do
   doneRef <- newSTRef False
   errRef  <- newSTRef (Nothing :: Maybe String)
   let fail' msg = writeSTRef errRef (Just msg) >> writeSTRef doneRef True
-      -- Direct bounds check rather than a Maybe-returning helper: this runs
-      -- once per bit of the compressed stream (tens of millions of times for a
-      -- photo-sized PNG), so the Just was a heap allocation per bit.
-      datLen = BS.length dat
-      getBit = do
-        p <- readArray st iBit
-        let i    = p `shiftR` 3
-            byte = if i >= 0 && i < datLen then fromIntegral (BS.index dat i) else 0
-            b    = (byte `shiftR` (p .&. 7)) .&. 1
-        writeArray st iBit (p+1)
-        pure b
-      getBits n = go 0 0
-        where go !i !acc | i >= n = pure acc
-                         | otherwise = do b <- getBit; go (i+1) (acc .|. (b `shiftL` i))
       -- Double the buffer, copying what is already in it. Geometric, so the
       -- copying costs O(n) over the whole stream.
       growTo !need = do
@@ -151,82 +220,90 @@ inflateWith dat startByte limit grow = do
           a <- readSTRef arrRef
           writeArray a o w
         writeArray st iOut (o+1)
-      copyBack !dist !len = forLoop 1 len $ \_ -> do
-        !o <- readArray st iOut
+      copyBack !dist !len = do
+        o <- readArray st iOut
         cap <- readSTRef capRef
-        !v <- if o - dist >= 0 && o - dist < cap
-                then do a <- readSTRef arrRef; readArray a (o-dist)
-                else pure 0
-        putByte v
-      decodeSym (Huff counts syms maxLen) = go 1 0 0 0
-        where go !len !code !first !index
-                | len > maxLen = pure (-1)
-                | otherwise = do
-                    b <- getBit
-                    let code1 = code .|. b
-                        cnt   = counts A.! len
-                    if code1 - first < cnt
-                      then pure (syms A.! (index + (code1 - first)))
-                      else go (len+1) (code1 `shiftL` 1) ((first+cnt) `shiftL` 1) (index+cnt)
+        when (grow && o+len > cap && o < limit) (growTo (min limit (o+len)))
+        cap' <- readSTRef capRef
+        a <- readSTRef arrRef
+        -- Copy forwards: overlapping matches must see bytes just written.
+        -- Capacity checks and mutable sink lookup happen once per match.
+        forLoop o (min cap' (o+len) - 1) $ \i -> do
+          v <- if i-dist >= 0 then readArray a (i-dist) else pure 0
+          writeArray a i v
+        writeArray st iOut (o+len)
       huffBlock lit dist = loop
         where loop = do
                 o <- readArray st iOut
                 if o >= limit then pure () else do
-                  sym <- decodeSym lit
+                  sym <- decodeSymI dat st lit
                   if sym < 0 then fail' "invalid Huffman code"
                   else if sym < 256 then putByte (fromIntegral sym) >> loop
                   else if sym == 256 then pure ()
                   else do
                     let li = sym - 257
                     if li >= nLenCodes then fail' "invalid length code" else do
-                      extra <- getBits (lenExtra ! li)
+                      extra <- getBitsI dat st (lenExtra ! li)
                       let len = lenBase ! li + extra
-                      dsym <- decodeSym dist
+                      dsym <- decodeSymI dat st dist
                       if dsym < 0 || dsym >= nDistCodes then fail' "invalid distance code" else do
-                        dextra <- getBits (distExtra ! dsym)
+                        dextra <- getBitsI dat st (distExtra ! dsym)
                         let d = distBase ! dsym + dextra
                         copyBack d len
                         loop
       storedBlock = do
         p <- readArray st iBit
         writeArray st iBit ((p + 7) .&. complement 7)   -- align to byte
-        len <- getBits 16
-        _nlen <- getBits 16
-        forLoop 1 len $ \_ -> do v <- getBits 8; putByte (fromIntegral v)
+        len <- getBitsI dat st 16
+        _nlen <- getBitsI dat st 16
+        bytePos <- (`shiftR` 3) <$> readArray st iBit
+        o <- readArray st iOut
+        cap <- readSTRef capRef
+        when (grow && o+len > cap && o < limit) (growTo (min limit (o+len)))
+        cap' <- readSTRef capRef
+        a <- readSTRef arrRef
+        -- Stored blocks are already byte-aligned. Copy their bytes directly,
+        -- retaining the reader's zero padding when the input is truncated.
+        forLoop 0 (min len (cap'-o) - 1) $ \i -> do
+          let pos = bytePos+i
+              v = if pos >= 0 && pos < BS.length dat then BS.index dat pos else 0
+          writeArray a (o+i) v
+        writeArray st iBit ((bytePos+len)*8)
+        writeArray st iOut (o+len)
       readDynamic = do
-        hlit  <- getBits 5
-        hdist <- getBits 5
-        hclen <- getBits 4
+        hlit  <- getBitsI dat st 5
+        hdist <- getBitsI dat st 5
+        hclen <- getBitsI dat st 4
         let nlit = hlit + 257; ndist = hdist + 1; nclen = hclen + 4
-        clRaw <- mapM (const (getBits 3)) [1..nclen]
+        clRaw <- mapM (const (getBitsI dat st 3)) [1..nclen]
         let clLens = A.elems (A.accumArray (\_ x -> x) 0 (0,18)
                        (zip (take nclen clOrder) clRaw)) :: [Int]
-            clHuff = buildHuff clLens
+            clHuff = buildInflateHuff clLens
         allLens <- decodeLens clHuff (nlit + ndist)
         let (litLens, distLens) = splitAt nlit allLens
-        pure (buildHuff litLens, buildHuff distLens)
+        pure (buildInflateHuff litLens, buildInflateHuff distLens)
       decodeLens clHuff total = reverse <$> go [] 0
         where go acc n
                 | n >= total = pure acc
                 | otherwise = do
-                    s <- decodeSym clHuff
+                    s <- decodeSymI dat st clHuff
                     if s < 0 then pure acc
                     else if s < 16 then go (s:acc) (n+1)
                     else if s == 16 then do
-                      r <- getBits 2
+                      r <- getBitsI dat st 2
                       let prev = case acc of (p:_) -> p; [] -> 0
                           k = r + 3
                       go (replicate k prev ++ acc) (n+k)
                     else if s == 17 then do
-                      r <- getBits 3; let k = r + 3 in go (replicate k 0 ++ acc) (n+k)
+                      r <- getBitsI dat st 3; let k = r + 3 in go (replicate k 0 ++ acc) (n+k)
                     else do
-                      r <- getBits 7; let k = r + 11 in go (replicate k 0 ++ acc) (n+k)
+                      r <- getBitsI dat st 7; let k = r + 11 in go (replicate k 0 ++ acc) (n+k)
       blockLoop = do
         done <- readSTRef doneRef
         o <- readArray st iOut
         if done || o >= limit then pure () else do
-          bfinal <- getBit
-          btype  <- getBits 2
+          bfinal <- getBitI dat st
+          btype  <- getBitsI dat st 2
           case btype of
             0 -> storedBlock
             1 -> huffBlock fixedLit fixedDist
@@ -249,12 +326,12 @@ forLoop lo hi act = go lo
 {-# INLINE forLoop #-}
 
 -- Fixed Huffman tables (RFC 1951 §3.2.6).
-fixedLit :: Huff
-fixedLit = buildHuff ([8 | _ <- [0..143 :: Int]] ++ [9 | _ <- [144..255 :: Int]]
+fixedLit :: InflateHuff
+fixedLit = buildInflateHuff ([8 | _ <- [0..143 :: Int]] ++ [9 | _ <- [144..255 :: Int]]
                    ++ [7 | _ <- [256..279 :: Int]] ++ [8 | _ <- [280..287 :: Int]])
 
-fixedDist :: Huff
-fixedDist = buildHuff (replicate 30 5)
+fixedDist :: InflateHuff
+fixedDist = buildInflateHuff (replicate 30 5)
 
 clOrder :: [Int]
 clOrder = [16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15]

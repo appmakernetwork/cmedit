@@ -27,8 +27,8 @@ Modes:
 | `bench wrap` | word-wrap vs horizontal-scroll paths | index ("checked and healthy") |
 | `bench io FILE` | load/save time and allocation on a large file | 0013 |
 | `bench share FILE` | Text slice pinning: heap retained by 10 lines | 0014 |
-| `bench csv FILE` | CSV parse, per-keystroke edit, isModified, undo/redo, widths, cell/text positions, `sessionShape` | 0016, 0026, 0028, 0029 |
-| `bench csvlive FILE lines\|text` | live heap + RSS of one CSV open path | 0026 |
+| `bench csv FILE` | CSV parse/save, per-keystroke edit, isModified, undo/redo, widths, cell/text positions, `sessionShape` | 0016, 0026, 0028, 0029, 0031 |
+| `bench csvlive FILE lines\|text` | live heap + RSS of one CSV open path | 0026, 0031 |
 | `bench paste` | bracketed-paste parser throughput (in-memory `ByteSource`) | 0017 |
 | `bench image FILE` | image decode + `scaleRGBA` cost | 0018 |
 | `bench search FILE` | literal vs regex matcher throughput | 0019 |

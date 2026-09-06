@@ -13,18 +13,18 @@ for how to build it, which mode produced which number, and the two
 laziness traps that make naive measurements of this codebase wrong in
 *both* directions).
 
-## Status — 18 of 20 closed
+## Status — 19 of 20 closed
 
 **Every confirmed defect is fixed**, every non-capability plan is closed —
 either implemented, or closed on a measurement showing it was unnecessary —
 and the huge-file paged view (`0012`) and the crash-safe journal (`0011`) have
-landed. One capability plan remains (`0015`), plus one partially-landed
-renderer plan (`0003`).
+landed. One capability plan from the original set remains (`0015`); the
+renderer plan (`0003`) is now fully resolved.
 
 | | Before | After |
 |---|---|---|
 | Live heap after 200 000 edits | 51 MB, growing linearly | **flat** |
-| Per keystroke, 3 000-char `.js` lines | 452 ms | **28.9 ms** |
+| Per keystroke, 3 000-char `.js` lines | 452 ms | **3.8 ms** |
 | Per keystroke, 3 000-char plain lines | 7.9 ms | **2.2 ms** |
 | RSS after opening *and closing* a 32 MB CSV | 2 507 MB, permanent | **33 MB** |
 | Heap held by copying one line out of a 49 MB file | 49 MB | **~0** |
@@ -128,7 +128,7 @@ recording what shipped and the before/after measurement.
 |---|---|---|---|---|
 | [0001](completed/0001-strict-bounded-history-stacks.md) | Strict bounded history stacks | memory leak | ✅ **DONE** | — |
 | [0002](completed/0002-quadratic-lexer-line-cost.md) | Remove the quadratic in the lexer's step driver | latency | ✅ **DONE** | — |
-| [0003](incomplete/0003-frame-cost-and-per-line-work.md) | Bound per-line frame work to the visible window | latency + allocation | 🟡 **Stage 1 done**; Stage 3 reverted (regressed large files) | 1–2 days |
+| [0003](completed/0003-frame-cost-and-per-line-work.md) | Bound per-line frame work to the visible window | latency + allocation | ✅ **DONE** (token runs + bounded visible cache; large-file regression removed) | — |
 | [0004](completed/0004-lint-single-flight-and-process-supervision.md) | Single-flight linting; stop process pile-up | resource stability | ✅ **DONE** (group-kill rejected) | — |
 | [0005](completed/0005-long-session-soak-harness.md) | A long-session soak harness | proving stability | ✅ **DONE** (in-process; PTY soak deferred) | — |
 | [0006](completed/0006-session-observability.md) | Session observability (`debug-stats`, `--stats-on-exit`) | diagnosis | ✅ **DONE** (log mode + Settings row dropped) | — |
@@ -178,6 +178,7 @@ measure-first discipline of the original set:
 | [0027](completed/0027-adaptive-journal-write-behind.md) | Adaptive journal write-behind, off-thread writes | resource stability + latency | ✅ **DONE** | Steady-state journal traffic for a 40 MB buffer 10 → **2 MB/s** (rate floor, not a longer debounce — a debounce resets per keystroke and would journal *nothing*); write off the loop thread, worst keystroke 96 → 32 ms |
 | [0028](completed/0028-csv-modified-flag-cost.md) | CSV modified flag in O(1) (`csvDirty`, the `csvWidths` discipline) | latency + allocation | ✅ **DONE** | `isModified` on a modified 223k-row table: 2.5 ms + 14 MB *per keystroke* → **0/0** (the unmodified case was never free either — 0016's 0.04 ms was a floated-out probe). Adversarial review confirmed the invariants and fixed two latent recovered/staged-CSV baselines that let one Ctrl+Z sweep the only journal copy. Found along the way: ~390 ms/keystroke at the *last row* of a huge CSV, driver-side — became `0029` |
 | [0029](completed/0029-csv-last-row-keystroke-cost.md) | CSV last-row keystroke cost (session shape forced the cursor) | latency | ✅ **DONE** | The 390 ms was `sessionShape` (0025) forcing a strict cursor field it then discarded, which for a table is `cellTextPos` re-serialising every row above the cursor. Shape no longer asks documents for cursors (pinned with an error-bomb grid) + a sparse newline-count cache in the `csvWidths` discipline: last-row keystroke **386 → 1.7 ms**, position-independent. Costs recorded: table open +30 %, undo pair +9 %. Adversarially reviewed clean (~24 000 independent assertions). Found along the way, still open: Ctrl+G is dead in the CSV *table* view while its menu entry advertises it |
+| [0031](completed/0031-compact-csv-rows.md) | Compact CSV rows without edit or save regressions | retained memory + latency | ✅ **DONE** | 32 MB / 223k-row table: live heap **192 → 146 MB**, real open path **1,045 → 697 ms**, save materialisation **339 → 273 ms**; source spans, packed widths, sparse edits, and bounded fallbacks preserve wide-row and dialect behaviour |
 
 Suggested order within the set: `0023` → `0021` (DOCX stage first) → `0022`
 → `0024` after `0011`. `0021`/`0022` share the read-only grid mechanism —

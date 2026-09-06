@@ -92,7 +92,8 @@ was still 477 MB, so **~95% of what remains is the entropy decode** — the
 per-bit `nextBit`/`getBitsJ`/`decodeHuffJ` path, whose `let`-bound actions GHC
 will not inline out of the enclosing `do` block. Getting further means lifting
 the bit reader to top-level `INLINE` functions over the state array. That is a
-real refactor of the decoder's core and was not attempted here.
+real refactor of the decoder's core and was not attempted here. The September
+follow-up below implements and measures that experiment.
 
 ### Test coverage, which did not exist
 
@@ -104,6 +105,136 @@ across hard edges, a gradient region, the checkerboard that stresses chroma
 upsampling, corner pixels (the upsampler's edge clamping), full opacity across
 every pixel, and truncated input. Verified to fail on a one-bit change to the
 IDCT output.
+
+### Entropy reader follow-up (2026-09-06)
+
+Lifted `loadByteJ`, `nextBitJ`, `getBitsJ`, `recvJ`, and `decodeHuffJ` into
+top-level `INLINE` functions taking the input bytes and the concrete
+`STUArray s Int Int` state. All baseline and progressive call sites use them
+directly. Bit ordering, stuffing, EOF/marker handling, restart resets, Huffman
+tables, and reconstruction arithmetic are unchanged.
+
+The same 1280×1014, 603 KiB photo, with **GHC 9.6.6** (the compiler installed
+on this machine, rather than the documented 9.0.2), `-O2`, nine fresh-process
+runs of each binary in alternating order:
+
+| | Before this refactor | After |
+|---|---:|---:|
+| Median decode CPU time | 264.983 ms | 245.538 ms |
+| Range | 260.302–290.531 ms | 243.626–248.731 ms |
+| Allocated bytes per decode | 509,555,128 | 193,178,488 |
+
+That is **7.3% less decode time and 62.1% less allocation**. The large churn
+reduction does not translate into a proportional speedup; this experiment
+does not establish where the remaining time is spent.
+
+Complete RGBA buffers compared byte-for-byte against the pre-change decoder
+for the photo and five small images: grayscale, 4:2:0, 4:4:4, progressive,
+and restart-marker JPEGs. Two entropy truncations (EOF and a final lone FF)
+also retained their full-buffer fingerprints. The suite now pins full RGBA
+fingerprints for grayscale, 4:2:0, progressive, and restart-marker inputs;
+the latter two are embedded fixtures with no runtime encoder dependency.
+
+`make test` passed (3408 checks, zero failures), including invariant lint;
+`make` passed. No PTY, Windows check, or soak was run: this change is confined
+to pure decoding, with no terminal, platform, editor-state, or job changes.
+GHC 9.0.2 was not available for a second compiler check.
+
+The standalone harness is `docs/plans/bench/ImageDecode.hs`. Build using the normal
+Makefile's package and extension settings, with an isolated output directory:
+
+```sh
+make -f Makefile -f /dev/stdin jpeg-bench <<'EOF'
+jpeg-bench:
+	$(GHC) --make docs/plans/bench/ImageDecode.hs -isrc -O2 -rtsopts -with-rtsopts=-T -outputdir /tmp/cmedit-jpeg-bench -o /tmp/cmedit-jpeg-bench-run $(PKGS) $(EXTS) $(WARN)
+EOF
+/tmp/cmedit-jpeg-bench-run Van_Gogh_-_Starry_Night_-_Google_Art_Project.jpg
+```
+
+Input IO and output hashing are outside the timed/allocation interval. Forcing
+`imgPix` to WHNF forces the decode; do not sum pixels inside that interval.
+Set `IMAGE_RGBA_DIR` to an existing directory to dump complete RGBA buffers
+after measurement for direct comparison. To compare revisions, build each
+source version into a separate output directory and alternate fresh processes.
+
+### PNG follow-up (2026-09-06)
+
+PNG had two substantial costs: shared DEFLATE decoding and scanline-to-RGBA
+conversion. Isolating inflation on the original decoder measured roughly
+197 ms for noise, 269 ms for the photo, and 108 ms for the screenshot. The
+complete decodes also allocated 1–2 GB each.
+
+What changed:
+
+* DEFLATE bit operations are typed top-level `INLINE` functions. Multi-bit
+  values consume available byte fragments instead of repeatedly reading and
+  updating state for each bit.
+* DEFLATE has a **512-entry Huffman prefix table** per tree, with the original
+  canonical walk for longer or missing codes. The shared JPEG `Huff`
+  representation is unchanged. Oversubscribed trees bypass the new table.
+* Stored blocks copy aligned bytes directly; backreferences fetch the sink
+  and check/grow capacity once per match. Copies still run forwards for
+  overlapping matches, and output caps and truncated-input padding remain.
+* PNG selects its filter once per scanline and reads only the neighbours it
+  needs. Two alternating rows replace the full-pass reconstruction buffer,
+  with a zero predecessor at the start of each Adam7 pass.
+* Pixel/sample operations inline into the conversion loop. Eight-bit samples
+  bypass the otherwise redundant scaling division.
+
+Inlining alone removed most allocation but barely improved time. The prefix
+table, filter/copy loops, and eight-bit conversion fast path supplied the
+larger speed gains. No new editor dependency, platform code, or background
+job was introduced.
+
+GHC 9.6.6, `-O2`, **nine fresh-process runs per version per image**, alternating
+before/after order. Input reading, output hashing and RGBA dumps are excluded.
+Times are median decode CPU times; MB below are decimal allocated bytes,
+not resident memory:
+
+| PNG workload | Before | After | Speedup | Allocation before → after |
+|---|---:|---:|---:|---:|
+| 1280×1014 RGB photo (3.23 MB PNG) | 417.772 ms | 162.640 ms | 2.57× | 2008.37 → 61.24 MB |
+| 1920×1080 RGBA screenshot (133 KB PNG) | 336.323 ms | 142.027 ms | 2.37× | 1008.94 → 27.35 MB |
+| 1024×768 RGB noise (2.36 MB PNG) | 277.051 ms | 79.042 ms | 3.51× | 1371.22 → 33.77 MB |
+
+Ranges (before → after): photo 414.477–443.225 → 162.020–192.443 ms;
+screenshot 333.209–347.159 → 141.243–168.095 ms;
+noise 276.265–302.318 → 78.361–104.198 ms.
+
+Validation:
+
+* All **33 complete PNG RGBA buffers** match the original decoder, including
+  all 15 supported colour/depth combinations both with and without Adam7.
+  The 30 small corpus images also match their source samples; supported
+  Pillow conversions provide an additional colour/output comparison.
+* Six JPEG RGBA buffers remain byte-identical after the shared-module change.
+* The permanent suite embeds 16 PNG cases covering mixed filters, pass
+  resets, split IDAT chunks, palette alpha, tRNS and every colour/depth pair.
+  DEFLATE tests exercise stored/fixed/dynamic coding, 15-bit Huffman codes,
+  overlapping matches, geometric growth, output caps, nonzero input offsets,
+  reserved block errors and truncated stored-block padding.
+* Another **420 comparisons against Python zlib** passed for mixed blocks,
+  varied compression strategies, repetitive/random inputs and output limits.
+* `make test` passed: **3507 checks, zero failures**, including invariant lint.
+  `make` passed. Windows, PTY and soak checks were not run for this pure
+  decoder change; these measurements do not include terminal image output.
+  GHC 9.0.2 was not installed for a second compiler check.
+
+Reproduce the large workloads with Pillow (11.1.0 was used here; it is only a
+fixture-generation tool, not a runtime or test-suite dependency):
+
+```sh
+python3 docs/plans/bench/gen_png.py \
+  Van_Gogh_-_Starry_Night_-_Google_Art_Project.jpg /tmp/cmedit-png-inputs
+make -f Makefile -f /dev/stdin image-bench <<'EOF'
+image-bench:
+	$(GHC) --make docs/plans/bench/ImageDecode.hs -isrc -O2 -rtsopts -with-rtsopts=-T -outputdir /tmp/cmedit-image-bench -o /tmp/cmedit-image-bench-run $(PKGS) $(EXTS) $(WARN)
+EOF
+/tmp/cmedit-image-bench-run /tmp/cmedit-png-inputs/*.png
+```
+
+The former JPEG benchmark is now named `ImageDecode.hs`; it handles both
+formats. Set `IMAGE_RGBA_DIR` to an existing directory for full-buffer dumps.
 
 The plan below is the original analysis, kept for the record.
 

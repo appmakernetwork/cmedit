@@ -5,10 +5,10 @@ module Main (main) where
 
 import Control.Monad (forM_, unless, void)
 import Text.Read (readMaybe)
-import Data.Bits (shiftR, (.&.))
+import Data.Bits (shiftR, (.&.), xor)
 import Data.Foldable (toList)
 import Data.IORef
-import Data.Word (Word8)
+import Data.Word (Word8, Word64)
 import Data.Either (isLeft)
 import Data.List (foldl', intercalate, isInfixOf, isPrefixOf, isSuffixOf, nub, tails)
 import System.Directory (getTemporaryDirectory, removeFile)
@@ -24,6 +24,7 @@ import qualified Data.Text.Encoding as TE
 import Data.Array (bounds)
 import qualified Data.Array as A
 import Data.Array.Unboxed ((!), listArray)
+import qualified Data.Array.Unboxed as U
 
 import Cmedit.Types
 import Cmedit.Link (filePathUri, urlSpans, linkIdOf)
@@ -71,8 +72,9 @@ import Cmedit.Pdf (PdfDoc(..))
 import qualified Cmedit.Pdf as Pdf
 import qualified Cmedit.Rtf as Rtf
 import Cmedit.Csv
+import qualified Cmedit.Inflate as Inflate
 import Cmedit.Image (Image(..), ImgMode(..), decodeImage, decodeFrames, decodeGIFFrames, sniffImage, renderImage, viewFit, scaleRGBA)
-import Cmedit.Render (renderEditor, renderFrame, scrollPlan, Screen(..), ScrollHint(..), Theme(..), defaultTheme, lightTheme, themeFor, FileKind(..), fileKind, expandLineCells)
+import Cmedit.Render (renderEditor, renderFrame, refreshHighlight, scrollPlan, Screen(..), ScrollHint(..), Theme(..), defaultTheme, lightTheme, themeFor, FileKind(..), fileKind, expandLineCells)
 import Cmedit.ConfigFile (ThemeName(..), defaultConfig)
 import Cmedit.Ansi (styleSgr, styleSgrWith)
 import Cmedit.Caps
@@ -81,8 +83,9 @@ import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Lazy as BSL
 import qualified Data.Map.Strict as M
 import Data.Char (isAlphaNum, isDigit, isSpace, toLower)
-import Cmedit.Syntax (Lang(..), Tok(..), HlState(..), langForPath, initialState, lexLine,
-                      refreshHlCache, hlStateBefore, hlCoverage)
+import Cmedit.Syntax (Lang(..), Tok(..), TokRun(..), HlState(..), langForPath, initialState, lexLine,
+                      lexLineRuns, expandTokRuns, refreshHlCache, refreshHlCacheFor,
+                      hlStateBefore, hlCoverage, hlTokenRuns)
 import Cmedit.Lint
   ( LinterId(..), Linter(..), Severity(..), Diag(..)
   , linters, linterById, lintersForPath
@@ -611,6 +614,17 @@ main = do
   checkEq "csv delete col" (cellAt 0 1 v5) (T.pack "c")
   let v6 = redo (undo v3)
   checkEq "csv undo/redo" (cellAt 0 0 v6) (T.pack "QZ")
+  -- Switching out of table mode rebuilds the buffer even when the table was
+  -- not semantically edited (canonical quoting may still change). A token
+  -- cache keyed by the document edit counter must therefore be dropped.
+  let edCsvCache0 = fst (update (KAltChar 't')
+                          (setLoaded "quoted.csv" (mkLR "\"abc\",x") ed0))
+      edCsvCache1 = refreshHighlight edCsvCache0
+      edCsvCache2 = fst (update (KAltChar 't')
+                          (fst (update (KAltChar 't') edCsvCache1)))
+  check "csv table-to-text clears a same-version highlight cache"
+        (maybe False (const True) (edHlCache edCsvCache1)
+          && case edHlCache edCsvCache2 of Nothing -> True; Just _ -> False)
 
   -- Multi-line cells: rows grow with embedded newlines (capped), and the
   -- char-index <-> (line,col) mapping used for in-cell up/down navigation.
@@ -847,6 +861,44 @@ main = do
                  ++ [0,0,0,4]  ++ s "IDAT" ++ [0xde,0xad,0xbe,0xef] ++ [0,0,0,0]
                  ++ [0,0,0,0]  ++ s "IEND" ++ [0,0,0,0])
   check "corrupt PNG -> error" (isLeft (decodeImage badPng))
+  -- Independent PNG encodings cover every supported colour/depth combination,
+  -- all five filters, Adam7 pass resets, alpha/tRNS and split IDAT chunks.
+  forM_ pngRegressionFixtures $ \(label, bytes, expected) ->
+    case decodeImage bytes of
+      Left e -> check ("png " ++ label ++ ": " ++ e) False
+      Right im -> do
+        checkEq ("png " ++ label ++ ": dimensions") (imgW im, imgH im) (9,9)
+        let fingerprint = foldl' (\h b -> (h `xor` fromIntegral b) * 1099511628211)
+                                 (14695981039346656037 :: Word64) (U.elems (imgPix im))
+        checkEq ("png " ++ label ++ ": all RGBA bytes") fingerprint expected
+  -- The same DEFLATE engine serves fixed-size PNG output and bounded,
+  -- geometrically grown PDF/archive output. Limits may split a backreference.
+  let inflatePayload = BS.concat (replicate 300 (BS.pack (s "abracadabra: " ++ [0..31])))
+      storedPayload = BS.pack [0..63]
+      storedStream = BS.pack ([1,64,0,191,255] ++ [0..63])
+  forM_ (("stored", storedStream, storedPayload) :
+         ("long codes", deflateLongCodes, BS.pack [65..79]) :
+         [(label, bytes, inflatePayload) | (label, bytes) <- deflateRegressionStreams]) $
+    \(label, bytes, expected) -> do
+      let n = BS.length expected
+      forM_ [1,31,4095,4097,n-1,n,n+7] $ \limit -> do
+        checkEq ("inflate fixed " ++ label ++ " limit " ++ show limit)
+          (U.elems <$> Inflate.inflate bytes 0 limit)
+          (Right (BS.unpack (BS.take limit expected) ++ replicate (max 0 (limit-n)) 0))
+        checkEq ("inflate dynamic " ++ label ++ " limit " ++ show limit)
+          (Inflate.inflateDyn bytes 0 limit) (Right (BS.take limit expected))
+      checkEq ("inflate dynamic " ++ label ++ " zero limit")
+        (Inflate.inflateDyn bytes 0 0) (Right BS.empty)
+      checkEq ("inflate " ++ label ++ " nonzero start")
+        (Inflate.inflateDyn (BS.pack [99,88] <> bytes) 2 n) (Right expected)
+  check "inflate rejects reserved block type"
+    (isLeft (Inflate.inflate (BS.singleton 7) 0 32))
+  check "inflate dynamic rejects reserved block type"
+    (isLeft (Inflate.inflateDyn (BS.singleton 7) 0 32))
+  checkEq "inflate truncated stored block keeps zero padding"
+    (U.elems <$> Inflate.inflate (BS.take 10 storedStream) 0 64)
+    (Right ([0..4] ++ replicate 59 0))
+
   -- Animated GIF: the full frame sequence, with sub-rectangle composition,
   -- transparency, disposal methods and the delay clamp.
   case decodeFrames mkGIFAnim of
@@ -1048,6 +1100,20 @@ main = do
                        , let (_,_,_,a) = pixelAt im x y ]
       checkEq "jpeg 4:2:0: fully opaque" (all (== 255) alphas, length alphas) (True, 32*24)
   check "truncated JPEG -> error" (isLeft (decodeImage (BS.take 120 jpegColour420)))
+  -- Full-buffer fingerprints captured before the entropy INLINE refactor.
+  -- Progressive exercises DC/AC refinement; restart markers reset bit state
+  -- and predictors between MCUs. Fixtures include stuffed 0xFF00 bytes.
+  forM_ [("gray", jpegGray8, 0x22fbd3b5b530fbcb)
+        ,("4:2:0", jpegColour420, 0xdda0dc786b1fd1e5)
+        ,("progressive", jpegProgressive, 0x81622e1736b5fdf4)
+        ,("restart", jpegRestart, 0x81622e1736b5fdf4)] $ \(label, bytes, expected) ->
+    case decodeImage bytes of
+      Left e -> check ("jpeg " ++ label ++ ": " ++ e) False
+      Right im -> do
+        let fingerprint = foldl' (\h b -> (h `xor` fromIntegral b) * 1099511628211)
+                                 (14695981039346656037 :: Word64) (U.elems (imgPix im))
+        checkEq ("jpeg " ++ label ++ ": all RGBA bytes") fingerprint expected
+
 
   -- Paged read-only view of huge files (plan 0012) ---------------------------
   -- The index is the whole basis of the view: if an offset is wrong, the file
@@ -3633,6 +3699,21 @@ main = do
     forM_ [JS, Python, SQL, Haskell, YAML] $ \lang ->
       checkEq "lexLine emits one token per character"
               (length (fst (lexLine lang initialState (T.pack src)))) (length src)
+  -- The renderer consumes compact runs, but the long-standing public lexer
+  -- result remains its exact expansion for every language family.
+  forM_ [SQL, Python, Markdown, HTML, JS, CSS, Shell, JSON, YAML, TOML, INI,
+         FTL, Jinja, CSV, Haskell, RTF, Archive] $ \lang ->
+    forM_ [ "var alpha = beta + 12; // tail"
+          , "# heading **bold** `code`"
+          , "{\\rtf1\\b bold}  12,34"
+          , "\x251c\x2500 file.txt  12  50%" ] $ \src -> do
+      let txt = T.pack src
+          (tokens, st) = lexLine lang initialState txt
+          (runs, runSt) = lexLineRuns lang initialState txt
+      checkEq "token runs expand to lexLine" (expandTokRuns runs, runSt) (tokens, st)
+      check "token runs contain no adjacent equal classes"
+            (and [ a /= b | (a, b) <- zip (map (\(TokRun _ t) -> t) runs)
+                                             (drop 1 (map (\(TokRun _ t) -> t) runs)) ])
 
   -- Highlight-state cache (HlCache) ---------------------------------------------
   -- Brute-force reference: state before line i is entry i of this scan.
@@ -3661,6 +3742,18 @@ main = do
       editC = refreshHlCache SQL (Seq.fromList editedLines) 10 (Just fullC)
   checkEq "hlcache: re-convergence adopts the old tail" (hlCoverage editC) deepN
   check "hlcache: adopted states agree with brute force" (agreesAll SQL editedLines editC)
+  -- The editor-facing cache uses an explicit document version. On an edit it
+  -- validates only through the requested viewport instead of proving the other
+  -- 2490 lines unchanged; unverified deep state is dropped, not trusted.
+  let editedSeq = Seq.fromList editedLines
+      versionC = refreshHlCacheFor SQL editedSeq 1 0 10 (Just fullC)
+      cachedRunsAgree c lns = and
+        [ expandTokRuns (hlTokenRuns c i)
+            == fst (lexLine SQL (hlStateBefore c i) (lns !! i))
+        | i <- [0 .. 10] ]
+  checkEq "versioned hlcache bounds validation to the viewport" (hlCoverage versionC) 11
+  check "versioned hlcache tokens agree with direct lexing"
+        (agreesAll SQL editedLines versionC && cachedRunsAgree versionC editedLines)
   -- An edit that changes the state (closing the comment) reflows everything below.
   let closedLines = take 5 editedLines ++ [T.pack "still */ closed"] ++ drop 6 editedLines
       closedC = refreshHlCache SQL (Seq.fromList closedLines) 2400 (Just editC)
@@ -4109,10 +4202,23 @@ main = do
   -- appended in order. The old parser emitted it reversed — "tyartsail".
   checkEq "stray text after a closing quote is appended, not reversed"
           (csvParse ',' (T.pack "\"stray\"tail,b"))
-          (Seq.fromList [Seq.fromList [T.pack "straytail", T.pack "b"]])
+          (Seq.fromList [rowFromList [T.pack "straytail", T.pack "b"]])
   checkEq "escaped quote at the end of a field"
           (csvParse ',' (T.pack "\"a\"\"\",\"b\""))
-          (Seq.fromList [Seq.fromList [T.pack "a\"", T.pack "b"]])
+          (Seq.fromList [rowFromList [T.pack "a\"", T.pack "b"]])
+  checkEq "packed CSV save still canonicalises redundant and missing quotes"
+          (csvToText (mkCsvView ',' (T.pack "\"abc\",a\"b,\"\"")))
+          (T.pack "abc,\"a\"\"b\",")
+  checkEq "packed CSV save reuses but does not alter canonical quoting"
+          (csvToText (mkCsvView ',' (T.pack "a,\"b,c\",\"d\"\"e\"")))
+          (T.pack "a,\"b,c\",\"d\"\"e\"")
+  checkEq "packed CSV save canonicalises tolerated post-quote text"
+          (csvToText (mkCsvView ',' (T.pack "\"stray\"tail,b")))
+          (T.pack "straytail,b")
+  let delimiterHeavy = T.replicate 100 (T.pack ",")
+  checkEq "delimiter-heavy quoted rows take the bounded fallback"
+          (csvToText (mkCsvView ',' (T.concat [T.pack "\"", delimiterHeavy, T.pack "\""])))
+          (T.concat [T.pack "\"", delimiterHeavy, T.pack "\""])
   -- Parsing is idempotent once serialised (a trailing empty record collapses on
   -- the first pass, so compare the second and third generations).
   forM_ csvCorpus $ \src ->
@@ -4158,7 +4264,7 @@ main = do
   -- Edge cases of the line cursor, pinned by hand: the implicit newline
   -- between lines is where every one of them lives.
   let pl = Seq.fromList . map T.pack
-      grid rs = Seq.fromList [ Seq.fromList (map T.pack r) | r <- rs ]
+      grid rs = Seq.fromList [ rowFromList (map T.pack r) | r <- rs ]
   checkEq "csvParseLines: an empty buffer is an empty grid"
           (csvParseLines ',' (pl [""])) Seq.empty
   checkEq "csvParseLines: two empty lines are one empty record"
@@ -4206,18 +4312,21 @@ main = do
   let widthsOk v = columnWidths v == columnWidths (mkCsvView (csvDelim v) (csvToText v))
       -- The dirty state from outside the module: plain structural comparison,
       -- no pointer tricks and no incremental anything (plan 0028).
-      shapeRef g = map Seq.length (toList g)
+      shapeRef g = map rowLength (toList g)
       dirtyRef v
         | shapeRef (csvRows v) /= shapeRef (csvSaved v) = DirtyShape
         | otherwise = DirtyCells (length
             [ () | (r, s) <- zip (toList (csvRows v)) (toList (csvSaved v))
-                 , (a, b) <- zip (toList r) (toList s), a /= b ])
+                 , (a, b) <- zip (rowToList r) (rowToList s), a /= b ])
       -- The embedded-newline map from outside the module (plan 0029), built
       -- only out of 'csvToText' — the serialisation 'cellTextPos' mirrors — so
       -- it shares no code at all with the cache it checks. One row through
       -- 'mkCsvGrid'/'csvToText' *is* that row's serialised form.
       nlT = T.pack "\n"
-      serRow v row = csvToText (mkCsvGrid (csvDelim v) (Seq.singleton row))
+      serRow v row = csvToText (mkCsvGrid (csvDelim v)
+                                  (Seq.singleton (Seq.fromList (rowToList row))))
+      serFields v fs = csvToText (mkCsvGrid (csvDelim v)
+                                    (Seq.singleton (Seq.fromList fs)))
       nlRef v = M.fromList
         [ (i, k)
         | (i, row) <- zip [0 ..] (toList (csvRows v))
@@ -4229,7 +4338,7 @@ main = do
             row  = Seq.index (csvRows v) r
             base = r + sum [ T.count nlT (serRow v (Seq.index (csvRows v) i))
                            | i <- [0 .. r - 1] ]
-            pre0 = serRow v (Seq.take c row)
+            pre0 = serFields v (take c (rowToList row))
             pre  = if c > 0 then pre0 <> dl else pre0
         in (base + T.count nlT pre, T.length (last (T.splitOn nlT pre)))
       -- ...and 'textPosCell' as it was: a running scan for the row whose
@@ -4243,8 +4352,8 @@ main = do
                                         (serRow v (Seq.index (csvRows v) i))) 0 [0 .. n - 1]
             r      = clampT 0 (n - 1) (length (takeWhile (<= line) starts) - 1)
             dl     = T.singleton (csvDelim v)
-            fs     = [ serRow v (Seq.singleton f)
-                     | f <- toList (Seq.index (csvRows v) r) ]
+            fs     = [ serFields v [f]
+                     | f <- rowToList (Seq.index (csvRows v) r) ]
             colSt  = scanl (\acc f -> acc + T.length f + 1) 0 fs
             c      = clampT 0 (max 0 (length fs - 1))
                             (length (takeWhile (<= col) (initSafe colSt)) - 1)
@@ -4259,7 +4368,7 @@ main = do
       posMapsOk s v =
         let n  = nRows v
             rs = nub [0, n - 1, s `mod` n]
-            wide row = [0 .. Seq.length row]
+            wide row = [0 .. rowLength row]
         in and [ cellTextPos v r c == cellTextPosRef v r c
                | r <- rs, c <- wide (Seq.index (csvRows v) r) ]
            && and [ textPosCell v l c == textPosCellRef v l c
@@ -4473,7 +4582,7 @@ main = do
   -- against the pre-cache definition, and every line back to its row.
   checkEq "0029: cellTextPos agrees with the pre-cache definition everywhere"
           [ (r, c) | r <- [0 .. nRows vnlM - 1]
-                   , c <- [0 .. Seq.length (Seq.index (csvRows vnlM) r)]
+                   , c <- [0 .. rowLength (Seq.index (csvRows vnlM) r)]
                    , cellTextPos vnlM r c /= cellTextPosRef vnlM r c ] []
   checkEq "0029: textPosCell agrees with the scan it replaced, on and off the ends"
           [ (l, c) | l <- [-2 .. nRows vnlM + 4], c <- [-1, 0, 1, 2, 3, 7, 40]
@@ -7859,7 +7968,7 @@ main = do
     -- bomb can.
     let boom = error "0029: sessionShape forced a table cursor position"
         vBomb = (Cmedit.Csv.mkCsvView ',' (T.pack "a,b\nc,d\ne,f"))
-                  { csvRows = Seq.fromList [Seq.fromList [T.pack "a", T.pack "b"], boom, boom]
+                  { csvRows = Seq.fromList [rowFromList [T.pack "a", T.pack "b"], boom, boom]
                   , csvCurRow = 2, csvCurCol = 1 }
         edBomb = (setLoaded "/w/t.csv" (mkLRs "a,b\nc,d\ne,f") edS0)
                    { edCsv = Just vBomb }
@@ -7969,8 +8078,7 @@ main = do
     -- de-duplication by folder, the labels, and MARestoreSession k addressing
     -- the same entry the label names.
     let edMs0 = (newEditor (24, 80) defaultConfig) { edSessions = [sA, sB, sC] }
-    -- With no folder open, the *folderless* session is the live one, so it is
-    -- the one excluded.
+    -- Folderless sessions are not project folders and are never menu entries.
     checkEq "sessions are offered newest first"
       (map sumFolder (sessionMenuList edMs0)) [Just "/w/website", Just "/w/api"]
     checkEq "at most sessionMenuMax sessions are offered"
@@ -7982,12 +8090,12 @@ main = do
     -- already open is noise, and the key is a function of the folder.
     let edMsOpen = explorerStart "/w/website" [] edMs0
     checkEq "the live session's own folder is not offered"
-      (map sumFolder (sessionMenuList edMsOpen)) [Just "/w/api", Nothing]
-    checkEq "with a folder open, the folderless session is offered"
+      (map sumFolder (sessionMenuList edMsOpen)) [Just "/w/api"]
+    checkEq "with a folder open, the folderless session is still omitted"
       (map sumFolder (sessionMenuList (explorerStart "/w/elsewhere" [] edMs0)))
-      [Just "/w/website", Just "/w/api", Nothing]
-    -- A legacy folderless session that names a folder now owning its own file
-    -- must not appear twice; the newer 'closed:' wins.
+      [Just "/w/website", Just "/w/api"]
+    -- Duplicate summaries for the same folder must not appear twice; the newer
+    -- 'closed:' wins.
     let dupOld = sumOf (Just "/w/api") (Just 50)  9
         dupNew = sumOf (Just "/w/api") (Just 800) 4
     checkEq "sessions are de-duplicated by folder, newest kept"
@@ -8018,6 +8126,10 @@ main = do
           && ixOf isRecAct ed < ixOf (== MASettings) ed)
     check "no sessions means no session section"
       (null [ () | MEItem _ _ (MARestoreSession _) <- fileMenu (newEditor (24, 80) defaultConfig) ])
+    checkEq "folderless history adds no File-menu row or separators"
+      (fileMenu (explorerStart "/w/current" []
+                  ((newEditor (24, 80) defaultConfig) { edSessions = [sC] })))
+      (fileMenu (explorerStart "/w/current" [] (newEditor (24, 80) defaultConfig)))
 
     -- Mnemonics. A free initial is claimed; a taken one, a digit and a
     -- non-letter get none -- and no dropdown may ever hold two entries with the
@@ -8039,9 +8151,8 @@ main = do
       (labelledMnemonic (edMn [sumOf (Just "/w/cmedit") (Just 1) 2]) "cmedit") [Nothing]
     checkEq "a session whose initial is a digit gets none"
       (labelledMnemonic (edMn [sumOf (Just "/w/2024-notes") (Just 1) 2]) "2024") [Nothing]
-    checkEq "the folderless session's '(' is no mnemonic"
-      (labelledMnemonic (explorerStart "/w/elsewhere" [] (edMn [sC])) "no folder")
-      [Nothing]
+    checkEq "a folderless session has no mnemonic because it is omitted"
+      (labelledMnemonic (explorerStart "/w/elsewhere" [] (edMn [sC])) "no folder") []
     -- Two sessions with the same initial: the first takes it, the second does
     -- not, so the dropdown never offers the same key twice.
     check "two sessions cannot claim the same letter"
@@ -8275,7 +8386,7 @@ chunkedSource k ws0 = do
 -- that replaced it. The engine is shared now ('csvParse' splits and calls
 -- 'csvParseLines'), so this is the only thing standing between a rewrite of it
 -- and a silent change of dialect.
-csvParsePrev :: Char -> T.Text -> Seq.Seq (Seq.Seq T.Text)
+csvParsePrev :: Char -> T.Text -> Seq.Seq Row
 csvParsePrev delim = Seq.fromList . rows
   where
     rows t
@@ -8287,8 +8398,8 @@ csvParsePrev delim = Seq.fromList . rows
       let (f, rest, term) = field t
       in case term of
            0 -> collect rest (f : acc)
-           1 -> (Seq.fromList (reverse (f : acc)), rest, not (T.null rest))
-           _ -> (Seq.fromList (reverse (f : acc)), rest, False)
+           1 -> (rowFromList (reverse (f : acc)), rest, not (T.null rest))
+           _ -> (rowFromList (reverse (f : acc)), rest, False)
     isSep c = c == delim || c == '\n' || c == '\r'
     field t = case T.uncons t of
       Just ('"', cs) -> quoted cs []
@@ -8334,8 +8445,8 @@ cellWidthRef = maximum . (0 :) . map lineW . T.splitOn (T.pack "\n")
 
 -- | The CSV parser as it was before plan 0016 replaced it (String-based), kept
 -- as an oracle so the Text version can be proved identical on a corpus.
-csvParseRef :: Char -> T.Text -> Seq.Seq (Seq.Seq T.Text)
-csvParseRef delim = Seq.fromList . map Seq.fromList . rows . T.unpack
+csvParseRef :: Char -> T.Text -> Seq.Seq Row
+csvParseRef delim = Seq.fromList . map rowFromList . rows . T.unpack
   where
     rows [] = []
     rows str = let (row, rest, more) = oneRow str
@@ -8626,4 +8737,377 @@ mkWebPLossyA = BS.pack
   , 0,28,24,0,254,241,175,249,149,127,7,249,5,121
   , 157,202,135,127,243,128,67,188,165,223,239,95,243,53
   , 213,158,243,241,177,70,214,57,108,0
+  ]
+
+-- Pillow 11.1.0 re-encodings of jpegColour420, quality=90: progressive=True
+-- and restart_marker_blocks=1 respectively. No runtime encoder dependency.
+
+jpegProgressive :: BS.ByteString
+jpegProgressive = BS.pack
+  [ 255,216,255,224,0,16,74,70,73,70,0,1,1,0,0,1
+  , 0,1,0,0,255,219,0,67,0,3,2,2,3,2,2,3
+  , 3,3,3,4,3,3,4,5,8,5,5,4,4,5,10,7
+  , 7,6,8,12,10,12,12,11,10,11,11,13,14,18,16,13
+  , 14,17,14,11,11,16,22,16,17,19,20,21,21,21,12,15
+  , 23,24,22,20,24,18,20,21,20,255,219,0,67,1,3,4
+  , 4,5,4,5,9,5,5,9,20,13,11,13,20,20,20,20
+  , 20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20
+  , 20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20
+  , 20,20,20,20,20,20,20,20,20,20,20,20,20,20,255,194
+  , 0,17,8,0,24,0,32,3,1,34,0,2,17,1,3,17
+  , 1,255,196,0,23,0,1,1,1,1,0,0,0,0,0,0
+  , 0,0,0,0,0,0,7,0,2,6,255,196,0,24,1,0
+  , 2,3,0,0,0,0,0,0,0,0,0,0,0,0,0,3
+  , 7,4,5,6,255,218,0,12,3,1,0,2,16,3,16,0
+  , 0,1,58,98,29,98,86,207,36,239,117,150,193,78,216,169
+  , 76,30,136,254,183,212,127,255,196,0,24,16,0,2,3,0
+  , 0,0,0,0,0,0,0,0,0,0,0,0,0,3,4,16
+  , 51,255,218,0,8,1,1,0,1,5,2,165,66,51,181,66
+  , 51,181,66,51,63,255,196,0,32,17,0,1,2,5,5,0
+  , 0,0,0,0,0,0,0,0,0,0,4,0,3,1,2,7
+  , 130,194,17,20,49,50,97,255,218,0,8,1,3,1,1,63
+  , 1,172,157,129,191,20,89,59,134,155,241,86,110,65,191,20
+  , 36,241,153,184,106,191,255,196,0,30,17,0,1,4,1,5
+  , 0,0,0,0,0,0,0,0,0,0,0,0,2,3,5,17
+  , 1,4,18,19,49,66,255,218,0,8,1,2,1,1,63,1
+  , 144,237,3,143,243,81,35,224,208,171,42,221,103,255,196,0
+  , 31,16,0,1,2,6,3,0,0,0,0,0,0,0,0,0
+  , 0,0,17,18,19,0,16,36,49,66,82,98,130,146,255,218
+  , 0,8,1,1,0,6,63,2,149,163,68,245,3,200,8,226
+  , 27,193,186,89,90,52,79,80,60,128,142,33,188,27,165,149
+  , 163,68,245,3,200,8,226,27,193,186,95,255,196,0,22,16
+  , 1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0
+  , 49,16,32,255,218,0,8,1,1,0,1,63,33,135,129,66
+  , 33,224,80,136,48,80,201,255,218,0,12,3,1,0,2,0
+  , 3,0,0,0,16,95,87,254,255,196,0,27,17,0,1,4
+  , 3,0,0,0,0,0,0,0,0,0,0,0,0,1,0,16
+  , 17,49,97,161,177,255,218,0,8,1,3,1,1,63,16,56
+  , 62,122,91,141,14,225,155,55,105,127,255,196,0,26,17,0
+  , 2,3,1,1,0,0,0,0,0,0,0,0,0,0,0,0
+  , 1,113,129,193,33,49,255,218,0,8,1,2,1,1,63,16
+  , 230,87,133,18,61,205,225,74,105,255,196,0,26,16,0,2
+  , 3,1,1,0,0,0,0,0,0,0,0,0,0,0,0,1
+  , 16,17,49,33,241,255,218,0,8,1,1,0,1,63,16,90
+  , 163,200,47,86,15,119,90,163,176,88,158,238,181,76,49,61
+  , 95,255,217
+  ]
+
+jpegRestart :: BS.ByteString
+jpegRestart = BS.pack
+  [ 255,216,255,224,0,16,74,70,73,70,0,1,1,0,0,1
+  , 0,1,0,0,255,219,0,67,0,3,2,2,3,2,2,3
+  , 3,3,3,4,3,3,4,5,8,5,5,4,4,5,10,7
+  , 7,6,8,12,10,12,12,11,10,11,11,13,14,18,16,13
+  , 14,17,14,11,11,16,22,16,17,19,20,21,21,21,12,15
+  , 23,24,22,20,24,18,20,21,20,255,219,0,67,1,3,4
+  , 4,5,4,5,9,5,5,9,20,13,11,13,20,20,20,20
+  , 20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20
+  , 20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20
+  , 20,20,20,20,20,20,20,20,20,20,20,20,20,20,255,192
+  , 0,17,8,0,24,0,32,3,1,34,0,2,17,1,3,17
+  , 1,255,196,0,31,0,0,1,5,1,1,1,1,1,1,0
+  , 0,0,0,0,0,0,0,1,2,3,4,5,6,7,8,9
+  , 10,11,255,196,0,181,16,0,2,1,3,3,2,4,3,5
+  , 5,4,4,0,0,1,125,1,2,3,0,4,17,5,18,33
+  , 49,65,6,19,81,97,7,34,113,20,50,129,145,161,8,35
+  , 66,177,193,21,82,209,240,36,51,98,114,130,9,10,22,23
+  , 24,25,26,37,38,39,40,41,42,52,53,54,55,56,57,58
+  , 67,68,69,70,71,72,73,74,83,84,85,86,87,88,89,90
+  , 99,100,101,102,103,104,105,106,115,116,117,118,119,120,121,122
+  , 131,132,133,134,135,136,137,138,146,147,148,149,150,151,152,153
+  , 154,162,163,164,165,166,167,168,169,170,178,179,180,181,182,183
+  , 184,185,186,194,195,196,197,198,199,200,201,202,210,211,212,213
+  , 214,215,216,217,218,225,226,227,228,229,230,231,232,233,234,241
+  , 242,243,244,245,246,247,248,249,250,255,196,0,31,1,0,3
+  , 1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,1
+  , 2,3,4,5,6,7,8,9,10,11,255,196,0,181,17,0
+  , 2,1,2,4,4,3,4,7,5,4,4,0,1,2,119,0
+  , 1,2,3,17,4,5,33,49,6,18,65,81,7,97,113,19
+  , 34,50,129,8,20,66,145,161,177,193,9,35,51,82,240,21
+  , 98,114,209,10,22,36,52,225,37,241,23,24,25,26,38,39
+  , 40,41,42,53,54,55,56,57,58,67,68,69,70,71,72,73
+  , 74,83,84,85,86,87,88,89,90,99,100,101,102,103,104,105
+  , 106,115,116,117,118,119,120,121,122,130,131,132,133,134,135,136
+  , 137,138,146,147,148,149,150,151,152,153,154,162,163,164,165,166
+  , 167,168,169,170,178,179,180,181,182,183,184,185,186,194,195,196
+  , 197,198,199,200,201,202,210,211,212,213,214,215,216,217,218,226
+  , 227,228,229,230,231,232,233,234,242,243,244,245,246,247,248,249
+  , 250,255,221,0,4,0,1,255,218,0,12,3,1,0,2,17
+  , 3,17,0,63,0,249,212,117,21,246,45,124,116,58,138,251
+  , 22,191,151,56,135,73,80,245,127,161,239,253,50,93,170,228
+  , 79,206,183,231,72,255,208,240,77,35,193,63,119,247,127,165
+  , 123,214,127,179,249,207,216,254,203,255,0,110,254,71,149,255
+  , 0,128,222,87,151,246,15,250,118,242,191,179,255,0,229,195
+  , 251,59,254,41,103,233,30,9,229,127,119,76,207,246,127,253
+  , 57,125,151,254,221,252,143,43,255,0,1,188,175,47,236,31
+  , 244,237,229,127,103,255,0,203,135,246,119,252,82,221,152,140
+  , 119,215,121,124,145,245,57,190,101,253,161,133,195,107,240,167
+  , 248,216,255,209,249,212,117,21,246,45,20,87,242,215,17,239
+  , 67,213,254,135,187,244,204,248,242,47,251,141,255,0,184,143
+  , 255,210,247,253,43,193,63,119,247,117,243,249,255,0,137,127
+  , 253,57,125,151,254,221,252,143,43,255,0,1,188,175,47,236
+  , 31,244,235,229,127,103,255,0,203,135,246,119,252,82,197,21
+  , 242,217,29,89,85,246,156,222,95,169,225,229,21,167,87,13
+  , 30,119,177,255,217
+  ]
+
+-- PNG fixtures encoded with Python zlib; mixed filters, split IDAT chunks,
+-- Adam7, all colour/depth combinations and tRNS. Expected full RGBA FNV-1a
+-- fingerprints use the source samples (colour bytes also checked with Pillow where supported).
+pngRegressionFixtures :: [(String, BS.ByteString, Word64)]
+pngRegressionFixtures =
+  [ ("ct0-bd1-adam1", BS.pack
+      [ 137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,9
+      , 0,0,0,9,1,0,0,0,1,191,237,11,43,0,0,0,2,116,82,78
+      , 83,0,1,1,148,253,174,0,0,0,7,73,68,65,84,120,156,99,96,96
+      , 4,66,173,168,71,86,0,0,0,34,73,68,65,84,38,32,100,102,96,97
+      , 96,0,99,134,15,140,31,128,252,10,22,6,198,85,215,152,24,24,152,67
+      , 95,3,133,1,68,167,5,62,247,189,219,15,0,0,0,0,73,69,78,68
+      , 174,66,96,130
+      ], 0xf7a083887a2ea138)
+  , ("ct0-bd2-adam1", BS.pack
+      [ 137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,9
+      , 0,0,0,9,2,0,0,0,1,248,77,113,251,0,0,0,2,116,82,78
+      , 83,0,1,1,148,253,174,0,0,0,7,73,68,65,84,120,156,99,96,96
+      , 4,66,173,168,71,86,0,0,0,47,73,68,65,84,38,32,100,94,192,194
+      , 192,176,128,165,227,7,67,71,3,67,57,227,93,166,89,204,139,88,102,49
+      , 230,48,92,97,138,138,106,96,230,188,188,138,37,138,225,23,0,227,81,12
+      , 102,90,51,238,151,0,0,0,0,73,69,78,68,174,66,96,130
+      ], 0xd95151e052512bc8)
+  , ("ct0-bd4-adam1", BS.pack
+      [ 137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,9
+      , 0,0,0,9,4,0,0,0,1,119,13,132,91,0,0,0,2,116,82,78
+      , 83,0,9,15,79,117,156,0,0,0,7,73,68,65,84,120,156,99,224,96
+      , 108,96,56,181,81,38,0,0,0,62,73,68,65,84,116,96,106,96,242,56
+      , 192,188,142,197,132,65,141,101,137,139,5,195,11,157,4,134,248,201,140,63
+      , 93,152,102,205,98,254,242,156,101,150,11,99,212,172,85,179,102,48,1,137
+      , 89,11,152,85,102,1,105,22,16,177,0,0,117,61,23,202,177,131,142,212
+      , 0,0,0,0,73,69,78,68,174,66,96,130
+      ], 0x8694652812e3e538)
+  , ("ct0-bd8-adam1", BS.pack
+      [ 137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,9
+      , 0,0,0,9,8,0,0,0,1,178,253,105,90,0,0,0,2,116,82,78
+      , 83,0,233,175,69,151,228,0,0,0,7,73,68,65,84,120,156,99,96,208
+      , 96,92,147,104,42,134,0,0,0,78,73,68,65,84,161,193,56,133,105,5
+      , 211,149,140,63,204,94,59,89,174,92,97,248,212,198,146,229,5,4,12,118
+      , 29,151,100,210,24,84,243,119,50,51,246,3,249,76,89,64,192,252,60,42
+      , 42,10,36,159,197,104,170,10,5,96,9,48,96,222,117,226,132,7,8,156
+      , 96,201,130,200,101,169,2,0,95,32,31,139,61,46,81,56,0,0,0,0
+      , 73,69,78,68,174,66,96,130
+      ], 0x5531be675f6c50ed)
+  , ("ct0-bd16-adam1", BS.pack
+      [ 137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,9
+      , 0,0,0,9,16,0,0,0,1,226,109,181,25,0,0,0,2,116,82,78
+      , 83,233,233,32,249,223,65,0,0,0,7,73,68,65,84,120,156,99,96,96
+      , 208,212,81,144,113,60,0,0,0,128,73,68,65,84,96,92,185,2,72,76
+      , 153,194,180,106,5,211,149,43,153,25,127,255,48,123,121,237,220,201,114,245
+      , 202,213,43,12,159,63,117,180,177,100,101,121,1,129,55,16,51,216,219,117
+      , 118,92,190,36,39,147,145,198,160,170,154,159,15,84,198,204,216,223,15,145
+      , 100,202,202,202,206,2,1,230,23,207,163,128,32,58,10,168,19,36,145,149
+      , 197,104,106,170,10,7,106,96,146,9,172,20,168,35,27,170,11,168,111,247
+      , 174,19,64,224,1,5,158,30,39,78,0,77,64,214,4,226,1,0,176,32
+      , 63,17,75,29,62,183,0,0,0,0,73,69,78,68,174,66,96,130
+      ], 0xd7338c8e89212fc5)
+  , ("ct2-bd8-adam1", BS.pack
+      [ 137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,9
+      , 0,0,0,9,8,2,0,0,1,24,244,161,209,0,0,0,6,116,82,78
+      , 83,0,233,0,48,0,119,161,104,163,48,0,0,0,7,73,68,65,84,120
+      , 156,99,96,112,239,211,139,12,109,211,0,0,0,146,73,68,65,84,200,223
+      , 198,184,226,189,153,134,134,6,227,148,219,74,76,43,86,172,96,186,34,157
+      , 148,177,254,219,31,231,46,102,175,137,55,118,222,101,96,185,2,6,12,159
+      , 44,27,218,206,138,176,100,109,252,225,133,4,24,236,90,207,116,156,23,187
+      , 36,153,32,147,188,42,109,237,23,6,213,156,205,249,219,254,238,100,112,7
+      , 106,103,236,191,38,11,87,201,148,133,4,152,159,119,173,139,130,1,22,160
+      , 128,151,87,22,24,122,49,154,214,28,86,197,1,80,140,64,3,204,187,238
+      , 54,158,240,240,0,34,48,0,51,97,4,200,2,152,25,89,168,132,42,0
+      , 254,217,95,98,59,64,253,147,0,0,0,0,73,69,78,68,174,66,96,130
+      ], 0x0032259d97444762)
+  , ("ct2-bd16-adam1", BS.pack
+      [ 137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,9
+      , 0,0,0,9,16,2,0,0,1,72,100,125,146,0,0,0,6,116,82,78
+      , 83,233,233,49,48,120,119,63,82,133,64,0,0,0,7,73,68,65,84,120
+      , 156,99,96,96,112,119,176,72,63,135,0,0,1,28,73,68,65,84,239,235
+      , 211,212,40,200,223,190,141,113,229,138,15,239,45,204,52,53,180,52,52,53
+      , 24,167,76,185,125,91,89,137,105,213,138,85,43,86,174,96,186,114,69,70
+      , 58,57,41,51,99,195,250,239,223,254,254,113,117,238,233,98,246,242,154,56
+      , 241,198,141,157,59,239,221,101,100,96,185,122,5,2,175,0,49,195,231,79
+      , 214,150,77,13,29,109,231,207,138,139,176,100,101,109,220,248,227,135,23,16
+      , 120,35,97,8,240,246,98,176,183,107,107,61,123,166,179,227,194,121,9,177
+      , 203,151,164,37,147,18,228,100,82,147,215,172,202,72,91,191,246,219,23,6
+      , 85,213,156,156,205,155,243,243,183,109,251,251,119,231,78,70,6,15,119,22
+      , 102,111,175,73,19,25,251,251,175,93,147,147,69,55,208,203,139,41,43,43
+      , 59,11,130,33,0,194,203,206,98,126,241,188,187,107,221,186,40,32,136,70
+      , 194,81,81,44,16,121,144,33,89,89,8,236,237,197,104,106,90,83,115,248
+      , 176,42,28,168,225,101,193,0,19,178,173,232,44,116,151,33,185,111,247,174
+      , 123,119,27,27,79,156,240,0,2,8,9,2,158,30,48,190,39,152,68,101
+      , 121,120,176,64,204,64,119,78,86,22,130,165,138,196,130,137,2,0,231,41
+      , 191,22,8,166,159,57,0,0,0,0,73,69,78,68,174,66,96,130
+      ], 0x90db9da44ec3c158)
+  , ("ct3-bd1-adam1", BS.pack
+      [ 137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,9
+      , 0,0,0,9,1,3,0,0,1,173,88,164,197,0,0,0,6,80,76,84
+      , 69,0,255,0,17,242,31,217,101,57,206,0,0,0,2,116,82,78,83,0
+      , 59,199,152,36,28,0,0,0,7,73,68,65,84,120,156,99,96,96,4,66
+      , 173,168,71,86,0,0,0,34,73,68,65,84,38,32,100,102,96,97,96,0
+      , 99,134,15,140,31,128,252,10,22,6,198,85,215,152,24,24,152,67,95,3
+      , 133,1,68,167,5,62,247,189,219,15,0,0,0,0,73,69,78,68,174,66
+      , 96,130
+      ], 0x0a5baece841287e0)
+  , ("ct3-bd2-adam1", BS.pack
+      [ 137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,9
+      , 0,0,0,9,2,3,0,0,1,234,248,222,21,0,0,0,12,80,76,84
+      , 69,0,255,0,17,242,31,34,229,62,51,216,93,120,3,87,137,0,0,0
+      , 4,116,82,78,83,0,59,118,177,94,174,49,129,0,0,0,7,73,68,65
+      , 84,120,156,99,96,96,4,66,173,168,71,86,0,0,0,47,73,68,65,84
+      , 38,32,100,94,192,194,192,176,128,165,227,7,67,71,3,67,57,227,93,166
+      , 89,204,139,88,102,49,230,48,92,97,138,138,106,96,230,188,188,138,37,138
+      , 225,23,0,227,81,12,102,90,51,238,151,0,0,0,0,73,69,78,68,174
+      , 66,96,130
+      ], 0x5f8e8f99f9702160)
+  , ("ct3-bd4-adam1", BS.pack
+      [ 137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,9
+      , 0,0,0,9,4,3,0,0,1,101,184,43,181,0,0,0,48,80,76,84
+      , 69,0,255,0,17,242,31,34,229,62,51,216,93,68,203,124,85,190,155,102
+      , 177,186,119,164,217,136,151,248,153,138,23,170,125,54,187,112,85,204,99,116
+      , 221,86,147,238,73,178,255,60,209,29,124,156,184,0,0,0,16,116,82,78
+      , 83,0,59,118,177,236,39,98,157,216,19,78,137,196,255,58,117,32,185,48
+      , 208,0,0,0,7,73,68,65,84,120,156,99,224,96,108,96,56,181,81,38
+      , 0,0,0,62,73,68,65,84,116,96,106,96,242,56,192,188,142,197,132,65
+      , 141,101,137,139,5,195,11,157,4,134,248,201,140,63,93,152,102,205,98,254
+      , 242,156,101,150,11,99,212,172,85,179,102,48,1,137,89,11,152,85,102,1
+      , 105,22,16,177,0,0,117,61,23,202,177,131,142,212,0,0,0,0,73,69
+      , 78,68,174,66,96,130
+      ], 0x2baedc1cd96b0db0)
+  , ("ct3-bd8-adam1", BS.pack
+      [ 137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,9
+      , 0,0,0,9,8,3,0,0,1,160,72,198,180,0,0,0,48,80,76,84
+      , 69,0,255,0,17,242,31,34,229,62,51,216,93,68,203,124,85,190,155,102
+      , 177,186,119,164,217,136,151,248,153,138,23,170,125,54,187,112,85,204,99,116
+      , 221,86,147,238,73,178,255,60,209,29,124,156,184,0,0,0,16,116,82,78
+      , 83,0,59,118,177,236,39,98,157,216,19,78,137,196,255,58,117,32,185,48
+      , 208,0,0,0,7,73,68,65,84,120,156,29,201,203,10,192,147,49,50,116
+      , 0,0,0,67,73,68,65,84,32,12,68,209,60,37,6,169,255,255,159,21
+      , 100,54,214,6,206,44,134,75,20,28,155,77,66,44,134,102,55,123,73,154
+      , 37,18,160,39,100,52,242,217,149,39,144,114,7,61,183,220,142,100,119,95
+      , 69,254,91,84,98,83,49,156,92,229,3,217,50,32,195,103,10,153,130,0
+      , 0,0,0,73,69,78,68,174,66,96,130
+      ], 0x2baedc1cd96b0db0)
+  , ("ct4-bd8-adam1", BS.pack
+      [ 137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,9
+      , 0,0,0,9,8,4,0,0,1,61,159,254,13,0,0,0,7,73,68,65
+      , 84,120,156,99,96,112,215,200,22,246,24,196,0,0,0,116,73,68,65,84
+      , 103,92,241,94,67,131,113,202,109,166,21,43,152,174,72,103,172,255,227,204
+      , 236,53,113,231,93,150,43,64,192,240,201,178,237,44,75,214,70,47,40,96
+      , 176,107,237,56,127,73,82,38,57,109,45,131,106,78,254,182,157,12,204,94
+      , 140,253,215,32,146,76,89,80,192,252,188,43,10,12,88,178,178,128,226,64
+      , 130,209,180,70,21,13,192,85,35,0,243,174,187,39,60,78,120,64,1,144
+      , 121,194,3,104,2,92,71,22,24,169,2,0,15,228,63,116,137,244,223,167
+      , 0,0,0,0,73,69,78,68,174,66,96,130
+      ], 0x2826832d6afd67c0)
+  , ("ct4-bd16-adam1", BS.pack
+      [ 137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,9
+      , 0,0,0,9,16,4,0,0,1,109,15,34,78,0,0,0,7,73,68,65
+      , 84,120,156,99,96,96,112,119,176,72,63,135,0,0,0,211,73,68,65,84
+      , 215,212,40,200,103,92,185,226,195,123,77,13,45,13,198,41,83,110,223,102
+      , 90,181,98,213,10,166,43,87,100,164,51,51,54,172,255,251,199,213,153,217
+      , 203,107,226,196,157,59,239,221,101,185,122,5,4,175,92,97,248,252,201,218
+      , 178,163,237,252,89,150,172,172,141,27,189,192,192,27,8,33,128,193,222,174
+      , 173,181,179,227,194,249,203,151,164,37,229,100,82,147,51,210,214,175,101,80
+      , 85,205,201,201,207,223,182,109,231,78,70,6,22,102,111,47,198,254,254,107
+      , 215,144,181,49,101,101,101,3,33,12,100,103,49,191,120,222,221,21,5,6
+      , 209,64,24,21,197,2,18,133,40,7,169,240,242,98,52,53,173,169,81,69
+      , 1,106,72,36,4,48,193,204,131,152,159,13,101,33,3,160,93,187,119,221
+      , 187,123,226,132,135,7,8,35,128,167,7,72,196,19,136,65,226,44,32,181
+      , 152,214,64,196,96,50,0,183,30,127,12,226,139,180,249,0,0,0,0,73
+      , 69,78,68,174,66,96,130
+      ], 0x5719dc19eee28986)
+  , ("ct6-bd8-adam0", BS.pack
+      [ 137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,9
+      , 0,0,0,9,8,6,0,0,0,224,145,6,16,0,0,0,7,73,68,65
+      , 84,120,156,99,96,112,239,187,200,101,132,185,0,0,0,115,73,68,65,84
+      , 170,154,179,249,151,215,196,27,242,249,219,254,186,76,185,173,148,185,19,40
+      , 120,15,40,200,12,20,212,0,10,50,154,214,28,230,82,37,0,152,76,137
+      , 0,204,89,125,27,67,117,65,96,173,46,78,138,5,164,82,213,20,98,44
+      , 46,138,129,51,96,250,61,189,210,61,204,193,179,30,106,84,236,103,243,157
+      , 251,68,187,232,16,80,240,57,80,144,7,40,104,8,20,100,180,107,61,35
+      , 76,29,135,231,79,50,139,212,37,0,0,172,48,83,195,142,75,124,55,0
+      , 0,0,0,73,69,78,68,174,66,96,130
+      ], 0x1eb16f4dafa27935)
+  , ("ct6-bd8-adam1", BS.pack
+      [ 137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,9
+      , 0,0,0,9,8,6,0,0,1,151,150,54,134,0,0,0,7,73,68,65
+      , 84,120,156,99,96,112,239,187,200,101,132,185,0,0,0,168,73,68,65,84
+      , 170,145,191,237,47,227,138,247,102,181,26,64,192,56,229,182,82,38,211,10
+      , 32,96,186,34,157,180,50,99,253,55,219,63,206,93,23,153,189,38,222,144
+      , 223,121,151,97,9,203,21,8,152,194,240,201,178,225,120,219,89,145,104,150
+      , 172,141,63,236,189,208,0,131,93,235,25,225,142,243,98,177,151,36,19,150
+      , 203,36,175,250,152,182,246,139,53,131,106,206,230,95,64,203,92,118,2,173
+      , 5,153,200,216,127,77,54,5,89,27,83,22,26,96,126,222,181,238,98,20
+      , 18,96,1,137,122,121,33,16,163,105,205,97,46,85,2,0,195,92,108,128
+      , 121,215,221,198,37,39,60,60,60,78,128,17,118,10,108,63,208,196,44,136
+      , 193,216,41,0,97,195,127,89,4,77,235,92,0,0,0,0,73,69,78,68
+      , 174,66,96,130
+      ], 0x1eb16f4dafa27935)
+  , ("ct6-bd16-adam1", BS.pack
+      [ 137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,9
+      , 0,0,0,9,16,6,0,0,1,199,6,234,197,0,0,0,7,73,68,65
+      , 84,120,156,99,96,96,112,119,176,72,63,135,0,0,1,70,73,68,65,84
+      , 239,235,187,122,85,83,163,32,127,251,182,127,127,25,87,174,248,240,222,194
+      , 172,190,86,83,67,75,67,19,8,25,167,76,185,125,91,89,41,43,147,105
+      , 213,138,85,43,86,2,49,211,149,43,50,210,201,73,171,86,102,102,108,88
+      , 255,253,155,189,237,223,63,174,206,61,93,151,47,50,123,121,77,156,120,227
+      , 134,130,252,206,157,247,238,50,50,44,89,194,114,245,10,8,94,129,226,169
+      , 83,24,62,127,178,182,108,106,56,121,188,163,237,252,89,113,145,184,104,150
+      , 172,172,141,27,127,252,112,176,247,2,2,111,47,220,36,131,189,93,91,235
+      , 217,51,162,194,157,29,23,206,75,136,197,199,94,190,36,45,153,148,176,114
+      , 185,156,76,106,242,154,85,159,63,102,164,173,95,251,237,139,157,53,131,170
+      , 106,78,206,230,205,191,126,229,231,111,219,246,247,175,171,203,206,157,140,12
+      , 30,238,253,125,44,204,222,94,147,38,222,188,193,216,223,127,237,154,156,108
+      , 106,10,170,37,48,224,237,197,148,149,149,157,5,2,168,100,54,156,100,126
+      , 241,188,187,107,221,186,203,23,163,128,32,58,10,147,100,129,169,4,25,157
+      , 149,229,5,37,189,225,36,163,169,105,77,205,225,195,220,92,170,72,64,77
+      , 149,116,30,19,186,11,201,229,49,239,222,117,239,110,99,227,210,37,39,78
+      , 120,0,129,167,7,132,38,157,199,2,51,19,226,192,172,44,100,231,146,194
+      , 3,0,10,25,255,57,54,135,226,31,0,0,0,0,73,69,78,68,174,66
+      , 96,130
+      ], 0xee7a6bb9677b5db4)
+  ]
+
+-- Independently encoded raw DEFLATE streams (Python zlib): the same payload
+-- with fixed and dynamic Huffman coding, including overlapping backreferences
+-- and enough output to force the PDF/archive decoder to grow its buffer.
+deflateRegressionStreams :: [(String, BS.ByteString)]
+deflateRegressionStreams =
+  [ ("fixed", BS.pack
+      [ 75,76,42,74,76,78,76,73,4,82,86,10,12,140,76,204,44,172,108,236
+      , 28,156,92,220,60,188,124,252,2,130,66,194,34,162,98,226,18,146,82,210
+      , 50,178,114,242,137,163,138,71,21,143,42,30,85,60,170,120,84,241,168,226
+      , 81,197,163,138,71,21,143,42,30,85,60,170,120,84,241,168,226,81,197,163
+      , 138,71,21,143,42,30,85,60,170,120,84,241,168,226,81,197,163,138,71,21
+      , 143,42,30,85,60,170,120,84,241,168,226,81,197,163,138,71,21,143,42,30
+      , 85,60,170,120,84,241,168,226,81,197,163,138,71,21,143,42,30,85,60,170
+      , 120,84,241,168,226,81,197,163,138,71,21,143,42,30,85,76,156,98,0
+      ])
+  , ("dynamic", BS.pack
+      [ 237,202,221,1,129,0,24,0,64,81,136,72,145,159,34,230,104,155,47,38
+      , 176,255,67,70,48,192,61,221,203,197,248,141,119,124,226,199,240,154,37,243
+      , 69,154,45,87,235,124,179,45,118,251,242,80,213,199,83,115,190,92,111,109
+      , 119,127,244,207,144,101,89,150,101,89,150,101,89,150,101,89,150,101,89,150
+      , 101,89,150,101,89,150,101,89,150,101,89,150,101,89,150,101,89,150,101,89
+      , 150,101,89,254,47,79
+      ])
+  ]
+
+-- Complete canonical tree with code lengths 1 through 15: exercises both
+-- the 9-bit prefix table and the longer-code fallback (checked with zlib).
+deflateLongCodes :: BS.ByteString
+deflateLongCodes = BS.pack
+  [ 5,224,1,144,36,73,146,36,73,2,0,0,0,0,0,0,0,0,0,0
+  , 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+  , 0,0,18,139,154,71,86,207,222,3,0,0,0,0,0,0,0,0,0,0
+  , 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+  , 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+  , 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+  , 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,60,106,247
+  , 190,223,223,191,255,254,247,127,255,239,255,251,255,253,255,1
   ]

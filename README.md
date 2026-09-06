@@ -313,7 +313,8 @@ escape sequences and the POSIX `termios` API.
   `cmedit` do it; naming files on the command line still just opens those, and
   files named alongside `--restore` open on top of the restored session.
   Session files hold paths, cursors and the times the files were last seen —
-  never file content. The **File menu also lists your last few sessions**
+  never file content. The **File menu also lists your last few project-folder
+  sessions**
   ("website (6 files)", up to four): choosing one restores it into the running
   editor, adding its folder and files to what you already have open — an
   already-open file is switched to, not duplicated — and closing nothing.

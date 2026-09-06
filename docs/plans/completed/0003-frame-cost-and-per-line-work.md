@@ -1,11 +1,43 @@
 # 0003 — The frame is the whole cost: bound per-line work to the visible window
 
 **Theme:** interactive latency and allocation churn under sustained editing
-**Status:** 🟡 **PARTIALLY LANDED** — Stage 1 shipped 2026-07-26. Stage 3 was
-implemented, measured, and **reverted**: it regressed large files 3.7×. Stages
-2 and 4 untouched.
-**Estimated effort remaining:** 1–2 days
-**Risk:** medium — touches the renderer's hot path
+**Status:** ✅ **RESOLVED 2026-09-05** — Stages 1–3 shipped. Stage 4 remains
+deliberately unnecessary: the lower-risk token representation and cache clear
+the measured latency/allocation targets without changing `Cell`.
+
+## Resolution
+
+The generic lexers now retain the runs they already discover instead of
+expanding them into one `[Tok]` cell per character. `lexLine` remains as a
+compatibility wrapper, while rendering uses `lexLineRuns`; `mkBaseAt` builds a
+small cumulative-end array and performs a binary search over runs.
+
+`HlCache` now holds compact tokens only for the current viewport, validated by
+the source line and incoming lexer state. The editor-facing refresh is keyed by
+the existing per-document `edDocSeq`: an unchanged frame performs no whole-
+buffer comparison. After a change, cache validation stops at the requested
+viewport and discards unverified deeper states. Scrolling later extends from
+that trusted frontier. This fixes the precise failure that caused the original
+Stage 3 prototype to be reverted: it no longer traverses the full 200k-line
+`Seq` on every frame.
+
+All figures below are 100 full driver cycles at `-O2`, on the same checkout and
+benchmark input:
+
+| Case | Before | After |
+|---|---:|---:|
+| JS, 5k × 120 | 303 ms / 621 MB | **145 ms / 447 MB** |
+| JS, 5k × 600 | 1,282 ms / 2,015 MB | **359 ms / 1,099 MB** |
+| JS, 5k × 3,000 | 4,336 ms / 5,499 MB | **379 ms / 917 MB** |
+| JS, 200k × 120 | 235 ms / 620 MB | **155 ms / 446 MB** |
+| plain, 5k × 120 | 126 ms / 399 MB | **112 ms / 399 MB** |
+| plain, 5k × 3,000 | 291 ms / 635 MB | **244 ms / 635 MB** |
+
+The unchanged/scrolling-frame benchmark also improves at every highlighted
+line length (for example, JS 5k × 3,000: 5,086 ms / 9,603 MB to **3,503 ms /
+6,138 MB**) while plain-text allocation is unchanged. Token-run expansion is
+tested against the historical lexer result for every supported language;
+versioned cache tokens and states are checked against direct lexing.
 
 ## Stage 1: shipped ✅
 
@@ -25,7 +57,7 @@ common case bit-identical.
 That is the long-line cliff for plain text essentially gone; what remains at
 3 000 characters is the lexer materialising a token per character.
 
-## Stage 3: implemented, measured, reverted ⛔
+## Stage 3: original prototype (later replaced) ⛔
 
 A per-line token cache was added to `HlCache` (`hcToks`, keyed by line index and
 validated by line identity + incoming lexer state, pruned to the visible
@@ -55,10 +87,11 @@ field to `HlCache` (or returning a new record from `refreshHlWindow`) changes
 how often the `ptrEq (hcLines c) cur` fast path hits. The token-cache idea is
 sound and the win is large; the interaction with cache identity is the problem.
 
-## Stages 2 and 4: untouched
+## Stages 2 and 3: shipped; Stage 4 not required
 
-Run-length token vectors (§2) and a cheaper `Cell` (§4) are unchanged from the
-analysis below.
+Run-length token vectors and the bounded visible-token cache now ship as
+described in the resolution above. A cheaper `Cell` remains an optional future
+experiment, not required to close this measured defect.
 
 ---
 

@@ -31,7 +31,7 @@ import Data.Array.ST (STArray)
 import Data.ByteString.Builder (Builder, charUtf8, intDec, string7)
 import qualified Data.Map.Strict as Map
 import Data.Char (toLower)
-import Data.List (find)
+import Data.List (find, foldl')
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -1075,7 +1075,7 @@ drawPager th ed pg lo arr = do
         Just line -> do
           let toks = case mlang of
                        Just lang | T.length line <= maxHlLine ->
-                         fst (lexLine lang initialState line)
+                         fst (lexLineRuns lang initialState line)
                        _ -> []
               baseAt0 = mkBaseAt th toks
               -- The cursor line is reverse-highlighted: with no editable
@@ -1438,34 +1438,43 @@ urlWindowLine = 2000
 tokStyle :: Theme -> Tok -> Style
 tokStyle = thTokens
 
--- A per-character base-style lookup for one line's tokens.
-mkBaseAt :: Theme -> [Tok] -> (Int -> Style)
-mkBaseAt th toks
-  | null toks = const (thText th)
+-- A per-character base-style lookup over compact token runs. The small boxed
+-- array contains cumulative exclusive ends, typically tens of entries rather
+-- than one entry per source character; lookup is logarithmic in run count.
+mkBaseAt :: Theme -> [TokRun] -> (Int -> Style)
+mkBaseAt th runs
+  | null runs = const (thText th)
   | otherwise =
-      let n = length toks
-          arr = listArray (0, n - 1) toks :: Array Int Tok
-      in \i -> if i >= 0 && i < n then tokStyle th (arr ! i) else thText th
+      let entries = snd (foldl' add (0, []) runs)
+          add (!off, acc) (TokRun n tok) =
+            let end = off + n in (end, (end, tok) : acc)
+          ordered = reverse entries
+          nRuns = length ordered
+          total = case ordered of [] -> 0; _ -> fst (last ordered)
+          arr = listArray (0, nRuns - 1) ordered :: Array Int (Int, Tok)
+          findRun i = search 0 (nRuns - 1)
+            where
+              search lo hi
+                | lo >= hi = snd (arr ! lo)
+                | otherwise =
+                    let mid = (lo + hi) `div` 2
+                    in if i < fst (arr ! mid) then search lo mid else search (mid + 1) hi
+      in \i -> if i >= 0 && i < total then tokStyle th (findRun i) else thText th
 
 -- Tokenise lines [top .. top+count) for highlighting. Line-start lexer states
 -- come from the 'HlCache' (refreshed here if the editor's copy is stale), so
 -- multi-line constructs are correct from the top of the file — there is no
 -- look-back cap — while each frame only lexes the visible window.
-highlightMap :: Lang -> Editor -> Int -> Int -> Map.Map Int [Tok]
+highlightMap :: Lang -> Editor -> Int -> Int -> Map.Map Int [TokRun]
 highlightMap lang ed top count =
   let buf   = edBuffer ed
       lns   = bufLines buf
       lastL = min (lineCount buf - 1) (top + count - 1)
-      cache = refreshHlCache lang lns lastL (edHlCache ed)
-      go _ li acc
-        | li > lastL = acc
-      go st li acc =
-        let (toks, st') = lexLine lang st (getLine' li buf)
-        in go st' (li + 1) (Map.insert li toks acc)
-  in go (hlStateBefore cache top) (max 0 top) Map.empty
+      cache = refreshHlCacheFor lang lns (edDocSeq ed) top lastL (edHlCache ed)
+  in Map.fromAscList [ (li, hlTokenRuns cache li) | li <- [max 0 top .. lastL] ]
 
 -- The highlight map for the visible region (empty when no language applies).
-visibleHighlight :: Editor -> Int -> Map.Map Int [Tok]
+visibleHighlight :: Editor -> Int -> Map.Map Int [TokRun]
 visibleHighlight ed count = case langForPath (edPath ed) of
   Just lang -> highlightMap lang ed (edTop ed) count
   Nothing   -> Map.empty
@@ -1484,7 +1493,8 @@ refreshHighlight ed
         let lo    = computeLayout ed
             buf   = edBuffer ed
             lastL = min (lineCount buf - 1) (edTop ed + loTextHeight lo - 1)
-        in ed { edHlCache = Just (refreshHlCache lang (bufLines buf) lastL (edHlCache ed)) }
+        in ed { edHlCache = Just (refreshHlCacheFor lang (bufLines buf) (edDocSeq ed)
+                                    (edTop ed) lastL (edHlCache ed)) }
 
 ------------------------------------------------------------------------------
 -- Menu bar

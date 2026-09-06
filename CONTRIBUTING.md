@@ -71,7 +71,9 @@ real memory or real milliseconds when it was broken.
 3. **Per-frame work is per-*visible*-cell work.** Anything the renderer does per
    line must be proportional to the visible window, not the line length.
    *Measured when broken: 7.9 ms per keystroke on 3 000-character lines with no
-   highlighting at all.*
+   highlighting at all.* Keep syntax tokens as runs and the token cache bounded
+   to the viewport; after an edit, discard unverified deep lexer state instead
+   of traversing the whole document to prove it unchanged.
 4. **When the caller knows what changed, tell the callee.** Rediscovering it by
    diffing is O(collection). *Measured when broken: 7.4 ms and 22 MB per
    keystroke on a 300 000-row CSV, spent working out which cell had just been
@@ -85,6 +87,11 @@ real memory or real milliseconds when it was broken.
    `adjust (const x) i` and stores a thunk capturing the old element; use
    `Seq.adjust'` and force what you store, or versions chain and none can be
    collected.
+8. **Compact CSV rows must stay cheap to edit and save.** Loaded single-line
+   rows use source spans plus a sparse edit overlay; do not replace that overlay
+   with a whole-row copy per keystroke, materialise every packed cell during
+   width/newline scans, or bypass the canonical-source save fast path. Preserve
+   the explicit wide-row, line-length, and exceptional-field fallbacks.
 
 ### Soak testing
 

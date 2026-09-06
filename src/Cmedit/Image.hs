@@ -678,7 +678,10 @@ decodePNG bs = do
                && ((at idat 0 * 256 + at idat 1) `mod` 31) == 0
   unless zlibOk $ Left "corrupt PNG (bad zlib header)"
   raw <- inflate idat 2 rawSize        -- skip the 2-byte zlib header
-  let scale v  = v * 255 `div` ((1 `shiftL` bd) - 1)
+  let -- Eight-bit samples already have the output range; avoid a division
+      -- for every colour/alpha component in the common RGB/RGBA path.
+      scale v | bd == 8 = v
+              | otherwise = v * 255 `div` ((1 `shiftL` bd) - 1)
       palAt i  = let o = i*3 in if o+2 < BS.length plte
                                   then (at plte o, at plte (o+1), at plte (o+2))
                                   else (0,0,0)
@@ -690,28 +693,46 @@ decodePNG bs = do
     _ <- foldM (\off (x0,y0,dx,dy,pw,ph) ->
             if pw <= 0 || ph <= 0 then pure off else do
               let rb = rowBytes pw
-              recon <- newArray (0, max 0 (ph*rb - 1)) 0 :: ST s (STUArray s Int Word8)
-              -- Unfilter every scanline of this pass.
-              forM_ [0 .. ph-1] $ \ry -> do
+              -- Only this row and its predecessor are needed. Start each
+              -- Adam7 pass with a zero predecessor, then alternate the slots.
+              recon <- newArray (0, 2*rb - 1) 0 :: ST s (STUArray s Int Word8)
+              forLoop 0 (ph-1) $ \ry -> do
                 let lineOff = off + ry*(1+rb)
-                    ft = ux raw lineOff
-                forM_ [0 .. rb-1] $ \i -> do
-                  let x = ux raw (lineOff+1+i)
-                  av <- if i >= bpp then fromIntegral <$> rd recon (ry*rb + i - bpp) else pure 0
-                  bv <- if ry > 0   then fromIntegral <$> rd recon ((ry-1)*rb + i) else pure 0
-                  cv <- if ry > 0 && i >= bpp then fromIntegral <$> rd recon ((ry-1)*rb + i - bpp) else pure (0 :: Int)
-                  let v = (x + paethPredict ft av bv cv) .&. 0xff
-                  writeArray recon (ry*rb + i) (fromIntegral v)
-              -- Convert + place each pixel of this pass into the image.
-              forM_ [0 .. ph-1] $ \ry -> forM_ [0 .. pw-1] $ \px -> do
-                (r,g,b,al) <- pngPixel recon (ry*rb) bd ct chans scale palAt palAlpha
-                                       grayTrans rgbTrans px
-                putRGBA a w (x0 + px*dx) (y0 + ry*dy) r g b al
+                    rowOff = (ry .&. 1)*rb
+                unfilterPngRow raw lineOff bpp rb recon rowOff (rb-rowOff)
+                -- Convert before reusing the row's scratch slot.
+                forLoop 0 (pw-1) $ \px -> do
+                  (r,g,b,al) <- pngPixel recon rowOff bd ct chans scale palAt palAlpha
+                                         grayTrans rgbTrans px
+                  putRGBA a w (x0 + px*dx) (y0 + ry*dy) r g b al
               pure (off + ph*(1+rb)))
           0 passes
     pure ()
 
+-- Dispatch once per row and read only the neighbours used by that filter.
+-- Inline the concrete ST operations so the per-byte arithmetic stays unboxed.
+{-# INLINE unfilterPngRow #-}
+unfilterPngRow :: UArray Int Word8 -> Int -> Int -> Int
+               -> STUArray s Int Word8 -> Int -> Int -> ST s ()
+unfilterPngRow raw lineOff bpp rb recon rowOff prevOff =
+  let left i = if i >= bpp then fromIntegral <$> rd recon (rowOff+i-bpp) else pure 0
+      above i = fromIntegral <$> rd recon (prevOff+i)
+      upperLeft i = if i >= bpp then above (i-bpp) else pure 0
+      put i predictor = writeArray recon (rowOff+i)
+                          (fromIntegral (ux raw (lineOff+1+i) + predictor))
+  in case ux raw lineOff of
+    1 -> forLoop 0 (rb-1) $ \i -> left i >>= put i
+    2 -> forLoop 0 (rb-1) $ \i -> above i >>= put i
+    3 -> forLoop 0 (rb-1) $ \i -> do
+           a <- left i; b <- above i
+           put i ((a+b) `div` 2)
+    4 -> forLoop 0 (rb-1) $ \i -> do
+           a <- left i; b <- above i; c <- upperLeft i
+           put i (paethPredict 4 a b c)
+    _ -> forLoop 0 (rb-1) $ \i -> put i 0
+
 -- Convert one pixel (component samples) from an unfiltered scanline to RGBA.
+{-# INLINE pngPixel #-}
 pngPixel :: STUArray s Int Word8 -> Int -> Int -> Int -> Int
          -> (Int -> Int) -> (Int -> (Int,Int,Int)) -> (Int -> Int)
          -> Maybe Int -> Maybe (Int,Int,Int) -> Int
@@ -735,6 +756,7 @@ pngPixel recon rowOff bd ct chans scale palAt palAlpha grayTrans rgbTrans px = d
     _ -> pure (0,0,0,255)
 
 -- Raw sample value (unscaled) from a scanline, handling 1/2/4/8/16-bit depths.
+{-# INLINE rawSampleST #-}
 rawSampleST :: STUArray s Int Word8 -> Int -> Int -> Int -> Int -> Int -> ST s Int
 rawSampleST recon rowOff bd chans x c
   | bd == 8  = fromIntegral <$> rd recon (rowOff + x*chans + c)
@@ -879,6 +901,56 @@ iBuf = 1   -- current byte being consumed, bit by bit
 iCnt = 2   -- bits left in that byte
 iMk  = 3   -- marker that stopped the entropy stream (0 = none)
 
+-- Keep these operations top-level and INLINE: local ST actions in the large
+-- scan decoder otherwise allocate through the per-bit call boundary (plan 0018).
+-- The byte/marker rules are shared by baseline and progressive scans.
+{-# INLINE loadByteJ #-}
+loadByteJ :: BS.ByteString -> STUArray s Int Int -> ST s ()
+loadByteJ bs st = do
+  mk <- readArray st iMk
+  if mk /= 0 then pure () else do
+    p <- readArray st iPos
+    case atM bs p of
+      Nothing -> writeArray st iMk 0xD9
+      Just b
+        | b == 0xFF -> case atM bs (p+1) of
+            Just 0  -> do writeArray st iPos (p+2); writeArray st iBuf 0xFF; writeArray st iCnt 8
+            Just nn -> writeArray st iMk nn
+            Nothing -> writeArray st iMk 0xD9
+        | otherwise -> do writeArray st iPos (p+1); writeArray st iBuf b; writeArray st iCnt 8
+
+{-# INLINE nextBitJ #-}
+nextBitJ :: BS.ByteString -> STUArray s Int Int -> ST s Int
+nextBitJ bs st = do
+  c0 <- readArray st iCnt
+  c  <- if c0 == 0 then loadByteJ bs st >> readArray st iCnt else pure c0
+  if c == 0 then pure 0
+  else do buf <- readArray st iBuf; writeArray st iCnt (c-1); pure ((buf `shiftR` (c-1)) .&. 1)
+
+{-# INLINE getBitsJ #-}
+getBitsJ :: BS.ByteString -> STUArray s Int Int -> Int -> ST s Int
+getBitsJ bs st n = go 0 n
+  where go acc 0 = pure acc
+        go acc k = do b <- nextBitJ bs st; go ((acc `shiftL` 1) .|. b) (k-1)
+
+{-# INLINE recvJ #-}
+recvJ :: BS.ByteString -> STUArray s Int Int -> Int -> ST s Int
+recvJ bs st s
+  | s == 0 = pure 0
+  | otherwise = do v <- getBitsJ bs st s
+                   pure (if v < (1 `shiftL` (s-1)) then v - (1 `shiftL` s) + 1 else v)
+
+{-# INLINE decodeHuffJ #-}
+decodeHuffJ :: BS.ByteString -> STUArray s Int Int -> Huff -> ST s Int
+decodeHuffJ bs st (Huff counts syms _) = go 1 0 0 0
+  where go len code first idx
+          | len > 16 = pure 0
+          | otherwise = do
+              b <- nextBitJ bs st
+              let code1 = (code `shiftL` 1) .|. b; cnt = counts A.! len
+              if code1 - first < cnt then pure (syms A.! (idx + (code1 - first)))
+              else go (len+1) code1 ((first+cnt) `shiftL` 1) (idx+cnt)
+
 -- The natural-order index for each zig-zag position.
 zigzag :: UArray Int Int
 zigzag = U.listArray (0,63)
@@ -936,39 +1008,9 @@ decodeJpegImage bs w h comps =
     -- GHC's allocation rate was most of its 679 ms.
     st <- newArray (0, 3) 0 :: ST s (STUArray s Int Int)
     writeArray st iPos 2
-    let loadByte = do
-          mk <- readArray st iMk
-          if mk /= 0 then pure () else do
-            p <- readArray st iPos
-            case atM bs p of
-              Nothing -> writeArray st iMk 0xD9
-              Just b
-                | b == 0xFF -> case atM bs (p+1) of
-                    Just 0  -> do writeArray st iPos (p+2); writeArray st iBuf 0xFF; writeArray st iCnt 8
-                    Just nn -> writeArray st iMk nn
-                    Nothing -> writeArray st iMk 0xD9
-                | otherwise -> do writeArray st iPos (p+1); writeArray st iBuf b; writeArray st iCnt 8
-        nextBit = do
-          c0 <- readArray st iCnt
-          c  <- if c0 == 0 then loadByte >> readArray st iCnt else pure c0
-          if c == 0 then pure 0
-          else do buf <- readArray st iBuf; writeArray st iCnt (c-1); pure ((buf `shiftR` (c-1)) .&. 1)
-        getBitsJ n = go 0 n where go acc 0 = pure acc
-                                  go acc k = do b <- nextBit; go ((acc `shiftL` 1) .|. b) (k-1)
-        recv s | s == 0 = pure 0
-               | otherwise = do v <- getBitsJ s
-                                pure (if v < (1 `shiftL` (s-1)) then v - (1 `shiftL` s) + 1 else v)
-        decodeHuffJ (Huff counts syms _) = go 1 0 0 0
-          where go len code first idx
-                  | len > 16 = pure 0
-                  | otherwise = do
-                      b <- nextBit
-                      let code1 = (code `shiftL` 1) .|. b; cnt = counts A.! len
-                      if code1 - first < cnt then pure (syms A.! (idx + (code1 - first)))
-                      else go (len+1) code1 ((first+cnt) `shiftL` 1) (idx+cnt)
-        -- After a scan, advance the read position to the next real marker (skipping the
-        -- entropy stream's stuffed 0xFF00 and any RST markers).
-        syncToMarker = do
+    -- After a scan, advance to the next real marker (skipping the entropy
+    -- stream's stuffed 0xFF00 and any RST markers).
+    let syncToMarker = do
           p0 <- readArray st iPos
           let go p | p+1 >= BS.length bs = BS.length bs
                    | at bs p == 0xFF && at bs (p+1) /= 0
@@ -1019,16 +1061,16 @@ decodeJpegImage bs w h comps =
                 if eob > 0 then writeSTRef eobRef (eob-1) else loop k0
                 where loop k | k > se = pure ()
                              | otherwise = do
-                                 rs <- decodeHuffJ actbl
+                                 rs <- decodeHuffJ bs st actbl
                                  let r = rs `shiftR` 4; s = rs .&. 15
                                  if s == 0
                                    then if r < 15
-                                          then do extra <- getBitsJ r
+                                          then do extra <- getBitsJ bs st r
                                                   writeSTRef eobRef ((1 `shiftL` r) - 1 + extra)
                                           else loop (k+16)         -- ZRL: 16 zeros
                                    else do let k' = k + r
                                            if k' > se then pure () else do
-                                             v <- recv s
+                                             v <- recvJ bs st s
                                              writeArray coef (zpos boff k') (v `shiftL` al)
                                              loop (k'+1)
               acRefine coef boff actbl k0 = do
@@ -1037,7 +1079,7 @@ decodeJpegImage bs w h comps =
                     refineNZ k = do
                       v <- readArray coef (zpos boff k)
                       if v /= 0
-                        then do b <- nextBit
+                        then do b <- nextBitJ bs st
                                 when (b /= 0 && (v .&. p1) == 0) $
                                   writeArray coef (zpos boff k) (if v > 0 then v+p1 else v+m1)
                                 pure True
@@ -1048,17 +1090,17 @@ decodeJpegImage bs w h comps =
                   let outer = do
                         k <- readSTRef kRef
                         when (k <= se) $ do
-                          rs <- decodeHuffJ actbl
+                          rs <- decodeHuffJ bs st actbl
                           let r = rs `shiftR` 4; s = rs .&. 15
                           newRef <- newSTRef 0
                           rRef   <- newSTRef r
                           brk    <- newSTRef False
                           if s == 0
                             then when (r < 15) $ do                 -- start an EOB run
-                                   extra <- getBitsJ r
+                                   extra <- getBitsJ bs st r
                                    writeSTRef eobRef ((1 `shiftL` r) + extra)
                                    writeSTRef brk True
-                            else do b <- nextBit                    -- one new +-1 coefficient
+                            else do b <- nextBitJ bs st                    -- one new +-1 coefficient
                                     writeSTRef newRef (if b /= 0 then p1 else m1)
                           stop <- readSTRef brk
                           if stop then pure () else do
@@ -1094,13 +1136,13 @@ decodeJpegImage bs w h comps =
                 actbl <- readArray acT ta
                 when (ss == 0) $
                   if ah == 0
-                    then do t <- decodeHuffJ dctbl                  -- DC first
-                            diff <- recv t
+                    then do t <- decodeHuffJ bs st dctbl                  -- DC first
+                            diff <- recvJ bs st t
                             pv <- readArray preds ci
                             let dc = pv + diff
                             writeArray preds ci dc
                             writeArray coef boff (dc `shiftL` al)
-                    else do b <- nextBit                            -- DC refine
+                    else do b <- nextBitJ bs st                            -- DC refine
                             when (b /= 0) $ do
                               v <- readArray coef boff
                               writeArray coef boff (v .|. (1 `shiftL` al))

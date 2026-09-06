@@ -421,12 +421,16 @@ benchCsv path = do
   timed "  csvParseLines (buffer lines) alone" $ do
     -- Deep-forced: a Seq is element-lazy, so WHNF parses nothing (trap 2).
     let g = Csv.csvParseLines ',' (bufLines buf)
-        !n = foldl' (\ !a row -> foldl' (\ !b c -> b + T.length c) a row) (0 :: Int) g
+        !n = foldl' (\ !a row -> foldl' (\ !b c -> b + T.length c) a
+                                    (Csv.rowToList row)) (0 :: Int) g
     n `seq` pure ()
   vL <- timed "  mkCsvLines (parse + width cache)" $ do
     let v = Csv.mkCsvLines ',' (bufLines buf)
         !n = Csv.nRows v * Csv.nCols v
     n `seq` length (Csv.columnWidths v) `seq` pure v
+  timed "  csvToText (full table save materialisation)" $ do
+    let !n = T.length (Csv.csvToText vL)
+    n `seq` pure ()
   -- (No live-heap figure here: the text-parsed grid above is still reachable,
   -- so it would measure both. `bench csvlive FILE lines|text` retains exactly
   -- one path, which is what 0026's live/RSS numbers came from.)
@@ -492,8 +496,8 @@ benchCsv path = do
           || (Seq.length a == Seq.length b && and (zipWith sameRow (toList a) (toList b)))
         where
           sameRow r s = (fast && ptrEq r s)
-                        || (Seq.length r == Seq.length s
-                            && and (zipWith sameCell (toList r) (toList s)))
+                        || (Csv.rowLength r == Csv.rowLength s
+                            && and (zipWith sameCell (Csv.rowToList r) (Csv.rowToList s)))
           sameCell x y = (fast && ptrEq x y) || x == y
       refProbe lbl fast v = timed lbl $ do
         let !k = length [ () | i <- [1 :: Int .. 100]

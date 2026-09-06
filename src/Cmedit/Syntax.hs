@@ -1,15 +1,15 @@
 -- | Syntax highlighting. Each supported language has a lexer that turns a line
--- of text into one 'Tok' per character, threading a small 'HlState' across
--- lines so multi-line constructs (block comments, PostgreSQL dollar-quoted
--- strings, Python triple-quoted strings, Markdown fenced code, HTML comments)
--- are highlighted correctly. The renderer maps 'Tok's to colours.
+-- into compact 'TokRun's, threading a small 'HlState' across lines so
+-- multi-line constructs (block comments, PostgreSQL dollar-quoted strings,
+-- Python triple-quoted strings, Markdown fenced code, HTML comments) are
+-- highlighted correctly. 'lexLine' expands the runs for compatibility; the
+-- renderer consumes them directly.
 --
 -- 'HlCache' keeps the per-line lexer states between frames so the renderer
--- only lexes the visible window instead of a bounded look-back. The cache is
--- self-validating: it remembers the exact line 'Seq' it was computed from and
--- locates edits itself by comparison (pointer-equality first, so unchanged
--- shared lines cost one comparison), which means no buffer-editing code path
--- has to remember to invalidate it.
+-- only lexes the visible window instead of a bounded look-back. The general
+-- API self-validates against its remembered line 'Seq'; the renderer uses the
+-- editor's explicit document version and validates only through the requested
+-- viewport, preventing an accidental full-file comparison per frame.
 {-# LANGUAGE MagicHash #-}
 module Cmedit.Syntax
   ( Lang(..)
@@ -18,6 +18,9 @@ module Cmedit.Syntax
   , langForPath
   , initialState
   , lexLine
+  , TokRun(..)
+  , lexLineRuns
+  , expandTokRuns
   , maxHlLine
     -- * Comment syntax (Edit ▸ Toggle Comment)
   , CommentSyntax(..)
@@ -25,19 +28,22 @@ module Cmedit.Syntax
     -- * Cached highlighting state
   , HlCache
   , refreshHlCache
+  , refreshHlCacheFor
   , hlStateBefore
   , hlCoverage
+  , hlTokenRuns
   ) where
 
 import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace, isUpper, toLower)
 import Data.Foldable (toList)
-import Data.List (isPrefixOf)
+import Data.List (foldl', isPrefixOf)
 import qualified Cmedit.Zip as Zip
 import Data.Sequence (Seq)
 import qualified Data.Sequence as Seq
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Set as Set
+import qualified Data.Map.Strict as Map
 import GHC.Exts (isTrue#, reallyUnsafePtrEquality#)
 import System.FilePath (takeExtension)
 
@@ -52,6 +58,13 @@ data Tok
   | TkFunction | TkBuiltin | TkDecorator | TkTag | TkAttr
   | TkHeading | TkEmph | TkStrong | TkCode | TkLink | TkPunct
   | TkProperty       -- ^ Keys / properties (config keys, CSS properties).
+  deriving (Eq, Show)
+
+-- | A run of characters sharing one token class. The length is in buffer
+-- characters, not terminal cells. Keeping the lexer output in this form avoids
+-- allocating one list cell per character merely for the renderer to turn that
+-- list into another lookup structure.
+data TokRun = TokRun !Int !Tok
   deriving (Eq, Show)
 
 -- | Lexer state carried between lines for multi-line constructs.
@@ -148,26 +161,50 @@ maxHlLine = 20000
 
 -- | Lex one line, returning a token per character and the trailing state.
 lexLine :: Lang -> HlState -> Text -> ([Tok], HlState)
-lexLine _ st line
+lexLine lang st line =
+  let (runs, st') = lexLineRuns lang st line
+  in (expandTokRuns runs, st')
+
+-- | Compact lexer output used by rendering and by the highlight cache. The
+-- generic source-language lexers already discover runs, so retain them instead
+-- of expanding with @replicate@. The three positional lexers keep their
+-- established implementations and are compacted at their boundary; those
+-- views are read-only or line-oriented and, once cached, pay that conversion
+-- only when their text changes.
+lexLineRuns :: Lang -> HlState -> Text -> ([TokRun], HlState)
+lexLineRuns _ st line
   | T.length line > maxHlLine = ([], st)
-lexLine lang st line = case lang of
-  SQL      -> lexWith sqlStep st line
-  Python   -> lexWith pyStep st line
-  HTML     -> lexWith htmlStep st line
-  Markdown -> lexMarkdown st line
-  JS       -> lexWith jsStep st line
-  CSS      -> lexWith cssStep st line
-  Shell    -> lexWith shStep st line
-  JSON     -> lexWith jsonStep st line
-  YAML     -> lexWith yamlStep st line
-  TOML     -> lexWith tomlStep st line
-  INI      -> lexWith iniStep st line
-  FTL      -> lexWith ftlStep st line
-  Jinja    -> lexWith jinjaStep st line
-  Haskell  -> lexWith hsStep st line
-  CSV      -> lexCsv line
-  RTF      -> lexRtf line
-  Archive  -> lexArchive line
+lexLineRuns lang st line = case lang of
+  SQL      -> lexWithRuns sqlStep st line
+  Python   -> lexWithRuns pyStep st line
+  HTML     -> lexWithRuns htmlStep st line
+  Markdown -> compactResult (lexMarkdown st line)
+  JS       -> lexWithRuns jsStep st line
+  CSS      -> lexWithRuns cssStep st line
+  Shell    -> lexWithRuns shStep st line
+  JSON     -> lexWithRuns jsonStep st line
+  YAML     -> lexWithRuns yamlStep st line
+  TOML     -> lexWithRuns tomlStep st line
+  INI      -> lexWithRuns iniStep st line
+  FTL      -> lexWithRuns ftlStep st line
+  Jinja    -> lexWithRuns jinjaStep st line
+  Haskell  -> lexWithRuns hsStep st line
+  CSV      -> compactResult (lexCsv line)
+  RTF      -> compactResult (lexRtf line)
+  Archive  -> compactResult (lexArchive line)
+  where
+    compactResult (ts, st') = (compactTokens ts, st')
+
+-- | Expand compact runs for callers that require the historical one-token-per-
+-- character API.
+expandTokRuns :: [TokRun] -> [Tok]
+expandTokRuns = concatMap (\(TokRun n tok) -> replicate n tok)
+
+compactTokens :: [Tok] -> [TokRun]
+compactTokens = reverse . foldl' add []
+  where
+    add (TokRun n old : rest) tok | old == tok = TokRun (n + 1) old : rest
+    add acc tok = TokRun 1 tok : acc
 
 ------------------------------------------------------------------------------
 -- Cached lexer states
@@ -185,6 +222,9 @@ data HlCache = HlCache
   , hcStates    :: !(Seq HlState)  -- ^ Trusted end-of-line states, one per covered line.
   , hcTail      :: !(Seq HlState)  -- ^ Old end-of-line states kept for re-convergence.
   , hcTailFloor :: !Int            -- ^ Tail entries are adoptable only at indices >= this.
+  , hcVersion   :: !Int            -- ^ Explicit document version; negative for self-validating callers.
+  , hcTokens    :: !(Map.Map Int (Text, HlState, HlState, [TokRun]))
+                                    -- ^ Visible line, incoming/trailing state and compact tokens.
   } deriving (Show)
 
 -- GC can move objects between comparisons, so a pointer mismatch proves
@@ -196,7 +236,7 @@ sameText :: Text -> Text -> Bool
 sameText a b = ptrEq a b || a == b
 
 freshCache :: Lang -> Seq Text -> HlCache
-freshCache lang cur = HlCache lang cur Seq.empty Seq.empty 0
+freshCache lang cur = HlCache lang cur Seq.empty Seq.empty 0 (-1) Map.empty
 
 -- | Sync the cache with the buffer (locating any edits itself) and extend the
 -- trusted states to cover line @target@. O(1) when the buffer is untouched
@@ -204,6 +244,93 @@ freshCache lang cur = HlCache lang cur Seq.empty Seq.empty 0
 -- covered region.
 refreshHlCache :: Lang -> Seq Text -> Int -> Maybe HlCache -> HlCache
 refreshHlCache lang cur target mc = extendTo target (syncCache lang cur mc)
+
+-- | Editor-facing refresh with an explicit per-document edit version and a
+-- bounded token window. When the version is unchanged there is no buffer
+-- comparison at all. This is deliberately separate from 'refreshHlCache':
+-- tests and non-editor callers keep the self-validating API, while the hot
+-- frame path uses the counter that the editor already maintains as the honest
+-- description of whether document text changed.
+refreshHlCacheFor :: Lang -> Seq Text -> Int -> Int -> Int -> Maybe HlCache -> HlCache
+refreshHlCacheFor lang cur version first target mc =
+  fillTokens (max 0 first) target extended
+  where
+    synced = case mc of
+      Just c | hcLang c == lang && hcVersion c == version -> c
+      _ -> (syncCacheTo lang cur target mc) { hcVersion = version }
+    extended = extendToWithTokens target synced
+
+-- Extend lexer states while retaining the compact output produced along the
+-- way. A cached line whose text and incoming state still match supplies both
+-- its tokens and trailing state without running the lexer at all. This is the
+-- common cursor-move case and, after a local edit, the re-converged suffix of
+-- the viewport.
+extendToWithTokens :: Int -> HlCache -> HlCache
+extendToWithTokens target c0 = go c0 (hcStates c0) prev0 start
+  where
+    n0 = Seq.length (hcStates c0)
+    prev0 = if n0 == 0 then initialState else Seq.index (hcStates c0) (n0 - 1)
+    start = toList (Seq.drop n0 (hcLines c0))
+    stop = min target (Seq.length (hcLines c0) - 1)
+    go c sts _ [] = c { hcStates = sts }
+    go c sts prev (ln : rest)
+      | Seq.length sts > stop = c { hcStates = sts }
+      | otherwise =
+          let i = Seq.length sts
+              (st', runs) = case Map.lookup i (hcTokens c) of
+                Just (oldLine, oldIn, oldOut, oldRuns)
+                  | sameText oldLine ln && oldIn == prev -> (oldOut, oldRuns)
+                _ -> let (newRuns, newOut) = lexLineRuns (hcLang c) prev ln
+                     in (newOut, newRuns)
+              toks' = Map.insert i (ln, prev, st', runs) (hcTokens c)
+          in go c { hcTokens = toks' } (sts Seq.|> st') st' rest
+
+-- The editor has an explicit document version, so on a changed version it
+-- only needs to validate cache entries that can affect the requested target.
+-- Keeping a previously trusted tail would require proving the entire suffix
+-- unchanged -- the O(file) scan that made the first token-cache prototype
+-- 3.7x slower on 200k-line files. Instead, preserve the equal prefix through
+-- @target@ and discard everything deeper. A later scroll extends from that
+-- trusted frontier over the current lines, so no unverified state is ever
+-- observed and edit-time work stays bounded by what the frame can use.
+syncCacheTo :: Lang -> Seq Text -> Int -> Maybe HlCache -> HlCache
+syncCacheTo lang cur _ Nothing = freshCache lang cur
+syncCacheTo lang cur target (Just c)
+  | hcLang c /= lang = freshCache lang cur
+  | otherwise =
+      let limit = max 0 (target + 1)
+          old = take limit (toList (hcLines c))
+          new = take limit (toList cur)
+          f = length (takeWhile (uncurry sameText) (zip old new))
+          keep = min f (Seq.length (hcStates c))
+      in HlCache lang cur (Seq.take keep (hcStates c)) Seq.empty 0 (-1)
+           (hcTokens c)
+
+-- Keep only the requested viewport. Entries are validated by both the source
+-- line and incoming state, so a one-line edit retains unaffected runs when the
+-- state re-converges; a stale entry can cost a re-lex but never correctness.
+fillTokens :: Int -> Int -> HlCache -> HlCache
+fillTokens first target c = c { hcTokens = go first kept }
+  where
+    lastL = min target (Seq.length (hcLines c) - 1)
+    kept = Map.filterWithKey (\i _ -> i >= first && i <= lastL) (hcTokens c)
+    go i acc
+      | i > lastL = acc
+      | otherwise =
+          let line = Seq.index (hcLines c) i
+              st = hlStateBefore c i
+              st' = Seq.index (hcStates c) i
+          in case Map.lookup i acc of
+               Just (oldLine, oldSt, oldOut, _)
+                 | sameText oldLine line && oldSt == st && oldOut == st' -> go (i + 1) acc
+               _ -> let (runs, out) = lexLineRuns (hcLang c) st line
+                    in go (i + 1) (Map.insert i (line, st, out, runs) acc)
+
+-- | Compact tokens cached for a line in the most recently requested window.
+hlTokenRuns :: HlCache -> Int -> [TokRun]
+hlTokenRuns c i = case Map.lookup i (hcTokens c) of
+  Just (_, _, _, runs) -> runs
+  Nothing              -> []
 
 -- | The lexer state at the start of line @i@. Only meaningful when a
 -- 'refreshHlCache' covered line @i-1@; anything else gets 'initialState'.
@@ -241,7 +368,8 @@ syncCache lang cur (Just c)
             | not singleLine = (Seq.empty, 0)
             | Seq.length (hcStates c) >= Seq.length (hcTail c) = (hcStates c, f)
             | otherwise = (hcTail c, max (hcTailFloor c) f)
-      in HlCache lang cur (Seq.take f (hcStates c)) tl fl
+      in HlCache lang cur (Seq.take f (hcStates c)) tl fl (-1)
+           (Map.filterWithKey (\i _ -> i < f) (hcTokens c))
 
 -- Lex forward until line @target@ is covered, adopting the old tail when the
 -- computed state re-converges with it.
@@ -259,7 +387,7 @@ extendTo target c0 = start c0
       | Seq.length sts > stop = c { hcStates = sts }
       | otherwise =
           let i   = Seq.length sts
-              st' = snd (lexLine (hcLang c) prev ln)
+              st' = snd (lexLineRuns (hcLang c) prev ln)
               tl  = hcTail c
           in if i >= hcTailFloor c && i + 1 < Seq.length tl && Seq.index tl i == st'
                then start c { hcStates = (sts Seq.|> st') Seq.>< Seq.drop (i + 1) tl
@@ -273,15 +401,20 @@ extendTo target c0 = start c0
 -- (count, token for those chars, new state).
 type Step = HlState -> String -> (Int, Tok, HlState)
 
-lexWith :: Step -> HlState -> Text -> ([Tok], HlState)
-lexWith step st0 line = loop st0 (T.unpack line)
+-- The lexer steps already return a run length. Accumulate those runs directly,
+-- coalescing adjacent steps with the same token class; this is the allocation
+-- saved by the renderer path.
+lexWithRuns :: Step -> HlState -> Text -> ([TokRun], HlState)
+lexWithRuns step st0 line = loop st0 (T.unpack line) []
   where
-    loop st [] = ([], st)
-    loop st cs =
+    loop st [] acc = (reverse acc, st)
+    loop st cs acc =
       let (n, tok, st') = step st cs
           n' = max 1 (clampLen n cs)
-          (rest, stEnd) = loop st' (drop n' cs)
-      in (replicate n' tok ++ rest, stEnd)
+          acc' = case acc of
+            TokRun k old : rest | old == tok -> TokRun (k + n') old : rest
+            _                                -> TokRun n' tok : acc
+      in loop st' (drop n' cs) acc'
 
 -- @min n (length xs)@, stopping as soon as @n@ elements have been seen. The
 -- clamp exists to survive a step that over-reports its count; measuring the

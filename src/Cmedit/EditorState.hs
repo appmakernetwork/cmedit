@@ -142,7 +142,7 @@ data Document = Document
   , docRtf           :: !(Maybe RtfDoc)   -- ^ Formatted read-only view when this doc is an RTF file being shown as a document.
   , docPdf           :: !(Maybe PdfDoc)   -- ^ Reading view when this doc is a PDF.
   , docSheets        :: !(Maybe Workbook) -- ^ Workbook when this doc is an @.xlsx@ (the sheets; the showing one lives in 'docCsv').
-  , docHlCache       :: !(Maybe HlCache)  -- ^ Cached syntax-highlight lexer states (perf only; self-validating).
+  , docHlCache       :: !(Maybe HlCache)  -- ^ Cached syntax-highlight states/runs (perf only; keyed by 'docDocSeq').
   , docDiags         :: ![Diag]           -- ^ Latest linter diagnostics for this doc (sorted by line,col; @[]@ until a lint pass posts).
   , docDocId         :: !Int              -- ^ Stable per-document id; names this document's journal while it is untitled ('Cmedit.Journal.journalFileName'). See 'edDocId'.
   , docDocSeq        :: !Int              -- ^ This document's own edit counter (see 'edDocSeq').
@@ -261,7 +261,7 @@ data Editor = Editor
   , edRtf           :: !(Maybe RtfDoc)  -- ^ Formatted RTF view, when the active doc is an @.rtf@ shown as a document rather than as its markup (a fifth view mode; see "Cmedit.Rtf"). Read-only and derived: the buffer stays the document and is the only thing saved.
   , edSheets        :: !(Maybe Workbook) -- ^ Open workbook, when the active doc is an @.xlsx@ (see "Cmedit.Xlsx"). The showing sheet is an ordinary 'edCsv' table view, so the renderer, key handler and scroll bars need to know nothing about workbooks; this holds the other sheets and marks the view read-only.
   , edPdf           :: !(Maybe PdfDoc)  -- ^ PDF reading view, when the active doc is a PDF (a sixth view mode; see "Cmedit.Pdf"). Like the image view and unlike the RTF one it has no buffer at all: the file is binary, so there is nothing to toggle to and nothing to save.
-  , edHlCache       :: !(Maybe HlCache) -- ^ Cached syntax-highlight lexer states for the active doc (perf only; self-validating against the buffer).
+  , edHlCache       :: !(Maybe HlCache) -- ^ Cached syntax-highlight states/runs for the active doc (perf only; keyed by 'edDocSeq').
   , edRecent        :: ![RecentEntry]   -- ^ Recently-opened files, most recent first (global; persisted by the driver).
   , edDetectedDark  :: !(Maybe Bool)    -- ^ OSC 11 verdict: the terminal background is dark (drives @theme = auto@; Nothing until the terminal answers).
   , edCellPx        :: !(Maybe (Int, Int)) -- ^ One character cell's (width, height) in pixels, when the terminal reported it (image aspect ratio).

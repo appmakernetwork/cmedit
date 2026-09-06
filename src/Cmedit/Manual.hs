@@ -156,7 +156,7 @@ manualText = T.unlines
   , "files were last seen on disk -- never any file content. Unnamed"
   , "buffers are not in it; their text is the journal's job."
   , ""
-  , "The File menu lists your most recent sessions too, just above the"
+  , "The File menu lists your most recent project folders too, just above the"
   , "recent files: `website (6 files)`, and so on, up to four of them."
   , "Choosing one restores it into the editor you are already running --"
   , "its folder opens, its files join whatever you already had open, and"

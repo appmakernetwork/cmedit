@@ -11,6 +11,10 @@ module Cmedit.Csv
   , csvParse
   , csvParseLines
     -- * Dimensions / access
+  , Row
+  , rowFromList
+  , rowToList
+  , rowLength
   , nRows
   , nCols
   , cellAt
@@ -103,15 +107,136 @@ import qualified Data.Sequence as Seq
 import Data.Text (Text)
 import qualified Data.Text as T
 import Control.Monad (forM_, when)
-import Data.Array.Unboxed (elems)
+import Control.Monad.ST (ST, runST)
+import Data.Array.Unboxed (UArray, elems)
+import qualified Data.Array.Unboxed as UA
+import qualified Data.Array as A
 import Data.Array.ST (STUArray, newArray, readArray, writeArray, runSTUArray)
+import Data.Array.MArray (freeze)
 
 import Cmedit.Types (Dir(..), ptrEq)
 import Cmedit.History (pushHist)
 import Cmedit.Width (charWidth, isInvisibleFormat)
 
-type Row  = Seq Text
+-- | A persistent CSV row. Ordinary loaded cells are source spans in compact
+-- unboxed arrays; edits are a sparse immutable overlay. This removes a Text
+-- header and finger-tree node per cell without turning an edit of an
+-- exceptionally wide row into an O(columns) array copy. Structural operations
+-- rebuild the row, which is already their whole-row cost.
+data Row
+  = PackedRow !Text !Int !(UArray Int Int) ![(Int, Text)] !(Map Int Text)
+    -- ^ Source line, packed (start,length) pairs, exceptional decoded values,
+    -- clamped display widths and edits. Exceptional values are rare (doubled
+    -- quotes / tolerated post-quote text). The second descriptor Int packs the
+    -- length and six-bit display width together. Caching the width avoids
+    -- rebuilding a Text slice for every cell during the mandatory load-time
+    -- width scan.
+  | OwnedRow !(A.Array Int Text) !(Map Int Text)
+    -- ^ Fallback for multiline records, pasted grids and workbook producers.
 type Grid = Seq Row
+
+rowFromList :: [Text] -> Row
+rowFromList xs = force xs `seq` OwnedRow (A.listArray (0, n - 1) xs) Map.empty
+  where
+    n = length xs
+    force [] = ()
+    force (t : ts) = t `seq` force ts
+
+rowFromSeq :: Seq Text -> Row
+rowFromSeq = rowFromList . toList
+
+rowToList :: Row -> [Text]
+rowToList row = [ rowIndex i row | i <- [0 .. rowLength row - 1] ]
+
+rowLength :: Row -> Int
+rowLength (PackedRow _ n _ _ _) = n
+rowLength (OwnedRow a _) = let (lo, hi) = A.bounds a in max 0 (hi - lo + 1)
+
+rowLookup :: Int -> Row -> Maybe Text
+rowLookup i row
+  | i < 0 || i >= rowLength row = Nothing
+  | otherwise = Just $ case row of
+      PackedRow src _ spans special edits ->
+        let start = spans UA.! (2 * i)
+            len = spans UA.! (2 * i + 1) `div` 64
+            packed | start >= 0 = T.take len (T.drop start src)
+                   | otherwise = fromMaybe T.empty (lookup i special)
+        in Map.findWithDefault packed i edits
+      OwnedRow a edits -> Map.findWithDefault (a A.! i) i edits
+
+rowIndex :: Int -> Row -> Text
+rowIndex i row = fromMaybe T.empty (rowLookup i row)
+
+rowUpdate :: Int -> Text -> Row -> Row
+rowUpdate i t row
+  | i < 0 || i >= rowLength row = row
+  | old == t = row
+  | t == base = setEdits (Map.delete i edits)
+  | otherwise = setEdits (Map.insert i t edits)
+  where
+    base = rowBaseAt i row
+    edits = rowEdits row
+    old = Map.findWithDefault base i edits
+    setEdits es = case row of
+      PackedRow src n spans special _ -> PackedRow src n spans special es
+      OwnedRow a _                  -> OwnedRow a es
+
+rowBaseAt :: Int -> Row -> Text
+rowBaseAt i (PackedRow src _ spans special _) =
+  let start = spans UA.! (2 * i)
+      len = spans UA.! (2 * i + 1) `div` 64
+  in if start >= 0 then T.take len (T.drop start src)
+                   else fromMaybe T.empty (lookup i special)
+rowBaseAt i (OwnedRow a _) = a A.! i
+
+rowEdits :: Row -> Map Int Text
+rowEdits (PackedRow _ _ _ _ edits) = edits
+rowEdits (OwnedRow _ edits) = edits
+
+rowInsertAt :: Int -> Text -> Row -> Row
+rowInsertAt i t row = rowFromList (take at xs ++ t : drop at xs)
+  where
+    xs = rowToList row
+    at = max 0 (min i (length xs))
+
+rowDeleteAt :: Int -> Row -> Row
+rowDeleteAt i row
+  | i < 0 || i >= rowLength row = row
+  | otherwise = rowFromList (take i xs ++ drop (i + 1) xs)
+  where xs = rowToList row
+
+rowPadTo :: Int -> Row -> Row
+rowPadTo n row
+  | rowLength row >= n = row
+  | otherwise = rowFromList (rowToList row ++ replicate (n - rowLength row) T.empty)
+
+instance Eq Row where
+  a == b = ptrEq a b || rowLength a == rowLength b && go 0
+    where
+      n = rowLength a
+      go i | i >= n = True
+           | otherwise = let x = rowIndex i a; y = rowIndex i b
+                         in (ptrEq x y || x == y) && go (i + 1)
+
+instance Show Row where
+  showsPrec d = showsPrec d . rowToList
+
+rowFoldl' :: (a -> Text -> a) -> a -> Row -> a
+rowFoldl' f z row = go 0 z
+  where
+    n = rowLength row
+    go i !acc | i >= n = acc
+              | otherwise = go (i + 1) (f acc (rowIndex i row))
+
+-- The width recorded by the parser for an untouched packed cell. Edited cells
+-- and producer-owned rows use the ordinary Text fold. Widths are display-
+-- clamped to 32, so the descriptor's low six bits are exact.
+rowWidthAt :: Int -> Row -> Int
+rowWidthAt i (PackedRow _ _ spans _ edits) =
+  case Map.lookup i edits of
+    Just t  -> clampW (cellWidth t)
+    Nothing -> spans UA.! (2 * i + 1) `mod` 64
+rowWidthAt i row = clampW (cellWidth (rowIndex i row))
 
 -- | The full table-view state for one CSV document.
 data CsvView = CsvView
@@ -179,7 +304,7 @@ maxUndo = 500
 
 -- | Build a table view from CSV text, using the given delimiter.
 mkCsvView :: Char -> Text -> CsvView
-mkCsvView delim t = mkCsvGrid delim (csvParse delim t)
+mkCsvView delim t = mkCsvRows delim (csvParse delim t)
 
 -- | Build a table view from a grid somebody else produced.
 --
@@ -189,9 +314,12 @@ mkCsvView delim t = mkCsvGrid delim (csvParse delim t)
 -- What it does /not/ get is a way back: 'csvToText' would serialise a
 -- workbook's sheet to CSV, which is not what its file is, so the views built
 -- this way are marked read-only by the editor and never saved.
-mkCsvGrid :: Char -> Grid -> CsvView
-mkCsvGrid delim rows0 =
-  let rows  = if Seq.null rows0 then Seq.singleton (Seq.singleton T.empty) else rows0
+mkCsvGrid :: Char -> Seq (Seq Text) -> CsvView
+mkCsvGrid delim rows0 = mkCsvRows delim (fmap rowFromSeq rows0)
+
+mkCsvRows :: Char -> Grid -> CsvView
+mkCsvRows delim rows0 =
+  let rows  = if Seq.null rows0 then Seq.singleton (rowFromList [T.empty]) else rows0
   in CsvView
        { csvRows = rows, csvCurRow = 0, csvCurCol = 0, csvTop = 0, csvLeft = 0
        , csvXOff = 0
@@ -205,15 +333,90 @@ mkCsvGrid delim rows0 =
 csvToText :: CsvView -> Text
 csvToText v =
   T.intercalate (T.pack "\n")
-    [ T.intercalate (T.singleton (csvDelim v)) (map (quoteField (csvDelim v)) (toList row))
+    [ serialRow (csvDelim v) row
     | row <- toList (csvRows v) ]
+
+-- Most loaded rows are already exactly how the canonical serializer would
+-- spell them. Reusing that source avoids manufacturing every cell merely to
+-- join it back into the same row. Descriptor signs distinguish decoded
+-- exceptions, and the span positions are enough to classify ordinary fields
+-- during save without burdening the load path with more retained metadata.
+serialRow :: Char -> Row -> Text
+serialRow delim row@(PackedRow src _ _ _ edits) | Map.null edits =
+  case packedPatch delim src of
+    NoPatch -> src
+    OnePatch col start len ->
+      T.concat [ T.take start src, quoteField delim (rowIndex col row)
+               , T.drop (start + len) src ]
+    ManyPatches -> full
+  where
+    full = T.intercalate (T.singleton delim)
+             (map (quoteField delim) (rowToList row))
+serialRow delim row =
+  T.intercalate (T.singleton delim) (map (quoteField delim) (rowToList row))
+
+data RowPatch = NoPatch | OnePatch !Int !Int !Int | ManyPatches
+
+-- One allocation-free pass over the raw row determines whether canonical CSV
+-- would spell each field identically. This keeps canonicalisation work out of
+-- table opening while avoiding a Text slice and scan for every cell at save.
+packedPatch :: Char -> Text -> RowPatch
+packedPatch delim src = finish (T.foldl' step (PatchScan 0 0 0 ScanPlain NoPatch) src)
+  where
+    step (PatchScan i col start mode patch) c = case mode of
+      ScanPlain
+        | c == delim -> next i col start True patch
+        | c == '"' && i == start -> PatchScan (i + 1) col start (ScanQuoted False) patch
+        | c == '"' -> PatchScan (i + 1) col start ScanPlainQuote patch
+        | otherwise -> PatchScan (i + 1) col start ScanPlain patch
+      ScanPlainQuote
+        | c == delim -> next i col start False patch
+        | otherwise -> PatchScan (i + 1) col start ScanPlainQuote patch
+      ScanQuoted needs
+        | c == '"' -> PatchScan (i + 1) col start (ScanClosed needs) patch
+        | otherwise -> PatchScan (i + 1) col start
+                         (ScanQuoted (needs || c == delim)) patch
+      ScanClosed needs
+        | c == '"' -> PatchScan (i + 1) col start (ScanQuoted True) patch
+        | c == delim -> next i col start needs patch
+        | otherwise -> PatchScan (i + 1) col start ScanStray patch
+      ScanStray
+        | c == delim -> next i col start False patch
+        | otherwise -> PatchScan (i + 1) col start ScanStray patch
+
+    next i col start canonical patch =
+      PatchScan (i + 1) (col + 1) (i + 1) ScanPlain
+        (record canonical col start (i - start) patch)
+
+    finish (PatchScan end col start mode patch) =
+      let canonical = case mode of
+            ScanPlain        -> True
+            ScanPlainQuote   -> False
+            ScanQuoted _     -> False  -- unreachable for a PackedRow
+            ScanClosed needs -> needs
+            ScanStray        -> False
+      in record canonical col start (end - start) patch
+
+    record True _ _ _ patch = patch
+    record False col start len NoPatch = OnePatch col start len
+    record False _ _ _ _ = ManyPatches
+
+data PatchScan = PatchScan !Int !Int !Int !PatchMode !RowPatch
+data PatchMode
+  = ScanPlain
+  | ScanPlainQuote
+  | ScanQuoted !Bool
+  | ScanClosed !Bool
+  | ScanStray
 
 quoteField :: Char -> Text -> Text
 quoteField delim f
-  | needs     = T.concat [T.pack "\"", T.replace (T.pack "\"") (T.pack "\"\"") f, T.pack "\""]
+  | fieldNeedsQuote delim f =
+      T.concat [T.pack "\"", T.replace (T.pack "\"") (T.pack "\"\"") f, T.pack "\""]
   | otherwise = f
-  where
-    needs = T.any (\c -> c == delim || c == '"' || c == '\n' || c == '\r') f
+
+fieldNeedsQuote :: Char -> Text -> Bool
+fieldNeedsQuote delim = T.any (\c -> c == delim || c == '"' || c == '\n' || c == '\r')
 
 -- | Parse CSV text into a grid of cells (RFC 4180-ish: quoted fields, @\"\"@
 -- escapes, embedded delimiters and newlines).
@@ -253,7 +456,7 @@ csvParseLines delim = parseFrom delim . toList
 
 -- | The table view for a buffer's lines. 'mkCsvView' is this over 'csvParse'.
 mkCsvLines :: Char -> Seq Text -> CsvView
-mkCsvLines delim ls = mkCsvGrid delim (csvParseLines delim ls)
+mkCsvLines delim ls = mkCsvRows delim (csvParseLines delim ls)
 
 -- The parser proper. The input is a cursor into a list of lines: the
 -- unconsumed remainder of the current line, and the lines after it. The
@@ -292,13 +495,13 @@ parseFrom delim ls0 = Seq.fromList (rows (mkCur ls0))
 
     -- 'rows' is entered at the start of a record, which is the start of a line
     -- except after a lone CR mid-line (which ends a record where it stands).
-    -- The fast path is right either way: it says "this record is the rest of
-    -- the cursor's line", and a record does end at the line end unless a quote
-    -- or a CR intervenes — which is exactly what 'plain' rules out.
+    -- A self-contained physical line is retained as one compact packed row.
+    -- Multiline quotes and CR-split records fall through to the general cursor
+    -- parser, which preserves all of the historical lenient edge cases.
     rows c@(Cur cur rest)
       | atEnd c = []
-      | plain cur =
-          fastRow cur :
+      | not (T.any (== '\r') cur), Just row <- packedSingle delim cur =
+          row :
             (case rest of
                []       -> []
                (l : ls) -> let c' = Cur l ls in if atEnd c' then [] else rows c')
@@ -306,24 +509,12 @@ parseFrom delim ls0 = Seq.fromList (rows (mkCur ls0))
           let (row, c', more) = oneRow c
           in row : if more then rows c' else []
 
-    -- No quoting and no embedded CR: the record is exactly this line's fields.
-    plain = not . T.any (\ch -> ch == '"' || ch == '\r')
-
-    -- @Seq.fromList . T.split (== delim)@, but strict: 'T.split' returns a
-    -- lazy list whose tail thunks cost more than the cells they defer, and the
-    -- bang is what keeps a parsed cell from being a selector thunk on the
-    -- 'T.break' pair.
-    fastRow t0 = mkRow (go t0 [])
-      where go t acc = case T.break (== delim) t of
-              (!f, r) | T.null r  -> f : acc
-                      | otherwise -> go (T.tail r) (f : acc)
-
     oneRow c0 = collect c0 []
     collect c acc = case field c of
       FDelim   f c' -> collect c' (f : acc)
       FNewline f c' -> (mkRow (f : acc), c', not (atEnd c'))
       FEof     f c' -> (mkRow (f : acc), c', False)
-    mkRow acc = Seq.fromList (reverse acc)
+    mkRow acc = rowFromList (reverse acc)
 
     field c@(Cur cur rest)
       | not (T.null cur), T.head cur == '"' = quoted (Cur (T.tail cur) rest) []
@@ -386,6 +577,103 @@ nlText, quoteText :: Text
 nlText    = T.singleton '\n'
 quoteText = T.singleton '"'
 
+-- Parse one physical record into packed source spans. 'Nothing' means a quote
+-- crosses the line boundary, so the general cursor parser must take over.
+-- A simple field retains only two unboxed Ints; doubled quotes and tolerated
+-- text after a closing quote keep their decoded value in the sparse exception
+-- list. The source line itself is shared with the editor buffer.
+packedSingle :: Char -> Text -> Maybe Row
+packedSingle delim src
+  | cap > maxPackedFields = Nothing
+  | T.length src > maxBound `div` 64 = Nothing
+  | otherwise = build cap
+  where
+    -- Counting raw delimiters can overestimate when a quoted value contains
+    -- one, but never underestimates. It is a tight, allocation-free primitive
+    -- for ordinary rows and avoids a second state-machine pass. Extremely wide
+    -- or delimiter-heavy rows take the owned fallback rather than overallocate.
+    cap = T.count (T.singleton delim) src + 1
+    maxPackedFields = 4096
+    build n = runST (buildST n)
+    buildST :: forall s. Int -> ST s (Maybe Row)
+    buildST n = do
+      a <- newArray (0, 2 * n - 1) 0 :: ST s (STUArray s Int Int)
+      result <- fields a 0 0 src []
+      case result of
+        Nothing -> pure Nothing
+        Just (actual, special) -> do
+          spans <- freeze a
+          let row = PackedRow src actual spans (reverse special) Map.empty
+          -- Keep sparse exception lookup and raw-delimiter overestimation
+          -- bounded. A deliberately adversarial row becomes owned instead of
+          -- making later access quadratic or retaining a mostly-empty array.
+          pure (Just (if length special <= 32 && n <= max 32 (actual * 4) then row
+                      else rowFromList (rowToList row)))
+
+    putDesc a col start len t = do
+      writeArray a (2 * col) start
+      writeArray a (2 * col + 1) (len * 64 + clampW (cellWidth t))
+
+    fields a !col !pos rest special
+      | T.null rest = do
+          putDesc a col pos 0 T.empty
+          pure (Just (col + 1, special))
+      | T.head rest == '"' = quoted a col (pos + 1) (T.tail rest)
+                               pos [] False special
+      | otherwise =
+          let (!val, r) = T.break (== delim) rest
+              n = T.length val
+          in do
+            putDesc a col pos n val
+            if T.null r
+              then pure (Just (col + 1, special))
+              else fields a (col + 1) (pos + n + 1) (T.tail r)
+                     special
+
+    quoted a !col !segPos rest !rawStart pieces complex special =
+      let (!seg, r) = T.break (== '"') rest
+          n = T.length seg
+      in if T.null r
+           then pure Nothing
+           else let afterQuote = T.tail r
+                in if not (T.null afterQuote) && T.head afterQuote == '"'
+                     then quoted a col (segPos + n + 2) (T.tail afterQuote)
+                            rawStart (quoteText : seg : pieces) True special
+                     else close a col segPos n afterQuote
+                                rawStart (seg : pieces) complex special
+
+    close a !col !segPos !segLen after !rawStart pieces complex special = do
+      let decoded = if complex then T.concat (reverse pieces)
+                               else T.take segLen (T.drop segPos src)
+          ordinaryEnd = T.null after || T.head after == delim
+          rawEnd | ordinaryEnd = T.length src - T.length after
+                 | otherwise = case T.break (== delim) after of
+                     (_, r) | T.null r -> T.length src
+                            | otherwise -> T.length src - T.length r
+          rawLen = rawEnd - rawStart
+          store start len val = do
+            putDesc a col start len val
+            pure ((col, val) : special)
+          storeSimple = do
+            putDesc a col segPos segLen (head pieces)
+            pure special
+      special' <- if ordinaryEnd
+                    then if complex then store (-1) 0 decoded else storeSimple
+                    else let (!stray, _) = T.break (== delim) after
+                         in store (-(rawStart + 2)) rawLen (decoded <> stray)
+      if T.null after
+        then pure (Just (col + 1, special'))
+        else if T.head after == delim
+          then let consumed = T.length src - T.length after + 1
+               in fields a (col + 1) consumed (T.tail after)
+                    special'
+          else let (_, r) = T.break (== delim) after
+               in if T.null r
+                    then pure (Just (col + 1, special'))
+                    else let consumed = T.length src - T.length r + 1
+                         in fields a (col + 1) consumed (T.tail r)
+                              special'
+
 ------------------------------------------------------------------------------
 -- Dimensions / access
 
@@ -400,10 +688,10 @@ nCols v = max 1 (Seq.length (csvWidths v))
 rowAt :: Int -> CsvView -> Row
 rowAt r v = case Seq.lookup r (csvRows v) of
   Just row -> row
-  Nothing  -> Seq.empty
+  Nothing  -> rowFromList []
 
 cellAt :: Int -> Int -> CsvView -> Text
-cellAt r c v = case Seq.lookup c (rowAt r v) of
+cellAt r c v = case rowLookup c (rowAt r v) of
   Just t  -> t
   Nothing -> T.empty
 
@@ -459,27 +747,26 @@ clampUserW w = max 2 (min 200 w)
 -- per grid cell is 2.7 million cons cells on a 32 MB table, for nothing.
 computeWidths :: Grid -> Seq Int
 computeWidths rows =
-  let cols = max 1 (foldl' (\ !m row -> max m (Seq.length row)) 0 rows)
+  let cols = max 1 (foldl' (\ !m row -> max m (rowLength row)) 0 rows)
   in Seq.fromList (elems (runSTUArray (do
        a <- newArray (0, cols - 1) (clampW 1)
        forM_ rows $ \row ->
-         let go !_ [] = pure ()
-             go !c (cell : rest)
-               | c >= cols = pure ()
+         let go !c
+               | c >= rowLength row || c >= cols = pure ()
                | otherwise = do
-                   let w = clampW (cellWidth cell)
+                   let w = rowWidthAt c row
                    old <- readArray a c
                    when (w > old) (writeArray a c w)
-                   go (c + 1) rest
-         in go (0 :: Int) (toList row)
+                   go (c + 1)
+         in go (0 :: Int)
        pure a)))
 
 -- The true width of one column (for when an edit shrinks a cell that may have
 -- been the column's widest).
 colWidth :: Grid -> Int -> Int
 colWidth rows c =
-  clampW (maximum (1 : [ cellWidth cell | row <- toList rows
-                                        , Just cell <- [Seq.lookup c row] ]))
+  maximum (clampW 1 : [ rowWidthAt c row | row <- toList rows
+                                         , c < rowLength row ])
 
 -- | Carry the column-width cache across a grid change. Pointer-equal rows and
 -- cells are skipped (persistent 'Seq' updates share everything untouched), so
@@ -500,14 +787,16 @@ syncWidths old ws new
     rowsDiff [] [] acc = Just acc
     rowsDiff (o : os) (n : ns) acc
       | ptrEq o n = rowsDiff os ns acc
-      | Seq.length o /= Seq.length n = Nothing
-      | otherwise = rowsDiff os ns (cellDiffs (toList o) (toList n) 0 acc)
+      | rowLength o /= rowLength n = Nothing
+      | otherwise = rowsDiff os ns (cellDiffs o n 0 acc)
     rowsDiff _ _ acc = Just acc
-    cellDiffs [] [] _ acc = acc
-    cellDiffs (a : as) (b : bs) !c acc
-      | ptrEq a b || a == b = cellDiffs as bs (c + 1) acc
-      | otherwise           = cellDiffs as bs (c + 1) ((c, a, b) : acc)
-    cellDiffs _ _ _ acc = acc
+    cellDiffs a b !c acc
+      | c >= rowLength a = acc
+      | ptrEq x y || x == y = cellDiffs a b (c + 1) acc
+      | otherwise           = cellDiffs a b (c + 1) ((c, x, y) : acc)
+      where
+        x = rowIndex c a
+        y = rowIndex c b
     applyChanges changes =
       let upd (w, redo) (c, oldCell, newCell) =
             let cur  = maybe (clampW 1) id (Seq.lookup c w)
@@ -548,9 +837,12 @@ syncWidths old ws new
 
 -- | Newlines row @row@ contributes to the serialised CSV.
 rowNl :: Char -> Row -> Int
+rowNl delim (PackedRow _ n _ _ _)
+  | delim == '\n' = max 0 (n - 1)
+  | otherwise = 0
 rowNl delim row =
-  foldl' (\ !a c -> a + nlCount c) 0 row
-    + (if delim == '\n' then max 0 (Seq.length row - 1) else 0)
+  rowFoldl' (\ !a c -> a + nlCount c) 0 row
+    + (if delim == '\n' then max 0 (rowLength row - 1) else 0)
 
 -- | The whole map, from scratch. O(grid); runs on load and wherever a change
 -- cannot be carried.
@@ -626,17 +918,20 @@ dirtyFrom saved rows
   where
     go !n (r : rs) (s : ss)
       | ptrEq r s                      = go n rs ss
-      | Seq.length r /= Seq.length s   = DirtyShape
+      | rowLength r /= rowLength s     = DirtyShape
       | otherwise                      = go (n + rowDirty s r) rs ss
     go !n _ _ = DirtyCells n
 
 -- | How many cells of two same-length rows differ.
 rowDirty :: Row -> Row -> Int
-rowDirty a b = go 0 (toList a) (toList b)
+rowDirty a b = go 0 0
   where
-    go !n (x : xs) (y : ys) | ptrEq x y || x == y = go n xs ys
-                            | otherwise           = go (n + 1) xs ys
-    go !n _ _ = n
+    lim = min (rowLength a) (rowLength b)
+    go !n !i
+      | i >= lim = n
+      | otherwise =
+          let x = rowIndex i a; y = rowIndex i b
+          in go (if ptrEq x y || x == y then n else n + 1) (i + 1)
 
 -- | Carry the dirty state across a grid change — the twin of 'syncWidths', and
 -- with the same cost model: pointer-equal rows are skipped, so a change that
@@ -661,7 +956,7 @@ syncDirty saved d old new
     go !n !i (o : os) (w : ws)
       | ptrEq o w = go n (i + 1) os ws
       | otherwise = case Seq.lookup i saved of
-          Just sv | Seq.length w == Seq.length sv ->
+          Just sv | rowLength w == rowLength sv ->
                       go (n - rowDirty sv o + rowDirty sv w) (i + 1) os ws
                   | otherwise -> DirtyShape
           Nothing -> dirtyFrom saved new    -- invariant broken; recompute exactly
@@ -683,7 +978,7 @@ dirtyCell saved d grew r c old new rows'
       -- that, and the biconditional in 'CsvDirty' is what lets us say so
       -- without looking.
       DirtyShape   -> DirtyShape
-      DirtyCells n -> case Seq.lookup r saved >>= Seq.lookup c of
+      DirtyCells n -> case Seq.lookup r saved >>= rowLookup c of
         Nothing -> dirtyFrom saved rows'    -- invariant broken; recompute exactly
         Just sv -> DirtyCells (n - diffBit old sv + diffBit new sv)
   where
@@ -729,7 +1024,9 @@ cellLineCount t = 1 + T.count (T.pack "\n") t
 
 -- | The number of lines the tallest cell in a row actually has (uncapped).
 rowLineCount :: CsvView -> Int -> Int
-rowLineCount v r = maximum (1 : map cellLineCount (toList (rowAt r v)))
+rowLineCount v r = case rowAt r v of
+  PackedRow{} -> 1
+  row         -> maximum (1 : map cellLineCount (rowToList row))
 
 -- | On-screen height of a table row: its tallest cell, capped at 'maxCellLines'.
 rowHeight :: CsvView -> Int -> Int
@@ -795,13 +1092,13 @@ withRows f v =
 withCell :: Int -> Int -> Text -> CsvView -> CsvView
 withCell r c t v =
   let oldRow = Seq.lookup r (csvRows v)
-      old    = maybe T.empty (fromMaybe T.empty . Seq.lookup c) oldRow
+      old    = maybe T.empty (fromMaybe T.empty . rowLookup c) oldRow
       rows'  = setCell r c t (csvRows v)
       -- Did 'ensureCell' have to pad? Then the shape moved and the counts and
       -- widths both need recomputing. In practice the cursor is always inside
       -- the grid, so this never fires.
       grew   = case oldRow of
-                 Just row -> c < 0 || c >= Seq.length row
+                 Just row -> c < 0 || c >= rowLength row
                  Nothing  -> True
       ws    = csvWidths v
       wNew  = clampW (cellWidth t)
@@ -835,13 +1132,13 @@ ensureCell r c grid0 =
   where
     padRows n g
       | Seq.length g >= n = g
-      | otherwise = g <> Seq.replicate (n - Seq.length g) (Seq.singleton T.empty)
+      | otherwise = g <> Seq.replicate (n - Seq.length g) (rowFromList [T.empty])
     padCells n row
-      | Seq.length row >= n = row
-      | otherwise = row <> Seq.replicate (n - Seq.length row) T.empty
+      | rowLength row >= n = row
+      | otherwise = rowPadTo n row
 
 setCell :: Int -> Int -> Text -> Grid -> Grid
-setCell r c t grid = Seq.adjust' (Seq.update c t) r (ensureCell r c grid)
+setCell r c t grid = Seq.adjust' (rowUpdate c t) r (ensureCell r c grid)
 
 clampCursor :: CsvView -> CsvView
 clampCursor v =
@@ -1003,7 +1300,7 @@ hScrollTo x v =
 -- trailing delimiter that precedes field @c@.
 prefixSerial :: CsvView -> Int -> Int -> Text
 prefixSerial v r c =
-  let body = T.intercalate (delimT v) (map (quoteField (csvDelim v)) (take c (toList (rowAt r v))))
+  let body = T.intercalate (delimT v) (map (quoteField (csvDelim v)) (take c (rowToList (rowAt r v))))
   in if c > 0 then body <> delimT v else body
 
 delimT :: CsvView -> Text
@@ -1042,7 +1339,7 @@ textPosCell :: CsvView -> Int -> Int -> (Int, Int)
 textPosCell v line col =
   let n        = nRows v
       r        = clampI 0 (n - 1) (lastRowAtOrBefore n line)
-      fs       = map (quoteField (csvDelim v)) (toList (rowAt r v))
+      fs       = map (quoteField (csvDelim v)) (rowToList (rowAt r v))
       colStart = scanl (\acc f -> acc + T.length f + 1) 0 fs
       c        = clampI 0 (max 0 (length fs - 1)) (lastLE (dropLast colStart) col)
   in (r, c)
@@ -1173,7 +1470,7 @@ setCurrentCell t v = withCell (csvCurRow v) (csvCurCol v) t (snapshot v)
 -- find-and-replace, which therefore only ever touches cell *contents*, never
 -- the delimiters between them.
 mapCells :: (Text -> Text) -> CsvView -> CsvView
-mapCells f v = withRows (fmap (fmap f)) (snapshot v)
+mapCells f v = withRows (fmap (rowFromList . map f . rowToList)) (snapshot v)
 
 ------------------------------------------------------------------------------
 -- Rectangular cell selection
@@ -1233,7 +1530,7 @@ writeGridAt :: Int -> Int -> Grid -> CsvView -> CsvView
 writeGridAt r0 c0 cg v =
   clampCursor (setCells [ (r0 + i, c0 + j, t)
                         | (i, row) <- zip [0 ..] (toList cg)
-                        , (j, t)   <- zip [0 ..] (toList row) ] v)
+                        , (j, t)   <- zip [0 ..] (rowToList row) ] v)
 
 -- | Paste clipboard text per the selection, returning the new view and a status
 -- message. A single scalar fills a multi-cell selection (or sets one cell); a
@@ -1243,7 +1540,7 @@ pasteClip txt v =
   let body = T.dropWhileEnd (== '\n') txt
       clip = csvParse (csvDelim v) body
       cgR  = Seq.length clip
-      cgC  = maximum (1 : map Seq.length (toList clip))
+      cgC  = maximum (1 : map rowLength (toList clip))
       single = cgR <= 1 && cgC <= 1
       (r0, c0, r1, c1) = selRect v
       selR = r1 - r0 + 1; selC = c1 - c0 + 1
@@ -1261,7 +1558,7 @@ pasteClip txt v =
 -- Structure: rows and columns
 
 emptyRow :: CsvView -> Row
-emptyRow v = Seq.replicate (nCols v) T.empty
+emptyRow v = rowFromList (replicate (nCols v) T.empty)
 
 insertRowAbove :: CsvView -> CsvView
 insertRowAbove v =
@@ -1276,7 +1573,7 @@ insertRowBelow v =
 
 deleteRow :: CsvView -> CsvView
 deleteRow v
-  | nRows v <= 1 = withRows (const (Seq.singleton (Seq.singleton T.empty))) (snapshot v)
+  | nRows v <= 1 = withRows (const (Seq.singleton (rowFromList [T.empty]))) (snapshot v)
                      { csvCurRow = 0, csvCurCol = 0 }
   | otherwise =
       let v' = snapshot v
@@ -1286,9 +1583,7 @@ insertColAt :: Int -> CsvView -> CsvView
 insertColAt c v =
   let v' = snapshot v
       cols = nCols v
-      ins row = Seq.insertAt (min c (Seq.length row)) T.empty (padTo cols row)
-      padTo n row | Seq.length row >= n = row
-                  | otherwise = row <> Seq.replicate (n - Seq.length row) T.empty
+      ins row = rowInsertAt (min c (rowLength row)) T.empty (rowPadTo cols row)
       -- Width overrides follow their columns rightward past the insertion.
       userW = Map.mapKeysMonotonic (\k -> if k >= c then k + 1 else k) (csvUserW v)
   in (withRows (fmap ins) v') { csvUserW = userW }
@@ -1301,12 +1596,12 @@ insertColRight v = (insertColAt (csvCurCol v + 1) v) { csvCurCol = csvCurCol v +
 
 deleteCol :: CsvView -> CsvView
 deleteCol v
-  | nCols v <= 1 = withRows (fmap (const (Seq.singleton T.empty))) (snapshot v)
+  | nCols v <= 1 = withRows (fmap (const (rowFromList [T.empty]))) (snapshot v)
                      { csvCurCol = 0 }
   | otherwise =
       let v' = snapshot v
           c  = csvCurCol v
-          del row = if c < Seq.length row then Seq.deleteAt c row else row
+          del row = if c < rowLength row then rowDeleteAt c row else row
           -- Drop the deleted column's override; the rest follow their columns.
           userW = Map.mapKeysMonotonic (\k -> if k > c then k - 1 else k)
                     (Map.delete c (csvUserW v))
@@ -1380,7 +1675,7 @@ sortKeyOfTyped p t =
          Nothing -> Right (T.toCaseFold s) )
 
 cellIn :: Int -> Row -> Text
-cellIn c row = if c < Seq.length row then Seq.index row c else T.empty
+cellIn c row = if c < rowLength row then rowIndex c row else T.empty
 
 -- | Sort the rows by column @c@. @keepHeader@ pins row 0 (the frozen header).
 -- Undoable (one checkpoint), stable, and the cursor follows its row to the

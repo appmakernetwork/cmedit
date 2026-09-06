@@ -157,7 +157,8 @@ csvToPlain :: CsvView -> Editor -> Editor
 csvToPlain v0 ed =
   let v         = Csv.commitEdit v0          -- flush any in-cell edit (records its undo step)
       ed1       = ed { edBuffer = fromText (Csv.csvToText v), edCsv = Nothing
-                     , edCsvStash = Just v, edStatus = "Plain-text mode" }
+                     , edCsvStash = Just v, edHlCache = Nothing
+                     , edStatus = "Plain-text mode" }
       (ln, col) = Csv.cellTextPos v (Csv.csvCurRow v) (Csv.csvCurCol v)
       pos       = clampPos (Pos ln col) (edBuffer ed1)
       line      = getLine' (posLine pos) (edBuffer ed1)
@@ -1110,15 +1111,17 @@ sessionMenuMax = 4
 sessionsListed :: [SessionSummary] -> Editor -> Editor
 sessionsListed sums ed = ed { edSessions = sums }
 
--- | The sessions the File menu offers, in the order it offers them —
--- newest-'sumClosed' first, at most 'sessionMenuMax'.
+-- | The folder-backed sessions the File menu offers, in the order it offers
+-- them — newest-'sumClosed' first, at most 'sessionMenuMax'. A folderless
+-- session is still available to startup restore, but there is no project
+-- folder for its menu entry to reopen, so it is omitted here.
 --
--- Two filters, both deliberate. The __live session's own key is excluded__
+-- The __live session's own key is excluded__
 -- (offering to restore what is already open is noise), and the key is a
 -- function of the folder, so comparing folders /is/ comparing keys. And the
--- list is __de-duplicated by folder__ so a legacy folderless session that names
--- a folder now owning its own file does not appear twice — sorted first, so the
--- newer @closed:@ is the one kept.
+-- list is __de-duplicated by folder__ so a legacy session that names a folder
+-- now owning its own file does not appear twice — sorted first, so the newer
+-- @closed:@ is the one kept.
 --
 -- 'MARestoreSession' addresses this list by index, so the label and the action
 -- cannot disagree.
@@ -1126,7 +1129,9 @@ sessionMenuList :: Editor -> [SessionSummary]
 sessionMenuList ed =
   take sessionMenuMax (dedup [] (sortBy newestFirst others))
   where
-    others = [ s | s <- edSessions ed, sumFolder s /= explorerRoot ed ]
+    others = [ s | s <- edSessions ed
+                 , isJust (sumFolder s)
+                 , sumFolder s /= explorerRoot ed ]
     -- Descending, so an unstamped v1 file (Nothing, which sorts first
     -- ascending) lands last, which is what it deserves.
     newestFirst = comparing (Down . sumClosed)
