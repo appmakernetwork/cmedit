@@ -969,12 +969,22 @@ in `README.md`; the cross-cutting structure that matters when editing:
   using only boot libraries. GIF LZW, JPEG Huffman/IDCT, VP8L prefix
   codes/transforms, and the VP8 boolean decoder / intra prediction / loop
   filter are all hand-rolled, and DEFLATE lives next door in the leaf module
-  `Cmedit.Inflate` (`inflate` for a known output size, which PNG has;
-  `inflateDyn`, which grows its buffer, for PDF content streams, which declare
-  only their *compressed* length; `Huff`/`buildHuff` are shared with JPEG's
-  own canonical tables). The result is an RGBA `Image`, and `renderImage`
-  area-averages it down to a grid of half-block (`▀`, fg=top pixel / bg=bottom
-  pixel, 24-bit colour) or ASCII-ramp `Cell`s.
+  `Cmedit.Inflate` (`inflate` for a known output size; `inflateInto`, the
+  same into a caller's buffer at an offset, which is how PNG inflates into the
+  tail of its own output image and decodes in place; `inflateDyn`, which grows
+  its buffer, for PDF content streams, which declare only their *compressed*
+  length; `Huff`/`buildHuff` are shared with JPEG's own canonical tables, and
+  the prefix-table decoder with VP8L). The result is an RGBA `Image`, and
+  `renderImage` area-averages it down to a grid of half-block (`▀`, fg=top
+  pixel / bg=bottom pixel, 24-bit colour) or ASCII-ramp `Cell`s.
+  **The decoders are hot loops held to byte-identical output**, and
+  `docs/plans/completed/0032-image-decoders-round-2.md` records the GHC
+  patterns that decide their speed (an `Int` returned from a non-inlined `ST`
+  function is boxed; a local function capturing many variables is allocated
+  per call unless it is a join point; two monadic exits duplicate an inlined
+  continuation) plus every rejected experiment. Change one with
+  `docs/plans/bench/imgbench.sh` (compare the hash column against the old
+  build) and `docs/plans/bench/ImageFuzz.hs` (diff corrupt-input outcomes).
   Detection is by **magic bytes** in `App.openPath` (not extension): it sniffs
   the file, decodes images via `imageLoaded`/`imageLoadedNew`/`addImageDocument`,
   and surfaces a `setError` for anything it recognises but cannot decode (rather

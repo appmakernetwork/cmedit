@@ -49,6 +49,40 @@ live heap in one process — whichever runs first is still reachable — so it
 retains exactly one of them, alongside the buffer, which is the state the
 editor is actually in with a table open.
 
+## The image-decoder harness (0018, 0032)
+
+`ImageDecode.hs` decodes files and prints, per file, the decode's CPU time,
+the bytes allocated during it, the RTS's peak memory in use and an FNV-1a hash
+of every frame's RGBA (`FRAMES=1` decodes through `decodeFrames`, so an
+animated GIF's every frame counts). `imgbench.sh` builds it against any source
+tree and runs each file in fresh processes:
+
+```sh
+python3 docs/plans/bench/gen_images.py PHOTO.jpg /tmp/imgcorpus   # needs Pillow
+docs/plans/bench/imgbench.sh build src /tmp/ib-new
+docs/plans/bench/imgbench.sh build /path/to/old/src /tmp/ib-old
+docs/plans/bench/imgbench.sh run /tmp/ib-new 5 /tmp/imgcorpus/*
+```
+
+Comparing the hash column of two builds is the byte-identity check every
+change in 0032 was held to. The peak column is whole-process, so it includes
+the input file (and a 6 MB floor); read it as a difference between builds.
+`gen_images.py` writes one workload per format variant the decoders handle;
+it writes the interlaced PNG itself, because Pillow silently ignores
+`interlace=1`, and a corpus that only *claims* an interlaced file leaves the
+Adam7 path unmeasured.
+
+`ImageFuzz.hs` (build like `ImageDecode.hs`, ideally with `-fno-omit-yields`
+so its timeout can interrupt a non-allocating loop) decodes N seeded mutants
+of each input (byte overwrites, truncations, both) and prints one line per
+mutant: a hash, the error, `EXC` with the exception, or `TIMEOUT`. Run two
+builds over the same small inputs and diff the output: an optimisation must
+not change what a corrupt file decodes to, and the decoders' unchecked array
+access makes a crash show up as a missing tail. Run against the 0032 baseline
+it found two pre-existing hangs (a DEFLATE stream truncated at a block
+boundary; a GIF LZW dictionary with a cycle), both now fixed and pinned by
+Spec tests.
+
 ## The PTY probes
 
 `pty_startup.py` and `pty_rss.py` drive the real `./cmedit` binary over a

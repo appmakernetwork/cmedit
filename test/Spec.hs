@@ -16,6 +16,7 @@ import System.FilePath ((</>))
 import Control.Exception (SomeException, evaluate, try)
 import System.Exit (exitFailure, exitSuccess)
 import GHC.Clock (getMonotonicTime)
+import System.Timeout (timeout)
 import GHC.Stats (getRTSStats, getRTSStatsEnabled, gc, gcdetails_live_bytes)
 import System.Mem (performMajorGC)
 import qualified Data.ByteString as BS
@@ -855,6 +856,36 @@ main = do
       checkEq "webp ALPH left"  (pixelAt im 0 0) (198,51,33,255)
       checkEq "webp ALPH right" (pixelAt im 7 0) (18,62,197,40)
   check "truncated WebP -> error" (isLeft (decodeImage (BS.take 30 mkWebPLossy)))
+  -- ALPH scanline filters (1 horizontal, 2 vertical, 3 gradient), which the
+  -- decoder undoes in place: a known alpha plane, forward-filtered here into
+  -- a raw ALPH chunk around the 8x8 lossy frame, must come back exactly.
+  forM_ [1, 2, 3] $ \filt ->
+    case decodeImage (mkWebPFilteredAlpha filt) of
+      Left e   -> check ("webp ALPH filter " ++ show filt ++ ": " ++ e) False
+      Right im -> checkEq ("webp ALPH filter " ++ show filt ++ " alpha")
+                    [ a | y <- [0..7], x <- [0..7], let (_,_,_,a) = pixelAt im x y ]
+                    [ fromIntegral (alphaPlane8 x y) | y <- [0..7], x <- [0..7] ]
+  -- A corrupt GIF whose LZW dictionary loops on itself: code 7 arrives
+  -- before entry 7 exists (taken as the KwKwK case), the entry made next
+  -- names 7 as its prefix and *is* entry 7, and the stream then emits 7. The
+  -- old chain walk indexed past its stack (an exception, which takes the
+  -- editor down); the stream now ends there, keeping the five indices
+  -- decoded (all 0), and the rest of the frame is index 0 too.
+  let cyclicGif = BS.pack
+        [ 71,73,70,56,57,97, 4,0, 2,0, 0x81,0,0, 0,0,0, 255,0,0, 0,255,0, 0,0,255
+        , 0x2c, 0,0, 0,0, 4,0, 2,0, 0, 2, 3, 0xC4,0x7D,0x05, 0, 0x3b ]
+  rCyc <- try (evaluate (either (const []) (U.elems . imgPix) (decodeImage cyclicGif)))
+  checkEq "cyclic GIF LZW chain decodes without an exception"
+    (either (\e -> Left (show (e :: SomeException))) Right rCyc)
+    (Right (concat (replicate 8 [0,0,0,255])))
+  -- A DEFLATE stream that ends at a block boundary without a final block
+  -- must stop: past the end the padding reads as endless empty stored
+  -- blocks, which once hung the decoder (PNG, PDF and ZIP members alike).
+  let truncDeflate = BS.pack [0x78,0x01, 0x00, 0x00,0x00,0xff,0xff]
+  rTrunc <- timeout 5000000 (evaluate (either length BS.length (Inflate.inflateDyn truncDeflate 2 1000)))
+  checkEq "truncated DEFLATE terminates (dynamic)" rTrunc (Just 0)
+  rTrunc2 <- timeout 5000000 (evaluate (either length (const 0) (Inflate.inflate truncDeflate 2 1000)))
+  checkEq "truncated DEFLATE terminates (known size)" rTrunc2 (Just 0)
   -- A PNG with an invalid zlib header is reported as an error, not rendered.
   let badPng = BS.pack ([137,80,78,71,13,10,26,10]
                  ++ [0,0,0,13] ++ s "IHDR" ++ be32b 2 ++ be32b 2 ++ [8,2,0,0,0] ++ [0,0,0,0]
@@ -8714,6 +8745,35 @@ mkWebPLLA = BS.pack
   ]
 
 -- 8x8 lossy (VP8): left half (200,50,30), right half (20,60,200).
+-- The alpha plane 'mkWebPFilteredAlpha' encodes.
+alphaPlane8 :: Int -> Int -> Int
+alphaPlane8 x y = (x*37 + y*91 + x*y*13) `mod` 256
+
+-- 'mkWebPLossy' in a VP8X container with a raw (uncompressed) ALPH chunk
+-- whose rows are filtered with ALPH filter @filt@, the residuals computed
+-- here with the predictors of the WebP container spec.
+mkWebPFilteredAlpha :: Int -> BS.ByteString
+mkWebPFilteredAlpha filt = BS.pack (riff ++ le32 (length body) ++ body)
+  where
+    a = alphaPlane8
+    clampB v = max 0 (min 255 v)
+    predict x y
+      | x == 0 && y == 0 = 0
+      | filt == 1 = if x == 0 then a x (y-1) else a (x-1) y
+      | filt == 2 = if y == 0 then a (x-1) y else a x (y-1)
+      | x == 0    = a x (y-1)
+      | y == 0    = a (x-1) y
+      | otherwise = clampB (a (x-1) y + a x (y-1) - a (x-1) (y-1))
+    residuals = [ fromIntegral ((a x y - predict x y) `mod` 256) | y <- [0..7], x <- [0..7] ]
+    alph = fromIntegral (filt * 4) : residuals                 -- 65 bytes: pad to even
+    s = map (fromIntegral . fromEnum)
+    le32 :: Int -> [Word8]
+    le32 n = map (\k -> fromIntegral ((n `shiftR` (8*k)) .&. 0xff)) [0..3]
+    riff = s "RIFF"
+    vp8x = s "VP8X" ++ le32 10 ++ [0x10,0,0,0, 7,0,0, 7,0,0]
+    alphChunk = s "ALPH" ++ le32 (length alph) ++ alph ++ [0]
+    body = s "WEBP" ++ vp8x ++ alphChunk ++ BS.unpack (BS.drop 12 mkWebPLossy)
+
 mkWebPLossy :: BS.ByteString
 mkWebPLossy = BS.pack
   [ 82,73,70,70,76,0,0,0,87,69,66,80,86,80
