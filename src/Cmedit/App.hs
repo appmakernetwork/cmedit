@@ -1659,8 +1659,7 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
     -- Images and PDFs are *decoded* rather than read, so the work is out of
     -- proportion to the byte count: both go to the background thread far
     -- sooner than a text file does.
-    slow <- looksLikeDecoded cpath
-    let asyncBar = if slow then imageAsyncBytes else asyncThresholdBytes
+    asyncBar <- asyncThresholdFor cpath
     case msz of
       -- Big (but openable) files load on a background thread with a spinner, so
       -- the event loop keeps painting; small/new/oversized files resolve inline.
@@ -3054,11 +3053,13 @@ asyncThresholdBytes = 2 * 1024 * 1024
 imageAsyncBytes :: Integer
 imageAsyncBytes = 64 * 1024
 
--- | Does this file open into a view that has to *decode* it (an image, a PDF)
--- rather than simply read it? Those pay for their content, not their size,
--- so they cross to the background loader at a much lower threshold.
-looksLikeDecoded :: FilePath -> IO Bool
-looksLikeDecoded path = do
+-- | The size above which this file loads on the background thread. A file
+-- that opens into a view that has to *decode* it (an image, a PDF) pays for
+-- its content, not its size, so it crosses at 'imageAsyncBytes'; a JPEG XL
+-- crosses at any size, since its compression ratios are such that a 47 KB
+-- file can be a 16-megapixel picture taking seconds to decode.
+asyncThresholdFor :: FilePath -> IO Integer
+asyncThresholdFor path = do
   r <- try (withBinaryFile path ReadMode (\h -> BS.hGet h 1024))
          :: IO (Either SomeException BS.ByteString)
   -- An archive is here for the container reading views: listing one is two
@@ -3066,8 +3067,10 @@ looksLikeDecoded path = do
   -- their XML, which is decode cost by any measure. Sniffing cannot tell the
   -- two apart from the first kilobyte, so every archive crosses at the lower
   -- threshold; the cost of being wrong is a spinner nobody sees.
-  pure (either (const False)
-               (\bs -> isJust (sniffImage bs) || Pdf.sniffPdf bs || Z.zipMagic bs) r)
+  pure $ case r of
+    Right bs | sniffImage bs == Just "JPEG XL" -> -1
+             | isJust (sniffImage bs) || Pdf.sniffPdf bs || Z.zipMagic bs -> imageAsyncBytes
+    _ -> asyncThresholdBytes
 
 -- List a directory for the file browser as (fullPath, isDirectory, size) tuples
 -- (size is Nothing for directories). Unreadable directories yield an empty

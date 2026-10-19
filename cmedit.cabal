@@ -65,6 +65,12 @@ library
                       Cmedit.History
                       Cmedit.Lint
                       Cmedit.Inflate
+                      Cmedit.JxlBits
+                      Cmedit.JxlEntropy
+                      Cmedit.JxlModular
+                      Cmedit.JxlPar
+                      Cmedit.JxlVarDct
+                      Cmedit.Jxl
                       Cmedit.Image
                       Cmedit.Pager
                       Cmedit.Pdf

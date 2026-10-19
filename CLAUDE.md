@@ -362,7 +362,7 @@ in `README.md`; the cross-cutting structure that matters when editing:
   already-open case: it is read-only, so switching to the open copy is the
   only sane result. Parsing is the expensive part, so a PDF crosses to the
   background loader at `imageAsyncBytes` rather than `asyncThresholdBytes`
-  (`looksLikeDecoded` covers both: these views pay for their *content*, not
+  (`asyncThresholdFor` covers both: these views pay for their *content*, not
   their byte count).
   Three things make a text view of PDF tractable without a rasteriser, and
   they are the load-bearing decisions in the module:
@@ -520,7 +520,7 @@ in `README.md`; the cross-cutting structure that matters when editing:
   `pdfLoaded` also uses; a field added to `Editor` and set in three of four
   installers is how a view mode survives into a document that is not it), and
   cross to the background loader at `imageAsyncBytes` like a PDF
-  (`looksLikeDecoded` now includes `zipMagic`: these pay for their *content*).
+  (`asyncThresholdFor` now includes `zipMagic`: these pay for their *content*).
   **The graceful floor is the listing.** `App.archiveOutcome` reads the central
   directory, picks the format from the *member names* (`docxBodyMember`,
   `isXlsx`, `isEpub`; zero extra reads, and more honest than the extension),
@@ -1052,6 +1052,102 @@ in `README.md`; the cross-cutting structure that matters when editing:
   paths keep animating the crop. The graceful floor is always the still
   image, and dumb terminals get the animated half-block picture, which
   needs no capability at all.
+- **JPEG XL (`Cmedit.Jxl` over `JxlBits`/`JxlEntropy`/`JxlModular`/
+  `JxlVarDct`).** The largest decoder in the tree and the only one split
+  across modules, layered like the editor itself: `JxlBits` (bit reader over a
+  zero-padded `ByteArray#`, plus the `J` monad, `ExceptT String (ST s)`, used
+  for *header* code only), `JxlEntropy` (ANS with alias tables, prefix codes,
+  LZ77, hybrid integers, clustered contexts), then `JxlModular` and
+  `JxlVarDct`, then `Jxl` (container, headers, TOC, frames, features,
+  blending, XYB→sRGB). `Image.decodeJXL` is only an adapter, and `sniffImage`
+  recognises both the bare codestream (`FF 0A`) and the box container. It
+  decodes the **first displayed frame** (layers, reference slots, LF frames,
+  patches and blending are all honoured to compose it); `decodeFrames` does
+  not animate a JXL yet.
+  **The correctness bar is libjxl's own 8-bit output, at most 1 code value
+  away, and exact for lossless.** That needs three things which are easy to
+  get wrong and were each found by measurement against libjxl rather than by
+  reading the spec: its **ordered 8×8 Bayer dither** on 8-bit output (indexed
+  by `x & 3`, not `x & 7`); **colour domains** (a frame not saved before the
+  colour transform is blended and stored in the *encoded* space, so `Img`
+  carries `imDomain` and `blendFrame` converts a mismatched reference first);
+  and the **noise seed**, which counts the frame being decoded, counts
+  reference-only and LF frames as neither visible nor invisible, and is
+  applied *after* upsampling. Modular property 8 follows libjxl, not the
+  spec's prose (j40 is wrong at `y = 0`).
+  **Hot loops are plain `ST`, never `J`, and the entropy reader reaches them
+  as a data value.** `withSymReader` hands the loop a `SymReader` (ANS or
+  general), and the `INLINE` `readWith` specialises at each call site; a
+  lambda reader used at two call sites is *not* inlined and allocates per
+  symbol. Every other GHC lesson from `0032` applies, and a few more are
+  recorded in `0033`: force a symbol before a continuation that might not
+  demand it (the `cctx >= 458` early exit left HF symbols boxed: 1.2 GB of
+  churn on one file), give `withSymReader` an explicitly `INLINE`
+  continuation, and read neighbours through index selects over a trailing
+  zero cell rather than monadic branches.
+  Three filters are restructured for speed but **bit-identical** to the
+  direct formula, and must stay so: **EPF** sums per-channel neighbour
+  differences once per row in ring buffers keyed by *virtual* (mirrored) row,
+  in the order the direct kernel takes them (and only where some pixel's
+  sigma will actually filter); **noise** is streamed a few rows at a time:
+  xorshift128+ is linear over GF(2), so a channel's (and a band's) starting
+  state is its group seed advanced *exactly* by a precomputed matrix power
+  (`xsJumpTable`), which keeps the spec's X→Y→B stream per group while only
+  eight rows of each field are ever live (scratch was three full-frame
+  planes, 192 MiB at 16 MP, before any of this); and the **IDCT**
+  skips all-zero rows, gathers columns sixteen at a time (a plane's stride is
+  a power of two, so column-at-a-time walking maps every row to one cache
+  set), and has unrolled 8/16/32-point kernels that keep the recursive
+  version's float operation graph, plus pruned kernels for the zero tails
+  that dominate large blocks (98.7% of one wallpaper's 64×64 blocks have at
+  most eight live rows). The same power-of-two-stride trap bit a second
+  time in **inverse squeeze**, whose vertical step now reconstructs row pairs
+  (with an `Int`-width scratch row, because intermediates can exceed `Int32`
+  before the store truncates), and an extra channel that is provably
+  constant (the opaque alpha of most wallpapers) is never materialised as a
+  plane at all. `docs/plans/completed/0033-jpeg-xl-decoder.md` has the
+  measurements, the rejected experiments and the reviewer's stopping point.
+  **Two stages consume their input's storage, and that is an ownership
+  contract.** `renderImg'` writes the RGBA output into the first colour
+  plane (a Float and an RGBA pixel are both four bytes, and a forward raster
+  scan never overtakes an unread sample), which is sound only because
+  `frames` returns straight after rendering the first displayed frame; and
+  `intsToFloats` converts final modular channels in place, after
+  `gmFinish` has run every inverse transform. Animating a JXL (keeping
+  frames, or reading a canvas after it is shown) must revisit the first.
+  **Parallelism goes through one primitive, `Cmedit.JxlPar.parOrdered`, and
+  must stay invisible.** `decodeJxl` is a pure function; workers run jobs
+  and the *calling* thread consumes results in index order with bounded
+  lookahead, so every shared write happens on one thread in a fixed order
+  and output is byte-identical at any capability count (at one capability
+  each site runs the original sequential code). It is **cancellation-safe
+  by construction**, and that is load-bearing: the editor decodes on a
+  background thread that can be killed, so the call forks under `mask` and
+  kills-and-joins every worker under `uninterruptibleMask` on any
+  exception; no worker may outlive the call. A new parallel site uses
+  `parOrdered`, never a bare `forkIO`, caps itself at four workers, and must
+  pass the kill test (interrupt real decodes at many points, compare the live
+  thread set) as well as the hash corpus at 1 and 4 threads. Current sites:
+  render row bands, restoration (gaborish + EPF) in 128-row bands of
+  512-pixel tiles with 8-pixel halos (`filterBands`, only for large noisy
+  frames), noise row bands that regenerate their halos from the RNG rather
+  than reading a neighbour's output, and lossless pass groups
+  (`passGroupsPar`). Two traps from that work: a job's result must be built
+  *inside* the job, not memoised in a pass-long array (that retained every
+  group's output, +305 MiB on a 4096² lossless image), and peak RSS here
+  follows the GC schedule, not the allocation total (reusing EPF scratch
+  allocated 60 MB less and *raised* the peak 8 MiB), so a memory change is
+  judged by measuring peak RSS, never by allocation counts.
+  **A tiny JXL can be a huge picture**: the GNOME wallpapers are 47–600 KB
+  for 4096×4096 and take seconds to decode, so `App.asyncThresholdFor`
+  sends a JPEG XL to the background loader at *any* size. Bounds:
+  `maxPixels` from `Image`, a frame no larger than 4× the image, the TOC
+  checked against the file length before any plane is allocated, libjxl's
+  spline-area estimate, caps on MA-tree size and cluster counts, and every
+  section's reads checked against its TOC extent; malformed input is a `Left`, never an exception (Spec
+  sweeps every truncation and two bit flips at every offset of each fixture).
+  There is no colour management: XYB renders to sRGB, other samples are shown
+  as stored, as every other decoder here does.
 - **Editing QoL cluster (all pure `Editor` logic).** Line ops (duplicate /
   Alt+↑↓ move / delete / Alt+J join; `EKMoveLine` coalesces held moves into
   one undo) work on `selLineSpan` (a selection ending at col 0 excludes that

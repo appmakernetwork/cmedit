@@ -137,8 +137,10 @@ escape sequences and the POSIX `termios` API.
   rather than opening as binary. Every decoder (BMP, GIF LZW, JPEG — both
   baseline and progressive — with hand-rolled Huffman+IDCT, PNG with a
   from-scratch `inflate`, WebP — both lossless VP8L and lossy VP8, boolean
-  arithmetic decoder, loop filter and all — and Netpbm) is written from first
-  principles using only GHC boot libraries.
+  arithmetic decoder, loop filter and all — JPEG XL — lossless modular and
+  lossy VarDCT, ANS entropy coding, the weighted predictor, every DCT size,
+  the restoration filters, patches, splines, noise and layered frames — and
+  Netpbm) is written from first principles using only GHC boot libraries.
 - **Archive listings**: opening a `.zip` — or anything built on it, a `.jar`,
   `.whl`, `.apk` (detected by magic bytes, not by name) —
   shows its contents as a read-only file tree with sizes, compression savings
@@ -545,6 +547,10 @@ logic unit-testable without a terminal.
 | `Cmedit.Csv` | CSV parse/serialise + spreadsheet table model |
 | `Cmedit.Inflate` | Hand-rolled DEFLATE (RFC 1951), shared by PNG and PDF's compressed streams |
 | `Cmedit.Image` | From-scratch BMP/PNM/GIF/PNG/JPEG (baseline+progressive)/WebP (VP8L+VP8) decoders + image→cell scaler |
+| `Cmedit.Jxl` | From-scratch JPEG XL decoder: container, headers, frames, VarDCT reconstruction, features, blending, XYB→sRGB |
+| `Cmedit.JxlBits` / `JxlEntropy` | JPEG XL bit reader; ANS/prefix codes, LZ77, hybrid integers, clustered contexts |
+| `Cmedit.JxlModular` / `JxlVarDct` | JPEG XL modular mode (MA trees, weighted predictor, RCT/palette/squeeze); DCT family, dequantisation, gaborish, EPF, HF coefficients |
+| `Cmedit.JxlPar` | The decoder's one parallel primitive: ordered, deterministic, cancellation-safe worker jobs (`parOrdered`) |
 | `Cmedit.Pdf` | From-scratch PDF reader: object scan, filters, content-stream interpreter, fonts, and page→document reconstruction |
 | `Cmedit.Pager` | Read-only paged view of files too large to load: sparse line index + windowed reads |
 | `Cmedit.Rtf` | RTF parser + document layout for the read-only formatted view of `.rtf` files |

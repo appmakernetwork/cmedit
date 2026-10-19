@@ -541,7 +541,7 @@ binaryExtension name = case break (== '.') (reverse name) of
 binaryExtensions :: [String]
 binaryExtensions =
   [ -- images / media
-    "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "tiff", "heic"
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "jxl", "tiff", "heic"
   , "mp3", "mp4", "m4a", "aac", "avi", "mkv", "mov", "webm", "ogg", "flac", "wav"
   , "woff", "woff2", "ttf", "otf", "eot"
     -- archives / packages

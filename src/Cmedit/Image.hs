@@ -7,7 +7,8 @@
 -- real graphical viewer is not available.
 --
 -- The module decodes BMP, PNM (PPM/PGM/PBM), GIF, PNG, baseline JPEG and WebP
--- (both lossless VP8L and lossy VP8, including the ALPH alpha channel) into a
+-- (both lossless VP8L and lossy VP8, including the ALPH alpha channel), plus
+-- JPEG XL via "Cmedit.Jxl", into a
 -- common RGBA 'Image', then 'renderImage' scales that to fit a character grid
 -- and paints it with Unicode half-block glyphs (two vertical pixels per cell,
 -- 24-bit colour) or an ASCII luminance ramp.
@@ -28,6 +29,7 @@ module Cmedit.Image
   ) where
 
 import Control.Monad (when, unless, forM, forM_, foldM)
+import Cmedit.Jxl (isJxl, decodeJxl)
 import Control.Monad.ST (ST, runST)
 import Data.Array (Array, listArray)
 import qualified Data.Array as A
@@ -141,6 +143,7 @@ sniffImage bs
   | at bs 0 == 0x42 && at bs 1 == 0x4D        = Just "BMP"
   | BS.length bs >= 12 && bsTake 4 == fourCC "RIFF"
       && BS.take 4 (BS.drop 8 bs) == fourCC "WEBP" = Just "WebP"
+  | isJxl bs                                  = Just "JPEG XL"
   | at bs 0 == ord' 'P' && (at bs 1 >= ord' '1' && at bs 1 <= ord' '6') = Just "PNM"
   | otherwise                                 = Nothing
   where bsTake n = BS.take n bs
@@ -159,6 +162,7 @@ decodeImage bs = case sniffImage bs of
   Just "BMP"  -> decodeBMP bs
   Just "PNM"  -> decodePNM bs
   Just "WebP" -> decodeWebP bs
+  Just "JPEG XL" -> decodeJXL bs
   _           -> Left "unrecognised image format"
 
 -- | Decode a recognised image into its full frame sequence: every frame is a
@@ -170,6 +174,15 @@ decodeFrames :: BS.ByteString -> Either String [(Image, Int)]
 decodeFrames bs = case sniffImage bs of
   Just "GIF" -> decodeGIFAnim bs
   _          -> (\img -> [(img, 0)]) <$> decodeImage bs
+
+------------------------------------------------------------------------------
+-- JPEG XL (the decoder lives in "Cmedit.Jxl"; this is only the adapter)
+
+decodeJXL :: BS.ByteString -> Either String Image
+decodeJXL bs = do
+  (w, h, px) <- decodeJxl maxPixels bs
+  checkDims w h
+  pure (Image w h "JPEG XL" px)
 
 ------------------------------------------------------------------------------
 -- BMP (Windows bitmap)

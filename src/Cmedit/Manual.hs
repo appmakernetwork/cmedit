@@ -485,7 +485,7 @@ manualText = T.unlines
   , ""
   , "## Viewing images"
   , ""
-  , "Opening a PNG, JPEG, GIF, WebP, BMP or Netpbm file shows the image"
+  , "Opening a PNG, JPEG, JPEG XL, GIF, WebP, BMP or Netpbm file shows the image"
   , "right in the terminal, scaled to fit in 24-bit colour half-blocks"
   , "(press `a` for an ASCII-art rendering instead). Files are detected"
   , "by content, not extension. Drag a rectangle with the mouse to zoom"

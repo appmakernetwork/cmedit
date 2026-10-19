@@ -3,7 +3,7 @@
 -- editor update function.
 module Main (main) where
 
-import Control.Monad (forM_, unless, void)
+import Control.Monad (forM, when, replicateM, forM_, unless, void)
 import Text.Read (readMaybe)
 import Data.Bits (shiftR, (.&.), xor)
 import Data.Foldable (toList)
@@ -13,7 +13,15 @@ import Data.Either (isLeft)
 import Data.List (foldl', intercalate, isInfixOf, isPrefixOf, isSuffixOf, nub, tails)
 import System.Directory (getTemporaryDirectory, removeFile)
 import System.FilePath ((</>))
-import Control.Exception (SomeException, evaluate, try)
+import Control.Exception (SomeException, evaluate, try, throwIO, ErrorCall(..), AsyncException(..), finally)
+import Control.Concurrent (forkIO, killThread, threadDelay, newEmptyMVar, putMVar, takeMVar, readMVar, tryPutMVar, MVar, ThreadId)
+import GHC.Conc.Sync (listThreads, threadStatus, ThreadStatus(..))
+import Cmedit.JxlPar (parOrdered)
+import qualified Cmedit.JxlVarDct as JVD
+import qualified Control.Monad.ST as ST
+import qualified Data.Array.ST as STA
+import qualified Data.Array.Base as AB
+import GHC.Float (castFloatToWord32)
 import System.Exit (exitFailure, exitSuccess)
 import GHC.Clock (getMonotonicTime)
 import System.Timeout (timeout)
@@ -856,6 +864,124 @@ main = do
       checkEq "webp ALPH left"  (pixelAt im 0 0) (198,51,33,255)
       checkEq "webp ALPH right" (pixelAt im 7 0) (18,62,197,40)
   check "truncated WebP -> error" (isLeft (decodeImage (BS.take 30 mkWebPLossy)))
+  -- JPEG XL: a lossless 4x4 RGBA image in the box container must come back
+  -- exactly, and a lossy (VarDCT) bare codestream matches libjxl's own
+  -- 8-bit output at the sampled pixels (the decoder reproduces its ordered
+  -- dither too).
+  checkEq "sniff JPEG XL container" (sniffImage mkJxlLossless) (Just "JPEG XL")
+  checkEq "sniff JPEG XL codestream" (sniffImage mkJxlLossy) (Just "JPEG XL")
+  case decodeImage mkJxlLossless of
+    Left e   -> check ("jxl lossless decode: " ++ e) False
+    Right im -> do
+      checkEq "jxl lossless dims" (imgW im, imgH im) (4, 4)
+      checkEq "jxl lossless pixels"
+        [ pixelAt im x y | y <- [0..3], x <- [0..3] ]
+        [ (x * 60, y * 60, (x * y * 17) `mod` 256, 255 - (x + y) * 20) | y <- [0..3], x <- [0..3] ]
+  case decodeImage mkJxlLossy of
+    Left e   -> check ("jxl lossy decode: " ++ e) False
+    Right im -> do
+      checkEq "jxl lossy dims" (imgW im, imgH im) (16, 16)
+      checkEq "jxl lossy samples"
+        [ pixelAt im x y | (x, y) <- [(0,0),(15,0),(0,15),(15,15),(7,9)] ]
+        [ (0,7,127,255), (235,11,129,255), (25,237,133,255), (243,239,128,255), (114,142,127,255) ]
+  check "truncated JPEG XL -> error" (isLeft (decodeImage (BS.take 60 mkJxlLossy)))
+  -- Corrupt input must be refused, never an exception (which would take the
+  -- editor down): every truncation, and a byte flipped at every offset.
+  let jxlVariants = [ BS.take n f | f <- [mkJxlLossless, mkJxlLossy], n <- [0 .. BS.length f - 1] ]
+        ++ [ BS.take i f <> BS.singleton (BS.index f i `xor` m) <> BS.drop (i + 1) f
+           | f <- [mkJxlLossless, mkJxlLossy], i <- [0 .. BS.length f - 1], m <- [0x01, 0x80] ]
+  rJxl <- try (evaluate (sum [ either (const 0) (sum . map fromIntegral . U.elems . imgPix) (decodeImage v)
+                             | v <- jxlVariants ] :: Int))
+  check "corrupt JPEG XL never throws" (either (\e -> const False (e :: SomeException)) (const True) rJxl)
+  -- The decoder's parallel stages (JxlPar.parOrdered) must be invisible:
+  -- results in index order whatever the timing, the first failing job in
+  -- index order reported, and an interrupted caller must stop and join
+  -- every worker before its exception propagates (the editor kills the
+  -- background decode when another file is opened).
+  do
+    order <- newIORef []
+    parOrdered 4 8 40 (\i -> threadDelay ((37 * i) `mod` 11 * 100) >> pure i)
+                      (\i v -> modifyIORef' order ((i, v) :) >> pure True)
+    got <- reverse <$> readIORef order
+    checkEq "parOrdered: results in index order" got [ (i, i) | i <- [0 .. 39 :: Int] ]
+    rErr <- try (parOrdered 4 8 40 (\i -> if i == 7 || i == 3 then throwIO (ErrorCall ("job " ++ show i)) else pure i)
+                                   (\_ _ -> pure True))
+    checkEq "parOrdered: first failing job in index order" (either (\(ErrorCall m) -> m) (const "") rErr) "job 3"
+    let liveThreads = do
+          ts <- listThreads
+          sts <- mapM threadStatus ts
+          pure [ t | (t, st) <- zip ts sts, st /= ThreadFinished, st /= ThreadDied ]
+        killMidFlight name look job = do
+          gate <- newEmptyMVar :: IO (MVar ())
+          live <- newIORef (0 :: Int)
+          before <- liveThreads
+          result <- newEmptyMVar
+          caller <- forkIO $ do
+            r <- try (parOrdered 4 look 64 (job gate live) (\_ _ -> pure True))
+            n <- readIORef live
+            putMVar result (either (\e -> show (e :: SomeException)) (const "finished") r, n)
+          let waitLive = do n <- readIORef live
+                            unless (n >= 1) (threadDelay 1000 >> waitLive)
+          waitLive
+          threadDelay 20000
+          killThread caller
+          (r, n) <- takeMVar result
+          let waitFinished = do st <- threadStatus caller
+                                unless (st == ThreadFinished || st == ThreadDied) (threadDelay 100 >> waitFinished)
+          waitFinished   -- the caller has reported but may not be marked finished yet
+          checkEq ("parOrdered " ++ name ++ ": caller dies of ThreadKilled") r (show ThreadKilled)
+          checkEq ("parOrdered " ++ name ++ ": no worker alive when the exception propagated") n 0
+          after <- liveThreads
+          check ("parOrdered " ++ name ++ ": no thread outlives the call") (null [ t | t <- after, t `notElem` before ])
+          void (tryPutMVar gate ())
+        parked gate live i = do
+          atomicModifyIORef' live (\n -> (n + 1, ()))
+          (readMVar gate >> pure i) `finally` atomicModifyIORef' live (\n -> (n - 1, ()))
+    killMidFlight "(workers parked in jobs)" 8 parked
+    killMidFlight "(workers blocked on the lookahead gate)" 1 (\gate live i -> if i == 0 then parked gate live i else pure i)
+    acc <- newIORef (0 :: Int)
+    parOrdered 4 8 16 pure (\_ v -> modifyIORef' acc (+ v) >> pure True)
+    accV <- readIORef acc
+    checkEq "parOrdered: works again after a killed call" accV (sum [0 .. 15])
+  -- A filter job leases slot i mod lookahead. Releasing the scheduler's
+  -- credit before consume returns would let a later job overwrite it.
+  do
+    slots <- replicateM 4 (newIORef (-1 :: Int))
+    intact <- newIORef True
+    parOrdered 4 4 40
+      (\i -> let ref = slots !! (i `mod` 4) in writeIORef ref i >> pure ref)
+      (\i ref -> do
+        threadDelay 1000
+        value <- readIORef ref
+        when (value /= i) (writeIORef intact False)
+        pure True)
+    readIORef intact >>= check "parOrdered: lease retained until consumer returns"
+  -- Filter tile retirement must retain the previous band's unfiltered
+  -- edge. Test both 128-row and 512-column boundaries, including padding.
+  forM_ [(17,129), (513,9)] $ \(w,h) -> do
+    let same = ST.runST $ do
+          let stride = w+3
+              count = stride*h
+              sw = (w+7) `div` 8
+              sh = (h+7) `div` 8
+              weights = [0.115,0.061,0.12,0.055,0.1,0.06]
+              scale = [40,5,3.5]
+              params = (1.65,0.45,0.7)
+          a <- replicateM 3 (STA.newArray (0,count-1) 0)
+          b <- replicateM 3 (STA.newArray (0,count-1) 0)
+          forM_ (zip3 [0..] a b) $ \(c,x,y) -> forM_ [0..count-1] $ \i -> do
+            let v = fromIntegral ((i*37+c*13) `mod` 1009) / 1024
+            AB.unsafeWrite x i v
+            AB.unsafeWrite y i v
+          sig <- STA.newArray (0,sw*sh-1) 1
+          JVD.gaborish a stride w h weights
+          JVD.epf a stride w h sig sw 3 scale params
+          JVD.filterBands 2 b stride w h sig sw (Just weights) 3 scale params
+          and <$> forM (zip a b) (\(x,y) -> and <$> forM [0..count-1] (\i -> do
+            vx <- AB.unsafeRead x i
+            vy <- AB.unsafeRead y i
+            pure (castFloatToWord32 vx == castFloatToWord32 vy)))
+    check ("JPEG XL filter bands exact across " ++ show (w,h)) same
   -- ALPH scanline filters (1 horizontal, 2 vertical, 3 gradient), which the
   -- decoder undoes in place: a known alpha plane, forward-filtered here into
   -- a raw ALPH chunk around the 8x8 lossy frame, must come back exactly.
@@ -9170,4 +9296,26 @@ deflateLongCodes = BS.pack
   , 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
   , 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,60,106,247
   , 190,223,223,191,255,254,247,127,255,239,255,251,255,253,255,1
+  ]
+
+mkJxlLossless :: BS.ByteString
+mkJxlLossless = BS.pack
+  [ 0,0,0,12,74,88,76,32,13,10,135,10,0,0,0,20,102,116
+  , 121,112,106,120,108,32,0,0,0,0,106,120,108,32,0,0,0,108
+  , 106,120,108,99,255,10,24,16,176,18,8,16,16,0,96,1,75,24
+  , 139,21,10,37,112,155,24,226,207,48,203,46,32,16,64,153,155,231
+  , 62,102,238,117,114,223,49,247,58,185,239,152,123,29,243,206,241,45
+  , 255,105,37,38,162,60,78,198,126,115,23,168,82,20,85,209,128,153
+  , 234,169,237,25,141,67,189,234,238,239,184,202,22,93,166,98,221,87
+  , 109,41,122,183,234,233,41,128,152,64,4,16,3,0
+  ]
+
+mkJxlLossy :: BS.ByteString
+mkJxlLossy = BS.pack
+  [ 255,10,67,6,0,19,136,2,0,112,1,181,159,32,0,0,21,42
+  , 163,140,27,188,156,235,249,242,67,135,197,180,141,235,12,109,181,109
+  , 97,9,99,179,189,48,72,72,56,130,109,147,14,222,155,199,36,178
+  , 120,89,202,228,222,222,199,218,201,145,158,33,139,1,160,146,68,42
+  , 162,77,118,190,110,81,1,48,168,195,167,223,231,123,222,93,221,207
+  , 66,58,96,10,40,128,212,181,37,93,81,173,51
   ]

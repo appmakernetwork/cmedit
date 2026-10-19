@@ -1999,7 +1999,7 @@ data FileKind
 -- step with the magic-byte sniffer there — this is only the explorer's hint.
 imageExtensions :: [String]
 imageExtensions =
-  ["png","jpg","jpeg","gif","bmp","webp","ppm","pgm","pbm","pnm"]
+  ["png","jpg","jpeg","gif","bmp","webp","jxl","ppm","pgm","pbm","pnm"]
 
 fileKind :: FilePath -> FileKind
 fileKind path
