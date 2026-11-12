@@ -439,6 +439,14 @@ main = do
   checkEq "replace-all case-sensitive" raCS (2, T.pack "X_X_AB", Just 3)
   let raCI = replaceAllText False False (T.pack "ab") (T.pack "X") (T.pack "ab_Ab_AB")
   checkEq "replace-all case-insensitive keeps surrounding text" raCI (3, T.pack "X_X_X", Just 5)
+  -- U+0130 lowercases to two code points, so an offset found in the folded
+  -- text used to land one character late per dotted I before the match, and
+  -- the replacement was written through the text beside it.
+  checkEq "replace-all case-insensitive stays aligned after U+0130"
+    (replaceAllText False False (T.pack "foo") (T.pack "X") (T.pack "\304stanbul foo bar"))
+    (1, T.pack "\304stanbul X bar", Just 10)
+  checkEq "search offsets stay aligned after U+0130"
+    (S.lineMatches False False (T.pack "foo") (T.pack "\304\304 foo")) [(3, 3)]
   let raWW = replaceAllText True True (T.pack "cat") (T.pack "DOG") (T.pack "cat category cat")
   checkEq "replace-all whole-word skips substrings" raWW (2, T.pack "DOG category DOG", Just 16)
   let raML = replaceAllText False False (T.pack "a\nb") (T.pack "Z") (T.pack "a\nb\na\nB")
@@ -1365,6 +1373,27 @@ main = do
         check ("pager: an enormous line is capped (got "
                ++ show (maybe 0 T.length (Seq.lookup 0 w)) ++ " chars)")
               (maybe 0 T.length (Seq.lookup 0 w) <= Pg.maxPagerLine)
+    -- A line longer than the carry cap, then ordinary lines: the bytes cut
+    -- from the carry still count towards every later offset.
+    let longThenLines = BS.replicate 300000 120 <> BS.singleton 10
+                          <> BS.concat [ TE.encodeUtf8 (T.pack ("line " ++ show n ++ "\n"))
+                                       | n <- [1 .. 3000 :: Int] ]
+    BS.writeFile tmp longThenLines
+    rLong <- Pg.buildPagerIndex tmp (fromIntegral (BS.length longThenLines))
+    case rLong of
+      Left e -> check ("pager long-line index: " ++ e) False
+      Right pg -> do
+        w <- Pg.readPagerWindow pg 2000 2
+        checkEq "pager: offsets after an over-long line are exact"
+          (toList w) [T.pack "line 2000", T.pack "line 2001"]
+    -- One stray CR in an LF file must not make it page as CR-only.
+    let strayCr = TE.encodeUtf8 (T.pack ("downloading 10%\rdownloading 100%\n"
+                                         ++ concat [ "l" ++ show n ++ "\n" | n <- [1 .. 50 :: Int] ]))
+    BS.writeFile tmp strayCr
+    rCr <- Pg.buildPagerIndex tmp (fromIntegral (BS.length strayCr))
+    case rCr of
+      Left e -> check ("pager stray-CR index: " ++ e) False
+      Right pg -> checkEq "pager: a stray CR does not make an LF file CR-only" (pgLineCount pg) 51
     _ <- try (removeFile tmp) :: IO (Either SomeException ())
     pure ()
 
@@ -3104,6 +3133,22 @@ main = do
     checkEq "a range that includes the formula's own cell is circular"
       (calc "=SUM(J1:J6)") "#CYCLE!"
 
+    -- Lookups need the range's shape: it arrives flattened, and reading it as
+    -- one long column returned a plausible value from the wrong cell.
+    checkEq "INDEX addresses row and column" (calc "=INDEX(A1:B5,2,2)") "row2"
+    checkEq "INDEX with a MATCH row" (calc "=INDEX(A1:B5,MATCH(30,A1:A5,0),2)") "row3"
+    checkEq "INDEX along a single column" (calc "=INDEX(B1:B5,4)") "row4"
+    checkEq "INDEX outside the block is #REF!" (calc "=INDEX(A1:B5,2,3)") "#REF!"
+    checkEq "VLOOKUP answers from the matching row" (calc "=VLOOKUP(20,A1:B5,2,FALSE)") "row2"
+    checkEq "VLOOKUP approximate takes the last key not above" (calc "=VLOOKUP(25,A1:B4,2)") "row2"
+    checkEq "VLOOKUP exact with no match is #N/A" (calc "=VLOOKUP(25,A1:B4,2,FALSE)") "#N/A"
+    checkEq "HLOOKUP keys on the first row" (calc "=HLOOKUP(10,A1:B5,2,FALSE)") "20"
+    checkEq "CEILING rounds a negative up" (calc "=CEILING(-2.1,1)") "-2"
+    checkEq "FLOOR rounds a negative down" (calc "=FLOOR(-2.1,1)") "-3"
+    checkEq "CEILING and FLOOR on positives" (calc "=CEILING(2.1,1)+FLOOR(2.9,1)") "5"
+    checkEq "SUBSTITUTE honours the instance" (calc "=SUBSTITUTE(\"aXbXc\",\"X\",\"-\",2)") "aXb-c"
+    checkEq "SUBSTITUTE without one replaces all" (calc "=SUBSTITUTE(\"aXbXc\",\"X\",\"-\")") "a-b-c"
+
     -- Number rendering matches how the file writes its own cached values:
     -- plain, no separators, no format applied.
     checkEq "an integer result has no decimal point" (Fm.showNumber 30) (T.pack "30")
@@ -3724,7 +3769,11 @@ main = do
   let refMatches cs ww term line
         | T.null term = []
         | otherwise =
-            let norm t = if cs then t else T.toLower t
+            let -- the length-preserving fold: T.toLower, except where it
+                -- would lengthen the text (U+0130) and shift every offset
+                norm t | cs = t
+                       | T.length (T.toLower t) == T.length t = T.toLower t
+                       | otherwise = T.map toLower t
                 len = T.length term
             in [ (i, len) | i <- S.scanMatches False ww (norm term) (norm line) ]
       corpusLines = map T.pack
@@ -5124,15 +5173,57 @@ main = do
       cellL r c = scrCells scrLong A.! (r * scrW scrLong + c)
       sliceChars = [ cellChar (cellL (loTextTop loLong) (loTextLeft loLong + k)) | k <- [0 .. 9] ]
   checkEq "windowed expand: deep h-scroll shows the right slice" sliceChars "0123456789"
-  -- A wide glyph straddling the left edge keeps its continuation sentinel at
-  -- the boundary (same cells the unwindowed expansion produced).
+  -- A wide glyph straddling the left edge shows as a blank at the boundary:
+  -- its head is off screen, and an orphan continuation sentinel would be
+  -- skipped by the emitter without advancing, drawing the whole row one
+  -- column to the left of the model ('sanitizeGrid').
   let wideLine = T.replicate 200 (T.pack "\27721")     -- 200 wide glyphs, 2 cells each
       edWide = (setLoaded "wide.txt" (mkLR (T.unpack wideLine)) ed0) { edLeft = 101 }
       scrWide = renderEditor edWide
       loWide = computeLayout edWide
       cellW k = cellChar (scrCells scrWide A.! (loTextTop loWide * scrW scrWide + loTextLeft loWide + k))
-  checkEq "windowed expand: straddling wide glyph leaves its cont cell" (cellW 0) '\0'
+  checkEq "windowed expand: a straddling wide glyph is a blank, not half a glyph" (cellW 0) ' '
   checkEq "windowed expand: next wide glyph starts after the boundary" (cellW 1) '\27721'
+
+  -- Grid invariants the emitter depends on, enforced on every frame: no
+  -- control character in any cell, and no half of a wide glyph.
+  do
+    let gridOK scr =
+          let cells = [ cellChar (scrCells scr A.! i) | i <- [0 .. scrW scr * scrH scr - 1] ]
+              rowsOf [] = []
+              rowsOf xs = let (a, b) = splitAt (scrW scr) xs in a : rowsOf b
+              rowOK (c : n : rest)
+                | c == '\0' = False                                  -- orphan continuation
+                | charWidth c == 2 = n == '\0' && rowOK rest
+                | otherwise = rowOK (n : rest)
+              rowOK [c] = c /= '\0' && charWidth c /= 2
+              rowOK [] = True
+              noCtl = all (\c -> c == '\0' || (c >= ' ' && not (c >= '\DEL' && c < '\xA0'))) cells
+          in noCtl && all rowOK (rowsOf cells)
+        -- an escape sequence in a CSV cell, and in a file name
+        edEscCsv = setLoaded "evil.csv" (mkLR "a,\ESC]52;c;cHduZWQ=\BEL,b\n1,\ESC[2J,3\n") ed0
+        edEscName = setLoaded "/w/a\ESC[2Jb.txt" (mkLR "x") ed0
+        -- wide glyphs under a horizontal scroll, in a file name, and under a dialog
+        edCjk = setLoaded "/w/\27721\23383.txt" (mkLR (concat (replicate 30 (replicate 60 '\27721' ++ "\n")))) ed0
+        edCjkL = edCjk { edLeft = 1 }
+        edCjkDlg = fst (update (KCtrlChar 'g') edCjk)
+        edCjkMenu = fst (update (KFn 10 noMods) edCjk)
+    check "a CSV cell cannot put a control character on screen" (gridOK (renderEditor edEscCsv))
+    check "nor can a file name" (gridOK (renderEditor edEscName))
+    check "wide glyphs: plain frame is well formed" (gridOK (renderEditor edCjk))
+    check "wide glyphs: scrolled half a glyph in" (gridOK (renderEditor edCjkL))
+    check "wide glyphs: under a dialog" (gridOK (renderEditor edCjkDlg))
+    check "wide glyphs: under the menu" (gridOK (renderEditor edCjkMenu))
+    check "a wide file name still shows in the status bar"
+      (any (T.isInfixOf (T.pack "\27721")) (map T.pack (screenLines (renderEditor edCjk))))
+  -- Input: a key code past the last code point must not throw, and the
+  -- extra mouse buttons are not left clicks.
+  kHuge <- parseBytes (map (fromIntegral . fromEnum) "\ESC[1114112u")
+  check "CSI u with an impossible code point is an unknown key"
+    (case kHuge of KUnknown (_ : _) -> True; _ -> False)
+  kBack <- parseBytes (map (fromIntegral . fromEnum) "\ESC[<128;5;5M")
+  check "mouse button 8 is not a left press"
+    (case kBack of KMouse me -> meButton me == MBNone; _ -> True)
 
   -- Workspace search: pure matching --------------------------------------------
   checkEq "lineMatches basic" (S.lineMatches True False (T.pack "foo") (T.pack "a foo foo")) [(2,3),(6,3)]
@@ -5245,19 +5336,25 @@ main = do
           dropSl ('/' : r) = dropSl r
           dropSl s' = s'
           baseG = reverse . takeWhile (/= '/') . reverse
-          goG [] [] = True
-          goG ('*' : '*' : ps) cs =
-            goG ('*' : dropStars ps) cs || anyTail (goG ps) cs
+          -- (the first argument is the pattern character before this point,
+          -- '/' at the start: a whole-segment "**/" may match no directories)
+          goG = goP '/'
+          goP _ [] [] = True
+          goP prev ('*' : '*' : ps) cs =
+            goP '*' ('*' : dropStars ps) cs || anyTail (goP '*' ps) cs
+              || (prev == '/' && case dropStars ps of
+                                   ('/' : r) -> goP '/' r cs
+                                   _         -> False)
             where dropStars ('*' : r) = dropStars r
                   dropStars r = r
-          goG ('*' : ps) cs =
-            goG ps cs || case cs of
-                           (c : cs') | c /= '/' -> goG ('*' : ps) cs'
+          goP _ ('*' : ps) cs =
+            goP '*' ps cs || case cs of
+                           (c : cs') | c /= '/' -> goP '*' ('*' : ps) cs'
                            _                    -> False
-          goG ('?' : ps) (c : cs) | c /= '/' = goG ps cs
-          goG ('/' : ps) ('/' : cs) = goG ps cs
-          goG (p : ps) (c : cs) | p == c = goG ps cs
-          goG _ _ = False
+          goP _ ('?' : ps) (c : cs) | c /= '/' = goP '?' ps cs
+          goP _ ('/' : ps) ('/' : cs) = goP '/' ps cs
+          goP _ (p : ps) (c : cs) | p == c = goP p ps cs
+          goP _ _ _ = False
           anyTail f cs = f cs || case cs of { (_ : cs') -> anyTail f cs'; [] -> False }
       globPatAlpha = "ab*?/*"
       globPathAlpha = "aab/b"
@@ -5275,6 +5372,14 @@ main = do
   check "glob with many stars is linear (hit)"
         (S.globMatch "*a*a*a*a*a*a*a*a*a*b" (replicate 60 'a' ++ "b"))
   check "glob *.hs matches basename" (S.globMatch "*.hs" "src/Foo.hs")
+  check "glob **/ matches zero directories"
+    (S.globMatch "src/**/*.hs" "src/Foo.hs" && S.globMatch "**/*.hs" "Foo.hs"
+       && S.globMatch "src/**/*.hs" "src/a/b/Foo.hs")
+  check "glob **/ still needs a segment boundary" (not (S.globMatch "a/**/b" "a/xb"))
+  check "a !pattern in the include list excludes"
+    (S.pathIncluded ["!vendor/**"] [] "src/a.py" && not (S.pathIncluded ["!vendor/**"] [] "vendor/a.py")
+       && S.pathIncluded ["*.py", "!vendor/**"] [] "src/a.py"
+       && not (S.pathIncluded ["*.py", "!vendor/**"] [] "vendor/a.py"))
   check "glob *.hs rejects .js" (not (S.globMatch "*.hs" "src/Foo.js"))
   check "glob ** spans segments" (S.globMatch "src/**/*.hs" "src/a/b/Foo.hs")
   check "glob ? single char" (S.globMatch "a?c.txt" "a-c.txt")
@@ -5505,6 +5610,67 @@ main = do
   check "multi-button confirm present" (edDialog edQuit' /= Nothing)
   check "multi-button confirm NOT dismissed by outside click" (edDialog edQuitClicked /= Nothing)
 
+  -- A newline typed into a row straight off the file (still packed, the edit
+  -- living in its overlay) must reach the row height and the newline map.
+  do
+    let vP0 = mkCsvView ',' (T.pack "a,b\nc,d\ne,f")
+        vP1 = commitEdit (editInsert 'y' (editInsert '\n' (editInsert 'x' (beginEdit vP0))))
+        vP2 = insertRowBelow vP1
+    checkEq "a newline edited into a loaded row grows the row" (rowHeight vP1 0) 2
+    checkEq "and survives a recompute of the newline map" (csvNl vP2) (M.fromList [(0, 1)])
+    checkEq "so later cells map to the right buffer line" (fst (cellTextPos vP2 2 0)) 3
+
+  -- A selection collapsed back onto its anchor must not come alive again
+  -- under the next keystrokes and swallow what was just typed.
+  do
+    let keys ks = foldl (\e k -> fst (update k e)) (newEditor (24, 80) defaultConfig) ks
+        shiftM = noMods { modShift = True }
+        textOf e = bufferToText LF False (edBuffer e)
+    checkEq "typing after Ctrl+A on an empty buffer keeps every character"
+      (textOf (keys [KCtrlChar 'a', KChar 'a', KChar 'b', KChar 'c'])) (T.pack "abc")
+    checkEq "typing after a selection collapsed by Shift+arrows keeps every character"
+      (textOf (keys [KChar 'h', KChar 'i', KArrow DLeft shiftM, KArrow DRight shiftM, KChar '!', KChar '?']))
+      (T.pack "hi!?")
+    -- Alt+Down with a selection ending at column 0 of the last line: the
+    -- cursor must stay inside the document.
+    let edMv = keys [ KChar 'a', KEnter, KChar 'b', KEnter, KChar 'c'
+                    , KArrow DUp noMods, KHome noMods, KArrow DDown shiftM
+                    , KArrow DDown (noMods { modAlt = True }) ]
+    checkEq "Alt+Down moved the line" (textOf edMv) (T.pack "a\nc\nb")
+    check "and left the cursor inside the buffer"
+      (posLine (edCursor edMv) < lineCount (edBuffer edMv))
+    -- A drag-select released below the text area still ends the drag.
+    let edDrag0 = keys (concat (replicate 3 [KChar 'x', KChar 'y', KEnter]))
+        loD = computeLayout edDrag0
+        mouseAt r c pressed drag = KMouse (MouseEvent MBLeft c r pressed drag noMods 1)
+        edDrag = foldl (\e k -> fst (update k e)) edDrag0
+                   [ mouseAt (loTextTop loD) (loTextLeft loD) True False
+                   , mouseAt (loTextTop loD + 1) (loTextLeft loD + 1) True True
+                   , mouseAt (fst (edSize edDrag0) - 1) (loTextLeft loD + 1) False False ]
+    check "a drag-select released on the status bar ends the drag" (not (edMouseSelecting edDrag))
+    -- A zoom rectangle dragged in the margin beside a small picture must
+    -- leave a crop that is on the image.
+    let tiny = Image 30 20 "PNG" (listArray (0, 30 * 20 * 4 - 1) (repeat 0))
+        edTiny = imageLoaded "/tiny.png" [(tiny, 0)] (newEditor (24, 80) defaultConfig)
+        edTinyZ = foldl (\e k -> fst (update k e)) edTiny
+                    [ mouseAt 18 75 True False, mouseAt 21 78 True True, mouseAt 21 78 False False ]
+    check "a zoom drag in the letterbox margin stays on the image"
+      (case idCrop =<< edImage edTinyZ of
+         Just (x, y, w, h) -> x >= 0 && y >= 0 && x + w <= 30 && y + h <= 20
+         Nothing -> True)
+    check "and the result renders" (not (null (screenLines (renderEditor edTinyZ))))
+
+  -- A case-insensitive range must not take in the punctuation between the
+  -- alphabets, and an unclosed Markdown link still lexes every character.
+  do
+    let hits pat line = case Rx.compile True (T.pack pat) of
+          Right r -> Rx.lineMatches r (T.pack line); Left _ -> [(-1, -1)]
+    checkEq "[0-Z] case-insensitively excludes _ ` ^" (hits "[0-Z]" "_`^") []
+    checkEq "but takes both cases of a letter" (hits "[0-Z]" "aZ5") [(0, 1), (1, 1), (2, 1)]
+    let mdLine = T.pack "see [the docs](http://example.com and **more**"
+    checkEq "an unclosed Markdown link lexes the whole line"
+      (length (fst (lexLine Markdown initialState mdLine))) (T.length mdLine)
+
   -- Regex engine ---------------------------------------------------------------
   let rxLM ci pat line = case Rx.compile ci (T.pack pat) of
         Right r -> Rx.lineMatches r (T.pack line); Left _ -> [(-1,-1)]
@@ -5639,6 +5805,74 @@ main = do
       let edTxt = setLoaded "/x.txt" (mkLR2 "hi") ed0
           txtActs = [ a | MEItem _ _ a <- entriesFor edTxt 2 ]
       check "text view keeps in-file Find" (MAFind `elem` txtActs && MAGoToLine `elem` txtActs)
+
+  -- Image view: the scroll wheel zooms around the pointer. The oracle maps a
+  -- text-area cell to the source pixel at its centre through 'viewFit', the
+  -- same geometry the renderer uses, and the zoom must keep that pixel under
+  -- the pointer.
+  do
+    let bigImg = Image 800 600 "PNG" (listArray (0, 800 * 600 * 4 - 1) (repeat 0))
+        edBig = imageLoaded "/big.png" [(bigImg, 0)] ed0
+        loB = computeLayout edBig
+        srcAt e r c = case edImage e of
+          Nothing -> (0, 0)
+          Just d ->
+            let (cx, cy, cw, ch) = imageCrop d
+                (oW, oH, oX, oY) = viewFit (cellAspect e) (imageFitCap e d)
+                                     (loTextWidth loB) (loTextHeight loB) cw ch
+            in ( fromIntegral cx + (fromIntegral (c - oX) + 0.5) * fromIntegral cw / fromIntegral oW
+               , fromIntegral cy + fromIntegral (2 * r + 1 - oY) * fromIntegral ch / fromIntegral oH ) :: (Double, Double)
+        wheelAt b r c = KMouse (MouseEvent b (loTextLeft loB + c) (loTextTop loB + r) True False noMods 1)
+        zoomAt b r c e = fst (update (wheelAt b r c) e)
+        (r0, c0) = (5, 20)
+        edIn = zoomAt MBWheelUp r0 c0 edBig
+        (sx0, sy0) = srcAt edBig r0 c0
+        (sx1, sy1) = srcAt edIn r0 c0
+        nearly a b' = abs (a - b') <= 2.5
+    check "wheel up in the image zooms in" ((idCrop =<< edImage edIn) /= Nothing)
+    -- At the first notch the 4:3 picture is still narrower than the text
+    -- area, so horizontally it stays centred; vertically it already overflows
+    -- and the pointer's pixel must hold.
+    check "the first notch holds the pointer's row" (nearly sy0 sy1)
+    check "and a picture still narrower than the screen stays centred"
+      (maybe False (\(x, _, w, _) -> x == 0 && w == 800) (idCrop =<< edImage edIn))
+    -- From the second notch the view overflows both ways and the pixel under
+    -- the pointer holds in both directions from notch to notch.
+    let edIn2 = iterate (zoomAt MBWheelUp r0 c0) edBig !! 2
+        edIn3 = zoomAt MBWheelUp r0 c0 edIn2
+        edIn5 = iterate (zoomAt MBWheelUp r0 c0) edIn3 !! 2
+        (sx2, sy2) = srcAt edIn2 r0 c0
+        (sx3, sy3) = srcAt edIn3 r0 c0
+        (sx5, sy5) = srcAt edIn5 r0 c0
+    check "the pixel under the pointer stays under it (x)" (nearly sx2 sx3 && nearly sx2 sx5)
+    check "the pixel under the pointer stays under it (y)" (nearly sy0 sy3 && nearly sy0 sy5)
+    -- with sx1 bound so the first notch's x is still exercised by the oracle
+    check "the first notch's x stays on the picture" (sx1 >= 0 && sx1 <= 800)
+    check "each notch narrows the view"
+      (maybe False (\(_, _, w1, _) -> maybe False (\(_, _, w3, _) -> w3 < w1) (idCrop =<< edImage edIn3))
+                   (idCrop =<< edImage edIn))
+    let edMax = iterate (zoomAt MBWheelUp r0 c0) edBig !! 60
+    check "zoom stops at a maximum"
+      (maybe False (\(_, _, w, _) -> w >= 4) (idCrop =<< edImage edMax) && edStatus edMax == "Maximum zoom")
+    let edOut = iterate (zoomAt MBWheelDown r0 c0) edIn3 !! 3
+    check "zooming back out returns to the whole-image fit" ((idCrop =<< edImage edOut) == Nothing)
+    check "wheel down at the fit stays at the fit"
+      ((idCrop =<< edImage (zoomAt MBWheelDown r0 c0 edBig)) == Nothing)
+    check "a click still resets the zoom"
+      (let (e1, _) = update (KMouse (MouseEvent MBLeft (loTextLeft loB + 3) (loTextTop loB + 3) True False noMods 1)) edIn3
+           (e2, _) = update (KMouse (MouseEvent MBLeft (loTextLeft loB + 3) (loTextTop loB + 3) False False noMods 1)) e1
+       in (idCrop =<< edImage e2) == Nothing)
+    -- A small image held at native size (cell-pixel size known): the first
+    -- notch jumps to fill, and wheeling back out must return to the fit
+    -- instead of re-deriving the fill scale from the whole-image crop forever.
+    let smallImg = Image 40 30 "PNG" (listArray (0, 40 * 30 * 4 - 1) (repeat 0))
+        edSmall = imageLoaded "/small.png" [(smallImg, 0)] (setCellPx (10, 20) ed0)
+        edSmallIn = zoomAt MBWheelUp r0 c0 edSmall
+    check "a native-size image zooms in to fill" ((idCrop =<< edImage edSmallIn) == Just (0, 0, 40, 30))
+    check "and wheels back out to the native fit"
+      ((idCrop =<< edImage (zoomAt MBWheelDown r0 c0 edSmallIn)) == Nothing)
+    check "the wheel outside the text area does nothing"
+      ((idCrop =<< edImage (fst (update (KMouse (MouseEvent MBWheelUp 0 0 True False noMods 1)) edBig))) == Nothing)
 
   -- Input parsing: Ctrl+Shift+F/H arrive as CSI u under the Kitty protocol.
   kcsF <- parseBytes (csiU 102 6)   -- 'f' with shift(1)+ctrl(4) -> mods param 6
@@ -5832,8 +6066,14 @@ main = do
                  , "(1):1:/a", "1:(1):/a", "1:1:/a/b/c.txt", "1:1: " ]
     check ("the recents parser is byte-identical to the pre-0030 one ("
              ++ show (length recentCorpus) ++ " inputs)")
-      (all (\t -> parseRecentText t == maybe [] (: []) (parseRecentPrev (T.strip t)))
+      -- (only the front of a line and a trailing CR are trimmed now: the
+      -- tail is the path, and a filename may end in a blank)
+      (all (\t -> parseRecentText t
+                   == maybe [] (: []) (parseRecentPrev (T.stripStart (T.dropWhileEnd (== '\r') t))))
            recentCorpus)
+    let trailRs = [RecentEntry "/a/trail " 0 0, RecentEntry "/a/tab\t" 2 3]
+    checkEq "a recent path ending in a blank round-trips"
+      (parseRecentText (renderRecentText trailRs)) trailRs
     check "recent list is capped"
       (length (parseRecentText (T.unlines
         [ T.pack ("1:1:/f" ++ show i) | i <- [1 .. 200 :: Int] ])) == 50)
@@ -7424,6 +7664,16 @@ main = do
     checkEq "workbook match 1 cell"   (fmap snd (mUnit (head wbMs))) (Just (T.pack "B1"))
     checkEq "workbook match 2 sheet"  (fmap fst (mUnit (wbMs !! 1))) (Just 2)
     checkEq "workbook match 2 cell"   (fmap snd (mUnit (wbMs !! 1))) (Just (T.pack "A1"))
+    -- A cell with a line break in it is still one extracted line, or every
+    -- match after it is labelled with some other cell (or none).
+    let wbNl = Xlsx.mkWorkbook
+                 [ (T.pack "S1", Seq.fromList [ Seq.fromList [T.pack "name", T.pack "note"]
+                                              , Seq.fromList [T.pack "alice", T.pack "line one\nline two"]
+                                              , Seq.fromList [T.pack "bob", T.pack "needle"] ]) ]
+                 T.empty
+        (nlMs, _, _) = DT.docMatches (lit "needle") (DT.extractBook wbNl)
+    checkEq "a multi-line cell does not shift later labels"
+      (map (fmap snd . mUnit) nlMs) [Just (T.pack "B3")]
 
     -- A term spanning two columns is deliberately not found: those are two
     -- values that happen to be adjacent, not a phrase.

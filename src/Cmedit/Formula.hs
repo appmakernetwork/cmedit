@@ -55,7 +55,7 @@ module Cmedit.Formula
 
 import Data.Char (isAlpha, isDigit, isSpace, ord, toUpper)
 import Data.Foldable (toList)
-import Data.List (foldl', sortBy)
+import Data.List (foldl', sortBy, transpose)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe, mapMaybe)
@@ -692,7 +692,9 @@ supportedFunctions =
 
 -- Evaluate a function's arguments, keeping ranges as ranges (the aggregates
 -- need every cell) and everything else as a single value.
-data Arg = AVal !Value | ARange ![Value]
+-- A range carries its width: it arrives flattened row-major, and the lookups
+-- (INDEX, VLOOKUP, HLOOKUP) cannot find a row or a column without the shape.
+data Arg = AVal !Value | ARange !Int ![Value]
 
 callFn :: Env -> Ctx -> Text -> [Expr] -> St -> (Value, St)
 callFn env ctx f as st0 = case f of
@@ -738,13 +740,13 @@ evalArg env ctx e st = case e of
           cc = [max 0 c0 .. min (nc - 1) (if c1 == maxBound then nc - 1 else c1)]
           step (vs, s) (r, c) = let (v, s') = evalCell env ctx (si, r, c) s in (v : vs, s')
           (vals, st') = foldl' step ([], st) [ (r, c) | r <- rr, c <- cc ]
-      in (ARange (reverse vals), st')
+      in (ARange (length cc) (reverse vals), st')
   _ -> let (v, st') = evalExpr env ctx e st in (AVal v, st')
 
 -- Every value an argument stands for (a range flattens, a scalar is itself).
 argVals :: Arg -> [Value]
 argVals (AVal v)   = [v]
-argVals (ARange vs) = vs
+argVals (ARange _ vs) = vs
 
 -- Numbers for an aggregate. Excel's rule: text and blanks inside a *range* are
 -- ignored, but a scalar argument is coerced — @SUM(A1:A9)@ skips a stray label,
@@ -758,7 +760,7 @@ aggNums = foldr step (Right [])
         AVal v -> case asNum v of
           Left e  -> Left e
           Right d -> Right (d : ns)
-        ARange vs -> case firstErr vs of
+        ARange _ vs -> case firstErr vs of
           Just e  -> Left e
           Nothing -> Right ([ d | VNum d <- vs ] ++ ns)
     firstErr vs = case [ v | v@(VErr _) <- vs ] of (e : _) -> Just e; [] -> Nothing
@@ -791,7 +793,7 @@ applyFn f args = case f of
   "AVERAGEIF" -> condAgg (\ms -> if null ms then errDiv0
                                    else VNum (sum ms / fromIntegral (length ms)))
   "COUNTIF" -> case args of
-    [ARange rs, AVal c] -> VNum (fromIntegral (length (filter (matches c) rs)))
+    [ARange _ rs, AVal c] -> VNum (fromIntegral (length (filter (matches c) rs)))
     [AVal r, AVal c]    -> VNum (if matches c r then 1 else 0)
     _                   -> errValue
 
@@ -810,8 +812,16 @@ applyFn f args = case f of
   "MOD" -> num2 (\x y -> if y == 0 then errDiv0
                            else VNum (x - y * fromIntegral (floor (x / y) :: Integer)))
   "POWER" -> num2 (\x y -> let r = x ** y in if isNaN r || isInfinite r then errNum else VNum r)
-  "CEILING" -> num2 (\x s -> if s == 0 then VNum 0 else VNum (ceilingAway (x / s) * s))
-  "FLOOR"   -> num2 (\x s -> if s == 0 then errDiv0 else VNum (truncateToward (x / s) * s))
+  -- Towards +infinity and -infinity in units of the significance, which is
+  -- Excel's rule for every sign combination it accepts (CEILING(-2.1,1) is
+  -- -2, FLOOR(-2.1,1) is -3); a positive number with a negative significance
+  -- is the one it rejects.
+  "CEILING" -> num2 (\x s -> if s == 0 then VNum 0
+                             else if x > 0 && s < 0 then errNum
+                             else VNum (fromIntegral (ceiling (x / s) :: Integer) * s))
+  "FLOOR"   -> num2 (\x s -> if s == 0 then errDiv0
+                             else if x > 0 && s < 0 then errNum
+                             else VNum (fromIntegral (floor (x / s) :: Integer) * s))
 
   "LEN"   -> one1 (VNum . fromIntegral . T.length . asText)
   "UPPER" -> text1 T.toUpper
@@ -833,9 +843,19 @@ applyFn f args = case f of
                 _ -> errValue)
     _ -> errValue
   "SUBSTITUTE" -> case scalars of
-    (a : b : c : _) | not (T.null (asText b)) ->
-                        VText (T.replace (asText b) (asText c) (asText a))
-                    | otherwise -> VText (asText a)
+    [a, b, c] | not (T.null (asText b)) ->
+                  VText (T.replace (asText b) (asText c) (asText a))
+              | otherwise -> VText (asText a)
+    -- the fourth argument picks one occurrence to replace
+    [a, b, c, n] -> withNums [n] (\ns -> case map truncate ns :: [Int] of
+      [k] | k < 1 -> errValue
+          | T.null (asText b) -> VText (asText a)
+          | otherwise ->
+              let parts = T.splitOn (asText b) (asText a)
+              in if k >= length parts then VText (asText a)
+                   else VText (T.intercalate (asText b) (take k parts) <> asText c
+                               <> T.intercalate (asText b) (drop k parts))
+      _ -> errValue)
     _ -> errValue
   "CONCATENATE" -> VText (T.concat (map asText vals))
   "CONCAT"      -> VText (T.concat (map asText vals))
@@ -856,22 +876,33 @@ applyFn f args = case f of
   "VLOOKUP" -> lookupFn False
   "HLOOKUP" -> lookupFn True
   "MATCH" -> case args of
-    (AVal needle : ARange hay : rest) ->
+    (AVal needle : ARange _ hay : rest) ->
       let approx = case rest of
                      (AVal m : _) -> either (const 1) id (fmap truncate (asNum m)) /= (0 :: Int)
                      _            -> True
       in matchIn needle hay approx
     _ -> errValue
   "INDEX" -> case args of
-    (ARange rs : rest) -> withNums (concatMap argVals rest) (\ns ->
-      let i = case ns of (n : _) -> truncate n - 1; _ -> 0
-      in if i >= 0 && i < length rs then rs !! i else errRef)
+    (ARange w0 rs : rest) -> withNums (concatMap argVals rest) (\ns ->
+      let w = max 1 w0
+          h = length rs `div` w
+          -- One index into a single row or column counts along it; into a
+          -- block it would name a whole row, which is not one cell's answer.
+          pos = case map truncate ns :: [Int] of
+            [n] | h == 1    -> Just (1, n)
+                | w == 1    -> Just (n, 1)
+                | otherwise -> Nothing
+            (r : c : _) -> Just (if r == 0 && h == 1 then 1 else r, if c == 0 && w == 1 then 1 else c)
+            []          -> Just (1, 1)
+      in case pos of
+           Just (r, c) | r >= 1 && r <= h && c >= 1 && c <= w -> rs !! ((r - 1) * w + (c - 1))
+           _ -> errRef)
     _ -> errValue
 
   _ -> errName
   where
     vals    = concatMap argVals args
-    scalars = [ v | AVal v <- args ] ++ [ v | ARange (v : _) <- args ]
+    scalars = [ v | AVal v <- args ] ++ [ v | ARange _ (v : _) <- args ]
 
     isNumV v = case v of VNum _ -> True; _ -> False
     numOf v  = case v of VNum d -> Just d; _ -> Nothing
@@ -920,13 +951,13 @@ applyFn f args = case f of
 
     -- SUMIF/AVERAGEIF: (range, criterion, [sum range]).
     condAgg g = case args of
-      [ARange rs, AVal c]            -> g [ d | VNum d <- rs, matches c (VNum d) ]
-      [ARange rs, AVal c, ARange ss] ->
+      [ARange _ rs, AVal c]            -> g [ d | VNum d <- rs, matches c (VNum d) ]
+      [ARange _ rs, AVal c, ARange _ ss] ->
         g [ d | (r, VNum d) <- zip rs ss, matches c r ]
       _ -> errValue
 
     lookupFn horizontal = case args of
-      (AVal needle : ARange hay : rest) ->
+      (AVal needle : ARange w hay : rest) ->
         let idx = case rest of
                     (a : _) -> either (const 0) truncate (asNum (headOf a))
                     _       -> 0
@@ -934,22 +965,29 @@ applyFn f args = case f of
             approx = case drop 1 rest of
                        (a : _) -> either (const True) id (asBool (headOf a))
                        _       -> True
-        in vlookupIn needle hay idx approx horizontal
+        in vlookupIn needle (chunk (max 1 w) hay) idx approx horizontal
       _ -> errValue
 
-    -- A range arrives flattened row-major, so a lookup has to know the shape.
-    -- It does not, so this supports the overwhelmingly common shape: the key
-    -- in the first column (or row) and the answer a fixed offset along. Any
-    -- other shape yields #N/A rather than a plausible wrong row.
-    vlookupIn needle hay idx _approx horizontal
-      | idx < 1 || null hay = errValue
+    -- The range as its rows. VLOOKUP keys on the first column and answers
+    -- from column @idx@ of the matching row; HLOOKUP is the same lookup on
+    -- the transposed block. An exact match wins; failing one, an approximate
+    -- lookup takes the last key not greater than the needle (Excel's rule for
+    -- the sorted table it assumes), and an index outside the block is #REF!.
+    vlookupIn needle rows0 idx approx horizontal
+      | idx < 1 || null rows0 = errValue
+      | idx > width = errRef
       | otherwise =
-          let w = if horizontal then length hay else idx
-              rowsOf = chunk (max 1 w) hay
-              keyOf r = case r of (v : _) -> v; [] -> VBlank
-          in case [ r | r <- rowsOf, compareValues (keyOf r) needle == EQ ] of
-               (r : _) | idx <= length r -> r !! (idx - 1)
-               _ -> errNA
+          let keyOf r = case r of (v : _) -> v; [] -> VBlank
+              exact  = [ r | r <- rows, compareValues (keyOf r) needle == EQ ]
+              below  = [ r | r <- rows, keyOf r /= VBlank, compareValues (keyOf r) needle /= GT ]
+              pick r = if idx <= length r then r !! (idx - 1) else errNA
+          in case exact of
+               (r : _) -> pick r
+               [] | approx, not (null below) -> pick (last below)
+                  | otherwise -> errNA
+      where
+        rows  = if horizontal then transpose rows0 else rows0
+        width = maximum (0 : map length rows)
 
     matchIn needle hay approx =
       case [ i | (i, v) <- zip [1 :: Int ..] hay, compareValues v needle == EQ ] of

@@ -113,6 +113,7 @@ import Data.Word (Word8)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.IntMap.Strict as IM
+import qualified Data.IntSet as IS
 import qualified Data.Map.Strict as M
 
 import Cmedit.Inflate (inflateDyn)
@@ -300,6 +301,7 @@ skipWs bs = go
 -- a malformed region costs the objects inside it and nothing more.
 parseObj :: BS.ByteString -> Int -> Maybe (Obj, Int)
 parseObj bs i0
+  | i0 < 0 = Nothing                        -- an offset the file made up
   | i >= n = Nothing
   | c == 47 = let (nm, j) = readName bs (i + 1) in Just (OName nm, j)
   | c == 40 = let (s, j) = readLitStr bs (i + 1) in Just (OStr s, j)
@@ -575,10 +577,19 @@ expandObjStms _bs found = foldl' step found (IM.toList found)
           let cnt = intOf base (M.lookup (BC.pack "N") d)
               first = intOf base (M.lookup (BC.pack "First") d)
               hdr = readPairs dat 0 (min cnt 100000)
-          in foldl' (\a (num, rel) -> case parseObj dat (first + rel) of
-                        Just (o, _) -> IM.insertWith later num (off, o) a
-                        Nothing     -> a)
-                    acc hdr
+              len = BS.length dat
+              -- Offsets come from the stream's own header, so each is checked
+              -- against the stream, and the bytes parsed are budgeted: N
+              -- entries may all point at one long unterminated string, and
+              -- parsing it N times is N copies of the stream.
+              budget0 = 8 * len + 4096
+          in fst (foldl' (\(a, left) (num, rel) ->
+                        let at0 = first + rel
+                        in if left <= 0 || at0 < 0 || at0 >= len then (a, left)
+                           else case parseObj dat at0 of
+                             Just (o, j) -> (IM.insertWith later num (off, o) a, left - max 1 (j - at0))
+                             Nothing     -> (a, left - 1))
+                    (acc, budget0) hdr)
     step acc _ = acc
     later new old = if fst new >= fst old then new else old
     -- The header is 2N integers: object number, then offset from /First.
@@ -873,13 +884,19 @@ collectPages f
   where
     root = dictOf f (M.findWithDefault ONull (BC.pack "Root") (pfTrailer f))
     pagesRef = M.findWithDefault ONull (BC.pack "Pages") root
-    viaTree = take maxPdfPages (walk [] 0 M.empty pagesRef)
+    viaTree = take maxPdfPages (reverse (fst (walk 0 M.empty ([], IS.empty) pagesRef)))
     inheritable = map BC.pack ["Resources", "MediaBox", "CropBox", "Rotate"]
-    walk seen depth inh node
-      | depth > 64 = []
-      | ORef r <- node, r `elem` seen = []
+    -- The visited set is global, not the ancestor path: a page tree is a
+    -- tree, so no node is reached twice, and with only the path checked a
+    -- file listing the same child several times per level made the walk
+    -- exponential in the depth (4^40 visits from 3 KB, and no pages at the
+    -- end of them for 'take' to stop on).
+    walk depth inh (acc, seen) node
+      | depth > (64 :: Int) = (acc, seen)
+      | ORef r <- node, r `IS.member` seen = (acc, seen)
+      | length acc >= maxPdfPages = (acc, seen)
       | otherwise =
-          let seen' = case node of ORef r -> r : seen; _ -> seen
+          let seen' = case node of ORef r -> IS.insert r seen; _ -> seen
               d = dictOf f node
               inh' = foldl' (\a k -> case M.lookup k d of
                                        Just v  -> M.insert k v a
@@ -887,8 +904,8 @@ collectPages f
               ty = M.lookup (BC.pack "Type") d
               kids = arrOf f (M.findWithDefault ONull (BC.pack "Kids") d)
           in if ty == Just (OName (BC.pack "Page")) || (null kids && M.member (BC.pack "Contents") d)
-               then [M.union d inh']
-               else concatMap (walk seen' (depth + 1) inh') kids
+               then (M.union d inh' : acc, seen')
+               else foldl' (walk (depth + 1) inh') (acc, seen') kids
 
 ------------------------------------------------------------------------------
 -- Fonts
@@ -1025,7 +1042,15 @@ parseToUnicode bs = IM.union (chars) (ranges)
   where
     chars = sections "beginbfchar" "endbfchar" bfChar
     ranges = sections "beginbfrange" "endbfrange" bfRange
-    sections open close h = foldl' IM.union IM.empty (map h (slices open close))
+    -- Budgeted across every section: a range is three short strings that
+    -- can stand for 65536 entries, so a 20 KB CMap could ask for hundreds of
+    -- millions. No real font maps more than a few tens of thousands.
+    sections open close h = fst (foldl' add (IM.empty, maxCMapEntries) (slices open close))
+      where add (m, left) body
+              | left <= 0 = (m, left)
+              | otherwise = let m' = IM.fromList (take left (h body))
+                            in (IM.union m m', left - IM.size m')
+    maxCMapEntries = 1048576 :: Int
     slices open close = go 0
       where
         go i =
@@ -1036,9 +1061,9 @@ parseToUnicode bs = IM.union (chars) (ranges)
                let s = i + BS.length pre + length open
                    (body, after) = BS.breakSubstring (BC.pack close) (BS.drop s bs)
                in body : (if BS.null after then [] else go (s + BS.length body + length close))
-    bfChar body = IM.fromList
+    bfChar body =
       [ (codeOf a, utf16 b) | [a, b] <- pairsOf (objsIn body) ]
-    bfRange body = IM.fromList (concatMap one (triplesOf (objsIn body)))
+    bfRange body = concatMap one (triplesOf (objsIn body))
       where
         one [OStr a, OStr b, OStr dst] =
           let lo = beInt a; hi = min (beInt b) (lo + 65535)

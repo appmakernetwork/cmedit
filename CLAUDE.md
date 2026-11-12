@@ -1018,6 +1018,19 @@ in `README.md`; the cross-cutting structure that matters when editing:
   cached); on release `cellRectToCrop` maps it to source pixels via the shared
   `Image.viewFit` geometry and sets `idCrop`. A single click or Esc clears
   `idCrop` back to the full image. Drag/click are handled in `handleImageMouse`.
+  **The wheel zooms around the pointer** (`EditorDoc.wheelZoom`, 1.25× per
+  notch, `wheelZoomStep`): the source pixel under the pointer is found
+  through the same `viewFit` geometry, the new window is the text area divided
+  by the new scale and is placed so that pixel keeps its screen position,
+  then clamped to the image. Two consequences follow from expressing zoom as a
+  crop rather than a free scale: a dimension the window spans entirely is
+  centred by `viewFit` (so a picture still narrower than the screen grows
+  about its centre horizontally until it overflows), and because any crop
+  lifts `imageFitCap`, the first notch on a small native-size image jumps to
+  fill the window. Zooming *out* from that whole-image crop returns to the fit
+  explicitly: the fill scale is re-derived from the crop on every notch, so
+  without the check the view could never get back. Zooming out to the fit sets `idCrop` back to `Nothing`, and
+  zoom stops at four source pixels across the text area.
   **Animation:** `Image.decodeFrames` returns every frame of an animated GIF
   as composed full-canvas RGBA images with per-frame delays (disposal
   methods, sub-rectangles, local palettes and transparency handled in
@@ -1706,6 +1719,31 @@ in `README.md`; the cross-cutting structure that matters when editing:
 - Terminal teardown (alt screen, mouse, cursor, termios restore) runs via
   `bracket`/`bracket_` in `runTui`, and a SIGTERM/SIGHUP handler throws to the
   main thread so cleanup still runs on external kill.
+- **`Render.sanitizeGrid` is the last pass over every frame, and it enforces
+  two grid invariants the emitter depends on** rather than trusting each draw
+  routine: no control character in any cell (a CSV cell, a file name or a
+  search term used to go into cells verbatim, so a file could carry an OSC 52
+  clipboard write straight to the terminal), and no half of a wide glyph (a
+  clip edge or an overlay can cut one; the emitter skips a continuation
+  without advancing and prints a lone head two columns wide, which shifted
+  the row). New draw code may rely on it, but `drawStr`/`drawStrL`/`drawStrU`
+  are width-aware in their own right; their *callers* still clip by `take n`
+  characters, so a CJK name in the chrome can overrun its region by one cell
+  per wide glyph.
+- **The search fold is length-preserving (`Search.normCase`, the only one).**
+  `T.toLower` turns U+0130 into two code points; replace maps offsets found in
+  the folded text back onto the original, so one `İ` before a match made a
+  case-insensitive Replace All write through the neighbouring text. The fast
+  fold is kept and its length checked; never fold with `T.toLower` directly
+  where an offset comes back out.
+- **The loop's animation timers are kept across iterations** (`keepTimer` in
+  `eventLoop`). A timer re-created on each wake-up never fires while events
+  arrive faster than its delay, and with mouse-motion reporting on, moving the
+  pointer froze an animated image, the load spinner and the About box.
+- **A path that exists is not necessarily a file.** `classifyFileWith` gives a
+  pipe or a device exactly one capped read (`isRegularFile`, `classifyBytes`):
+  the sniffing reads each consume a stream and its size reads as zero, so
+  `cmedit <(git diff)` opened empty and `/dev/zero` read until memory ran out.
 - Clipboard prefers external helpers (`xclip`/`wl-copy`/`xsel`/`pbcopy`) and
   falls back to an OSC 52 escape; copy returns a `CopyOutcome` telling the
   driver whether to emit the OSC 52 sequence.

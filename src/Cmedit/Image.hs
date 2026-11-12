@@ -99,8 +99,12 @@ checkDims w h
 ------------------------------------------------------------------------------
 -- Little byte helpers over a ByteString (all O(1) indexing)
 
+-- Total: a byte past either end reads as 0. Header and segment parsers call
+-- this with offsets taken from the file, and a truncated or lying file must
+-- come out as a decode error (or a damaged picture), never an exception.
 at :: BS.ByteString -> Int -> Int
-at bs i = fromIntegral (BS.index bs i)
+at bs i | i >= 0 && i < BS.length bs = fromIntegral (BSU.unsafeIndex bs i)
+        | otherwise                  = 0
 
 -- Bounds-checked byte read; Nothing past the end.
 atM :: BS.ByteString -> Int -> Maybe Int
@@ -583,6 +587,12 @@ frameAt bs gctFlag pos gce = do
         | otherwise = -1
   when' (pos + 10 > BS.length bs) "truncated GIF image descriptor"
   when' (iw <= 0 || ih <= 0) "GIF image has zero size"
+  -- The frame is decoded at its own size before it is clipped to the canvas,
+  -- so that size must be believable: two bytes each let a 500-byte file ask
+  -- for a 4-gigapixel frame. A frame may overhang a small logical screen (real
+  -- files do), but not by orders of magnitude.
+  let canvas = le16 bs 6 * le16 bs 8
+  when' (iw * ih > maxPixels || iw * ih > 16 * canvas + 65536) "GIF frame is larger than its canvas"
   when' (not lctFlag && not gctFlag) "GIF has no colour table"
   let minCode = atSafe bs dataOff0
   when' (minCode < 1 || minCode > 11) "bad GIF LZW code size"
@@ -1202,6 +1212,10 @@ decodeJPEG bs = do
   fr <- findFrame bs 2
   let w = jfW fr; h = jfH fr; comps = jfComps fr
   checkDims w h
+  -- Sampling factors are 1..4 and a quantisation table id 0..3; anything
+  -- else divides by zero or indexes outside the tables and the planes.
+  when' (any (\c -> jcH c < 1 || jcH c > 4 || jcV c < 1 || jcV c > 4 || jcTq c > 3) comps)
+        "bad JPEG frame header"
   when' (null comps) "JPEG missing frame header"
   when' (not (length comps `elem` [1,3])) "unsupported JPEG component count"
   Right (decodeJpegImage bs w h comps)
@@ -1516,7 +1530,7 @@ decodeJpegImage bs w h comps =
                               readVal i = if pq == 0 then at bs (p+1+i) else be16 bs (p+1+2*i)
                               tbl = U.array (0,63) [ (zigzag ! i, readVal i) | i <- [0..63] ]
                                       :: UArray Int Int
-                          writeArray quantT tq tbl
+                          when (tq <= 3) (writeArray quantT tq tbl)   -- ids are 0..3
                           goD (p + 1 + (if pq == 0 then 64 else 128))
         applyDHT seg end = goH seg
           where goH p | p >= end = pure ()
@@ -1527,18 +1541,22 @@ decodeJpegImage bs w h comps =
                               syms = [ at bs (p+17+i) | i <- [0..nsym-1] ]
                               hf = Huff (A.listArray (0,16) (0:counts))
                                         (A.listArray (0, max 0 (nsym-1)) (syms++[0])) 16
-                          if tc == 0 then writeArray dcT th (mkJHuff hf)
-                                     else writeArray acT th (mkJHuff hf)
+                          when (th <= 3) $                            -- ids are 0..3
+                            if tc == 0 then writeArray dcT th (mkJHuff hf)
+                                       else writeArray acT th (mkJHuff hf)
                           goH (p+17+nsym)
     -- Decode one scan (its band [Ss,Se] at successive-approximation Ah/Al) into
     -- the coefficient buffers. Handles baseline, DC first/refine and AC
     -- first/refine; the AC routines maintain an EOB-run counter.
     let decodeScan seg next = do
           let ns = at bs seg
-              ents = [ (at bs o, at bs (o+1) `shiftR` 4, at bs (o+1) .&. 15)
+              -- Table selectors are 0..3 and the spectral band 0..63; masked
+              -- and clamped (a no-op for any valid file) so a corrupt scan
+              -- header decodes to noise instead of indexing out of range.
+              ents = [ (at bs o, (at bs (o+1) `shiftR` 4) .&. 3, at bs (o+1) .&. 3)
                      | i <- [0..ns-1], let o = seg+1+2*i ]
               hdr = seg + 1 + 2*ns
-              ss = at bs hdr; se = at bs (hdr+1); ahal = at bs (hdr+2)
+              ss = min 63 (at bs hdr); se = min 63 (at bs (hdr+1)); ahal = at bs (hdr+2)
               ah = ahal `shiftR` 4; al = ahal .&. 15
               scanComps = [ (ci, td, ta) | (cs,td,ta) <- ents
                                          , (ci,c) <- zip [0..] comps, jcId c == cs ]

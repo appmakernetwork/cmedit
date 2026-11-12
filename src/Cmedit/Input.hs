@@ -310,7 +310,9 @@ otherKey code m
       -- these into the C0 range, so map the disambiguated form to the same KCtrlChar.
       | hasCtrl m && c >= 0x20 && c <  0x7f      = KCtrlChar (chr c)
       | hasAlt  m && c >= 0x20 && c <  0x7f      = KAltChar (chr c)             -- Alt+printable
-      | c >= 0x20                                = KChar (chr c)
+      -- (bounded: 'chr' throws past the last code point, and a key code is
+      -- whatever number the byte stream says it is)
+      | c >= 0x20 && c <= 0x10FFFF               = KChar (chr c)
       | otherwise                                = KUnknown [fromIntegral (c .&. 0xff), 0x75]
 
 -- Kitty functional codes for numpad keys that have an obvious printable twin:
@@ -399,6 +401,9 @@ parseMouse body final =
       wheel    = (cb .&. 0x40) /= 0
       base     = cb .&. 0x03
       button
+        -- 128..131 are the extra (back/forward) buttons; without this
+        -- they decode as left/middle/right presses and click things
+        | (cb .&. 0x80) /= 0 = MBNone
         | wheel     = case base of        -- SGR 64..67: up, down, wheel-left, wheel-right
             0 -> MBWheelUp
             1 -> MBWheelDown

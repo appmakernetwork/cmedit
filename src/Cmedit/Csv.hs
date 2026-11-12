@@ -837,9 +837,12 @@ syncWidths old ws new
 
 -- | Newlines row @row@ contributes to the serialised CSV.
 rowNl :: Char -> Row -> Int
-rowNl delim (PackedRow _ n _ _ _)
-  | delim == '\n' = max 0 (n - 1)
-  | otherwise = 0
+-- A packed row was cut from one line of the file, so its base cells hold no
+-- newline; its /edits/ are another matter. 'rowUpdate' keeps an edited row
+-- packed, and a newline typed or pasted into one lives only in the overlay.
+rowNl delim (PackedRow _ n _ _ edits) =
+  Map.foldl' (\ !a c -> a + nlCount c) 0 edits
+    + (if delim == '\n' then max 0 (n - 1) else 0)
 rowNl delim row =
   rowFoldl' (\ !a c -> a + nlCount c) 0 row
     + (if delim == '\n' then max 0 (rowLength row - 1) else 0)
@@ -1025,8 +1028,9 @@ cellLineCount t = 1 + T.count (T.pack "\n") t
 -- | The number of lines the tallest cell in a row actually has (uncapped).
 rowLineCount :: CsvView -> Int -> Int
 rowLineCount v r = case rowAt r v of
-  PackedRow{} -> 1
-  row         -> maximum (1 : map cellLineCount (rowToList row))
+  -- only the edits overlay of a packed row can hold a newline (see 'rowNl')
+  PackedRow _ _ _ _ edits -> Map.foldl' (\ !a c -> max a (cellLineCount c)) 1 edits
+  row                     -> maximum (1 : map cellLineCount (rowToList row))
 
 -- | On-screen height of a table row: its tallest cell, capped at 'maxCellLines'.
 rowHeight :: CsvView -> Int -> Int
@@ -1947,7 +1951,7 @@ undo :: CsvView -> CsvView
 undo v = case Seq.viewl (csvUndo v) of
   Seq.EmptyL -> v
   (g Seq.:< gs) ->
-    clampCursor v { csvRows = g, csvUndo = gs
+    clampCursor . dropStaleUserW $ v { csvRows = g, csvUndo = gs
                   , csvRedo = pushHist maxUndo (csvRows v) (csvRedo v)
                   , csvEdit = Nothing, csvSelAnchor = Nothing
                   , csvWidths = syncWidths (csvRows v) (csvWidths v) g
@@ -1958,12 +1962,21 @@ redo :: CsvView -> CsvView
 redo v = case Seq.viewl (csvRedo v) of
   Seq.EmptyL -> v
   (g Seq.:< gs) ->
-    clampCursor v { csvRows = g, csvRedo = gs
+    clampCursor . dropStaleUserW $ v { csvRows = g, csvRedo = gs
                   , csvUndo = pushHist maxUndo (csvRows v) (csvUndo v)
                   , csvEdit = Nothing, csvSelAnchor = Nothing
                   , csvWidths = syncWidths (csvRows v) (csvWidths v) g
                   , csvDirty = syncDirty (csvSaved v) (csvDirty v) (csvRows v) g
                   , csvNl = syncNl (csvDelim v) (csvRows v) (csvNl v) g }
+
+-- | Forget width overrides for columns the grid no longer has. Undo and redo
+-- can change the column count behind 'csvUserW''s back, and an override left
+-- past the last column would be inherited by whatever column is added there
+-- next.
+dropStaleUserW :: CsvView -> CsvView
+dropStaleUserW v
+  | Map.null (csvUserW v) = v
+  | otherwise = v { csvUserW = Map.filterWithKey (\k _ -> k < nCols v) (csvUserW v) }
 
 -- | Give @new@ the undo history of @old@, with @old@'s grid pushed as the most
 -- recent undo step. Used when a CSV document is edited as plain text and then

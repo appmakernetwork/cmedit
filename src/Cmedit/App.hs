@@ -14,7 +14,7 @@ import Control.Concurrent (ThreadId, forkIO, getNumCapabilities, killThread, myT
 import Control.Concurrent.MVar (MVar, newMVar, modifyMVar, modifyMVar_, readMVar)
 import Control.Concurrent.STM
 import GHC.Conc (getNumProcessors, setNumCapabilities)
-import Control.Exception (SomeException, bracket, bracket_, catch, finally, handle, mask_, throwIO, try)
+import Control.Exception (ErrorCall, SomeException, evaluate, bracket, bracket_, catch, finally, handle, mask_, throwIO, try)
 import Control.Monad (filterM, foldM, forM, forM_, unless, void, when)
 import qualified Data.ByteString as BS
 import Data.ByteString.Builder (Builder, char7, hPutBuilder)
@@ -39,7 +39,7 @@ import Text.Printf (printf)
 import Text.Read (readMaybe)
 import System.Directory
   ( XdgDirectory(XdgCache)
-  , canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, doesFileExist
+  , canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, doesFileExist, doesPathExist
   , findExecutable, getCurrentDirectory, getFileSize, getHomeDirectory
   , getModificationTime
   , getXdgDirectory, listDirectory
@@ -614,10 +614,13 @@ removeDirIfPresent d = do
 snapshotStampOK :: FilePath -> Maybe Integer -> IO Bool
 snapshotStampOK _ Nothing = pure False
 snapshotStampOK dir (Just want) = do
-  r <- try (readFile (dir </> stampFileName))
-  pure $ case r :: Either SomeException String of
-    Right txt -> readMaybe (takeWhile (/= '\n') txt) == Just want
-    Left _    -> False
+  -- Strict and byte-wise: a lazy 'readFile' keeps the handle open until the
+  -- GC gets to it, and decodes outside the 'try', so a corrupt stamp was an
+  -- uncaught exception at startup rather than "no snapshots".
+  r <- try (BS.readFile (dir </> stampFileName))
+  pure $ case r :: Either SomeException BS.ByteString of
+    Right bs -> readMaybe (map (toEnum . fromIntegral) (BS.unpack (BS.takeWhile (/= 10) bs))) == Just want
+    Left _   -> False
 
 -- | One file's snapshot from a (stamp-verified) snapshot directory.
 --
@@ -832,7 +835,11 @@ readerLoop :: ByteSource -> TQueue Key -> IORef ClickState -> IO ()
 readerLoop src q clickRef = go
   where
     go = do
-      k0 <- nextKey src
+      -- No parse error may end this thread: it is the only reader, and
+      -- without it the editor stays on screen and deaf. (Never the empty
+      -- 'KUnknown', which is the EOF sentinel.)
+      k0 <- (nextKey src >>= evaluate)
+              `catch` \(_ :: ErrorCall) -> pure (KUnknown [0])
       k  <- annotateClicks clickRef k0
       atomically (writeTQueue q k)
       case k of
@@ -1107,7 +1114,9 @@ eventLoop :: IORef Editor -> IORef (Maybe Screen) -> IORef String
 eventLoop editorRef prevRef titleRef q drv _src = do
   pollT0 <- registerDelay fsPollDelayUs
   idle0  <- armIdle
-  loop pollT0 Nothing Nothing idle0
+  tickRef <- newIORef Nothing
+  imgRef  <- newIORef Nothing
+  runLoop tickRef imgRef pollT0 Nothing Nothing idle0
   where
     loadQ   = drvLoadQ drv
     searchQ = drvSearchQ drv
@@ -1118,26 +1127,40 @@ eventLoop editorRef prevRef titleRef q drv _src = do
     -- 'mlint' (the lint debounce, armed when the lint fingerprint changes),
     -- 'mjour' (the crash-recovery journal write-behind, armed the same way)
     -- and 'midle' (the idle collection, disarmed once it has fired).
-    loop pollT mlint mjour midle = do
+    -- The two animation timers live in refs, not in the loop's arguments,
+    -- and are *kept* across iterations: a timer re-created on every wake-up
+    -- never fires while events arrive faster than its delay, and with mouse
+    -- motion reporting on, moving the pointer over an animated image (or
+    -- holding a key during a load) froze it. One is replaced only once it
+    -- has fired or its delay has changed, and dropped when nothing animates.
+    keepTimer ref want = case want of
+      Nothing -> writeIORef ref Nothing >> pure Nothing
+      Just us -> do
+        cur <- readIORef ref
+        case cur of
+          Just (us', tv) | us' == (us :: Int) -> pure (Just tv)
+          _ -> do tv <- registerDelay us
+                  writeIORef ref (Just (us, tv))
+                  pure (Just tv)
+    runLoop tickRef imgRef pollT0' mlint0 mjour0 midle0 = loop pollT0' mlint0 mjour0 midle0
+     where
+     loop pollT mlint mjour midle = do
       -- While a file is loading or a search is running, arm a timer so the
       -- spinner animates; otherwise block purely on input / load / search results.
       ed0 <- readIORef editorRef
       -- Animate only when something is visibly moving: a file load spinner, a
       -- running search whose panel is on screen, or the About-box wordmark
       -- (which ticks faster, and stops re-arming once it has settled).
-      mtick <- if isJust (edLoading ed0) || (searchRunning ed0 && searchViewActive ed0)
-                 then Just <$> registerDelay spinnerDelayUs
-                 else if aboutAnimating ed0
-                   then Just <$> registerDelay aboutTickUs
-                   else pure Nothing
+      mtick <- keepTimer tickRef $
+                 if isJust (edLoading ed0) || (searchRunning ed0 && searchViewActive ed0)
+                   then Just spinnerDelayUs
+                   else if aboutAnimating ed0 then Just aboutTickUs else Nothing
       -- A separate timer steps an animated image when the editor drives the
       -- animation (half-block cells or a sixel placement; a kitty terminal
       -- loops natively so 'imageTickUs' is Nothing there). Armed with the
       -- current frame's own delay, and not at all once nothing is animating —
       -- a still image costs nothing, like the settled About box.
-      mimg <- case imageTickUs ed0 of
-                Just us -> Just <$> registerDelay us
-                Nothing -> pure Nothing
+      mimg <- keepTimer imgRef (imageTickUs ed0)
       action <- atomically $
                 (GotLoad   <$> readTQueue loadQ)
         `orElse` (GotSearch <$> readTQueue searchQ)
@@ -1203,12 +1226,14 @@ eventLoop editorRef prevRef titleRef q drv _src = do
           loop pollT mlint' mjour' idle'
         -- Advance the spinner(s) / About animation one frame.
         Tick -> do
+          writeIORef tickRef Nothing
           modifyIORef' editorRef (tickLoading . searchTick . tickAbout)
           renderNow drv editorRef prevRef titleRef
           armIdle >>= loop pollT mlint mjour
         -- Advance the animated image one frame ('tickImage' re-checks that
         -- the editor still owns playback before stepping).
         ImgTick -> do
+          writeIORef imgRef Nothing
           modifyIORef' editorRef tickImage
           renderNow drv editorRef prevRef titleRef
           armIdle >>= loop pollT mlint mjour
@@ -1661,9 +1686,11 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
     -- sooner than a text file does.
     asyncBar <- asyncThresholdFor cpath
     case msz of
-      -- Big (but openable) files load on a background thread with a spinner, so
-      -- the event loop keeps painting; small/new/oversized files resolve inline.
-      Just sz | sz > asyncBar && sz <= maxOpenBytes -> do
+      -- Big files load on a background thread with a spinner, so the event
+      -- loop keeps painting; small and new files resolve inline. That
+      -- includes files over 'maxOpenBytes': the paged view's index pass
+      -- reads the whole file, which is the longest load there is.
+      Just sz | sz > asyncBar -> do
         startJob drv JLoad (classifyFileWith (cfgPagedView (edConfig ed)) cpath
                               >>= atomically . writeTQueue loadQ)
         pure (beginLoading (takeFileName cpath) ed)
@@ -2207,9 +2234,27 @@ classifyFile = classifyFileWith True
 classifyFileWith :: Bool -> FilePath -> IO LoadOutcome
 classifyFileWith pagedOK path = do
   exists <- doesFileExist path
-  hdr4 <- if exists then readHead path 4 else pure Nothing
+  regular <- if exists then isRegularFile path else pure True
+  hdr4 <- if exists && regular then readHead path 4 else pure Nothing
   if not exists
     then pure (OutText path emptyLoadResult)  -- new file
+    -- A pipe or a device (`cmedit <(git diff)`, /dev/zero) passes for a file
+    -- but is a *stream*: every read consumes it and its size reads as zero.
+    -- The sniffing reads below would each eat a piece of it and the size
+    -- guard would wave an endless one through, so it gets exactly one read,
+    -- capped where the guard would have stopped a file.
+    else if not regular then do
+      let cap = fromIntegral maxOpenBytes + 1
+      ebs <- try (withBinaryFile path ReadMode (\h -> BS.hGet h cap))
+               :: IO (Either SomeException BS.ByteString)
+      case ebs of
+        Left e -> pure (OutError (show e))
+        Right bs
+          | BS.length bs >= cap ->
+              pure (OutError (takeFileName path ++ ": too large to open (limit "
+                              ++ humanSize maxOpenBytes ++ ")"))
+          -- read-only: there is nothing at this path to save back to
+          | otherwise -> classifyBytes True path bs
     -- Archives are sniffed before anything else reads the file. They are
     -- binary, so the refusal below would otherwise be the whole story, and
     -- they can be arbitrarily large, so the size check must not see them
@@ -2236,24 +2281,42 @@ classifyFileWith pagedOK path = do
           ebs <- try (BS.readFile path) :: IO (Either SomeException BS.ByteString)
           case ebs of
             Left e   -> pure (OutError (show e))
-            Right bs -> case sniffImage bs of
-              Just _  -> pure (either (\err -> OutError (takeFileName path ++ ": " ++ err))
-                                      (OutImage path) (decodeFrames bs))
-              Nothing
-                -- Sniffed before the binary refusal, exactly like an image: a
-                -- PDF is binary by nature, so that refusal would otherwise be
-                -- the only thing that ever happened to one.
-                | Pdf.sniffPdf bs ->
-                    pure (either (\err -> OutError (takeFileName path ++ ": " ++ err))
-                                 (OutPdf path) (Pdf.parsePdf bs))
-                | looksBinary bs ->
-                    pure (OutError (takeFileName path ++ ": binary file ("
-                                    ++ humanSize (fromIntegral (BS.length bs))
-                                    ++ ") \x2014 cannot be edited"))
-                | otherwise -> do
-                    ro <- not <$> canWrite path
-                    mt <- fileMtime path
-                    pure (OutText path (loadFromBytes ro mt bs))
+            Right bs -> classifyBytes False path bs
+
+-- | Classify a file's bytes, already read: an image, a PDF, a refused binary,
+-- or text. @forceRO@ marks the text read-only whatever the path's permissions
+-- say (a stream has nothing to save back to).
+classifyBytes :: Bool -> FilePath -> BS.ByteString -> IO LoadOutcome
+classifyBytes forceRO path bs = case sniffImage bs of
+  Just _  -> pure (either (\err -> OutError (takeFileName path ++ ": " ++ err))
+                          (OutImage path) (decodeFrames bs))
+  Nothing
+    -- Sniffed before the binary refusal, exactly like an image: a
+    -- PDF is binary by nature, so that refusal would otherwise be
+    -- the only thing that ever happened to one.
+    | Pdf.sniffPdf bs ->
+        pure (either (\err -> OutError (takeFileName path ++ ": " ++ err))
+                     (OutPdf path) (Pdf.parsePdf bs))
+    | looksBinary bs ->
+        pure (OutError (takeFileName path ++ ": binary file ("
+                        ++ humanSize (fromIntegral (BS.length bs))
+                        ++ ") \x2014 cannot be edited"))
+    | otherwise -> do
+        ro <- if forceRO then pure True else not <$> canWrite path
+        mt <- fileMtime path
+        pure (OutText path (loadFromBytes ro mt bs))
+
+-- | Whether a path that exists is a regular file, as opposed to a pipe or a
+-- device. Portable by construction: 'hFileSize' refuses anything that is not
+-- one, and asking does not consume a stream. A file that cannot be opened at
+-- all counts as regular, so it reaches the ordinary read and its error.
+isRegularFile :: FilePath -> IO Bool
+isRegularFile path = do
+  r <- try (withBinaryFile path ReadMode (\h -> try (hFileSize h)))
+         :: IO (Either SomeException (Either SomeException Integer))
+  pure $ case r of
+    Right (Left _) -> False
+    _              -> True
 
 -- | Top up the paged view's window if the viewport has moved off what is
 -- loaded. Cheap: a pure 'pagerFillRequest' query, and when it does fire, a seek
@@ -3060,7 +3123,11 @@ imageAsyncBytes = 64 * 1024
 -- file can be a 16-megapixel picture taking seconds to decode.
 asyncThresholdFor :: FilePath -> IO Integer
 asyncThresholdFor path = do
-  r <- try (withBinaryFile path ReadMode (\h -> BS.hGet h 1024))
+  -- (never sniffed from a stream: the read would consume its first kilobyte)
+  regular <- isRegularFile path
+  r <- if regular
+         then try (withBinaryFile path ReadMode (\h -> BS.hGet h 1024))
+         else pure (Right BS.empty)
          :: IO (Either SomeException BS.ByteString)
   -- An archive is here for the container reading views: listing one is two
   -- short reads, but rendering a .docx or an .epub inflates members and maps
@@ -3129,7 +3196,17 @@ fileSizeSafe p = do
 canonicalizeSafe :: FilePath -> IO FilePath
 canonicalizeSafe p = do
   r <- try (canonicalizePath p) :: IO (Either SomeException FilePath)
-  pure (either (const p) id r)
+  case r of
+    Left _ -> pure p
+    Right c
+      | c == p -> pure c
+      -- A process substitution (@/dev/fd/63@) resolves to a name like
+      -- @pipe:[4711]@ that exists nowhere; keep the path that can be opened.
+      | otherwise -> do
+          okC <- try (doesPathExist c) :: IO (Either SomeException Bool)
+          okP <- try (doesPathExist p) :: IO (Either SomeException Bool)
+          let yes = either (const False) id
+          pure (if not (yes okC) && yes okP then p else c)
 
 ------------------------------------------------------------------------------
 -- Background workspace-search walker

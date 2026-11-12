@@ -352,9 +352,19 @@ inflateWith dat startByte size grow base given = do
       huffBlock lit dist
         | not grow = huffBlockFixed lit dist
         | otherwise = loop
-        where loop = do
+        -- Unknown output size: the input is the only thing that can end a
+        -- truncated stream. Past it the reader supplies zero bits, which
+        -- decode as symbols for ever, so a stream cut mid-block used to
+        -- "inflate" to the full cap (64 MiB of garbage per PDF stream, each
+        -- then parsed). Stop at the last real bit and keep what came out.
+        -- (The known-size loop keeps its zero-padding tolerance: its output
+        -- is bounded by a size the file declared.)
+        where endBits = 8 * BS.length dat
+              loop = do
                 o <- unsafeRead st iOut
-                if o >= limit then pure () else do
+                p <- unsafeRead st iBit
+                if o >= limit then pure ()
+                else if p > endBits then fail' "truncated DEFLATE stream" else do
                   sym <- decodeSymI dat st lit
                   if sym < 0 then fail' "invalid Huffman code"
                   else if sym < 256 then putByte (fromIntegral sym) >> loop

@@ -66,7 +66,7 @@ module Cmedit.Ansi
   , setTitle
   ) where
 
-import Data.ByteString.Builder (Builder, char7, intDec, string7, word8HexFixed)
+import Data.ByteString.Builder (Builder, char7, intDec, string7, stringUtf8, word8HexFixed)
 import Data.Text (Text)
 import Data.Text.Encoding (encodeUtf8Builder)
 import Data.Word (Word8)
@@ -282,7 +282,12 @@ resetCursorColor = osc (string7 "112")
 -- | OSC 9: post a desktop notification (iTerm2 convention, honoured by
 -- kitty/WezTerm/Ghostty and friends; silently ignored elsewhere).
 notify :: String -> Builder
-notify msg = osc (string7 "9;" <> string7 (filter (\c -> c >= ' ' && c /= '\DEL') msg))
+notify msg = osc (string7 "9;" <> stringUtf8 (filter printable msg))
+
+-- Text safe to place inside an OSC string: no C0, DEL or C1 control, any of
+-- which could end the sequence early or start another.
+printable :: Char -> Bool
+printable c = c >= ' ' && not (c >= '\DEL' && c < '\xA0')
 
 -- | Reset all styling to the terminal default.
 resetSgr :: Builder
@@ -366,4 +371,7 @@ bgCodes c = case c of
 
 -- | Set the terminal window title via OSC 0.
 setTitle :: String -> Builder
-setTitle t = esc <> char7 ']' <> char7 '0' <> char7 ';' <> string7 t <> char7 '\BEL'
+-- UTF-8, and never 'string7': that keeps the low seven bits of each
+-- character, which turned an accented name into the wrong letters and some
+-- Cyrillic and CJK ones into ESC or BEL, ending the sequence mid-title.
+setTitle t = esc <> char7 ']' <> char7 '0' <> char7 ';' <> stringUtf8 (filter printable t) <> char7 '\BEL'

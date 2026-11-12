@@ -190,9 +190,14 @@ sheetGrid strs bs = finish (foldl' step (ss0 strs) (parseXmlBytes bs))
     finish st =
       let st' = endRow st
           w   = ssWidth st'
-      in ( fmap (padTo w) (ssOut st')
+          -- Padding makes the grid rectangular, so the budget has to hold
+          -- for rows x width and not just for the cells the file spelled out:
+          -- one wide row above a long column would otherwise pad to billions.
+          keep = maxSheetCells `div` max 1 w
+          out  = ssOut st'
+      in ( fmap (padTo w) (Seq.take keep out)
          , ssForms st'
-         , ssCut st' )
+         , ssCut st' || Seq.length out > keep )
     padTo w r = r <> Seq.replicate (max 0 (w - Seq.length r)) T.empty
 
     step st ev
@@ -339,6 +344,11 @@ value st = case ssType st of
 endRow :: SS -> SS
 endRow st
   | not (ssOpen st) = st { ssNext = max (ssNext st) (ssRowAt st) }
+  -- A row number is whatever the file says (@r="99999999"@ in a 900-byte
+  -- workbook): the rows skipped to reach it count against the budget
+  -- /before/ they are materialised, and a row beyond it is dropped.
+  | max 0 (ssRowAt st - Seq.length (ssOut st)) + ssCells st > maxSheetCells =
+      st { ssCut = True, ssRow = Seq.empty, ssCol = 0, ssOpen = False }
   | otherwise =
       let r    = ssRowAt st
           gap  = max 0 (r - Seq.length (ssOut st))

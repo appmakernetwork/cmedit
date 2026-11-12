@@ -225,7 +225,11 @@ buildPagerIndex path size = handle onErr $ withBinaryFile path ReadMode $ \h -> 
   first <- BS.hGet h chunkSize
   let (enc, _) = stripBom first
       bomLen   = if enc == Utf8Bom then 3 else 0
+      -- CR-only is claimed only by a block with a CR and *no* LF: a stray
+      -- carriage return in an LF file (a progress bar captured in a log)
+      -- must not make the whole file page as a handful of 64 KiB lines.
       eol | BS.isInfixOf (BS.pack [13, 10]) first = CRLF
+          | BS.elem 10 first                      = LF
           | BS.elem 13 first                      = CR
           | otherwise                             = LF
       -- Offsets are of the *start* of each indexed line, so a reader can seek
@@ -245,8 +249,13 @@ buildPagerIndex path size = handle onErr $ withBinaryFile path ReadMode $ \h -> 
       -- The carry between blocks is the current partial line. A file with no
       -- newlines would otherwise grow it to the whole file; cap it, since the
       -- offsets are all that matter here (the window reader re-reads content).
-      loop !bs0 !base !nl !acc !next = do
-        let bs = if BS.length bs0 > 2 * chunkSize then BS.drop (BS.length bs0 - chunkSize) bs0 else bs0
+      loop !bs0 !base0 !nl !acc !next = do
+        -- (the bytes cut from the front still count towards every later
+        -- offset: forget to advance the base and each line after a long one
+        -- is indexed short by exactly what was dropped)
+        let cut = if BS.length bs0 > 2 * chunkSize then BS.length bs0 - chunkSize else 0
+            bs = BS.drop cut bs0
+            base = base0 + fromIntegral cut
         (nl', acc', next') <- go bs base nl acc next
         -- Carry the unterminated tail forward with its absolute offset.
         let consumed = case BS.elemIndexEnd sepByte bs of

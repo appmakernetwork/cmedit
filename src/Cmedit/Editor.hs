@@ -634,7 +634,12 @@ withPagerFill (ed, effs) = case pagerFillRequest ed of
 -- (zoomed) view; a single click — or Esc — snaps back to the whole image.
 handleImageMouse :: MouseEvent -> ImageDoc -> Editor -> Editor
 handleImageMouse me idoc ed
-  | meButton me == MBWheelUp || meButton me == MBWheelDown = ed   -- ignore wheel
+  -- the wheel zooms around the pointer (inside the picture's area, and not
+  -- in the middle of a drag-to-zoom)
+  | meButton me == MBWheelUp || meButton me == MBWheelDown =
+      if inArea && isNothing (idDrag idoc)
+        then wheelZoom (meButton me == MBWheelUp) row col ed
+        else ed
   -- press: begin a drag if inside the image area
   | mePressed me && not (meDrag me) && meButton me == MBLeft =
       if inArea then modImage (\d -> d { idDrag = Just (row, col, row, col) }) ed else ed
@@ -1954,7 +1959,14 @@ handleMouse me ed
       in if row >= loTextTop lo && row < loTextTop lo + loTextHeight lo
                   && col >= loTextLeft lo
              then mouseText me lo ed'
-             else ed'
+             -- A drag-select released outside the text (past the bottom onto
+             -- the status bar, in the gutter, over the explorer) still ends:
+             -- 'edMouseSelecting' gates the chrome's mouse guards, so left
+             -- set it kills the explorer and the scroll bars until the next
+             -- click in the text.
+             else if edMouseSelecting ed' && not (mePressed me)
+               then ed' { edMouseSelecting = False, edSelAnchor = dropEmptySel ed' }
+               else ed'
 
 -- The buffer position (and display column) under a mouse event in the text
 -- area — shared by click/drag handling and Ctrl+Click go-to-definition.

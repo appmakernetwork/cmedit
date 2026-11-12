@@ -853,8 +853,47 @@ renderEditor ed = runST $ do
     Just f  -> forM_ [0 .. rows * cols - 1] $ \i -> do
       cell <- readArray arr i
       writeArray arr i cell { cellStyle = f (cellStyle cell) }
+  sanitizeGrid arr cols rows
   frozen <- freeze arr
   pure (Screen cols rows frozen (computeCursor ed lo) (scrollHintFor ed lo))
+
+-- | The last pass over a frame, and the one place two grid invariants are
+-- /enforced/ rather than hoped for, because the emitter prints whatever a
+-- cell holds:
+--
+--  * __No control character reaches the terminal.__ The text view spells
+--    them out, but a CSV cell, a file name in the explorer or a search term
+--    went into cells verbatim, so a file could carry an escape sequence (an
+--    OSC 52 clipboard write, a screen clear) straight to the terminal.
+--  * __A wide glyph is a head followed by its continuation, or it is not
+--    there.__ A clip edge or an overlay (scroll bar, menu, dialog) can cut
+--    one in half; the emitter skips a continuation without advancing and
+--    prints a lone head two columns wide, so half a glyph shifted the rest of
+--    its row, or pushed the last column past the right margin.
+--
+-- Either half of a split glyph becomes a space in the same style.
+sanitizeGrid :: Surf s -> Int -> Int -> ST s ()
+sanitizeGrid arr cols rows = forM_ [0 .. rows - 1] $ \r -> row (r * cols) 0
+  where
+    row !base !c
+      | c >= cols = pure ()
+      | otherwise = do
+          cell <- readArray arr (base + c)
+          let ch = cellChar cell
+          if | ch == contChar -> blank base c cell >> row base (c + 1)   -- orphan: heads consume theirs
+             | ch < '\x1100' ->
+                 if isUnsafe ch
+                   then writeArray arr (base + c) cell { cellChar = '\xFFFD' } >> row base (c + 1)
+                   else row base (c + 1)
+             | charWidth ch == 2 -> do
+                 ok <- if c + 1 < cols
+                         then (== contChar) . cellChar <$> readArray arr (base + c + 1)
+                         else pure False
+                 if ok then row base (c + 2) else blank base c cell >> row base (c + 1)
+             | otherwise -> row base (c + 1)
+    blank base c cell = writeArray arr (base + c) cell { cellChar = ' ' }
+    -- C0 (the continuation sentinel is handled above), DEL and C1
+    isUnsafe ch = ch < ' ' || (ch >= '\DEL' && ch < '\xA0')
 
 -- The scroll identity of this frame, when the main content is the plain
 -- (non-wrapped) text view — the one path whose vertical scroll moves whole
@@ -881,22 +920,35 @@ putCell arr cols rows r c cell =
     writeArray arr (r * cols + c) cell
 
 drawStr :: Surf s -> Int -> Int -> Int -> Int -> Style -> String -> ST s ()
-drawStr arr cols rows r c0 st s =
-  forM_ (zip [0 ..] s) $ \(k, ch) -> putCell arr cols rows r (c0 + k) (Cell ch st)
+drawStr arr cols rows r c0 st = drawStrL arr cols rows r c0 st Nothing
 
 -- | 'drawStr' with an OSC 8 hyperlink target attached to every cell
 -- ('Nothing' is a plain 'drawStr', so callers can pass a computed target).
 drawStrL :: Surf s -> Int -> Int -> Int -> Int -> Style -> Maybe Text -> String -> ST s ()
-drawStrL arr cols rows r c0 st mlnk s =
-  forM_ (zip [0 ..] s) $ \(k, ch) -> putCell arr cols rows r (c0 + k) (CellL ch st mlnk)
+drawStrL arr cols rows r c0 st mlnk = go c0
+  where
+    -- Width-aware, like the text view: a wide glyph takes its cell plus a
+    -- continuation (carrying its style and link), or the row it is on ends up
+    -- longer than the screen is wide.
+    go _ [] = pure ()
+    go !c (ch : cs) = do
+      let cw = if ch < '\x1100' then 1 else max 1 (charWidth ch)
+      putCell arr cols rows r c (CellL ch st mlnk)
+      when (cw == 2) $ putCell arr cols rows r (c + 1) (CellL contChar st mlnk)
+      go (c + cw) cs
 
 -- Like 'drawStr' but underlines the character at index @ui@ (the menu
 -- mnemonic). A negative @ui@ underlines nothing.
 drawStrU :: Surf s -> Int -> Int -> Int -> Int -> Style -> Int -> String -> ST s ()
-drawStrU arr cols rows r c0 st ui s =
-  forM_ (zip [0 ..] s) $ \(k, ch) ->
-    let st' = if k == ui then st { styleAttr = styleAttr st .|. attrUnderline } else st
-    in putCell arr cols rows r (c0 + k) (Cell ch st')
+drawStrU arr cols rows r c0 st ui = go c0 (0 :: Int)
+  where
+    go _ _ [] = pure ()
+    go !c !k (ch : cs) = do
+      let st' = if k == ui then st { styleAttr = styleAttr st .|. attrUnderline } else st
+          cw = if ch < '\x1100' then 1 else max 1 (charWidth ch)
+      putCell arr cols rows r c (Cell ch st')
+      when (cw == 2) $ putCell arr cols rows r (c + 1) (Cell contChar st')
+      go (c + cw) (k + 1) cs
 
 -- | 'drawStr' but clip characters that would land at a screen column below
 -- @minC@ (used by the CSV table, whose column region is shifted left by

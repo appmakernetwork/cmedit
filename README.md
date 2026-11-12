@@ -131,8 +131,9 @@ escape sequences and the POSIX `termios` API.
   scaled rendering of the picture — useful for glancing at images over SSH where
   a real viewer isn't an option. Drawn with Unicode half-block glyphs in 24-bit
   colour (two pixels per cell); press **`a`** to switch to a monochrome ASCII
-  ramp. **Drag a rectangle** to zoom into that region (still aspect-fit); a
-  single click or **Esc** snaps back to the whole image. The
+  ramp. **Drag a rectangle** to zoom into that region (still aspect-fit), or
+  turn the **scroll wheel** to zoom in and out around the point under the
+  pointer; a single click or **Esc** snaps back to the whole image. The
   image re-scales to fit on resize, and an undecodable file reports a clear error
   rather than opening as binary. Every decoder (BMP, GIF LZW, JPEG — both
   baseline and progressive — with hand-rolled Huffman+IDCT, PNG with a

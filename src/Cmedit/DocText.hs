@@ -98,10 +98,17 @@ mkExtract :: DocKind -> [(Text, DocUnit)] -> DocExtract
 mkExtract kind ls =
   let taken = takeChars 0 (take maxExtractLines ls)
   in DocExtract { dxKind  = kind
-                , dxText  = T.intercalate nl (map fst taken)
+                -- One line per unit, exactly: 'docMatches' maps a match
+                -- back to its unit by line index, so a unit whose own text
+                -- holds a line break (an Alt+Enter cell, an RTF @\\line@)
+                -- would shift the label of every match after it.
+                , dxText  = T.intercalate nl (map (oneLine . fst) taken)
                 , dxUnits = Seq.fromList (map snd taken) }
   where
     nl = T.singleton '\n'
+    oneLine t | T.any isBreak t = T.map (\c -> if isBreak c then ' ' else c) t
+              | otherwise       = t
+    isBreak c = c == '\n' || c == '\r'
     takeChars _ [] = []
     takeChars !n (x@(t, _) : rest)
       | n > maxExtractChars = []

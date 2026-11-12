@@ -625,17 +625,26 @@ endCell st
 -- one cell carrying number-columns-repeated="1024".
 endRow :: SS -> SS
 endRow st
-  | null (ssCells st) = st { ssRowIx = ssRowIx st + ssRowRep st, ssRowRep = 1 }
+  | null (ssCells st) || ssCut st =
+      st { ssCells = [], ssRowIx = ssRowIx st + ssRowRep st, ssRowRep = 1 }
   | otherwise =
+      -- The budget is enforced here, on the repeat counts, before anything
+      -- is expanded: both are numbers the file supplies (a cell repeated
+      -- 16384 times, a row repeated 1048576 times), and recording that the
+      -- sheet was cut while still materialising all of it was no limit.
       let cells = trimEnd (reverse (ssCells st))
-          !row  = Seq.fromList (concat [ replicate n v | (v, n, _) <- cells ])
+          left  = max 0 (maxOdfCells - ssCount st)
+          wide  = concat [ replicate n v | (v, n, _) <- cells ]
+          !row  = Seq.fromList (take left wide)
           n     = Seq.length row
-      in st { ssRows = if n == 0 then ssRows st else (row, ssRowRep st) : ssRows st
+          rep   = min (ssRowRep st) (left `div` max 1 n)
+          cut   = rep < ssRowRep st || not (null (drop left wide))
+      in st { ssRows = if n == 0 || rep == 0 then ssRows st else (row, rep) : ssRows st
             , ssCells = []
             , ssRowIx = ssRowIx st + ssRowRep st
             , ssRowRep = 1
-            , ssCount = ssCount st + n * ssRowRep st
-            , ssCut = ssCut st || ssCount st + n > maxOdfCells }
+            , ssCount = ssCount st + n * rep
+            , ssCut = ssCut st || cut }
   where trimEnd = reverse . dropWhile (\(v, _, keep) -> T.null v && not keep) . reverse
 
 -- Close the sheet in progress, dropping the trailing empty rows the same
@@ -646,8 +655,10 @@ endTable st
   | otherwise =
       let st'  = endRow st
           rows = reverse (ssRows st')
-          grid = Seq.fromList (concat [ replicate n r | (r, n) <- rows ])
           w    = maximum (0 : map (Seq.length . fst) rows)
+          -- (rows x width within the budget too: padding is cells as well)
+          grid = Seq.fromList (take (maxOdfCells `div` max 1 w)
+                                    (concat [ replicate n r | (r, n) <- rows ]))
           padded = fmap (\r -> r <> Seq.replicate (max 0 (w - Seq.length r)) T.empty) grid
       in st' { ssDone = (ssName st', padded, ssForms st') : ssDone st'
              , ssRows = [], ssCells = [], ssForms = M.empty

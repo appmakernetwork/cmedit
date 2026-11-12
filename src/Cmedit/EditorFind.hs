@@ -1096,14 +1096,20 @@ replaceSubst cs ww regex term repl
 -- snapshot onto their own undo stacks).
 replaceInOpenDocs :: (Text -> (Int, Text)) -> [FilePath] -> Editor -> (Editor, Int)
 replaceInOpenDocs subst paths ed =
-  let hit d = isPlainDoc d && maybe False (`elem` paths) (docPath d)
+  -- Read-only documents are left alone: that covers the manual and, above
+  -- all, an archive listing, which is an ordinary text buffer under the
+  -- archive's path (Save All would write the edited listing over the archive).
+  let hit d = isPlainDoc d && not (docReadOnly d) && maybe False (`elem` paths) (docPath d)
       doBuf buf = let (c, big') = subst (bufferToText LF False buf)
                   in (fromText big', c)
-      activeHit = isNothing (edCsv ed) && isNothing (edImage ed)
+      activeHit = isNothing (edCsv ed) && isNothing (edImage ed) && not (edReadOnly ed)
                   && maybe False (`elem` paths) (edPath ed)
+      -- A document the substitution leaves untouched (the result list can be
+      -- staler than the buffer) is not edited at all: no undo step, and no
+      -- modified flag on text identical to what is saved.
       (edA, activeCount)
-        | activeHit = let ed1    = beginEdit EKOther ed
-                          (b, c) = doBuf (edBuffer ed1)
+        | activeHit, (b, c) <- doBuf (edBuffer ed), c > 0 =
+                      let ed1 = beginEdit EKOther ed
                       in ( ed1 { edBuffer = b, edCursor = clampPos (edCursor ed1) b
                                , edSelAnchor = Nothing, edModified = True, edStatus = ""
                                -- bypasses afterEdit, so bump the lint edit
@@ -1114,8 +1120,8 @@ replaceInOpenDocs subst paths ed =
                                , edDocSeq = edDocSeq ed1 + 1 }, c)
         | otherwise = (ed, 0)
       onDoc d
-        | hit d = let snap   = UndoState (docBuffer d) (docCursor d) (docSelAnchor d)
-                      (b, c) = doBuf (docBuffer d)
+        | hit d, (b, c) <- doBuf (docBuffer d), c > 0 =
+                  let snap   = UndoState (docBuffer d) (docCursor d) (docSelAnchor d)
                   in (d { docBuffer = b, docModified = True
                         , docUndo = pushHist maxUndo snap (docUndo d)
                         -- An inactive document edited in place: its own counter

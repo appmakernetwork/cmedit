@@ -12,7 +12,7 @@ module Cmedit.Clipboard
   ) where
 
 import Control.Concurrent (forkIO)
-import Control.Exception (SomeException, handle)
+import Control.Exception (SomeException, handle, onException, try)
 import Control.Monad (void)
 import Data.Maybe (listToMaybe)
 import Data.ByteString.Builder (Builder, char7, string7)
@@ -121,8 +121,14 @@ openUrl url = handle onErr $ do
   case mcmd of
     Nothing -> pure False
     Just (cmd, args) -> do
+      -- The null device, not pipes nobody reads: a browser the opener leaves
+      -- running inherits these, and with a pipe it would block once it had
+      -- logged 64 KiB and take a SIGPIPE when we exit. ('createProcess'
+      -- closes our copy of a 'UseHandle' handle itself.)
+      nul <- openFile (if windows then "NUL" else "/dev/null") ReadWriteMode
       (_, _, _, ph) <- createProcess (proc cmd (args ++ [url]))
-        { std_in = CreatePipe, std_out = CreatePipe, std_err = CreatePipe }
+        { std_in = UseHandle nul, std_out = UseHandle nul, std_err = UseHandle nul }
+        `onException` hClose nul
       _ <- forkIO (void (waitForProcess ph))
       pure True
   where
@@ -150,11 +156,14 @@ runCopy cmd args txt = handle onErr $ do
   case mIn of
     Nothing  -> pure False
     Just hin -> do
-      hSetBinaryMode hin True
-      BS.hPutStr hin (TE.encodeUtf8 txt)
-      hClose hin
+      -- A helper that exits without reading its input (no display to talk
+      -- to) makes the write fail with EPIPE. It must still be reaped, or
+      -- every copy leaves a zombie behind.
+      wrote <- try (do hSetBinaryMode hin True
+                       BS.hPutStr hin (TE.encodeUtf8 txt)
+                       hClose hin) :: IO (Either SomeException ())
       ec <- waitForProcess ph
-      pure (ec == ExitSuccess)
+      pure (either (const False) (const True) wrote && ec == ExitSuccess)
   where
     onErr :: SomeException -> IO Bool
     onErr _ = pure False
@@ -168,8 +177,13 @@ runPaste cmd args = handle onErr $ do
     Just hout -> do
       hSetBinaryMode hout True
       bs <- BS.hGetContents hout
-      _  <- waitForProcess ph
-      pure (Just (TE.decodeUtf8With TEE.lenientDecode bs))
+      ec <- waitForProcess ph
+      -- A helper that failed (installed, but no display to reach) has no
+      -- answer; reporting its empty output as the clipboard would stop the
+      -- caller falling back to the editor's own.
+      pure $ if ec == ExitSuccess
+               then Just (TE.decodeUtf8With TEE.lenientDecode bs)
+               else Nothing
   where
     onErr :: SomeException -> IO (Maybe Text)
     onErr _ = pure Nothing

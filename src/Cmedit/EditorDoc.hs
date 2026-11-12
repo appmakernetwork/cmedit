@@ -824,11 +824,92 @@ cellRectToCrop ed idoc (r0,c0,r1,c1) =
       x1d = clampD (fromIntegral cx) (fromIntegral (cx+cw)) (fx (c1+1))
       y0d = clampD (fromIntegral cy) (fromIntegral (cy+ch)) (fy (2*r0))
       y1d = clampD (fromIntegral cy) (fromIntegral (cy+ch)) (fy (2*r1+2))
-      x0 = floor x0d; x1 = ceiling x1d
-      y0 = floor y0d; y1 = ceiling y1d
+      -- (a drag wholly right of or below the picture clamps to its far edge,
+      -- which is one past the last pixel: keep the origin on the image)
+      x0 = min (imgW img - 1) (floor x0d); x1 = ceiling x1d
+      y0 = min (imgH img - 1) (floor y0d); y1 = ceiling y1d
       nw = max 1 (min (imgW img - x0) (x1 - x0))
       nh = max 1 (min (imgH img - y0) (y1 - y0))
   in (max 0 x0, max 0 y0, nw, nh)
+
+-- | One scroll-wheel notch of zoom in the image view, anchored on the text-area
+-- cell @(row, col)@ under the pointer: the source pixel there stays put on
+-- screen, as in a desktop image viewer. Each notch scales by 'wheelZoomStep';
+-- the visible window then fills the text area (so zooming in turns a
+-- letterboxed picture into a full-screen one) and is clamped to the image,
+-- which is why the anchor can only hold in a direction the window does not
+-- already span. Zooming out to the full-image fit returns to the unzoomed
+-- view ('idCrop' = 'Nothing'), so a click or Esc still resets as before.
+--
+-- The geometry is 'viewFit''s: the physical scale is display cells per
+-- source pixel horizontally, a sub-pixel (half a cell row) is 'cellAspect'
+-- times as tall as a cell is wide, and the window in source pixels is the
+-- text area divided by the new scale. One wrinkle is inherited from
+-- 'imageFitCap': an image shown at native size is capped below the fill
+-- scale, and any crop lifts the cap, so the first notch on a small image
+-- jumps to fill the window rather than growing by one step.
+wheelZoom :: Bool -> Int -> Int -> Editor -> Editor
+wheelZoom zoomIn row col ed = case edImage ed of
+  Nothing -> ed
+  Just idoc ->
+    let lo = computeLayout ed
+        cols = max 1 (loTextWidth lo)
+        subH = 2 * max 1 (loTextHeight lo)
+        a = cellAspect ed
+        img = idImage idoc
+        iw = imgW img; ih = imgH img
+        (cx, cy, cw, ch) = imageCrop idoc
+        (outW, outH, offX, offY) = viewFit a (imageFitCap ed idoc) cols (subH `div` 2) cw ch
+        (fullW, _, _, _) = viewFit a (imageFitCap ed idoc { idCrop = Nothing }) cols (subH `div` 2) iw ih
+        sCur  = fromIntegral outW / fromIntegral (max 1 cw) :: Double
+        sFull = fromIntegral fullW / fromIntegral (max 1 iw) :: Double
+        -- never closer than four source pixels across the text area
+        sMax  = max sFull (fromIntegral cols / 4)
+        s' | zoomIn    = min sMax (sCur * wheelZoomStep)
+           | otherwise = sCur / wheelZoomStep
+        -- the source point under the pointer (the centre of its cell; a cell
+        -- row is two sub-pixels), clamped onto the picture
+        clampD l h v = max l (min h v) :: Double
+        px = clampD (fromIntegral cx) (fromIntegral (cx + cw))
+               (fromIntegral cx + (fromIntegral (col - offX) + 0.5) * fromIntegral cw / fromIntegral (max 1 outW))
+        py = clampD (fromIntegral cy) (fromIntegral (cy + ch))
+               (fromIntegral cy + (fromIntegral (2 * row + 1 - offY)) * fromIntegral ch / fromIntegral (max 1 outH))
+        winW = fromIntegral cols / s'
+        winH = fromIntegral subH * a / s'
+        -- place the window so the anchor keeps its screen position, then
+        -- clamp it to the image (a dimension it spans is the whole image,
+        -- centred by 'viewFit')
+        place p screen win full
+          | win >= fromIntegral full = (0, full)
+          | otherwise =
+              let w = max 1 (min full (round win))
+                  x0 = round (p - screen / s')
+              in (max 0 (min (full - w) x0), w)
+        (nx, nw) = place px (fromIntegral col + 0.5) winW iw
+        (ny, nh) = place py (fromIntegral (2 * row + 1) * a) winH ih
+        -- A window that spans the image both ways is the whole picture, shown
+        -- at the fill scale (any crop lifts 'imageFitCap'), whatever s' asked
+        -- for. That only differs from the fit for a small image held at
+        -- native size, and there it must be handled: zooming *out* to it has
+        -- to return to the fit, or the fill scale is re-derived from the crop
+        -- on every notch and the view can never get back.
+        whole = nw == iw && nh == ih
+        (fillW, _, _, _) = viewFit a Nothing cols (subH `div` 2) iw ih
+        sFill = fromIntegral fillW / fromIntegral (max 1 iw) :: Double
+        factor = (if whole then sFill else s') / sFull
+        msg z = T.pack ("Zoom " ++ showZoom z ++ " \x2014 scroll to zoom, click or Esc to reset")
+    in if zoomIn && sCur >= sMax
+         then ed { edStatus = "Maximum zoom" }
+         else if s' <= sFull * 1.0001 || (whole && not zoomIn)
+           then refreshImage (modImage (\d -> d { idCrop = Nothing }) ed { edStatus = "Zoom reset to fit" })
+           else refreshImage (modImage (\d -> d { idCrop = Just (nx, ny, nw, nh) }) ed { edStatus = msg factor })
+  where
+    -- relative to the whole-image fit, which is what 100% looks like on screen
+    showZoom z = show (round (z * 100) :: Int) ++ "%"
+
+-- | Scale factor of one wheel notch in the image view.
+wheelZoomStep :: Double
+wheelZoomStep = 1.25
 
 setImgMode :: ImgMode -> Editor -> Editor
 setImgMode m ed = case edImage ed of
@@ -1521,10 +1602,13 @@ modifiedDocPaths ed =
 modifiedDocsToSave :: Editor -> [(FilePath, Encoding, LineEnding, Bool, Buffer)]
 modifiedDocsToSave ed0 =
   let ed = syncCsvToBuffer ed0
+      -- Never a read-only document: an archive listing is one, under the
+      -- archive's own path, and writing it would replace the archive with
+      -- its table of contents.
       fromDoc d = [ (p, docEncoding d, docLineEnding d, docFinalNewline d, docBuffer d)
-                  | docModified d, Just p <- [docPath d] ]
+                  | docModified d, not (docReadOnly d), Just p <- [docPath d] ]
       active = [ (p, edEncoding ed, edLineEnding ed, edFinalNewline ed, edBuffer ed)
-               | edModified ed, Just p <- [edPath ed] ]
+               | edModified ed, not (edReadOnly ed), Just p <- [edPath ed] ]
   in concatMap fromDoc (edBefore ed) ++ active ++ concatMap fromDoc (edAfter ed)
 
 -- | Driver callback: mark the given (path, new-mtime) documents saved after a

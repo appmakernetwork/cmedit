@@ -369,7 +369,10 @@ maxRecentEntries = 50
 parseRecentText :: Text -> [RecentEntry]
 parseRecentText txt =
   take maxRecentEntries
-    [ e | raw <- T.lines txt, Just e <- [parseRecentLine (T.strip raw)] ]
+    -- Only the front of a line is trimmed (and a CR from a CRLF file): the
+    -- path is the tail, and a filename may end in a space.
+    [ e | raw <- T.lines txt
+        , Just e <- [parseRecentLine (T.stripStart (T.dropWhileEnd (== '\r') raw))] ]
 
 -- | Split a @f1:f2:\@\<k fields\>:path@ line: exactly @k@ colon-separated
 -- leading fields, and /everything/ after the k-th colon is the path.
@@ -522,15 +525,16 @@ parseSessionText txt = case dropWhile (T.null . T.strip) rawLines of
   _ -> Nothing
   where
     supportedVersions = [1, sessionVersion]
-    rawLines = map (T.strip . T.dropWhileEnd (== '\r')) (T.lines txt)
+    -- (the tail of a line is a path, which may end in a space: trim the front only)
+    rawLines = map (T.stripStart . T.dropWhileEnd (== '\r')) (T.lines txt)
     versionOf line = case T.words line of
       ["cmedit-session", n] -> readMaybe (T.unpack n) :: Maybe Int
       _                     -> Nothing
     step ver acc@(folder, files, active, closed) line
-      | T.null line = acc
+      | T.null (T.strip line) = acc
       | Just f <- T.stripPrefix "folder:" line =
           -- An empty value is no folder, not a folder named "".
-          ( if T.null (T.strip f) then Nothing else Just (T.unpack (T.strip f))
+          ( if T.null (T.strip f) then Nothing else Just (T.unpack (T.stripStart f))
           , files, active, closed )
       | Just a <- T.stripPrefix "active:" line =
           (folder, files, maybe active id (readMaybe (T.unpack (T.strip a))), closed)

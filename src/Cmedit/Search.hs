@@ -311,8 +311,19 @@ maxFileBytesToSearch = 8 * 1024 * 1024
 -- while @T.map@ goes through stream fusion and re-encodes per character. The
 -- microbenchmark that suggested otherwise was fusing @length . map@ into a
 -- count that never built the result. Left as-is deliberately.
+--
+-- But the fold /must/ preserve length wherever a caller maps an offset found
+-- in the folded text back onto the original, and replace does exactly that:
+-- on a line containing @İ@, every case-insensitive Replace All wrote one
+-- character late per @İ@ before the match, through the text beside it. So the
+-- fast fold is kept and its result checked ('T.length' is a vectorised count,
+-- cheap next to the fold), and only a text the fold lengthened pays for the
+-- per-character one.
 normCase :: Bool -> Text -> Text
-normCase cs = if cs then id else T.toLower
+normCase True  t = t
+normCase False t =
+  let l = T.toLower t
+  in if T.length l == T.length t then l else T.map toLower t
 
 isWordCh :: Char -> Bool
 isWordCh c = isAlphaNum c || c == '_'
@@ -484,20 +495,32 @@ matchGlob pat path = memo ! (0, 0)
           '*' | i + 1 < m && pv ! (i + 1) == '*' ->
                 -- ** : match any run (including '/'); collapse consecutive stars.
                 memo ! (dropStars (i + 2), j) || (j < n && memo ! (i, j + 1))
+                  -- A whole-segment @**/@ also matches /no/ directories, so
+                  -- @src/**/*.hs@ finds @src/Main.hs@ and @**/*.hs@ a file at
+                  -- the root.
+                  || (segStart i && (j == 0 || cv ! (j - 1) == '/') && slashAt (dropStars (i + 2))
+                        && memo ! (dropStars (i + 2) + 1, j))
               | otherwise ->
                 -- * : match within a segment (no '/').
                 memo ! (i + 1, j) || (j < n && cv ! j /= '/' && memo ! (i, j + 1))
           '?' -> j < n && cv ! j /= '/' && memo ! (i + 1, j + 1)
           c   -> j < n && cv ! j == c && memo ! (i + 1, j + 1)
+    segStart i = i == 0 || pv ! (i - 1) == '/'
+    slashAt k = k < m && pv ! k == '/'
     dropStars i | i < m && pv ! i == '*' = dropStars (i + 1)
                 | otherwise = i
 
 -- | Should this relative path be searched? Passes when it matches at least one
 -- include glob (or there are none) and no exclude glob and no default exclude.
 pathIncluded :: [String] -> [String] -> FilePath -> Bool
-pathIncluded includes excludes rel =
+pathIncluded includes0 excludes0 rel =
   includeOK && not (any (`globMatch` rel) excludes) && not excludedByDefault
   where
+    -- A @!pattern@ in the include list is an exclusion (the form the manual
+    -- shows). Matched literally it would match nothing, and an include list
+    -- that matches nothing excludes every file.
+    includes = [ g | g <- includes0, take 1 g /= "!" ]
+    excludes = excludes0 ++ [ g | '!' : g <- includes0, not (null g) ]
     includeOK = null includes || any (`globMatch` rel) includes
     excludedByDefault = any (`segMatch` rel) defaultExcludes
     segMatch name p = name `elem` splitSegs p

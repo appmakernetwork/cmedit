@@ -23,7 +23,7 @@ module Cmedit.Regex
   ) where
 
 import Data.Array (Array, listArray, (!), bounds)
-import Data.Char (toLower, isAlphaNum, isSpace, isDigit)
+import Data.Char (toLower, toUpper, isAlphaNum, isSpace, isDigit)
 import qualified Data.IntMap.Strict as IM
 import qualified Data.IntSet as IS
 import Data.Maybe (fromMaybe)
@@ -172,7 +172,10 @@ rangePred :: Bool -> Char -> Char -> (Char -> Bool)
 rangePred ci a b ch =
   let lo = min a b; hi = max a b
       inR x = x >= lo && x <= hi
-  in if ci then inR (toLower ch) || inR ch || (toLower ch >= toLower lo && toLower ch <= toLower hi)
+  -- Either case of the character inside the range as written. (Comparing
+  -- against the range's /lowered/ ends instead turns @[0-Z]@ into @0..z@,
+  -- which takes in the punctuation between the two alphabets.)
+  in if ci then inR ch || inR (toLower ch) || inR (toUpper ch)
            else inR ch
 
 escToRe :: Bool -> Char -> Re

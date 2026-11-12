@@ -3,6 +3,7 @@
 module Main (main) where
 
 import Control.Monad (when)
+import GHC.IO.Encoding (setLocaleEncoding)
 import System.Environment (getArgs, getProgName)
 import System.Exit (exitFailure, exitSuccess)
 import System.IO
@@ -42,6 +43,12 @@ baseOptions cfg = Options
 
 main :: IO ()
 main = do
+  -- Every text file this program reads or writes (config, recents, sessions,
+  -- history) is UTF-8, whatever the locale says. Left to the locale, a bare
+  -- `LANG=C` session throws on the first non-ASCII path or search term, and
+  -- since those writes are best-effort the session, the recents and the
+  -- history were silently never persisted.
+  setLocaleEncoding utf8
   args <- getArgs
   -- The config file supplies the defaults; command-line flags override it.
   (fileCfg, cfgWarns) <- loadConfigFile

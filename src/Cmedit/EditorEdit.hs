@@ -195,7 +195,13 @@ moveTo extend newPos ed =
                  then Just (fromMaybe (edCursor ed) (edSelAnchor ed))
                  else Nothing
       cur = clampPos newPos (edBuffer ed)
-  in ensureVisible ed { edCursor = cur, edSelAnchor = anchor, edLastEdit = EKNone }
+      -- A selection extended back onto its own anchor is no selection. Keep
+      -- the anchor and 'getSelection' agrees there is none, so nothing clears
+      -- it; the next character typed then moves the cursor off it and the
+      -- stale anchor comes alive as a selection over what was just typed,
+      -- which the keystroke after that replaces.
+      anchor' = if anchor == Just cur then Nothing else anchor
+  in ensureVisible ed { edCursor = cur, edSelAnchor = anchor', edLastEdit = EKNone }
 
 moveHoriz :: Bool -> (Editor -> Pos) -> Editor -> Editor
 moveHoriz extend f ed =
@@ -282,7 +288,9 @@ redo ed = case Seq.viewl (edRedo ed) of
 -- Remove the current selection (if any). Does not push undo itself.
 removeSelection :: Editor -> Editor
 removeSelection ed = case getSelection ed of
-  Nothing -> ed
+  -- (an anchor sitting on the cursor is not a selection, but left in place it
+  -- becomes one as soon as the edit that follows moves the cursor; see 'moveTo')
+  Nothing -> if isJust (edSelAnchor ed) then ed { edSelAnchor = Nothing } else ed
   Just (a, b) ->
     let (buf', cur') = deleteRange a b (edBuffer ed)
     in ed { edBuffer = buf', edCursor = cur', edSelAnchor = Nothing }
@@ -951,9 +959,13 @@ moveLines dir ed0 = case lineOpBlocked ed0 of
                             bufA  = fst (deleteRange (Pos (a - 1) 0) (Pos a 0) buf)
                         in fst (insertText (Pos (b - 1) (lineLen (b - 1) bufA))
                                            (T.cons '\n' above) bufA)
+               -- clamped: a selection ending at column 0 of the line after
+               -- the block has its end on a line 'selLineSpan' excludes, and
+               -- shifting that past the last line leaves the document
+               keep p = clampPos (shift p) buf'
            in setDesired (afterEdit ed1 { edBuffer = buf'
-                                        , edCursor = shift (edCursor ed1)
-                                        , edSelAnchor = fmap shift (edSelAnchor ed1) })
+                                        , edCursor = keep (edCursor ed1)
+                                        , edSelAnchor = fmap keep (edSelAnchor ed1) })
 
 -- | Delete the selected lines (or the cursor line) outright (no clipboard —
 -- Ctrl+K cuts). The cursor keeps its column on the line that moves up.

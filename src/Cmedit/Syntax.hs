@@ -710,7 +710,9 @@ mdInline = goStart True
              in case after2 of
                   (')' : r2) -> replicate (1 + length txt + 2) TkLink
                                 ++ replicate (length url) TkLink ++ [TkLink] ++ go r2
-                  _          -> TkLink : map (const TkLink) txt
+                  -- no closing paren: still one token per character, so
+                  -- the rest of the line keeps its inline styling
+                  _          -> TkLink : map (const TkLink) txt ++ go after
            _ -> TkText : go rest
     go (_ : rest) = TkText : go rest
 

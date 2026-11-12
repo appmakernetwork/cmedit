@@ -1466,8 +1466,11 @@ versionText = "0.5.0"
 ------------------------------------------------------------------------------
 -- Search
 
+-- | The search fold. One definition ('Cmedit.Search.normCase'), because it is
+-- length-preserving on purpose and a second copy here was not: replace maps
+-- offsets found in the folded text back onto the original.
 normCase :: Bool -> Text -> Text
-normCase cs = if cs then id else T.toLower
+normCase = S.normCase
 
 isWordCh :: Char -> Bool
 isWordCh c = isAlphaNum c || c == '_'
