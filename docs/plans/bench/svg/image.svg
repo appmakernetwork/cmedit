@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="200">
+<image x="10" y="10" width="80" height="80" style="image-rendering:pixelated" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAGUlEQVR4nGNgYPj//z+QQKJBLCAbRhNUAQDrkCfZYoK6GgAAAABJRU5ErkJggg=="/>
+<image x="110" y="10" width="80" height="40" xlink:href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAGUlEQVR4nGNgYPj//z+QQKJBLCAbRhNUAQDrkCfZYoK6GgAAAABJRU5ErkJggg=="/>
+<image x="110" y="60" width="80" height="30" preserveAspectRatio="xMinYMid slice" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAGUlEQVR4nGNgYPj//z+QQKJBLCAbRhNUAQDrkCfZYoK6GgAAAABJRU5ErkJggg=="/>
+<image x="10" y="110" width="80" height="40" preserveAspectRatio="none" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAGUlEQVR4nGNgYPj//z+QQKJBLCAbRhNUAQDrkCfZYoK6GgAAAABJRU5ErkJggg==" opacity="0.5"/>
+<image x="110" y="110" width="80" height="80" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10'%3E%3Ccircle cx='5' cy='5' r='5' fill='green'/%3E%3C/svg%3E"/>
+<image x="10" y="160" width="30" height="30" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAGUlEQVR4nGNgYPj//z+QQKJBLCAbRhNUAQDrkCfZYoK6GgAAAABJRU5ErkJggg==" transform="rotate(15 25 175)" style="image-rendering:optimizeSpeed"/>
+</svg>

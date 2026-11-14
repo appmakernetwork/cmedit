@@ -438,8 +438,11 @@ pdfOrdinalMsg a ms
 applyPendingDoc :: Editor -> Editor
 applyPendingDoc ed = case edPendingDoc ed of
   Just (p, unit, term) | edPath ed == Just p ->
-    let ed0 = ed { edPendingDoc = Nothing, edSearchTerm = detach term
-                 , edSearchMode = False, edFocus = FEdit }
+    -- A search hit is shown (and selectable) in the reflow view, so a PDF
+    -- showing its page view goes to its reflow view first.
+    let edP = if pageViewOn ed then togglePdfPage ed else ed
+        ed0 = edP { edPendingDoc = Nothing, edSearchTerm = detach term
+                  , edSearchMode = False, edFocus = FEdit }
         h   = max 1 (rtfHeight ed0)
     in if | Just _ <- edPdf ed0 ->
               let edR = refreshPdf ed0
@@ -1069,7 +1072,7 @@ stagedDoc path lr buf' = Document
   , docUndo = Seq.singleton (UndoState (lrBuffer lr) origin Nothing)
   , docRedo = Seq.empty, docLastEdit = EKNone
   , docOverwrite = False, docDiscard = False
-  , docCsv = Nothing, docCsvStash = Nothing, docImage = Nothing
+  , docCsv = Nothing, docCsvStash = Nothing, docImage = Nothing, docSvgStash = Nothing, docPdfView = Nothing
   , docPager = Nothing, docRtf = Nothing, docSheets = Nothing, docPdf = Nothing
   , docHlCache = Nothing
   , docDiags = []
@@ -1102,7 +1105,9 @@ replaceInOpenDocs subst paths ed =
   let hit d = isPlainDoc d && not (docReadOnly d) && maybe False (`elem` paths) (docPath d)
       doBuf buf = let (c, big') = subst (bufferToText LF False buf)
                   in (fromText big', c)
-      activeHit = isNothing (edCsv ed) && isNothing (edImage ed) && not (edReadOnly ed)
+      -- (an SVG's picture view is over its live buffer: replaced like text,
+      -- and the picture re-derives from the bumped counter)
+      activeHit = isNothing (edCsv ed) && not (bufferlessImage (edImage ed)) && not (edReadOnly ed)
                   && maybe False (`elem` paths) (edPath ed)
       -- A document the substitution leaves untouched (the result list can be
       -- staler than the buffer) is not edited at all: no undo step, and no

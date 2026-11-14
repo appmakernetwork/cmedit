@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="200">
+<defs>
+<symbol id="sym" viewBox="0 0 10 10"><circle cx="5" cy="5" r="5" fill="teal"/><rect x="-5" y="-5" width="8" height="8" fill="red"/></symbol>
+<symbol id="sym2" viewBox="0 0 20 10" preserveAspectRatio="xMinYMax slice"><rect width="20" height="10" fill="gold" stroke="black"/></symbol>
+<g id="grp"><rect width="20" height="20"/><circle cx="25" cy="10" r="5" fill="red"/></g>
+</defs>
+<use href="#sym" x="10" y="10" width="40" height="40"/>
+<use href="#sym" x="60" y="10" width="80" height="40"/>
+<use href="#sym2" x="150" y="10" width="40" height="40"/>
+<use xlink:href="#grp" x="10" y="70" fill="blue"/>
+<use href="#grp" transform="translate(60 70) scale(1.5)" fill="green"/>
+<use href="#grp" x="120" y="70" opacity="0.5" fill="purple"/>
+<svg x="10" y="120" width="60" height="60" viewBox="0 0 10 20"><rect width="10" height="20" fill="orchid"/><circle cx="5" cy="10" r="8" fill="navy"/></svg>
+<svg x="80" y="120" width="60" height="60" viewBox="0 0 10 20" preserveAspectRatio="none"><circle cx="5" cy="10" r="5" fill="olive"/></svg>
+<svg x="150" y="120" width="40" height="60" viewBox="0 0 10 10" preserveAspectRatio="xMidYMax meet" overflow="visible"><circle cx="5" cy="5" r="6" fill="crimson"/></svg>
+<use href="#grp" x="160" y="180"><title>t</title></use>
+</svg>

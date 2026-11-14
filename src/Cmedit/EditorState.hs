@@ -25,7 +25,7 @@ import Cmedit.History (pushHist)
 import Cmedit.Width (colToDisplay, displayToCol, textCells, wrapLine)
 import qualified Cmedit.Zip as Zip
 import Cmedit.ConfigFile
-  ( Config(..), ThemeName(..), defaultConfig, RecentEntry(..)
+  ( Config(..), ThemeName(..), PdfViewMode(..), defaultConfig, RecentEntry(..)
   , maxRecentEntries, maxHistoryEntries, SessionSummary(..) )
 import Cmedit.Menu
 import Cmedit.Dialog
@@ -46,6 +46,8 @@ import Cmedit.About (aboutCanvasH, aboutCanvasMinW, aboutTotalFrames)
 import Cmedit.HelpCard (helpCanvasMinW, helpDialogText)
 import Cmedit.Clipboard (CopyOutcome(..))
 import Cmedit.Image (Image(..), ImgMode(..), renderImage, viewFit)
+import Cmedit.VecView (VecDoc(..), SceneSize(..), emptyVecDoc, vecDims, placeholderImage)
+import Cmedit.Scene (Scene)
 import Cmedit.Pager (PagerDoc(..), pagerStatus)
 import Cmedit.Rtf (RtfDoc(..))
 import qualified Cmedit.Rtf as Rtf
@@ -138,6 +140,8 @@ data Document = Document
   , docCsv          :: !(Maybe CsvView)
   , docCsvStash      :: !(Maybe CsvView)  -- ^ Table model kept while in plain-text view (preserves CSV undo).
   , docImage         :: !(Maybe ImageDoc) -- ^ Image-view model when this doc is an image.
+  , docSvgStash      :: !(Maybe ImageDoc) -- ^ An SVG's picture-view model kept while its source is showing (see 'edSvgStash').
+  , docPdfView       :: !(Maybe PdfView)  -- ^ The PDF page view's state (see 'edPdfView'); its scenes are dropped while inactive.
   , docPager         :: !(Maybe PagerDoc) -- ^ Paged read-only view when this doc is too big to load.
   , docRtf           :: !(Maybe RtfDoc)   -- ^ Formatted read-only view when this doc is an RTF file being shown as a document.
   , docPdf           :: !(Maybe PdfDoc)   -- ^ Reading view when this doc is a PDF.
@@ -165,6 +169,14 @@ data ImageDoc = ImageDoc
     -- when the cell grid dimensions stay the same, and an animation step must
     -- re-scale the new frame.
   , idCache :: !(Maybe (Int, Int, ImgMode, (Int, Int, Int, Int), (Int, Int), Int, Array (Int, Int) Cell))
+  , idVec   :: !(Maybe VecDoc)
+    -- ^ A vector picture (an SVG) instead of a decoded bitmap: 'idImage' and
+    -- 'idFrames' then hold a 1×1 placeholder that nothing samples, the
+    -- geometry runs in the picture's virtual pixels ('imageDims'), and every
+    -- raster comes from the scene at exactly the size it is shown at (see
+    -- "Cmedit.VecView"). Unlike a bitmap the document under it is a live,
+    -- editable text buffer, so the "image means no buffer" checks ask
+    -- 'bufferlessImage' instead of 'isJust'.
   } deriving (Show)
 
 -- | Build the image-view model for a decoded frame sequence (never empty; the
@@ -172,9 +184,112 @@ data ImageDoc = ImageDoc
 mkImageDoc :: [(Image, Int)] -> ImageDoc
 mkImageDoc frames@((img, _) : _) = ImageDoc
   { idImage = img, idMode = HalfBlock, idCrop = Nothing, idDrag = Nothing
-  , idFrames = frames, idFrame = 0, idCache = Nothing
+  , idFrames = frames, idFrame = 0, idCache = Nothing, idVec = Nothing
   }
 mkImageDoc [] = error "mkImageDoc: empty frame list"  -- decoders never produce this
+
+-- | A picture view of a vector document, waiting for its first parse, with
+-- a fresh epoch (see 'Cmedit.VecView.vdEpoch').
+mkVectorDoc :: Int -> ImageDoc
+mkVectorDoc epoch = (mkImageDoc [(placeholderImage, 0)]) { idVec = Just (emptyVecDoc epoch) }
+
+-- | Draw the next value of the session clock that stamps vector-picture
+-- epochs and recency.
+tickVecClock :: Editor -> (Int, Editor)
+tickVecClock ed = (edVecClock ed, ed { edVecClock = edVecClock ed + 1 })
+
+-- | The image view's source size: the bitmap's pixels, or a vector
+-- picture's virtual grid ("Cmedit.VecView").
+imageDims :: ImageDoc -> (Int, Int)
+imageDims idoc = case idVec idoc of
+  Just vd -> vecDims (vdSize vd)
+  Nothing -> (imgW (idImage idoc), imgH (idImage idoc))
+
+-- | An image view with no buffer under it (a decoded bitmap). A vector
+-- picture is the opposite: its buffer is the document.
+bufferlessImage :: Maybe ImageDoc -> Bool
+bufferlessImage = maybe False (isNothing . idVec)
+
+-- | The active document's SVG picture, when its picture view is showing.
+-- (SVG-specific: the "edits the buffer under it" guards. The picture
+-- machinery itself asks 'activePicVec', which also covers a PDF page.)
+activeVec :: Editor -> Maybe VecDoc
+activeVec ed = edImage ed >>= idVec
+
+-- | The PDF page view's state, per document (see 'PdfView').
+--
+-- __The page view is a mode of the PDF view, not an image document.__ The
+-- document stays 'edPdf' (its pages, Go To page, its disabled actions, its
+-- place in the zipper); the page view adds a vector picture of /one page/
+-- ('pvPic', an ordinary vector 'ImageDoc' whose 'vdSeq' is the page it holds)
+-- and borrows the whole picture machinery through 'activePicture'/
+-- 'modPicture': fit, zoom crops, drag-to-zoom, the cell raster, the overlay.
+data PdfView = PdfView
+  { pvOn          :: !Bool    -- ^ The page view is showing (False: the reflow view).
+  , pvManual      :: !Bool    -- ^ The user chose the mode (Alt+T); @pdf-view = auto@ never overrides it.
+  , pvAutoPending :: !Bool    -- ^ Auto chose reflow for want of pixel caps; switch once, if they arrive.
+  , pvPage        :: !Int     -- ^ Current page, 1-based.
+  , pvPages       :: !Int     -- ^ Page dictionaries in the file.
+  , pvEpoch       :: !Int     -- ^ Identity of this opening of the file (see 'Cmedit.VecView.vdEpoch').
+  , pvPic         :: !ImageDoc -- ^ The current page's picture.
+  , pvScenes      :: ![(Int, PageScene)]
+    -- ^ Other pages' scenes: prefetched, or recently shown. Held to the
+    -- current page ±1 within a cost budget ('Cmedit.VecView.keepScenes').
+  , pvFailed      :: ![(Int, String)]
+    -- ^ Pages whose render failed in this opening, with the reason: never
+    -- prefetched again, and shown as the error when turned to.
+  , pvNoFit       :: ![Int]
+    -- ^ Neighbours prefetched for the current page that the cache could not
+    -- keep within its budget: not prefetched again until the page changes
+    -- (without this, two heavy neighbours evict each other forever).
+  , pvLeftAt      :: !(Maybe Int)
+    -- ^ The reflow window's top line as the page view left it. Re-entering
+    -- with the window still there returns to 'pvPage' exactly; the reflow
+    -- window cannot always show the page's start (a short document clamps
+    -- the scroll), so deriving the page from it again would lose the page.
+  } deriving (Show)
+
+-- | A cached page scene.
+data PageScene = PageScene
+  { psSceneId :: !Int
+  , psScene   :: !Scene
+  , psNotes   :: ![String]
+  , psFontless :: !Bool
+  , psSize    :: !SceneSize   -- ^ Measured by the job ('Cmedit.VecView.measureScene'), never on this thread.
+  } deriving (Show)
+
+-- | Is the active document's PDF page view showing?
+pageViewOn :: Editor -> Bool
+pageViewOn ed = isJust (edPdf ed) && maybe False pvOn (edPdfView ed)
+
+-- | The picture the image-view machinery works on: an image document's, or
+-- the PDF page view's current page.
+activePicture :: Editor -> Maybe ImageDoc
+activePicture ed = case edImage ed of
+  Just i -> Just i
+  Nothing | pageViewOn ed -> fmap pvPic (edPdfView ed)
+          | otherwise -> Nothing
+
+-- | Update the picture 'activePicture' returns (no-op without one).
+modPicture :: (ImageDoc -> ImageDoc) -> Editor -> Editor
+modPicture f ed = case edImage ed of
+  Just i -> ed { edImage = Just (f i) }
+  Nothing | pageViewOn ed, Just pv <- edPdfView ed -> ed { edPdfView = Just pv { pvPic = f (pvPic pv) } }
+          | otherwise -> ed
+
+-- | The vector side of 'activePicture'.
+activePicVec :: Editor -> Maybe VecDoc
+activePicVec ed = activePicture ed >>= idVec
+
+-- | Is this an SVG (by extension)? The extension says a file is a
+-- candidate; 'Cmedit.Svg.sniffSvgText' on its content decides whether the
+-- picture view is entered (so an XML file that merely mentions @<svg@ is
+-- never shown as a picture, and a broken .svg falls back to its source).
+isSvgPath :: FilePath -> Bool
+isSvgPath p = map toLower (takeExtension p) `elem` [".svg", ".svgz"]
+
+isSvgFile :: Editor -> Bool
+isSvgFile ed = maybe False isSvgPath (edPath ed)
 
 data Editor = Editor
   { edBuffer        :: !Buffer
@@ -260,6 +375,23 @@ data Editor = Editor
   , edCsv           :: !(Maybe CsvView) -- ^ Table view, when the active doc is in CSV mode.
   , edCsvStash      :: !(Maybe CsvView) -- ^ Table model retained while viewing a CSV doc as plain text (keeps its undo across toggles).
   , edImage         :: !(Maybe ImageDoc) -- ^ Image view, when the active doc is an image (a separate mode to text/CSV).
+  , edVecClock      :: !Int
+    -- ^ Session-monotonic clock for vector pictures: each new picture model
+    -- takes its epoch from it, and each deactivation its recency stamp.
+    -- Global, not per document.
+  , edFontsReady    :: !Bool  -- ^ The driver's system-font discovery has finished.
+  , edVecGfxReady   :: !Bool
+    -- ^ Mirrored by the driver before each frame: a pixel placement of the
+    -- active vector picture, for the current view, is in hand. Until it is,
+    -- the cell picture stays painted (see 'imageOverlayActive').
+  , edPdfView       :: !(Maybe PdfView)
+    -- ^ The PDF page view's state, when the active document is a PDF (per
+    -- document: 'docPdfView'). 'Nothing' for every other document.
+  , edSvgStash      :: !(Maybe ImageDoc)
+    -- ^ An SVG's picture-view model, kept while its source is showing (Alt+T):
+    -- toggling back reuses it outright when the buffer has not been edited
+    -- since ('vdSeq' still equals 'edDocSeq'), and otherwise shows it until
+    -- the re-parse lands. Per document, like 'edCsvStash'.
   , edPager         :: !(Maybe PagerDoc) -- ^ Paged read-only view, when the active doc is too big to hold in a buffer (a fourth view mode; see "Cmedit.Pager").
   , edRtf           :: !(Maybe RtfDoc)  -- ^ Formatted RTF view, when the active doc is an @.rtf@ shown as a document rather than as its markup (a fifth view mode; see "Cmedit.Rtf"). Read-only and derived: the buffer stays the document and is the only thing saved.
   , edSheets        :: !(Maybe Workbook) -- ^ Open workbook, when the active doc is an @.xlsx@ (see "Cmedit.Xlsx"). The showing sheet is an ordinary 'edCsv' table view, so the renderer, key handler and scroll bars need to know nothing about workbooks; this holds the other sheets and marks the view read-only.
@@ -432,6 +564,11 @@ newEditor size cfg = Editor
   , edCsv           = Nothing
   , edCsvStash      = Nothing
   , edImage         = Nothing
+  , edSvgStash      = Nothing
+  , edPdfView       = Nothing
+  , edVecClock      = 1
+  , edFontsReady    = False
+  , edVecGfxReady   = False
   , edPager         = Nothing
   , edRtf           = Nothing
   , edSheets        = Nothing
@@ -599,6 +736,8 @@ cellPxKey ed = fromMaybe (0, 0) (edCellPx ed)
 -- 'Cmedit.Gfx.gfxFit'.
 imageFitCap :: Editor -> ImageDoc -> Maybe Double
 imageFitCap ed idoc = case edCellPx ed of
+  -- A vector picture has no native size worth pinning: it fills the view.
+  _ | isJust (idVec idoc) -> Nothing
   Just (pw, _) | isNothing (idCrop idoc), pw > 0 -> Just (1 / fromIntegral pw)
   _                                              -> Nothing
 
@@ -623,7 +762,18 @@ setGfxCaps kitty kittyAnim sixel ed =
 -- pixels; keep it in step with @wantGfx@ so the two never disagree (blanking a
 -- cell the driver won't cover would leave a hole, and vice versa).
 imageOverlayActive :: Editor -> Bool
-imageOverlayActive ed = case edImage ed of
+imageOverlayActive ed =
+  imageOverlayWanted ed
+    -- A vector picture's placement is rasterised on a background job, and
+    -- may be slow or refused; until it exists the cells are the picture.
+    && (isNothing (activePicVec ed) || edVecGfxReady ed)
+
+-- | The driver's half of 'imageOverlayActive': is a pixel placement /wanted/
+-- (the terminal can draw pixels and the image is the unobstructed content)?
+-- For a bitmap the two are the same; for a vector picture the placement must
+-- also have been rendered before the renderer may blank the cells under it.
+imageOverlayWanted :: Editor -> Bool
+imageOverlayWanted ed = case activePicture ed of
   Nothing   -> False
   Just idoc ->
     let lo = computeLayout ed
@@ -738,7 +888,7 @@ pointerShapeFor ed row col
   | onDivider                                = "col-resize" -- panel width handle
   | inPanel                                  = "pointer"
   | edSearchMode ed && inContent             = "pointer"   -- result rows / fields
-  | isJust (edImage ed) && inContent         = "crosshair" -- drag-zoom
+  | isJust (activePicture ed) && inContent  = "crosshair" -- drag-zoom
   | Just v <- edCsv ed, row == loTextTop lo, inContent
   , isJust (csvBorderColAt v (col - loContentLeft lo))
                                              = "col-resize" -- header column border
@@ -862,6 +1012,15 @@ pageSize ed = max 1 (loTextHeight (computeLayout ed) - 1)
 scrollBarInfo :: Editor -> Maybe (Int, Int, Int, Int, Int)
 scrollBarInfo ed
   | isJust (edImage ed) = Nothing
+  -- The page view's bar measures pages: each page is one track's worth of
+  -- rows, so the thumb is one page long and sits at the current page
+  -- ('scrollBarTo' maps a click back the same way).
+  | pageViewOn ed, cfgScrollBarV (edConfig ed), Just pv <- edPdfView ed =
+      let lo = computeLayout ed
+          h = loTextHeight lo
+      in if pvPages pv > 1 && h > 0
+           then Just (loCols lo - 1, loTextTop lo, h, pvPages pv * h, (pvPage pv - 1) * h)
+           else Nothing
   | not (cfgScrollBarV (edConfig ed)) = Nothing
   | otherwise =
       let lo = computeLayout ed
@@ -1559,7 +1718,7 @@ isPlainDoc :: Document -> Bool
 -- ('refreshRtf').
 -- A container-derived formatted view (DOCX, EPUB) is /not/ plain, for the
 -- opposite reason: it has no buffer at all.
-isPlainDoc d = isNothing (docCsv d) && isNothing (docImage d) && isNothing (docPager d)
+isPlainDoc d = isNothing (docCsv d) && not (bufferlessImage (docImage d)) && isNothing (docPager d)
                  && isNothing (docPdf d) && isNothing (docSheets d)
                  && not (maybe False Rtf.rtfDerived (docRtf d))
 
@@ -1603,7 +1762,7 @@ pushNavIfFar tpath tpos ed
 -- "Linting" switch and rows @nEditingSettings+1 ..@ are one per 'linters'
 -- entry, in table order. A Spec test keeps this constant in step with the spec.
 nEditingSettings :: Int
-nEditingSettings = 14
+nEditingSettings = 16
 
 -- | The 'linters' entry a Settings dialog choice row maps to, if it is a
 -- per-linter row (the master switch and the editing rows return 'Nothing').
@@ -1623,8 +1782,11 @@ lintOnOf cfg lid = maybe (linDefaultOn (linterById lid)) id (lookup lid (cfgLint
 lintRowHintNote :: LintAvail -> Linter -> (Text, Maybe Text)
 lintRowHintNote av l = case lookup (linId l) av of
   Just (Just (_, ver)) ->
-    ( T.pack (linName l ++ " " ++ ver ++ " \x2014 external linter.")
-    , Just (T.pack ("\x2713 " ++ ver)) )
+    -- "" until the Settings dialog's own probe answers (detection never runs
+    -- a tool; see 'Cmedit.Lint.mayFetchTool')
+    let shown = if null ver then "installed" else ver
+    in ( T.pack (linName l ++ " " ++ shown ++ " \x2014 external linter.")
+       , Just (T.pack ("\x2713 " ++ shown)) )
   _ ->
     ( "Not installed."
     , Just (T.pack ("\x2717 not installed \x2014 " ++ linInstall l)) )
@@ -1753,7 +1915,7 @@ lintResults path ds ed
 journalableDoc :: Document -> Bool
 journalableDoc d =
   docModified d
-    && isNothing (docImage d) && isNothing (docPager d) && isNothing (docPdf d)
+    && not (bufferlessImage (docImage d)) && isNothing (docPager d) && isNothing (docPdf d)
     && isNothing (docSheets d)
     && not (maybe False Rtf.rtfDerived (docRtf d))
     && maybe True (not . ("cmedit://" `isPrefixOf`)) (docPath d)
@@ -1807,7 +1969,7 @@ maxSnapshotBytes = 4 * 1024 * 1024
 snapshotableDoc :: Document -> Bool
 snapshotableDoc d =
   isJust (docPath d)
-    && isNothing (docImage d) && isNothing (docPager d) && isNothing (docPdf d)
+    && not (bufferlessImage (docImage d)) && isNothing (docPager d) && isNothing (docPdf d)
     && isNothing (docSheets d)
     && not (maybe False Rtf.rtfDerived (docRtf d))
     && maybe True (not . ("cmedit://" `isPrefixOf`)) (docPath d)

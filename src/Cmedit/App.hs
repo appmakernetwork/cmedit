@@ -8,13 +8,14 @@ module Cmedit.App
     -- * Exposed for testing
   , convertPath
   , abbreviateHome
+  , detectLinters
   ) where
 
 import Control.Concurrent (ThreadId, forkIO, getNumCapabilities, killThread, myThreadId)
 import Control.Concurrent.MVar (MVar, newMVar, modifyMVar, modifyMVar_, readMVar)
 import Control.Concurrent.STM
 import GHC.Conc (getNumProcessors, setNumCapabilities)
-import Control.Exception (ErrorCall, SomeException, evaluate, bracket, bracket_, catch, finally, handle, mask_, throwIO, try)
+import Control.Exception (AsyncException(..), ErrorCall, SomeException, SomeAsyncException, fromException, evaluate, bracket, bracket_, catch, finally, handle, mask_, throwIO, try)
 import Control.Monad (filterM, foldM, forM, forM_, unless, void, when)
 import qualified Data.ByteString as BS
 import Data.ByteString.Builder (Builder, char7, hPutBuilder)
@@ -69,6 +70,15 @@ import qualified Cmedit.Definition as D
 import Cmedit.Editor
 import Cmedit.Gfx
 import Cmedit.Image (Image, imgW, imgH, sniffImage, decodeFrames, scaleRGBA)
+import Cmedit.Jobs (JobTable, newJobTable, startJobIn, cancelJobIn)
+import Cmedit.FontProvider (FontProvider, newFontProvider, startFontDiscovery, providerFiles, facesForQueries, fontFor)
+import qualified Cmedit.PdfRender as PR
+import qualified Cmedit.PdfObj as PO
+import Cmedit.Raster (RenderStats(..))
+import Cmedit.Scene (Scene(..))
+import Cmedit.Svg (SvgEnv(..), defaultSvgEnv, parseSvgText, svgFontQueries, svgExternalRefs, sniffSvg)
+import Cmedit.SvgTree (decodeSvgBytes)
+import Cmedit.VecView (VecDoc(..), VecKey(..), SceneSize, rasterVec, rasterNoteList, measureScene, imageRGBA, keepPreviousPlacement)
 import Cmedit.Pager (PagerDoc(..))
 import qualified Cmedit.Pager as Pg
 import Cmedit.Pdf (PdfDoc(..))
@@ -85,7 +95,7 @@ import Cmedit.Journal (Journal(..))
 import qualified Cmedit.Journal as J
 import Cmedit.Lint
   ( LinterId, Linter(..), Diag(..), LintAvail
-  , linters, linterById, parseLintOutput, maxDiagsPerFile )
+  , linters, linterById, parseLintOutput, maxDiagsPerFile, mayFetchTool, versionUnchecked )
 import Cmedit.Render
 import Cmedit.Search (SearchReq(..), FileResult(..))
 import qualified Cmedit.Search as S
@@ -198,12 +208,13 @@ runTui cfg cfgWarns files readOnly statsOnExit restoreFlag = do
     journalLastRef <- newIORef 0
     journalRunRef <- newIORef False
     journalGate <- newMVar True
-    jobsRef <- newIORef M.empty
+    jobsRef <- newJobTable
     stats <- newDrvStats
+    vecDrv <- newVecDrv
     let drv = Drv loadQ searchQ searchGen defGen dirMtimes focused recentsRef sessionRef quickGen
                   capsRef pointerRef themeRef gfxRef lintGen lintFpRef lintAvRef lintRunRef
                   lintLastRef journalDir journalsRef journalFpRef journalWarnRef
-                  journalLastRef journalRunRef journalGate stats jobsRef
+                  journalLastRef journalRunRef journalGate stats jobsRef vecDrv
     src       <- mkHandleSource stdin
     clickRef  <- newIORef (ClickState 0 (-1) (-1) 0)
     mainTid   <- myThreadId
@@ -217,7 +228,10 @@ runTui cfg cfgWarns files readOnly statsOnExit restoreFlag = do
     -- Probe which external linters are installed (off the main thread; the
     -- result arrives as an SMLintAvail message). The root, when a workspace
     -- folder was opened, lets node-local tools in node_modules/.bin be found.
-    forkDetectLinters drv (explorerRoot ed0Px)
+    forkDetectLinters drv False (explorerRoot ed0Px)
+    -- Find the installed fonts (SVG text, later PDF pages) off the main
+    -- thread; a parse that needs them waits for this, never the UI.
+    startFontDiscovery (vdrFonts vecDrv) (atomically (writeTQueue searchQ SMFontsReady))
 
     bracket_
       (enterScreen ed0)
@@ -907,11 +921,12 @@ data Drv = Drv
       --   resurrecting the journal of a document that was saved (or of a
       --   session that has just quit) while the bytes were being written.
   , drvStats     :: !DrvStats        -- ^ Session counters for @--stats-on-exit@.
-  , drvJobs      :: !(IORef (M.Map JobKind ThreadId))
+  , drvJobs      :: !(JobTable JobKind)
       -- ^ At most one background job of each kind. Starting one cancels the
       --   previous: the generation counters already made a superseded result be
       --   dropped, but the work itself carried on — a retyped search term left
       --   the old walk reading files nobody would look at.
+  , drvVec       :: !VecDrv            -- ^ Vector-picture jobs, fonts and overlay rasters.
   }
 
 -- | Cheap session counters. Bumped with 'modifyIORef'' at a handful of sites
@@ -943,7 +958,47 @@ bump f drv = modifyIORef' (f (drvStats drv)) (+ 1)
 -- | Kinds of background work the driver supervises. At most one of each runs;
 -- the input reader and the main loop are deliberately not in this list.
 data JobKind = JSearch | JDefs | JQuickOpen | JLoad | JReplace | JJournal
+             | JSvgParse   -- ^ An SVG document → scene (with its font and image loads).
+             | JVecCells   -- ^ A vector picture's cell-resolution raster.
+             | JVecGfx     -- ^ A vector picture's pixel-overlay raster.
+             | JPdfPage    -- ^ The PDF page view's current page → scene.
+             | JPdfPrefetch -- ^ A neighbouring page → scene, while the view is idle.
+             | JVecGfxPrefetch -- ^ The next page's overlay raster, while the view is idle.
   deriving (Eq, Ord, Show)
+
+-- | The driver's half of the vector-picture view (plan 0034). Everything here
+-- is bookkeeping for background jobs; the pure model holds the scene and the
+-- cell raster, and the overlay rasters live here because only the driver
+-- emits them.
+data VecDrv = VecDrv
+  { vdrFonts    :: !FontProvider
+  , vdrParse    :: !(IORef (Maybe SvgWant))
+      -- ^ The parse in flight: not re-requested while it runs.
+  , vdrCells    :: !(IORef (Maybe VecKey))   -- ^ The cell raster in flight.
+  , vdrGfxReq   :: !(IORef (Maybe VecKey))   -- ^ The overlay raster in flight.
+  , vdrGfx      :: !(IORef [(VecKey, Maybe BS.ByteString)])
+      -- ^ The last 'vecGfxCacheSize' overlay rasters as RGBA payloads (Nothing:
+      --   the raster was refused, so it is not retried for this key). Bounded
+      --   by count and so by bytes: each is at most 'maxGfxPixels' pixels.
+  , vdrSceneGen :: !(IORef Int)              -- ^ Session-unique scene ids.
+  , vdrPage     :: !(IORef (Maybe PageWant))  -- ^ The current-page parse in flight.
+  , vdrPrefetch :: !(IORef (Maybe PageWant))  -- ^ The neighbouring-page parse in flight.
+  , vdrGfxPre   :: !(IORef (Maybe VecKey))    -- ^ The next page's overlay raster in flight.
+  , vdrWheelAt  :: !(IORef Double)            -- ^ When the wheel last turned a PDF page (rate limit).
+  }
+
+-- | Overlay rasters kept: the one on screen and the one before it (so
+-- zooming back out by a notch re-places without re-rendering).
+vecGfxCacheSize :: Int
+vecGfxCacheSize = 3
+
+newVecDrv :: IO VecDrv
+newVecDrv = do
+  fp <- newFontProvider
+  VecDrv fp <$> newIORef Nothing <*> newIORef Nothing <*> newIORef Nothing
+            <*> newIORef [] <*> newIORef 0
+            <*> newIORef Nothing <*> newIORef Nothing <*> newIORef Nothing
+            <*> newIORef 0
 
 -- | What the driver watches to decide a fresh lint pass is due: the active
 -- document path, its edit counter, and the linting configuration/availability.
@@ -974,6 +1029,7 @@ data GfxKey = GfxKey
   , gkGeom :: !(Int, Int, Int, Int)     -- ^ (top, left, tw, th) of the text area.
   , gkPx   :: !(Int, Int)               -- ^ Cell pixel size in effect.
   , gkKind :: !GfxKind
+  , gkScene :: !Int                     -- ^ A vector picture's scene id (0 for a bitmap): a re-parse re-places.
   , gkFrame :: !Int                     -- ^ Displayed animation frame. Static under
                                         --   real kitty (the terminal loops natively);
                                         --   the editor's tick steps it elsewhere —
@@ -1041,6 +1097,21 @@ data SearchMsg
   | SMQuickDone  !Int             -- ^ quick-gen, the quick-open walk finished.
   | SMLint       !Int !FilePath ![Diag]  -- ^ lint-gen, one file's diagnostics (empty list clears old squiggles).
   | SMLintAvail  !LintAvail       -- ^ detected linter availability (from the startup / on-demand probe).
+  | SMSvgParsed  !SvgWant !Int !Bool !(Either String (Scene, SceneSize, [String]))
+      -- ^ An SVG parse finished: the request it answers, the scene id it was
+      --   given, whether it ran before font discovery finished, and the
+      --   scene with its notes (or why there is none).
+  | SMFontsReady
+      -- ^ System-font discovery finished.
+  | SMVecCells   !VecKey !(Maybe (Image, Bool, [String]))
+      -- ^ A cell raster finished (Nothing: refused or failed); the flag says
+      --   the budget ran out.
+  | SMVecGfx     !Bool !VecKey !(Maybe (BS.ByteString, [String]))
+      -- ^ (whether it was a prefetch)
+  | SMPageParsed !PageWant !Int !Bool !(Either String (Scene, SceneSize, [String]))
+      -- ^ A PDF page's scene: the request, its scene id, drawn before fonts
+      --   were known, the scene and its notes.
+      -- ^ An overlay raster finished, as the RGBA payload to place.
   | SMJournal    ![(FilePath, Int)] !Int
       -- ^ A write-behind pass finished: the journals that now hold their
       --   document's content as of the given edit counter, and how many writes
@@ -1338,6 +1409,45 @@ eventLoop editorRef prevRef titleRef q drv _src = do
       SMLintAvail av -> do
         writeIORef (drvLintAvail drv) av
         modifyIORef' editorRef (lintersDetected av)
+      -- Vector pictures: a parse or a raster landed. Each clears its own
+      -- in-flight marker only if it is the request still in flight, so a
+      -- superseded result never lets a duplicate of the newer one start.
+      SMSvgParsed w sid fontless res -> do
+        let v = drvVec drv
+        atomicModifyIORef' (vdrParse v) (\cur -> (if cur == Just w then Nothing else cur, ()))
+        modifyIORef' editorRef (svgParsed w sid fontless res)
+      SMFontsReady -> modifyIORef' editorRef fontsReady
+      SMVecCells k res -> do
+        let v = drvVec drv
+        atomicModifyIORef' (vdrCells v) (\cur -> (if cur == Just k then Nothing else cur, ()))
+        case res of
+          Just (img, ex, notes) -> modifyIORef' editorRef (vecCellsRendered k img ex notes)
+          -- recorded against its key, so it is not asked for again every frame
+          Nothing -> modifyIORef' editorRef (vecCellsFailed k)
+      SMVecGfx pre k res -> do
+        let v = drvVec drv
+        atomicModifyIORef' (if pre then vdrGfxPre v else vdrGfxReq v)
+          (\cur -> (if cur == Just k then Nothing else cur, ()))
+        ed <- readIORef editorRef
+        -- Only a raster of a scene still showing (or, for a prefetch, still
+        -- cached beside it) may take a cache slot: a late result for a closed
+        -- or re-parsed document must not evict the entry that is on screen.
+        let showing = fmap vdSceneId (activePicVec ed) == Just (vkScene k)
+            cached = maybe False (any ((== vkScene k) . psSceneId . snd) . pvScenes) (edPdfView ed)
+        when (showing || (pre && cached)) $ do
+          modifyIORef' (vdrGfx v) (\c -> take vecGfxCacheSize ((k, fmap fst res) : filter ((/= k) . fst) c))
+          when (isNothing res && not pre) $
+            modifyIORef' editorRef (setStatus "The pixel view of this picture could not be drawn \x2014 showing cells")
+          -- the rasteriser's notes (images over its memory cap, a truncated
+          -- drawing), deduplicated against our own wording ('rasterNoteList')
+          case res of
+            Just (_, notes@(_ : _)) | showing -> modifyIORef' editorRef (setStatus (T.intercalate "; " (map T.pack notes)))
+            _ -> pure ()
+      SMPageParsed w sid fontless res -> do
+        let v = drvVec drv
+        atomicModifyIORef' (vdrPage v) (\cur -> (if cur == Just w then Nothing else cur, ()))
+        atomicModifyIORef' (vdrPrefetch v) (\cur -> (if cur == Just w then Nothing else cur, ()))
+        modifyIORef' editorRef (pdfPageParsed w sid fontless res)
       -- A finished write-behind pass. The model is told which journals now
       -- hold which version, so a document edited while its journal was being
       -- written stays stale and is rewritten by the next tick.
@@ -1364,6 +1474,12 @@ eventLoop editorRef prevRef titleRef q drv _src = do
       -- must repaint whatever is on screen.
       SMStaged _ _    -> True
       SMReplaceDone _ -> True
+      -- A picture landed: the frame shows it (or re-places the overlay).
+      SMSvgParsed {}  -> True
+      SMVecCells {}   -> True
+      SMVecGfx {}     -> True
+      SMPageParsed {} -> True
+      SMFontsReady    -> True
       _               -> False
 
     -- Re-arm the lint debounce when the fingerprint changed since last time
@@ -1491,10 +1607,21 @@ eventLoop editorRef prevRef titleRef q drv _src = do
               emit (setPointerShape shape)   -- flushed with the batch's repaint
           _ -> pure ()
         ed <- readIORef editorRef
-        let (ed1, effs) = update k ed
-        ed2 <- performEffects drv effs ed1
-        writeIORef editorRef ed2
-        if edQuit ed2 then pure False else applyBatch ks
+        -- A wheel notch that would turn a PDF page (the page view at the
+        -- fit, no Ctrl) is held to one turn per 'wheelPageGapS': a trackpad
+        -- flick sends dozens of notches, and each would otherwise turn a page.
+        dropIt <- case k of
+          KMouse me | wheelTurnsPage me ed -> do
+            now <- getMonotonicTime
+            lastT <- readIORef (vdrWheelAt (drvVec drv))
+            if now - lastT < wheelPageGapS then pure True
+              else writeIORef (vdrWheelAt (drvVec drv)) now >> pure False
+          _ -> pure False
+        if dropIt then applyBatch ks else do
+         let (ed1, effs) = update k ed
+         ed2 <- performEffects drv effs ed1
+         writeIORef editorRef ed2
+         if edQuit ed2 then pure False else applyBatch ks
 
 ------------------------------------------------------------------------------
 -- Terminal replies / capabilities
@@ -1521,7 +1648,7 @@ applyReplyIO drv editorRef rep = do
   -- half-block fallback under a real placement (kept in step with 'wantGfx').
   caps' <- readIORef (drvCaps drv)
   modifyIORef' editorRef
-    (setGfxCaps (tcKittyGfx caps')
+    (pdfCapsArrived . setGfxCaps (tcKittyGfx caps')
                 (maybe False supportsKittyAnim (tcVersion caps'))
                 (tcSixel caps'))
   case rep of
@@ -1767,7 +1894,7 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
     entries <- listEntries cpath
     -- A new workspace root may bring node-local linters into scope (or take
     -- some out): re-probe availability against it.
-    forkDetectLinters drv (Just cpath)
+    forkDetectLinters drv False (Just cpath)
     pure (explorerStart cpath entries ed)
 
   EffExplorerList path -> do
@@ -1922,7 +2049,7 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
   -- Re-probe which linters are installed (e.g. after opening the Settings
   -- dialog); the result arrives as an SMLintAvail message.
   EffDetectLinters -> do
-    forkDetectLinters drv (explorerRoot ed)
+    forkDetectLinters drv True (explorerRoot ed)
     pure ed
 
   -- Run an immediate lint pass of the active document (save-time tools too),
@@ -1976,23 +2103,35 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
 -- Linting (external-linter integration)
 
 -- | Probe linter availability off the main thread and post the result back as
--- an 'SMLintAvail' message.
-forkDetectLinters :: Drv -> Maybe FilePath -> IO ()
-forkDetectLinters drv mroot =
+-- an 'SMLintAvail' message. @versions@: also ask each tool for its version
+-- (only for the Settings dialog, which shows them; see 'detectLinters').
+forkDetectLinters :: Drv -> Bool -> Maybe FilePath -> IO ()
+forkDetectLinters drv versions mroot =
   void $ forkIO $ do
-    av <- detectLinters mroot
+    av <- detectLinters versions mroot
     atomically (writeTQueue (drvSearchQ drv) (SMLintAvail av))
 
 -- | Detect which linters are installed. For each catalogue entry: look the
 -- executable up on @PATH@; on a miss, and if the tool ships as a node package,
 -- try @\<root\>/node_modules/.bin/\<cmd\>@, then a Yarn Plug'n'Play workspace
--- ('findYarnPnp'). A found tool is probed with @--version@ (its first output
--- line is the version label; @""@ if the probe fails — the tool still counts
--- as installed). The exception is a PnP pseudo-executable: there a silent
--- probe means the bootstrap could not resolve the tool, i.e. the workspace
--- doesn't depend on it, so it counts as not installed.
-detectLinters :: Maybe FilePath -> IO LintAvail
-detectLinters mroot = forM linters $ \l -> do
+-- ('findYarnPnp').
+--
+-- __Detection executes nothing.__ Availability is a @PATH@ lookup and file
+-- tests, because what is on @PATH@ is often a package-runner shim (a
+-- @pyright@ that is @exec corepack yarn pyright@, PyPI's @pyright@ wrapper),
+-- and running one is a download: detection used to run every tool's
+-- @--version@ at startup, so opening a PDF in an empty folder left a Yarn
+-- that corepack had fetched in @~\/.cache@. Only with @versions@ (the
+-- Settings dialog, which shows them) is a found tool asked for its version,
+-- and even then not one 'mayFetchTool' recognises as a shim (it is listed as
+-- installed, with 'versionUnchecked' for a label). The first output line is
+-- the version label; @""@ if the probe fails (the tool still counts as
+-- installed). The exception is a PnP pseudo-executable: there a silent probe
+-- means the bootstrap could not resolve the tool, i.e. the workspace doesn't
+-- depend on it, so it counts as not installed; without @versions@ it counts as
+-- installed until the Settings probe says otherwise.
+detectLinters :: Bool -> Maybe FilePath -> IO LintAvail
+detectLinters versions mroot = forM linters $ \l -> do
   mexe <- findExecutable (linCmd l)
   resolved <- case mexe of
     Just exe -> pure (Just exe)
@@ -2004,14 +2143,30 @@ detectLinters mroot = forM linters $ \l -> do
       | otherwise -> pure Nothing
   case resolved of
     Nothing  -> pure (linId l, Nothing)
+    Just exe | not versions -> pure (linId l, Just (exe, ""))
     Just exe -> do
-      let (pexe, pargs) = toolCommand (linCmd l) exe ["--version"]
-      mver <- runToolCapture pexe pargs "." Nothing
-      case mver of
-        Just t | (v : _) <- T.lines t, not (T.null v)
-          -> pure (linId l, Just (exe, T.unpack v))
-        _ | takeFileName exe == pnpMarker -> pure (linId l, Nothing)
-          | otherwise -> pure (linId l, Just (exe, ""))
+      shim <- toolMayFetch exe
+      if shim then pure (linId l, Just (exe, versionUnchecked)) else do
+        let (pexe, pargs) = toolCommand (linCmd l) exe ["--version"]
+        mver <- runToolCapture pexe pargs "." Nothing
+        case mver of
+          Just t | (v : _) <- T.lines t, not (T.null v)
+            -> pure (linId l, Just (exe, T.unpack v))
+          _ | takeFileName exe == pnpMarker -> pure (linId l, Nothing)
+            | otherwise -> pure (linId l, Just (exe, ""))
+
+-- | 'mayFetchTool' for a found executable: its canonical path (a global
+-- @yarn@ is a symlink into corepack) and its first 4 KiB. A PnP
+-- pseudo-executable runs the workspace's own zipped cache through @node@,
+-- which fetches nothing.
+toolMayFetch :: FilePath -> IO Bool
+toolMayFetch exe
+  | takeFileName exe == pnpMarker = pure False
+  | otherwise = do
+      real <- either (\(_ :: SomeException) -> exe) id <$> try (canonicalizePath exe)
+      hd <- either (\(_ :: SomeException) -> BS.empty) id
+              <$> try (withBinaryFile real ReadMode (\h -> BS.hGet h 4096))
+      pure (mayFetchTool real (map (toEnum . fromIntegral) (BS.unpack hd)))
 
 -- | The CommonJS entry point of a Yarn Plug'n'Play workspace, and the marker
 -- 'toolCommand' recognises a PnP pseudo-executable by.
@@ -2093,18 +2248,339 @@ replaceFailed drv req _ =
 -- | Fork a supervised background job, cancelling any previous job of the same
 -- kind. The job removes itself from the table when it finishes.
 startJob :: Drv -> JobKind -> IO () -> IO ()
-startJob drv kind act = mask_ $ do
-  prev <- atomicModifyIORef' (drvJobs drv) (\m -> (M.delete kind m, M.lookup kind m))
-  forM_ prev killThread
+startJob drv kind act = do
+  -- "Cmedit.Jobs" forks the job unmasked: a superseded job must die at once,
+  -- not when it has finished (see that module's header).
+  killed <- startJobIn (drvJobs drv) kind act
   bump stJobs drv
-  forM_ prev (const (bump stKilled drv))
-  tid <- forkIO (act `finally` clear)
-  modifyIORef' (drvJobs drv) (M.insert kind tid)
+  when killed (bump stKilled drv)
+
+-- | Cancel a running job whose result nobody wants any more.
+cancelJob :: Drv -> JobKind -> IO ()
+cancelJob drv kind = do
+  killed <- cancelJobIn (drvJobs drv) kind
+  when killed (bump stKilled drv)
+
+------------------------------------------------------------------------------
+-- Vector pictures: background parse and raster jobs (plan 0034)
+
+-- | Start whatever the vector picture needs that is not already in flight:
+-- a parse when the buffer moved past the scene ('svgParseWant'), a cell
+-- raster the pure model could not afford synchronously ('vecCellWant').
+-- Called at the top of every frame, so a request follows the state that is
+-- about to be drawn and nothing has to remember to ask. Cheap when there is
+-- nothing to do: two IORef reads.
+vectorUpkeep :: Drv -> IORef Editor -> IO ()
+vectorUpkeep drv editorRef = do
+  ed <- readIORef editorRef
+  caps <- readIORef (drvCaps drv)
+  let v = drvVec drv
+  -- The parse. A request no longer wanted (the document closed or switched,
+  -- the picture left for its source) is cancelled, not left to run.
+  pendP <- readIORef (vdrParse v)
+  case svgParseWant ed of
+    Just w | isNothing (edLoading ed) ->
+      when (pendP /= Just w) $ do
+        writeIORef (vdrParse v) (Just w)
+        -- The text is handed over as a thunk over the (immutable) buffer, so
+        -- joining a large document's lines happens on the job, not here.
+        startSvgParse drv w (bufferToText Cmedit.TextBuffer.LF False (edBuffer ed))
+    Just _ -> pure ()
+    Nothing -> when (isJust pendP) $ do
+      writeIORef (vdrParse v) Nothing
+      cancelJob drv JSvgParse
+  -- The cell raster, likewise.
+  pendC <- readIORef (vdrCells v)
+  case vecCellWant ed of
+    Just (k, sc) ->
+      when (pendC /= Just k) $ do
+        writeIORef (vdrCells v) (Just k)
+        startVecCells drv k sc
+    Nothing -> when (isJust pendC) $ do
+      writeIORef (vdrCells v) Nothing
+      cancelJob drv JVecCells
+  -- The overlay raster: requested here, placed by 'gfxOverlay' once it is in
+  -- the cache. Whether it is in the cache is mirrored into the editor, which
+  -- is what lets the renderer keep the cell picture until it is.
+  pendG <- readIORef (vdrGfxReq v)
+  cache <- readIORef (vdrGfx v)
+  ready <- case vecGfxTarget caps ed of
+    Just (_, vk, sc, _) -> case lookup vk cache of
+      Just r -> pure (isJust r)
+      Nothing -> do
+        when (pendG /= Just vk) $ do
+          writeIORef (vdrGfxReq v) (Just vk)
+          startVecGfx drv vk sc
+        pure False
+    Nothing -> do
+      when (isJust pendG) $ do
+        writeIORef (vdrGfxReq v) Nothing
+        cancelJob drv JVecGfx
+      pure False
+  when (edVecGfxReady ed /= ready) $
+    modifyIORef' editorRef (\e -> e { edVecGfxReady = ready })
+  pdfPageUpkeep drv editorRef caps ready
+
+-- | The PDF page view's half of 'vectorUpkeep': the current page's scene,
+-- then, once everything for it is settled, the neighbours' (prefetch) and
+-- the next page's overlay raster, so PgDn lands on a picture already made.
+-- Every request not wanted any more is cancelled, and a prefetch that the
+-- user has just turned to is promoted rather than started again.
+pdfPageUpkeep :: Drv -> IORef Editor -> TermCaps -> Bool -> IO ()
+pdfPageUpkeep drv editorRef caps gfxReady = do
+  ed <- readIORef editorRef
+  let v = drvVec drv
+  pendP <- readIORef (vdrPage v)
+  pendF <- readIORef (vdrPrefetch v)
+  -- The current page.
+  let want = pdfPageWant ed
+  case want of
+    Just w
+      | pendF == Just w -> pure ()      -- the prefetch already under way is this page
+      | pendP /= Just w -> startPageParse drv JPdfPage (vdrPage v) w ed
+      | otherwise -> pure ()
+    Nothing -> when (isJust pendP) $ do
+      writeIORef (vdrPage v) Nothing
+      cancelJob drv JPdfPage
+  -- Current-page work comes first. While any of it is pending (the page's
+  -- parse, its cell raster, its overlay) a prefetch is cancelled, not merely
+  -- not started: with few capabilities a prefetch competing for the CPU
+  -- would delay the page on screen. A prefetch that /is/ the current page
+  -- (just turned to) is the current page's work and keeps running.
+  pendP' <- readIORef (vdrPage v)
+  pendC <- readIORef (vdrCells v)
+  pendG <- readIORef (vdrGfxReq v)
+  let promoted = isJust pendF && pendF == want
+      busy = isJust pendP' || isJust pendC || isJust pendG || promoted
+             || (imageOverlayWanted ed && not gfxReady)
+      stillWanted w = case edPdfView ed of
+        Just pv -> pageViewOn ed && edPath ed == Just (pwPath w) && pvEpoch pv == pwEpoch w
+                     && abs (pwPage w - pvPage pv) <= 1
+                     && isNothing (lookup (pwPage w) (pvScenes pv))
+        Nothing -> False
+  case pendF of
+    Just w | not promoted && (busy || not (stillWanted w)) -> do
+      writeIORef (vdrPrefetch v) Nothing
+      cancelJob drv JPdfPrefetch
+    _ -> pure ()
+  pendF' <- readIORef (vdrPrefetch v)
+  when (not busy && isNothing pendF') $ case pdfPrefetchWant ed of
+    Just w -> startPageParse drv JPdfPrefetch (vdrPrefetch v) w ed
+    Nothing -> pure ()
+  -- The next page's overlay, at exactly the key the turn will look up:
+  -- computed from the cached scene and the current placement geometry
+  -- ('pdfNextPageFit'), never by simulating the turn (which ran the next
+  -- page's synchronous cell raster on every frame).
+  pendGP <- readIORef (vdrGfxPre v)
+  cache <- readIORef (vdrGfx v)
+  let next = do
+        (sid, sc, crop@(_, _, cw, ch)) <- pdfNextPageFit ed
+        key <- wantGfx caps ed
+        let cellPx = case gkPx key of (0, 0) -> (8, 16); p -> p
+            (_, _, _, _, pxW, pxH) = gfxFitVector (gkKind key) cellPx (gkGeom key) (cw, ch)
+        pure (VecKey sid crop pxW pxH, sc)
+  case next of
+    Just (vk, sc) | not busy, gfxReady, isNothing (lookup vk cache) ->
+      when (pendGP /= Just vk) $ do
+        writeIORef (vdrGfxPre v) (Just vk)
+        startVecGfxPre drv vk sc
+    Just (vk, _) | not busy, pendGP == Just vk -> pure ()
+    _ -> when (isJust pendGP) $ do
+      writeIORef (vdrGfxPre v) Nothing
+      cancelJob drv JVecGfxPrefetch
+
+-- | The shortest gap between two page turns by the wheel.
+wheelPageGapS :: Double
+wheelPageGapS = 0.12
+
+-- | Would this mouse event turn a PDF page (see 'handlePdfPageKey')?
+wheelTurnsPage :: MouseEvent -> Editor -> Bool
+wheelTurnsPage me ed =
+  (meButton me == MBWheelUp || meButton me == MBWheelDown)
+    && pageViewOn ed && edFocus ed == FEdit && not (modCtrl (meMods me))
+    && maybe False (isNothing . idCrop) (activePicture ed)
+
+-- | Run a job's body, and if it dies of an asynchronous exception other than
+-- a kill (a stack or heap overflow), report that through @failed@ so the
+-- request's in-flight marker is cleared and the failure shown; otherwise the
+-- view would wait for that result forever. A kill (a newer request, a
+-- cancellation) is let through: nobody is waiting for that result.
+guardJob :: (String -> IO ()) -> IO () -> IO ()
+guardJob failed body = body `catch` \(e :: SomeException) ->
+  case fromException e of
+    Just ThreadKilled -> throwIO e
+    _ -> failed (takeWhile (/= '\n') (show e))
+
+-- | Render one PDF page to a scene off the event-loop thread: the pure
+-- pre-pass lists the substitute fonts the page needs ('pageFontNeeds'),
+-- they are loaded through the font provider (waiting up to 3 s for the
+-- startup discovery), and only then is the pure 'renderPage' called. The
+-- scene is forced here, so no lazily built path is evaluated on the UI
+-- thread. The in-flight marker is written only once a job has started; a
+-- page with no dictionary is answered at once with a failure.
+startPageParse :: Drv -> JobKind -> IORef (Maybe PageWant) -> PageWant -> Editor -> IO ()
+startPageParse drv kind marker w ed = case edPdf ed >>= \pd -> Pdf.pdfPageSource pd (pwPage w) of
+  Nothing -> atomically (writeTQueue (drvSearchQ drv) (SMPageParsed w 0 False (Left "the page is missing from the file")))
+  Just (file, dict) -> do
+    let v = drvVec drv
+        post sid fl res = atomically (writeTQueue (drvSearchQ drv) (SMPageParsed w sid fl res))
+    startJob drv kind $ guardJob (post 0 False . Left) $ do
+      r <- trySync $ do
+        let (needs, fu1) = PR.pageFontNeeds file PO.fuelDefault dict
+        (fonts, fontless) <- if null needs then pure ([], False) else do
+          mfiles <- providerFiles 3000000 (vdrFonts v)
+          case mfiles of
+            Nothing -> pure ([], True)
+            Just files -> do
+              got <- forM needs (\q -> (,) q <$> fontFor (vdrFonts v) files q)
+              pure ([ (q, f) | (q, Just f) <- got ], False)
+        let env = PR.RenderEnv { PR.reFonts = \q -> lookup q fonts, PR.reAnnotations = True }
+            (sc, _) = PR.renderPage env file fu1 dict
+        sz <- measureScene sc
+        pure ((sc, sz, scNotes sc), fontless)
+      sid <- atomicModifyIORef' (vdrSceneGen v) (\n -> (n + 1, n + 1))
+      let (res, fl) = case r of
+            Left e -> (Left (takeWhile (/= '\n') (show e)), False)
+            Right (x, f) -> (Right x, f)
+      post sid fl res
+    writeIORef marker (Just w)
+
+-- | 'startVecGfx' for the next page, as a prefetch.
+startVecGfxPre :: Drv -> VecKey -> Scene -> IO ()
+startVecGfxPre drv k sc = startJob drv JVecGfxPrefetch $
+  guardJob (const (atomically (writeTQueue (drvSearchQ drv) (SMVecGfx True k Nothing)))) $ do
+  r <- trySync $ case rasterVec sc (vkCrop k) (vkW k) (vkH k) of
+    Nothing -> pure Nothing
+    Just (img, st) -> do
+      let rgba = imageRGBA img
+      _ <- evaluate (BS.length rgba)
+      pure (Just (rgba, rasterNoteList st))
+  atomically (writeTQueue (drvSearchQ drv) (SMVecGfx True k (either (const Nothing) id r)))
+
+-- | The overlay the active vector picture wants this frame, if any: its
+-- placement key, its raster key, the scene, and the fitted placement
+-- @(row, col, cols, rows, pxW, pxH)@ ('gfxFitVector': the payload is sized
+-- to the display, never to the virtual crop).
+vecGfxTarget :: TermCaps -> Editor -> Maybe (GfxKey, VecKey, Scene, (Int, Int, Int, Int, Int, Int))
+vecGfxTarget caps ed = do
+  key <- wantGfx caps ed
+  vd <- activePicVec ed
+  sc <- vdScene vd
+  let (_, _, cw, ch) = gkCrop key
+      cellPx = case gkPx key of (0, 0) -> (8, 16); p -> p
+      fit@(_, _, _, _, pxW, pxH) = gfxFitVector (gkKind key) cellPx (gkGeom key) (cw, ch)
+  pure (key, VecKey (vdSceneId vd) (gkCrop key) pxW pxH, sc, fit)
+
+-- | 'try' for the work a job does, letting asynchronous exceptions through:
+-- a job killed by a newer one must die, not post a failure for a request
+-- nobody is waiting on.
+trySync :: IO a -> IO (Either SomeException a)
+trySync act = do
+  r <- try act
+  case r of
+    Left e | Just (_ :: SomeAsyncException) <- fromException e -> throwIO e
+    _ -> pure r
+
+-- | Parse an SVG off the event-loop thread: the pure pre-pass lists the
+-- fonts and external images the document needs, they are loaded (fonts
+-- through the provider's bounded cache, waiting up to 3 s for the startup
+-- discovery; images local-only and size-capped), and only then is the pure
+-- parser called with a pure environment. The scene is forced here, so none
+-- of its lazily built paths or glyph outlines is evaluated on the UI thread.
+startSvgParse :: Drv -> SvgWant -> T.Text -> IO ()
+startSvgParse drv w txt = startJob drv JSvgParse $
+  guardJob (\e -> atomically (writeTQueue (drvSearchQ drv) (SMSvgParsed w 0 False (Left e)))) $ do
+  let path = swPath w
+  let v = drvVec drv
+  r <- trySync $ do
+    let env0 = defaultSvgEnv
+        qs = svgFontQueries env0 txt
+        refs = svgExternalRefs txt
+    -- Nothing from 'providerFiles' means discovery has not finished: draw
+    -- without fonts for now, and say so in the result, so that the picture is
+    -- redrawn when 'SMFontsReady' arrives (a 'Just []' is final: no fonts).
+    (fonts, fontless) <- if null qs then pure (const Nothing, False) else do
+      mfiles <- providerFiles 3000000 (vdrFonts v)
+      case mfiles of
+        Nothing -> pure (const Nothing, True)
+        Just [] -> pure (const Nothing, False)
+        Just files -> (\f -> (f, False)) <$> facesForQueries (vdrFonts v) files qs
+    imgs <- loadSvgRefs (takeDirectory path) refs
+    let env = env0 { seFonts = fonts, seResolve = \h -> M.lookup h imgs }
+    case parseSvgText env txt of
+      Left e -> pure (Left e)
+      Right sc -> do
+        sz <- measureScene sc
+        pure (Right ((sc, sz, scNotes sc), fontless))
+  sid <- atomicModifyIORef' (vdrSceneGen v) (\n -> (n + 1, n + 1))
+  let (res, fl) = case r of
+        Left e -> (Left (takeWhile (/= '\n') (show e)), False)
+        Right (Left e) -> (Left e, False)
+        Right (Right (x, f)) -> (Right x, f)
+  atomically (writeTQueue (drvSearchQ drv) (SMSvgParsed w sid fl res))
+
+-- | Most external images one SVG may pull in, each and in total.
+maxSvgRefs :: Int
+maxSvgRefs = 16
+
+maxSvgRefBytes, maxSvgRefTotal :: Integer
+maxSvgRefBytes = 16 * 1024 * 1024
+maxSvgRefTotal = 64 * 1024 * 1024
+
+-- | Read an SVG's external image references: local files only (no scheme
+-- other than @file:@, never the network), relative ones against the
+-- document's directory, each and all of them size-capped. What cannot be
+-- read is simply absent; the front-end notes "external image not available".
+loadSvgRefs :: FilePath -> [T.Text] -> IO (M.Map T.Text BS.ByteString)
+loadSvgRefs dir refs = go (take maxSvgRefs refs) 0 M.empty
   where
-    clear = do
-      me <- myThreadId
-      atomicModifyIORef' (drvJobs drv) $ \m ->
-        (M.update (\t -> if t == me then Nothing else Just t) kind m, ())
+    go [] _ acc = pure acc
+    go (h : hs) used acc = case localPath h of
+      Nothing -> go hs used acc
+      Just p -> do
+        r <- trySync $ do
+          sz <- getFileSize p
+          if sz > maxSvgRefBytes || used + sz > maxSvgRefTotal then pure Nothing
+            else Just . (,) sz <$> BS.readFile p
+        case r of
+          Right (Just (sz, bs)) -> go hs (used + sz) (M.insert h bs acc)
+          _ -> go hs used acc
+    localPath h0 =
+      let h = T.unpack (fromMaybe h0 (T.stripPrefix "file://" h0))
+      in if null h || "//" `isPrefixOf` h || hasScheme h then Nothing
+         else Just (if isAbsolutePath h then h else dir </> h)
+    hasScheme h = case break (== ':') h of
+      (pre, ':' : _) -> length pre > 1 && all (\c -> c `elem` ['a' .. 'z'] || c `elem` ['A' .. 'Z']) pre
+      _ -> False
+    isAbsolutePath h = case h of
+      ('/' : _) -> True
+      ('\\' : _) -> True
+      (_ : ':' : _) -> True    -- a Windows drive letter
+      _ -> False
+
+-- | Rasterise a vector picture's cell raster off the event-loop thread.
+startVecCells :: Drv -> VecKey -> Scene -> IO ()
+startVecCells drv k sc = startJob drv JVecCells $
+  guardJob (const (atomically (writeTQueue (drvSearchQ drv) (SMVecCells k Nothing)))) $ do
+  r <- trySync (evaluate (rasterVec sc (vkCrop k) (vkW k) (vkH k)))
+  let res = case r of
+        Right (Just (img, st)) -> Just (img, rsExhausted st, rasterNoteList st)
+        _ -> Nothing
+  atomically (writeTQueue (drvSearchQ drv) (SMVecCells k res))
+
+-- | Rasterise a vector picture's overlay at exactly the placement's pixel
+-- size and crop, off the event-loop thread, and pack it as the RGBA payload
+-- the kitty/sixel encoders take (that copy is done here too).
+startVecGfx :: Drv -> VecKey -> Scene -> IO ()
+startVecGfx drv k sc = startJob drv JVecGfx $
+  guardJob (const (atomically (writeTQueue (drvSearchQ drv) (SMVecGfx False k Nothing)))) $ do
+  r <- trySync $ case rasterVec sc (vkCrop k) (vkW k) (vkH k) of
+    Nothing -> pure Nothing
+    Just (img, st) -> do
+      let rgba = imageRGBA img
+      _ <- evaluate (BS.length rgba)
+      pure (Just (rgba, rasterNoteList st))
+  atomically (writeTQueue (drvSearchQ drv) (SMVecGfx False k (either (const Nothing) id r)))
 
 -- | Start a lint pass, cancelling whatever was in flight.
 --
@@ -2322,6 +2798,15 @@ classifyBytes forceRO path bs = case sniffImage bs of
     | Pdf.sniffPdf bs ->
         pure (either (\err -> OutError (takeFileName path ++ ": " ++ err))
                      (OutPdf path) (Pdf.parsePdf bs))
+    -- A compressed SVG is binary on disk; it opens as its decompressed
+    -- markup, read-only (Save would otherwise write text over the gzip
+    -- stream). The picture view is derived from that text like any SVG's.
+    | isSvgPath path, BS.take 2 bs == BS.pack [0x1f, 0x8b], sniffSvg bs ->
+        case decodeSvgBytes bs of
+          Left err -> pure (OutError (takeFileName path ++ ": " ++ err))
+          Right txt -> do
+            mt <- fileMtime path
+            pure (OutText path (loadFromBytes True mt (TE.encodeUtf8 txt)))
     | looksBinary bs ->
         pure (OutError (takeFileName path ++ ": binary file ("
                         ++ humanSize (fromIntegral (BS.length bs))
@@ -3199,6 +3684,10 @@ asyncThresholdFor path = do
   -- two apart from the first kilobyte, so every archive crosses at the lower
   -- threshold; the cost of being wrong is a spinner nobody sees.
   pure $ case r of
+    -- An SVG's load is a text decode, but its picture is a parse and a
+    -- raster: big ones load on the background thread like images, and the
+    -- parse is a background job either way.
+    _ | isSvgPath path -> imageAsyncBytes
     Right bs | sniffImage bs == Just "JPEG XL" -> -1
              | isJust (sniffImage bs) || Pdf.sniffPdf bs || Z.zipMagic bs -> imageAsyncBytes
     _ -> asyncThresholdBytes
@@ -3526,6 +4015,7 @@ listDirNames dir = do
 renderNow :: Drv -> IORef Editor -> IORef (Maybe Screen) -> IORef String -> IO ()
 renderNow drv editorRef prevRef titleRef = do
   tStart <- getMonotonicTime
+  vectorUpkeep drv editorRef
   ed0 <- readIORef editorRef
   prev <- readIORef prevRef
   caps <- readIORef (drvCaps drv)
@@ -3604,6 +4094,7 @@ gfxOverlay drv caps ed fullRedraw = do
       pure (Just kittyGfxDeleteAll)
     (mprev, Just key)
       | mprev == Just key && not fullRedraw -> pure Nothing
+      | isJust (activePicVec ed) -> vecPlacement drv caps ed mprev key
       | otherwise -> do
           -- When only the animation frame moved on a kitty placement whose
           -- frames are pre-uploaded (client-driven animation), swap the
@@ -3620,7 +4111,7 @@ gfxOverlay drv caps ed fullRedraw = do
 -- Is a pixel placement wanted right now, and under what identity?
 wantGfx :: TermCaps -> Editor -> Maybe GfxKey
 wantGfx caps ed = do
-  idoc <- edImage ed
+  idoc <- activePicture ed
   kind <- if tcKittyGfx caps then Just GfxKitty
           else if tcSixel caps then Just GfxSixel
           else Nothing
@@ -3629,7 +4120,7 @@ wantGfx caps ed = do
   -- picture beneath — explorer-panel focus is allowed since the panel sits left
   -- of the image). The renderer shares that predicate and blanks the cell area
   -- when it holds, so the two never disagree. Caps only pick the *kind* here.
-  if not (imageOverlayActive ed)
+  if not (imageOverlayWanted ed)
     then Nothing
     else let lo = computeLayout ed
          in Just GfxKey
@@ -3638,8 +4129,43 @@ wantGfx caps ed = do
               , gkGeom = (loTextTop lo, loTextLeft lo, loTextWidth lo, loTextHeight lo)
               , gkPx   = cellPxKey ed
               , gkKind = kind
+              , gkScene = maybe 0 vdSceneId (idVec idoc)
               , gkFrame = idFrame idoc
               }
+
+-- A vector picture's placement: rasterised from the scene at exactly the
+-- placement's pixel size and crop, on a background job ('JVecGfx'), and
+-- placed once the raster is in the cache. While it renders, the previous
+-- placement of the same document stays on screen (a zoom shows the old
+-- pixels for a moment, never nothing); a placement belonging to some other
+-- document is removed at once.
+vecPlacement :: Drv -> TermCaps -> Editor -> Maybe GfxKey -> GfxKey -> IO (Maybe Builder)
+vecPlacement drv caps ed mprev key = do
+  cache <- readIORef (vdrGfx (drvVec drv))
+  let target = vecGfxTarget caps ed
+      look = case target of
+        Just (_, vk, _, _) -> lookup vk cache
+        Nothing -> Nothing
+      failed = maybe False (isJust . vdError) (activePicVec ed)
+      samePlace = case mprev of
+        Just prev -> gkPath prev == gkPath key && gkGeom prev == gkGeom key
+                     && gkPx prev == gkPx key && gkKind prev == gkKind key
+        Nothing -> False
+  case (target, look) of
+    (Just (_, _, _, (row, col, cols, rows, pxW, pxH)), Just (Just rgba)) -> do
+      writeIORef (drvGfx drv) (Just key)
+      pure $ Just $ case gkKind key of
+        GfxKitty -> kittyPlace (row, col) (cols, rows) (pxW, pxH) rgba
+        GfxSixel -> sixelPlace (row, col) (pxW, pxH) rgba
+    -- Nothing to place yet (still rendering) or ever (refused, failed): the
+    -- previous placement may stay up only while this one is genuinely on its
+    -- way, and only at the same place ('keepPreviousPlacement'); otherwise a
+    -- failed page would sit under the previous page's pixels indefinitely.
+    _ | isNothing mprev -> pure Nothing
+      | keepPreviousPlacement samePlace failed (fmap (const ()) <$> look) -> pure Nothing
+      | otherwise -> do
+          writeIORef (drvGfx drv) Nothing
+          pure (Just kittyGfxDeleteAll)
 
 -- Scale the cropped source to the fitted pixel size and emit the placement.
 -- A multi-frame image on real kitty ('edGfxKittyAnim') uploads the whole

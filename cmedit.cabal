@@ -73,10 +73,37 @@ library
                       Cmedit.Jxl
                       Cmedit.Image
                       Cmedit.Pager
+                      Cmedit.Ccitt
+                      Cmedit.PdfObj
+                      Cmedit.PdfFunc
+                      Cmedit.PdfImage
+                      Cmedit.IntervalMap
                       Cmedit.Pdf
                       Cmedit.Rtf
                       Cmedit.Zip
                       Cmedit.Xml
+                      Cmedit.Geom
+                      Cmedit.Scene
+                      Cmedit.RasterGeom
+                      Cmedit.RasterCore
+                      Cmedit.RasterFilter
+                      Cmedit.Raster
+                      Cmedit.FontCore
+                      Cmedit.FontTT
+                      Cmedit.FontCFF
+                      Cmedit.FontT1
+                      Cmedit.FontSys
+                      Cmedit.Font
+                      Cmedit.SvgPath
+                      Cmedit.SvgCss
+                      Cmedit.SvgTree
+                      Cmedit.Svg
+                      Cmedit.VecView
+                      Cmedit.FontProvider
+                      Cmedit.Jobs
+                      Cmedit.PdfRenderFont
+                      Cmedit.PdfRenderShade
+                      Cmedit.PdfRender
                       Cmedit.Docx
                       Cmedit.Xlsx
                       Cmedit.Formula
@@ -120,6 +147,13 @@ test-suite cmedit-test
     type:             exitcode-stdio-1.0
     hs-source-dirs:   test
     main-is:          Spec.hs
+    other-modules:    RasterSpec
+                      FontSpec
+                      PdfImageSpec
+                      SvgSpec
+                      SvgViewSpec
+                      PdfViewSpec
+                      PdfRenderSpec
     build-depends:    base, cmedit, text, containers, time
     default-language: Haskell2010
     default-extensions: OverloadedStrings

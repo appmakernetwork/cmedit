@@ -17,3 +17,6 @@ website/
 Van_Gogh_-_Starry_Night_-_Google_Art_Project.jpg
 animated.gif
 test.htm
+
+# Python bytecode from the bench harnesses (docs/plans/bench)
+__pycache__/

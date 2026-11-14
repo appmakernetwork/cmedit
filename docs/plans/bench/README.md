@@ -83,6 +83,21 @@ it found two pre-existing hangs (a DEFLATE stream truncated at a block
 boundary; a GIF LZW dictionary with a cycle), both now fixed and pinned by
 Spec tests.
 
+## The font-reader oracles (0034 B)
+
+`fontcheck.sh [DIR...]` builds `FontCheck.hs` at `-O2` and walks every font
+file under the given directories (default `/usr/share/fonts`): it parses every
+face, outlines every glyph, and checks each against the font's own data —
+TrueType outlines against their `glyf` header boxes (simple glyphs exact;
+where a font's header is a unit off, an independent decoder of the same bytes
+finds the same count, so those are reported apart), OpenType-CFF charstring
+widths against `hmtx`, Type 1 and CFF glyphs against the `.afm` beside them
+(widths exact; an AFM box that lies between the curve's box and the control
+polygon's is the AFM generator's approximation and is reported apart), and
+the URW `.t1` fonts against their `.otf` twins point for point. It ends with a
+SUMMARY block and the parse/outline times. Nothing here is part of `make
+test`, which builds its fixtures in code.
+
 ## The PTY probes
 
 `pty_startup.py` and `pty_rss.py` drive the real `./cmedit` binary over a
@@ -268,3 +283,67 @@ computed to produce.
 
 All three produce plausible-looking numbers, in opposite directions. Any new
 measurement added here should state which side of them it sits on.
+
+## SVG oracle (plan 0034, workstream D)
+
+`svgcheck.sh [list] [outdir]` renders SVGs through `Cmedit.Svg` +
+`Cmedit.Raster` (`SvgCheck.hs`, which also builds a text `Face` from
+`Cmedit.Font`/`Cmedit.FontSys`) and compares each against `resvg` at the
+size resvg chose (`--width 256`, or the natural size for the hand-written
+feature corpus in `svg/`, which also gets an `rsvg-convert` second opinion).
+Both images are flattened onto white; a file passes when ImageMagick's AE
+at 15% fuzz is at most 1% of the pixels. Results land in
+`<outdir>/results.tsv`; text-bearing files are tagged, since resvg resolves
+font families its own way (and draws nothing for a family it lacks).
+
+## The vector stack's oracles (plan 0034, workstreams A–E)
+
+Each builds its checker at `-O2` against `src/` and compares against a
+reference renderer installed on the machine; none of them is part of
+`make test`, and each prints a distribution plus the worst cases.
+
+| Script | Compares | Against |
+|---|---|---|
+| `rastercheck.sh [OUT]` / `bench` / `safe` | `Cmedit.Raster` on hand-written cases (`RasterCheck.hs`); `bench` the -O2 targets, `safe` a bounds-checked core over random scenes | resvg (ImageMagick RMSE/AE, flattened on white and alpha alone) |
+| `fontcheck.sh [DIR...]`, `FontHostile.hs` | every system font's outlines and advances; hostile-input costs of the readers | (see the font section above) |
+| `svgcheck.sh [list] [out]` | `Cmedit.Svg` + `Cmedit.Raster` (`SvgCheck.hs`) | resvg, rsvg-convert |
+| `pdfimagecheck.sh build/run/corpus`, `gen_pdfimages.py`, `pdfimagecompare.py` | `Cmedit.PdfImage`, image by image (CMYK compared through the naive conversion) | poppler's `pdfimages` |
+| `pdfrendercheck.sh [list] [out]` / `synth`, `gen_pdfrender.py`, `pdfrendercompare.py` | `Cmedit.PdfRender` + `Cmedit.Raster`, page by page (`PdfRenderCheck.hs`); the committed feature corpus is `pdf/` | poppler's `pdftoppm` |
+
+## The picture views over a PTY (plan 0034, workstream F)
+
+These drive the real `./cmedit` (build it first) through `pty_journal.py`'s
+emulator. `pty_svg.py`'s `RawSession` also keeps every byte written and
+**cuts kitty/sixel payloads out before the emulator sees them**: the
+emulator walks string sequences a byte at a time in Python, and before that
+change every latency the harness reported was mostly the harness parsing
+megabytes of base64. A fake kitty terminal answers the graphics probe,
+DA1 and `CSI 6;16;8t`; a fake sixel terminal answers DA1 with attribute 4.
+
+```sh
+python3 docs/plans/bench/pty_svg.py      # SVG: floor, kitty, zoom, heavy, fonts, svgz, resize
+python3 docs/plans/bench/pty_pdf.py      # PDF page view: floor, kitty, PgDn, zoom, manual mode, fonts
+python3 docs/plans/bench/pty_pdfbench.py [--sixel|--nocaps] [--max N] LIST_OR_PDFS...
+```
+
+`pty_svg.py` and `pty_pdf.py` are pass/fail (exit status = failed
+scenarios) and print the latencies they see. `pty_pdfbench.py` measures real
+PDFs, one table row per file, the file named only `doc1`, `doc2`, … so a
+private corpus can be measured without its names or contents appearing
+anywhere: pages, size, open → first placement, a cold PgDn (straight after
+the first placement), a prefetched PgDn (after 3 s idle), a Ctrl+wheel
+zoom, peak RSS (`VmHWM`) after paging through up to 20 pages, CPU while
+idle (ticks per second, i.e. percent of a core: it must be ~0, which is
+what catches a prefetch or retry loop) and the largest single graphics
+payload in bytes.
+
+`SvgViewBench.hs` times the SVG view's hot paths at `-O2` (parse, the cell
+raster with and without the synchronous budget, a full overlay, an 8× zoom,
+the payload copy) for given files:
+
+```sh
+ghc -O2 -isrc docs/plans/bench/SvgViewBench.hs -outputdir /tmp/svb -o /tmp/svb/svgviewbench \
+    -XLambdaCase -XOverloadedStrings -XBangPatterns -XTupleSections \
+    -XScopedTypeVariables -XMultiWayIf -XRecordWildCards -XNamedFieldPuns
+/tmp/svb/svgviewbench FILE.svg...
+```

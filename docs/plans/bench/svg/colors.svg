@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="200">
+<rect x="0" y="0" width="40" height="40" fill="#f00"/>
+<rect x="40" y="0" width="40" height="40" fill="#00ff0080"/>
+<rect x="80" y="0" width="40" height="40" fill="#00f8"/>
+<rect x="120" y="0" width="40" height="40" fill="rgb(255, 128, 0)"/>
+<rect x="160" y="0" width="40" height="40" fill="rgb(50%, 20%, 80%)"/>
+<rect x="0" y="40" width="40" height="40" fill="rgba(0,0,0,.3)"/>
+<rect x="40" y="40" width="40" height="40" fill="rgb(10 200 100 / 50%)"/>
+<rect x="80" y="40" width="40" height="40" fill="hsl(200, 80%, 40%)"/>
+<rect x="120" y="40" width="40" height="40" fill="hsla(300 70% 50% / 0.6)"/>
+<rect x="160" y="40" width="40" height="40" fill="LightGoldenRodYellow" stroke="black"/>
+<rect x="0" y="80" width="40" height="40" fill="rebeccapurple"/>
+<rect x="40" y="80" width="40" height="40" fill="transparent" stroke="black"/>
+<g color="darkgreen"><rect x="80" y="80" width="40" height="40" fill="currentColor"/></g>
+<rect x="120" y="80" width="40" height="40" fill="#0f0 icc-color(acmecmyk, 0.11, 0.48, 0.83, 0.00)"/>
+<rect x="160" y="80" width="40" height="40" fill="url(#missing) gold"/>
+<rect x="0" y="120" width="40" height="40" fill="notacolor"/>
+<rect x="40" y="120" width="40" height="40" fill="grey" fill-opacity="0.5"/>
+<rect x="80" y="120" width="40" height="40" fill="none" stroke="dodgerblue" stroke-width="8" stroke-opacity="0.4"/>
+<rect x="120" y="120" width="40" height="40" fill="lime" opacity="0.5" stroke="black" stroke-width="10"/>
+<g opacity="0.5"><rect x="160" y="120" width="30" height="30" fill="red"/><rect x="170" y="130" width="30" height="30" fill="blue"/></g>
+</svg>

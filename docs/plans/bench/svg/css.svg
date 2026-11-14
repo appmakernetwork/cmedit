@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="200">
+<style type="text/css"><![CDATA[
+  /* comment */
+  rect { fill: blue }
+  .a { fill: green }
+  #c { fill: red }
+  g > .b { fill: purple }
+  g .d { stroke: black; stroke-width: 4 }
+  [data-k] { fill: orange }
+  rect:first-child { stroke: magenta; stroke-width: 3 }
+  .imp { fill: teal !important }
+  @media print { rect { fill: black } }
+  circle:hover { fill: red }
+  .x, .y { fill: brown }
+]]></style>
+<g><rect x="10" y="10" width="40" height="40"/>
+<rect class="a" x="60" y="10" width="40" height="40"/>
+<rect id="c" class="a" x="110" y="10" width="40" height="40"/>
+<rect class="b" x="160" y="10" width="30" height="40"/></g>
+<rect class="d" x="10" y="60" width="40" height="40"/>
+<g><rect class="d" x="60" y="60" width="40" height="40" fill="red"/></g>
+<rect data-k="1" x="110" y="60" width="40" height="40"/>
+<rect class="imp" style="fill: red" x="160" y="60" width="30" height="40"/>
+<rect style="fill: yellow" x="10" y="110" width="40" height="40"/>
+<circle cx="80" cy="130" r="20" fill="pink"/>
+<rect class="y" x="110" y="110" width="40" height="40"/>
+<rect fill="red" style="fill:bogus; fill: navy" x="160" y="110" width="30" height="40"/>
+</svg>

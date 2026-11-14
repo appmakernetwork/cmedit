@@ -24,7 +24,7 @@ import Cmedit.Types
 import Cmedit.TextBuffer
 import Cmedit.Width (colToDisplay, displayToCol, strCells, textCells, wrapLine)
 import Cmedit.ConfigFile
-  ( Config(..), ThemeName(..), defaultConfig, RecentEntry(..)
+  ( Config(..), ThemeName(..), PdfViewMode(..), defaultConfig, RecentEntry(..)
   , maxRecentEntries, maxHistoryEntries )
 import Cmedit.Menu
 import Cmedit.Dialog
@@ -43,6 +43,7 @@ import Cmedit.Csv (CsvView(..))
 import qualified Cmedit.Csv as Csv
 import Cmedit.About (aboutCanvasH, aboutCanvasMinW, aboutTotalFrames)
 import Cmedit.Clipboard (CopyOutcome(..))
+import Cmedit.VecView (VecDoc(..), svgSizeLabel)
 import Cmedit.Image (Image(..), ImgMode(..), renderImage, viewFit)
 import Cmedit.Syntax (HlCache, CommentSyntax(..), langComment, langForPath)
 import Cmedit.Lint (Linter(..), Severity(..), Diag(..), LintAvail, linters, linterById)
@@ -492,7 +493,7 @@ applySaveFixups :: Editor -> Editor
 applySaveFixups ed0 = ensureNl (trimStep ed0)
   where
     cfg = edConfig ed0
-    plainDoc = isNothing (edCsv ed0) && isNothing (edImage ed0)
+    plainDoc = isNothing (edCsv ed0) && not (bufferlessImage (edImage ed0))
     trimStep ed
       | cfgTrimTrailingWs cfg && plainDoc && not (edReadOnly ed) =
           case trimTrailingWs (edBuffer ed) of
@@ -517,7 +518,7 @@ applySaveFixupsAll ed0 =
   let ed1 = applySaveFixups ed0
       cfg = edConfig ed0
       fixDoc d
-        | not (docModified d) || isJust (docCsv d) || isJust (docImage d) || docReadOnly d = d
+        | not (docModified d) || isJust (docCsv d) || bufferlessImage (docImage d) || docReadOnly d = d
         | otherwise =
             let d1 = case trimTrailingWs (docBuffer d) of
                        Just b' | cfgTrimTrailingWs cfg ->
@@ -639,6 +640,12 @@ settingsSpec =
   , ( Nothing, "Restore session on start", offOn
     , boolIx cfgRestoreSession
     , "Reopen this directory's session (files and folder) when started with no arguments." )
+  , ( Nothing, "Open SVG files as", ["source", "picture"]
+    , boolIx cfgSvgPicture
+    , "The picture they draw, or their markup (Alt+T switches either way)." )
+  , ( Nothing, "Open PDF files as", ["auto", "pages", "reflow"]
+    , \c -> case cfgPdfView c of PdfViewAuto -> 0; PdfViewPage -> 1; PdfViewReflow -> 2
+    , "Pages as pictures, or reflowed text; auto shows pages when the terminal draws pixels." )
   -- Linting rows (row 'nEditingSettings' onward). The master switch first, then
   -- one row per 'linters' entry in table order. Per-linter hints and the
   -- availability notes are filled in by 'mkSettings' from 'edLintAvail'.
@@ -667,6 +674,24 @@ mkSettings avail cfg = Dialog DKSettings "Settings" [] []
   | (i, (hdr, lbl, vals, ixOf, hint)) <- zip [0 ..] settingsSpec ]
   ["Save", "Cancel"] 0 "" False
 
+-- | The page view's status text: "Page 3/12 · 100%", what is still on its
+-- way, and that a cell picture is a thumbnail.
+pageStatus :: PdfView -> String
+pageStatus pv =
+  let pic = pvPic pv
+      vd = idVec pic
+      (vw, vh) = imageDims pic
+      zoom = case idCrop pic of
+        Nothing -> 100
+        Just (_, _, w, h) -> round (100 * max (fromIntegral vw / fromIntegral (max 1 w))
+                                             (fromIntegral vh / fromIntegral (max 1 h)) :: Double) :: Int
+      pending = case vd of
+        Just v | vdSeq v /= pvPage pv -> "  rendering\x2026"
+               | vdExhausted v || vdCellsPartial v -> "  (truncated)"
+               | (n : _) <- vdRasterNotes v -> "  (" ++ n ++ ")"
+        _ -> ""
+  in "Page " ++ show (pvPage pv) ++ "/" ++ show (pvPages pv) ++ " \xb7 " ++ show zoom ++ "%" ++ pending ++ "   PDF "
+
 -- | The clickable regions of the status bar's right side.
 data StatusZone = SZGoTo | SZOverwrite | SZEncoding | SZLineEnding | SZDiagnostics
   deriving (Eq, Show)
@@ -694,6 +719,7 @@ statusRightInfo ed = flatten segs
       Just pg -> [ zone SZGoTo (Pg.pagerStatus pg) ]
       -- The PDF view has no cursor, no selection and nothing writable; what
       -- matters is which page you are on, and clicking it opens Go To Page.
+      Nothing | pageViewOn ed, Just pv <- edPdfView ed -> [ zone SZGoTo (pageStatus pv) ]
       Nothing | Just pd <- edPdf ed -> [ zone SZGoTo (Pdf.pdfStatus pd) ]
       -- The formatted view has no cursor and no selection, and its line
       -- numbers are laid-out rows rather than file lines, so Go To Line does
@@ -706,6 +732,16 @@ statusRightInfo ed = flatten segs
                 | otherwise -> [ plain (Rtf.rtfStatus rd), zone SZLineEnding eol, plain " " ]
         Nothing -> segsDoc
     segsDoc = case edImage ed of
+      Just idoc | Just vd <- idVec idoc ->
+        let m = case idMode idoc of HalfBlock -> "colour"; Ascii -> "ASCII"
+            what = case (vdScene vd, vdError vd) of
+              (Just _, _) -> "SVG  " ++ svgSizeLabel vd
+              (Nothing, Just _) -> "SVG (not shown)"
+              _ -> "SVG  rendering\x2026"
+            extra | vdExhausted vd = "  (truncated)"
+                  | (n : _) <- vdRasterNotes vd = "  (" ++ n ++ ")"
+                  | otherwise = ""
+        in [ plain (what ++ extra ++ "   PICTURE/" ++ m ++ " ") ]
       Just idoc ->
         let img = idImage idoc
             m   = case idMode idoc of HalfBlock -> "colour"; Ascii -> "ASCII"

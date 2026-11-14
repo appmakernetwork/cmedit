@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="200">
+<path d="M10 10h30v30h-30z" fill="tomato"/>
+<path d="M50,10 L90,10 90,40 Z" fill="teal"/>
+<path d="m100 10 30 0 0 30-30 0z" fill="none" stroke="black" stroke-width="2"/>
+<path d="M140 40C140 10 190 10 190 40S140 70 140 40" fill="gold" stroke="navy"/>
+<path d="M10 90Q35 50 60 90T110 90" fill="none" stroke="purple" stroke-width="3"/>
+<path d="M120 60a25 25 0 1 0 50 0 25 25 0 1 0-50 0" fill="orchid"/>
+<path d="M10 120a1.5.5 0 0010 10l.5.5-3e1 2e1z" fill="green" stroke="black"/>
+<path d="M60 110 A5 5 0 0 1 100 110" fill="none" stroke="red" stroke-width="2"/>
+<path d="M110 110 A30 15 30 1 1 150 150" fill="none" stroke="blue" stroke-width="2"/>
+<path d="M10 160 h40 v30 h-40 z M20 170 h20 v10 h-20 z" fill="slateblue" fill-rule="evenodd"/>
+<path d="M60 160 h40 v30 h-40 z M70 170 v10 h20 v-10 z" fill="darkcyan"/>
+<path d="M120 160 L190 160 L130 195 L155 150 L180 195 z" fill="crimson" fill-rule="evenodd"/>
+<path d="M160 100 l20 0 l junk" stroke="black" stroke-width="4"/>
+</svg>

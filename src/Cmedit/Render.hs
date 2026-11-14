@@ -33,6 +33,7 @@ import qualified Data.Map.Strict as Map
 import Data.Char (toLower)
 import Data.List (find, foldl')
 import Data.Maybe (fromMaybe, isJust)
+import Cmedit.VecView (VecDoc(..))
 import Data.Text (Text)
 import qualified Data.Text as T
 
@@ -831,6 +832,9 @@ renderEditor ed = runST $ do
         Nothing -> case edRtf ed of
           Just rd -> drawRtf th ed rd lo arr
           Nothing -> case edPdf ed of
+            -- the page view is the PDF view's other mode: its picture is
+            -- drawn by the image view's code ('activePicture')
+            Just _ | pageViewOn ed, Just pic <- activePicture ed -> drawImage ed pic lo arr
             Just pd -> drawPdf th ed pd lo arr
             Nothing -> maybe (drawTextArea th ed lo arr) (\v -> drawCsvTable th ed v lo arr) (edCsv ed)
   maybe (pure ()) (drawVScroll th arr cols rows) (scrollBarInfo ed)
@@ -1750,6 +1754,9 @@ drawHints th ed lo arr = do
          [ ("\x2191\x2193", "Move"), ("\x21b5", "Open"), ("Ins", "New")
          , ("F2", "Rename"), ("Del", "Delete"), (".", "Hidden")
          , ("^B", "Editor"), ("F10", "Menu") ]
+       | pageViewOn ed =
+         [ ("PgDn", "Page"), ("+-", "Zoom"), ("0", "Fit"), ("^G", "GoToPage")
+         , ("A+T", "Text"), ("^O", "Open"), ("^Q", "Quit"), ("F10", "Menu") ]
        | isJust (edPdf ed) =
          [ ("[ ]", "Page"), ("^G", "GoToPage"), ("^F", "Find"), ("F3", "FindNext")
          , ("^C", "Copy"), ("^O", "Open"), ("^Q", "Quit"), ("F10", "Menu") ]
@@ -2120,7 +2127,10 @@ data FileKind
 -- step with the magic-byte sniffer there — this is only the explorer's hint.
 imageExtensions :: [String]
 imageExtensions =
-  ["png","jpg","jpeg","gif","bmp","webp","jxl","ppm","pgm","pbm","pnm"]
+  ["png","jpg","jpeg","gif","bmp","webp","jxl","ppm","pgm","pbm","pnm"
+  -- vector pictures: they open in the image view too (as a derived picture of
+  -- their source text)
+  ,"svg","svgz"]
 
 fileKind :: FilePath -> FileKind
 fileKind path
@@ -2495,14 +2505,37 @@ drawImage ed idoc lo arr = do
       -- is exactly what the overlay composites its own transparency over.
       forM_ [0 .. th-1] $ \r -> forM_ [0 .. tw-1] $ \c ->
         putCell arr cols rows (top+r) (left+c) blankCell
-    else do
-      let grid = case idCache idoc of
-                   Just (c, r, m, cr, px, fr, g)
-                     | c == tw && r == th && m == idMode idoc && cr == crop && px == pxk
-                         && fr == idFrame idoc -> g
-                   _ -> renderImage (cellAspect ed) (imageFitCap ed idoc) (idMode idoc) tw th crop (idImage idoc)
-      forM_ [0 .. th-1] $ \r -> forM_ [0 .. tw-1] $ \c ->
-        putCell arr cols rows (top+r) (left+c) (grid ! (r, c))
+    else case idVec idoc of
+      -- A vector picture's grid is built from its latest raster by
+      -- 'refreshImage'; while a new raster is pending the previous grid stays
+      -- on screen (when it is the right shape), and before the first one the
+      -- area is blank. It never falls back to sampling 'idImage', which for a
+      -- vector picture is a placeholder.
+      -- A picture that failed says so where the picture would be (a PDF page
+      -- the renderer could not draw), not only on the status line.
+      Just vd | Just err <- vdError vd, maybe True (const False) (vdScene vd) -> do
+        forM_ [0 .. th-1] $ \rr -> forM_ [0 .. tw-1] $ \cc ->
+          putCell arr cols rows (top+rr) (left+cc) blankCell
+        let msg = takeCells (max 0 (tw - 4)) ("This page could not be drawn: " ++ err)
+            hint = takeCells (max 0 (tw - 4)) "Alt+T shows its text"
+            at r m = drawStr arr cols rows (top + r) (left + max 0 ((tw - strCells m) `div` 2))
+                       (Style BrightBlack Default attrNone) m
+        at (th `div` 2 - 1) msg
+        at (th `div` 2 + 1) hint
+      Just _ -> case idCache idoc of
+        Just (c, r, _, _, _, _, g) | c == tw && r == th ->
+          forM_ [0 .. th-1] $ \rr -> forM_ [0 .. tw-1] $ \cc ->
+            putCell arr cols rows (top+rr) (left+cc) (g ! (rr, cc))
+        _ -> forM_ [0 .. th-1] $ \rr -> forM_ [0 .. tw-1] $ \cc ->
+               putCell arr cols rows (top+rr) (left+cc) blankCell
+      Nothing -> do
+        let grid = case idCache idoc of
+                     Just (c, r, m, cr, px, fr, g)
+                       | c == tw && r == th && m == idMode idoc && cr == crop && px == pxk
+                           && fr == idFrame idoc -> g
+                     _ -> renderImage (cellAspect ed) (imageFitCap ed idoc) (idMode idoc) tw th crop (idImage idoc)
+        forM_ [0 .. th-1] $ \r -> forM_ [0 .. tw-1] $ \c ->
+          putCell arr cols rows (top+r) (left+c) (grid ! (r, c))
   -- While dragging, highlight the border of the selection rectangle.
   case idDrag idoc of
     Nothing -> pure ()
@@ -2709,6 +2742,7 @@ computeCursor ed lo = case edFocus ed of
   -- selection, and while one is being made the caret is the one thing on
   -- screen worth pointing at. With no selection it goes back to having no
   -- position at all, so no cursor is shown.
+  FEdit | pageViewOn ed -> Nothing
   FEdit | Just pd <- edPdf ed ->
     case pdAnchor pd of
       Nothing -> Nothing

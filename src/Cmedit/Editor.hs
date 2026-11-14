@@ -7,6 +7,7 @@ module Cmedit.Editor
   ( -- * State
     Editor(..)
   , Config(..)
+  , PdfViewMode(..)
   , defaultConfig
   , Focus(..)
   , EditKind(..)
@@ -47,6 +48,54 @@ module Cmedit.Editor
     -- * Formatted RTF view
   , RtfDoc(..)
   , toggleRtf
+    -- * Vector pictures (SVG)
+  , toggleSvg
+  , enterSvg
+  , svgParseWant
+  , svgParsed
+  , SvgWant(..)
+  , fontsReady
+  , vecCellsFailed
+  , leaveSvgIfRenamed
+  , trimVecScenes
+    -- * PDF page view
+  , PdfView(..)
+  , PageScene(..)
+  , PageWant(..)
+  , pageViewOn
+  , activePicture
+  , modPicture
+  , activePicVec
+  , togglePdfPage
+  , enterPageView
+  , pdfTurnTo
+  , pdfPageWant
+  , pdfPrefetchWant
+  , pdfPageParsed
+  , pdfCapsArrived
+  , newPdfView
+  , dropPageScenes
+  , pdfSourcePages
+  , pdfPageSize
+  , pdfPan
+  , pdfZoomCentre
+  , pageStatus
+  , trimPageCache
+  , pdfNextPageFit
+  , handlePdfPageKey
+  , vecCellWant
+  , vecCellKey
+  , vecCellsRendered
+  , vecTruncatedNote
+  , svgBufferLooksSvg
+  , mkVectorDoc
+  , imageDims
+  , wheelZoom
+  , cellRectToCrop
+  , activeVec
+  , bufferlessImage
+  , isSvgPath
+  , isSvgFile
   , enterRtf
   , refreshRtf
   , rtfActive
@@ -98,6 +147,8 @@ module Cmedit.Editor
   , imageFitCap
   , setGfxCaps
   , imageOverlayActive
+  , imageOverlayWanted
+  , tickVecClock
   , pointerShapeFor
   , pointerShapeAt
   , urlAtMouse
@@ -333,7 +384,7 @@ import qualified Cmedit.Pdf as Pdf
 import Cmedit.TextBuffer
 import Cmedit.Width (colToDisplay, displayToCol, inputWindow, takeCells, textCells, wrapLine)
 import Cmedit.ConfigFile
-  ( Config(..), ThemeName(..), defaultConfig, RecentEntry(..)
+  ( Config(..), ThemeName(..), PdfViewMode(..), defaultConfig, RecentEntry(..)
   , maxRecentEntries, maxHistoryEntries, SessionSummary(..) )
 import Cmedit.Menu
 import Cmedit.Dialog
@@ -368,6 +419,10 @@ import Cmedit.EditorFind
 -- trapped, and text-editing keys are swallowed (the doc is read-only).
 handleImageKey :: Key -> ImageDoc -> Editor -> (Editor, [Effect])
 handleImageKey key idoc ed = case key of
+  -- An SVG's picture sits over its editable source: the keys that would edit
+  -- the buffer behind it say where the source is instead.
+  KCtrlChar c | isVec, c `elem` ("xvkhacdj_/ " :: String) -> noEff ed { edStatus = svgSourceNote }
+  KPaste _ | isVec -> noEff ed { edStatus = svgSourceNote }
   KChar c | c == 'a' || c == 'A' ->
       noEff (refreshImage (setImgMode (otherMode (idMode idoc)) ed))
   KMouse me   -> noEff (handleImageMouse me idoc ed)
@@ -379,9 +434,12 @@ handleImageKey key idoc ed = case key of
   -- Alt+Left/Right navigation history works from the image view too.
   KArrow _ m | hasAlt m -> handleEditKey key ed
   KEsc        -> handleEditKey key ed
+  KChar _ | isVec -> noEff ed { edStatus = svgSourceNote }
+  KEnter  | isVec -> noEff ed { edStatus = svgSourceNote }
   _           -> noEff ed
   where otherMode HalfBlock = Ascii
         otherMode Ascii     = HalfBlock
+        isVec = isJust (idVec idoc)
 
 -- | Keys in the paged read-only view of a too-large file.
 --
@@ -538,6 +596,7 @@ handleRtfMouse me rd ed
 -- into pages, so it can be navigated by them ('[' and ']', and Go To, which
 -- means \"page\" here rather than \"line\").
 handlePdfKey :: Key -> PdfDoc -> Editor -> (Editor, [Effect])
+handlePdfKey key _ ed | pageViewOn ed, Just pv <- edPdfView ed = handlePdfPageKey key pv ed
 handlePdfKey key pd ed = case key of
   -- Plain movement scrolls the *window*, which is what this view is for; it
   -- deliberately leaves any selection alone, so you can scroll to see the
@@ -592,6 +651,65 @@ handlePdfKey key pd ed = case key of
       DRight -> Pdf.pdfCaretRight
     pageMove n p = iterate (if n < 0 then Pdf.pdfCaretUp else Pdf.pdfCaretDown) p !! abs n
     readOnlyNote = noEff ed { edStatus = "PDF view is read-only \x2014 [ and ] turn the page" }
+
+-- | Keys in the PDF page view. One scheme, chosen so that every key does
+-- the obvious thing at the fit and the zoomed view gets panning:
+--
+-- * pages: PgDn/PgUp, Space, @]@/@[@ (and @n@/@p@), Home/End for the first
+--   and last page, Ctrl+G for any page; at the fit the arrows turn pages too;
+-- * zoom: @+@/@-@ about the centre, Ctrl+wheel about the pointer, drag a
+--   rectangle to zoom into it; once zoomed the plain wheel zooms about the
+--   pointer as in the image view, and the arrows pan by a tenth of the view;
+--   @0@, Esc or a click go back to the fit;
+-- * at the fit the plain wheel turns pages (down = next);
+-- * Alt+T reads the text (reflow view, same page), where Ctrl+F and Ctrl+C
+--   live: both are sent there from here.
+handlePdfPageKey :: Key -> PdfView -> Editor -> (Editor, [Effect])
+handlePdfPageKey key pv ed = case key of
+  KPageDown _     -> turn 1
+  KPageUp _       -> turn (-1)
+  KChar ' '       -> turn 1
+  KChar ']'       -> turn 1
+  KChar '['       -> turn (-1)
+  KChar 'n'       -> turn 1
+  KChar 'p'       -> turn (-1)
+  KHome _         -> noEff (pdfTurnTo 1 ed)
+  KEnd _          -> noEff (pdfTurnTo (pvPages pv) ed)
+  KArrow d _
+    | zoomed -> noEff (case d of
+                         DLeft  -> pdfPan (-0.1) 0 ed
+                         DRight -> pdfPan 0.1 0 ed
+                         DUp    -> pdfPan 0 (-0.1) ed
+                         DDown  -> pdfPan 0 0.1 ed)
+    | otherwise -> turn (if d == DLeft || d == DUp then -1 else 1)
+  KChar '+'       -> noEff (pdfZoomCentre True ed)
+  KChar '='       -> noEff (pdfZoomCentre True ed)
+  KChar '-'       -> noEff (pdfZoomCentre False ed)
+  KChar '0'       -> noEff (refreshImage (zoomFull ed))
+  KEsc | zoomed   -> noEff (refreshImage (zoomFull ed))
+  KChar c | c == 'a' || c == 'A' ->
+      noEff (refreshImage (setImgMode (if idMode (pvPic pv) == HalfBlock then Ascii else HalfBlock) ed))
+  KMouse me
+    | meButton me == MBWheelUp || meButton me == MBWheelDown ->
+        let down = meButton me == MBWheelDown
+            lo = computeLayout ed
+            row = meRow me - loTextTop lo
+            col = meCol me - loTextLeft lo
+        in if modCtrl (meMods me) || zoomed
+             then noEff (wheelZoom (not down) row col ed)
+             else turn (if down then 1 else -1)
+    | otherwise -> noEff (handleImageMouse me (pvPic pv) ed)
+  KChar _     -> readOnlyNote
+  KEnter      -> readOnlyNote
+  KBackspace  -> readOnlyNote
+  KDelete _   -> readOnlyNote
+  KTab        -> readOnlyNote
+  KPaste _    -> readOnlyNote
+  _           -> handleEditKey key ed
+  where
+    zoomed = isJust (idCrop (pvPic pv))
+    turn d = noEff (pdfTurnTo (pvPage pv + d) ed)
+    readOnlyNote = noEff ed { edStatus = "Page view \x2014 PgUp/PgDn turn pages, +/- zoom, Alt+T for the text" }
 
 -- | Mouse in the PDF view: select text to copy out of it.
 --
@@ -722,6 +840,8 @@ pruneEntries ed = map (relabelEntry ed)
     dropTV = dropViewModes unwantedMode
     unwantedMode a = case a of
       MAToggleRtf   -> not (isRtfFile ed)
+      MAToggleSvg   -> not (isSvgFile ed || isJust (activeVec ed))
+      MATogglePdfPage -> isNothing (edPdf ed) || isNothing (edPdfView ed)
       MAArchiveView -> not (containerViewActive ed || containerListing ed)
       -- A workbook keeps the freeze-header row (it is a view setting, and a
       -- spreadsheet has a header row more often than a CSV does) and loses
@@ -778,6 +898,15 @@ dropTextToggles es = dropTrailingSep (filter (not . isTextToggle) es)
 -- text to search or line to jump to). Workspace Find/Replace in Files still do.
 imageDisabledFind :: [MenuAction]
 imageDisabledFind = [MAFind, MAFindNext, MAFindPrev, MAReplace, MAGoToLine, MAGoToDef, MAGoToBracket, MANextProblem]
+
+-- | Actions refused in an SVG's picture view, on top of 'imageDisabledFind':
+-- they would edit the buffer under the picture through a cursor and a
+-- selection it does not show.
+svgPictureDisabled :: [MenuAction]
+svgPictureDisabled = [MACut, MAPaste, MADelete, MASelectAll, MACopy, MACycleLineEnding, MAToggleBom]
+
+svgSourceNote :: T.Text
+svgSourceNote = "Picture view \x2014 Alt+T edits the SVG source"
 
 -- | The same, for the paged read-only view — except 'MAGoToLine', which is
 -- exactly what a viewer of a multi-gigabyte log is for. In-file *search* needs
@@ -888,6 +1017,7 @@ goToUnitOK _ _ = False
 -- Rewrite value-carrying menu labels to show the document's current setting.
 relabelEntry :: Editor -> MenuEntry -> MenuEntry
 relabelEntry ed e = case e of
+  MEItem _ acc MATogglePdfPage | pageViewOn ed -> MEItem "&Reflow View (PDF)" acc MATogglePdfPage
   -- One action, two meanings: in the PDF view Go To takes a page number (see
   -- 'gotoLine'), so the menu has to say so — the dialog already does.
   MEItem _ acc MAGoToLine | isJust (edPdf ed) ->
@@ -948,7 +1078,7 @@ dropViewModes unwanted es = case span isModeItem es of
 
 viewModeActions :: [MenuAction]
 viewModeActions =
-  [MAToggleCsv, MAToggleFreezeHeader, MASortColumn, MAToggleRtf, MAArchiveView]
+  [MAToggleCsv, MAToggleFreezeHeader, MASortColumn, MAToggleRtf, MAToggleSvg, MATogglePdfPage, MAArchiveView]
 
 windowEntries :: Editor -> [MenuEntry]
 windowEntries ed =
@@ -978,6 +1108,11 @@ runAction a ed0 =
        -- In-file find is meaningless on a read-only image (also blocks the
        -- keyboard shortcuts Ctrl+F/R/G and F3, which bypass the pruned menu).
        then noEff ed { edStatus = "Not available in image view" }
+     -- An SVG's picture view sits over a live, editable buffer: anything
+     -- that would edit it through a cursor and selection the picture does not
+     -- show is refused (Undo/Redo stay: their effect re-derives the picture).
+     else if isJust (activeVec ed) && a `elem` svgPictureDisabled
+       then noEff ed { edStatus = svgSourceNote }
      else if isJust (edPager ed) && a `elem` pagerDisabledFind
        then noEff ed { edStatus = "Not available in the paged view of a large file" }
      else if isJust (edPager ed) && a `elem` [MASave, MASaveAll, MARevert]
@@ -988,6 +1123,13 @@ runAction a ed0 =
        then noEff ed { edStatus = if containerViewActive ed
                                     then T.pack (containerRefusal ed)
                                     else "Not available in the formatted view \x2014 Alt+T edits the RTF markup" }
+     -- The page view draws the page and keeps no text model of its own, so
+     -- finding goes to the reflow view (on the same page) and runs there,
+     -- which is where the hit can be shown and copied; copying says where.
+     else if pageViewOn ed && a `elem` [MAFind, MAFindNext, MAFindPrev]
+       then runAction a (togglePdfPage ed)
+     else if pageViewOn ed && a `elem` [MACopy, MASelectAll]
+       then noEff ed { edStatus = "The page view has no text selection \x2014 Alt+T for the reflow view, where you can select and copy" }
      else if isJust (edPdf ed) && a `elem` pdfDisabledActions
        then noEff ed { edStatus = "Not available in the PDF view" }
      else if isJust (edPdf ed) && a `elem` [MASave, MASaveAll, MARevert]
@@ -1041,6 +1183,8 @@ runAction a ed0 =
        MAToggleWhitespace  -> noEff ed { edShowWhitespace = not (edShowWhitespace ed) }
        MAToggleCsv  -> noEff (toggleCsv ed)
        MAToggleRtf  -> noEff (toggleRtf ed)
+       MAToggleSvg  -> noEff (toggleSvg ed)
+       MATogglePdfPage -> noEff (togglePdfPage ed)
        MAArchiveView -> archiveViewFlow ed
        MAToggleFreezeHeader -> noEff (toggleFreezeHeader ed)
        MASortColumn -> noEff (sortCsvColumn ed)
@@ -1117,7 +1261,11 @@ applySettingRow k v ed = case k of
   12 -> upd (\c -> c { cfgJournal = on }) ed
   -- Likewise startup-only: nothing in this session reads it again.
   13 -> upd (\c -> c { cfgRestoreSession = on }) ed
-  14 ->                                                  -- master linting switch
+  -- Read when an SVG is opened; nothing already open changes view.
+  14 -> upd (\c -> c { cfgSvgPicture = on }) ed
+  -- Likewise read when a PDF is opened.
+  15 -> upd (\c -> c { cfgPdfView = [PdfViewAuto, PdfViewPage, PdfViewReflow] !! max 0 (min 2 v) }) ed
+  16 ->                                                  -- master linting switch
     let ed1 = upd (\c -> c { cfgLint = on }) ed
     -- Off means no future pass will ever clear diagnostics, so drop them
     -- everywhere now (active doc and zipper) — squiggles must not outlive
@@ -1126,8 +1274,8 @@ applySettingRow k v ed = case k of
        else ed1 { edDiags = []
                 , edBefore = map (\d -> d { docDiags = [] }) (edBefore ed1)
                 , edAfter  = map (\d -> d { docDiags = [] }) (edAfter ed1) }
-  _ | k >= 15, k - 15 < length linters ->                -- one row per linter
-        let lid = linId (linters !! (k - 15))
+  _ | k >= 17, k - 17 < length linters ->                -- one row per linter
+        let lid = linId (linters !! (k - 17))
             ed1 = upd (\c -> c { cfgLintOn = setLintOn lid on (cfgLintOn c) }) ed
         -- Turning a linter off immediately drops its squiggles on the active
         -- doc; zipper docs refresh on their next lint pass.
@@ -1206,7 +1354,12 @@ update key ed =
   -- has more sources than the handful of sites that call 'relayout' (turning
   -- the scrollbar off in Settings changes it by a column). Its cache key
   -- comparison is as cheap, so it goes here rather than being chased.
-  let (ed', effs) = fmapEd (refreshPdf . refreshRtf) (dispatchKey key ed)
+  --
+  -- A vector picture's cell raster rides along for the same reason as the
+  -- PDF's width (a Settings change moves the text area under it): its check
+  -- is a layout and a key comparison, and it is skipped for everything else.
+  let refreshVecView e = if isJust (activePicVec e) then refreshImage (leaveSvgIfRenamed e) else e
+      (ed', effs) = fmapEd (refreshVecView . refreshPdf . refreshRtf) (dispatchKey key ed)
   -- When a menu has just been opened, refresh the active file's stale-on-disk
   -- flag so the File menu can offer Revert if the file changed underneath us —
   -- and, for the File menu specifically, re-read the sessions directory, for the
@@ -1422,8 +1575,14 @@ handleAlt c ed = case c of
   -- Alt+T is "show this file as the thing it describes": the table for a CSV,
   -- the document for an RTF, the archive listing (or back) for a container.
   -- A file is at most one of those.
-  't' | containerViewActive ed || containerListing ed -> runAction MAArchiveView ed
+  -- A showing SVG picture is checked first, by the view and not the name: a
+  -- picture whose file was renamed (to .rtf, .csv, ...) must still be able
+  -- to go back to its text.
+  't' | isJust (activeVec ed) -> runAction MAToggleSvg ed
+      | isJust (edPdf ed) && isJust (edPdfView ed) -> runAction MATogglePdfPage ed
+      | containerViewActive ed || containerListing ed -> runAction MAArchiveView ed
       | isRtfFile ed -> runAction MAToggleRtf ed
+      | isSvgFile ed -> runAction MAToggleSvg ed
       | otherwise    -> runAction MAToggleCsv ed
   's' -> runAction MASortColumn ed
   'j' -> runAction MAJoinLines ed
@@ -1907,6 +2066,8 @@ scrollBarTo row ed = case scrollBarInfo ed of
            Nothing -> case edRtf ed of
              Just rd -> ed { edRtf = Just (Rtf.rtfClamp (rtfHeight ed) rd { rdTop = target }) }
              Nothing -> case edPdf ed of
+               -- (the page view's bar measures pages: see 'scrollBarInfo')
+               Just _ | pageViewOn ed -> pdfTurnTo (target `div` max 1 h + 1) ed
                Just pd -> ed { edPdf = Just (Pdf.pdfClamp (pdfHeight ed) pd { pdTop = target }) }
                Nothing -> scrollLine (target - edTop ed) ed
 

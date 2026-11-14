@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="200">
+<rect x="10" y="10" width="50" height="30" fill="steelblue"/>
+<rect x="70" y="10" width="50" height="30" rx="10" fill="darkorange"/>
+<rect x="130" y="10" width="60" height="30" rx="5" ry="15" fill="seagreen"/>
+<rect x="10" y="50" width="50" height="30" rx="100" fill="indigo"/>
+<rect x="70" y="50" width="50" height="30" ry="8" fill="peru"/>
+<circle cx="155" cy="65" r="18" fill="firebrick"/>
+<ellipse cx="35" cy="115" rx="25" ry="12" fill="olive"/>
+<ellipse cx="95" cy="115" rx="15" fill="cadetblue"/>
+<line x1="130" y1="100" x2="190" y2="130" stroke="black" stroke-width="3"/>
+<polyline points="10,150 30,180 50,150 70,180" fill="none" stroke="maroon" stroke-width="3"/>
+<polygon points="90,150 120,150 130,180 100,195 80,180" fill="plum" stroke="black"/>
+<polygon points="140,150 190,150 165 195 170" fill="khaki" stroke="black"/>
+<rect x="5" y="190" width="-5" height="5" fill="red"/>
+<circle cx="195" cy="195" r="0" fill="red"/>
+</svg>

@@ -11,6 +11,7 @@ module Cmedit.Lint
   , linters, linterById, lintersForPath
   , parseLintOutput, diagSpans, diagAt
   , maxDiagsPerFile
+  , mayFetchTool, versionUnchecked
   ) where
 
 import Data.Char (isAsciiUpper, isDigit, isSpace, isAlphaNum, toLower)
@@ -41,6 +42,41 @@ data Diag = Diag
 
 -- | Resolved availability: @Nothing@ = not installed; @Just (exePath, versionLine)@.
 type LintAvail = [(LinterId, Maybe (FilePath, String))]
+
+-- | Could running this "executable" download something? Asked before the
+-- @--version@ probe, which runs only when the Settings dialog asks for
+-- versions: detection itself never executes anything (a @PATH@ lookup and
+-- file tests only), because a linter on @PATH@ is quite often a
+-- package-runner shim, and running one is a network fetch. A @pyright@ that
+-- is @exec corepack yarn pyright@ made corepack download Yarn into
+-- @~\/.cache@ when a PDF was merely opened; PyPI's @pyright@ installs Node
+-- and the npm package on its first run. Takes the canonical path (symlinks
+-- resolved: a global @yarn@ is a link into corepack) and the file's first
+-- bytes, as Latin-1; a false positive only costs the version label.
+mayFetchTool :: FilePath -> String -> Bool
+mayFetchTool real hd =
+  any (`elem` runnerDirs) (init' parts)   -- inside a package manager's own tree
+  || stem `elem` runners
+  || (isScript && any (`isInfixOf` map toLower hd) markers)
+  where
+    parts = splitParts (map toLower real)
+    splitParts str = case break (`elem` ("/\\" :: String)) str of
+      (a, []) -> [a]
+      (a, _ : rest) -> a : splitParts rest
+    init' xs = if null xs then [] else init xs
+    base = if null parts then "" else last parts
+    runnerDirs = ["corepack", "npm", "pnpm", "yarn", "bun"]
+    stem = foldr (\e b -> maybe b reverse (stripPrefix (reverse e) (reverse b))) base [".exe", ".cmd", ".bat", ".ps1", ".js", ".cjs", ".mjs"]
+    runners = ["corepack", "npx", "npm", "pnpm", "pnpx", "yarn", "yarnpkg", "bun", "bunx", "uvx", "pipx", "deno"]
+    isScript = "#!" `isPrefixOf` hd || '\0' `notElem` hd
+    markers = [ "corepack", "npx", "npm exec", "npm x ", "pnpm dlx", "pnpm exec", "pnpx", "yarn dlx"
+              , "yarn exec", "bunx", "bun x ", "pipx run", "uvx", "uv tool run", "uv run"
+              , "pyright.cli", "nodeenv" ]
+
+-- | The version label of a tool that was found but deliberately not run
+-- ('mayFetchTool').
+versionUnchecked :: String
+versionUnchecked = "(version not checked: it runs through a package manager, which may download)"
 
 -- | Static description of a linter: how to invoke it and how to surface it in
 -- config / the settings dialog.

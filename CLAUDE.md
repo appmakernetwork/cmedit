@@ -181,7 +181,10 @@ in `README.md`; the cross-cutting structure that matters when editing:
   that changes or after a full redraw; `Image.scaleRGBA` area-averages the
   crop to the fitted resolution (`gfxFit`, aspect-true via the real cell
   pixel size, capped at `maxGfxPixels`), then `kittyPlace` (base64 RGBA
-  chunks, delete-all first) or `sixelPlace` (hand-rolled encoder: 6×7×6
+  chunks, delete-all first; the base64 is written in place by
+  `base64Strict`, because a `Builder` of one `word8` per output character
+  was two heap objects per byte, 20+ MB live per placement and the bulk of a
+  page view's peak RSS) or `sixelPlace` (hand-rolled encoder: 6×7×6
   palette, transparency via P2=1, RLE) positions it over the text area.
   `gfxFit` centres the placement and, unless a zoom crop is active (or the
   cell-pixel size is unknown), refuses to enlarge past native (1 device
@@ -460,6 +463,101 @@ in `README.md`; the cross-cutting structure that matters when editing:
   beside them are what stop a real document spending them on repetition. Extraction is at parity with
   `pdftotext`'s word count across the test corpus, which is the bar to hold if
   the heuristics are ever retuned.
+  **The page view (plan 0034 F2, `edPdfView`/`docPdfView`, `PdfView`) is a
+  mode of this view, not an image document**, and that is the decision to
+  keep. The document stays `edPdf`: its pages, Go To page, the disabled-action
+  lists and its place in the zipper are the PDF view's, unchanged. What the
+  mode adds is one vector picture, `pvPic`, of the *current page* (an ordinary
+  vector `ImageDoc` whose `vdSeq` is the page it holds), and it borrows the
+  whole picture machinery through `activePicture`/`modPicture`/`activePicVec`
+  (the image view's fit, zoom crops, drag-to-zoom, the cell raster, the
+  overlay, `gfxFitVector`): every one of those used to ask `edImage`, and now
+  asks for "the picture on screen", which is either. `activeVec` stays the
+  SVG-only question, because its callers guard an editable buffer a PDF does
+  not have. **Alt+T** (`MATogglePdfPage`, View ▸ Page/Reflow View) switches
+  keeping the place: reflow → page lands on the page holding the reflow top
+  line, page → reflow on that page's first line (a short document's reflow
+  view cannot scroll its last pages to the top, so it lands as near as
+  `pdfClamp` allows). `pdf-view = auto|page|reflow`; **auto chooses pages
+  only when the terminal draws pixels**, and since the probe replies arrive
+  after the first frame it remembers having chosen reflow for want of them
+  (`pvAutoPending`): `pdfCapsArrived`, called by the driver after every
+  `setGfxCaps`, switches each such PDF (active or in the zipper) once, never
+  after a manual choice (`pvManual`). On a dumb terminal the page view is a
+  half-block thumbnail and its status line says so and points at Alt+T.
+  **Scenes come from a background job keyed by (path, epoch, page)**, the
+  SVG's identity with the page in place of the edit counter (a PDF cannot be
+  edited, and its pages can be turned): `pdfPageWant` names the current page
+  when `pvPic` holds another; `App.pdfPageUpkeep` (inside `vectorUpkeep`,
+  every frame) runs `JPdfPage`: the pure `PdfRender.pageFontNeeds` pre-pass,
+  `fontFor` for each need, then the pure `renderPage` under a `RenderEnv`,
+  the scene forced on the job thread; `SMPageParsed` → `pdfPageParsed`
+  installs it only for the very opening and page that asked (a neighbour is
+  cached, anything else dropped). **Prefetch is what makes PgDn instant**:
+  once the current page is settled (its scene in, its cells drawn, no job for
+  it in flight, its overlay ready) the driver parses the next page, then the
+  previous (`pdfPrefetchWant`, `JPdfPrefetch`), and renders the next page's
+  *overlay* at exactly the key the turn will ask for, straight from the
+  cached scene and the current placement geometry (`pdfNextPageFit`;
+  `JVecGfxPrefetch`; `vdrGfx` holds three payloads). A prefetch the user has
+  just turned to is promoted, not restarted. `pdfTurnTo` moves the page being
+  left into `pvScenes` and takes the arriving one out of it, then
+  `trimPageCache` holds the cache to the current page ±1 **by memory, not by
+  drawing cost**: `szBytes` (decoded images at four bytes a
+  pixel, paths at a few dozen bytes a segment) against `pageKeepBytes`
+  (160 MB for the neighbours; the current page is always held), next page
+  first, and a neighbour that does not fit is not kept at all. `szCost`,
+  the SVG measure, was the wrong one: a page of photographs is cheap to draw
+  and holds hundreds of megabytes, and a 39 MB scanned document sat at 540 MB
+  resident with three pages cached. `captureDoc` drops every page scene
+  (`dropPageScenes`) and the page re-parses on return.
+  **The prefetch must agree with the cache, or it never stops**: two
+  neighbours too heavy to keep together used to evict each other forever (the
+  want asked again for whatever the trim had just dropped), and a neighbour
+  whose render failed was asked for again on every frame. So `trimPageCache`
+  ranks the next page above the previous, `pdfPageParsed` records what the
+  budget could not keep (`pvNoFit`, forgotten on a turn) and what failed
+  (`pvFailed`, for the whole opening, shown as the page's error when turned
+  to and drawn inside the page area), and `pdfPrefetchWant` skips both. A
+  prefetch is **cancelled whenever the current page has work pending** (its
+  parse, cells or overlay; `runTui` runs `min 4 (cores-1)` capabilities, a
+  single one on a two-core machine) and restarted once idle, the next page's
+  overlay key comes straight from its cached scene (`pdfNextPageFit`: no
+  simulated turn, which ran the next page's synchronous cell raster on every
+  frame, 5 ms measured), and every vector job runs under `App.guardJob`, so a
+  stack or heap overflow posts a failure instead of leaving its in-flight
+  marker (and "rendering…") stuck; a marker is written only once its job has
+  started. Entering the page view from reflow opens on the **first** page
+  starting at the reflow window's top (`reflowPageAt`): a cover with no text
+  starts on the same laid-out line as the page after it, and
+  `pdfCurrentPage`, which counts every such page, opened fresh documents on
+  page 2. The rasteriser's own notes (`rsNotes`: images over its memory cap,
+  a truncated drawing) reach the status line and the page status through
+  `VecView.rasterNoteList`, which puts its budget note in our wording so
+  "truncated" is never said twice. **`pvPage` is authoritative across Alt+T**: leaving records the
+  reflow top it set (`pvLeftAt`), and re-entering with the window still there
+  returns to `pvPage` (a short document's reflow cannot scroll its later
+  pages to the top, so re-deriving the page from it returned page 1 every
+  time). The previous page's placement stays up while the next renders only
+  if that render is genuinely pending (`VecView.keepPreviousPlacement`): a
+  refused raster or a failed page deletes it. The wheel turns at most one page
+  per 120 ms (`App.wheelTurnsPage`, driver-side, since only the driver has a
+  clock), so a trackpad flick does not skip thirty pages.
+  Thousands of pages cost nothing until visited: opening reads the page count
+  (`pdfSourcePages`) and one crop box. Keys (`handlePdfPageKey`, one scheme):
+  PgDn/PgUp/Space/`[`/`]`/Home/End/Ctrl+G turn pages, at the fit the arrows
+  and the plain wheel turn them too, Ctrl+wheel and `+`/`-` zoom, drag zooms
+  into a rectangle, zoomed the wheel zooms about the pointer and the arrows
+  pan by a tenth of the view, `0`/Esc/click return to the fit; Find (and
+  Next/Previous) switch to the reflow view on the same page and run there,
+  Copy and Select All say to use it, and a workspace-search hit lands there
+  too (`applyPendingDoc`). The scrollbar measures pages (`scrollBarInfo` with
+  a track's worth of rows per page, and `scrollBarTo` maps back), and the
+  status zone reads `Page 3/12 · 100%`. The pages themselves are
+  `Cmedit.PdfRender`'s (see the PDF page rendering bullet); the view only ever
+  sees a `Scene`. `docs/plans/bench/pty_pdf.py` checks the view (placements,
+  paging, zoom, modes, and that a non-embedded Helvetica page has text pixels
+  where a blank page has none), and `pty_pdfbench.py` measures real files.
 - **Archive listings (`Cmedit.Zip`).** A `.zip`, and everything built on it
   (`.jar`, `.whl`, `.docx`, `.epub`, `.apk`; sniffed by `zipMagic` in
   `classifyFileWith`, *before* the size check and the binary refusal, exactly
@@ -685,7 +783,9 @@ in `README.md`; the cross-cutting structure that matters when editing:
   `App.classifyFile`, which refuses files over `maxOpenBytes` and binary files
   (`TextBuffer.looksBinary`: a NUL byte in the first 8 KiB), so a huge blob can
   never be decoded into millions of junk lines and hang the loop, sniffs images
-  by magic bytes, and otherwise decodes text (`loadFromBytes`); a missing path
+  by magic bytes, decompresses an `.svgz` into a read-only text buffer (before
+  the binary refusal), and otherwise decodes text (`loadFromBytes`; an `.svg`
+  is ordinary text here, and `setLoaded` decides on the picture); a missing path
   becomes a new empty buffer. The *interactive* open (`EffOpen`) loads files
   larger than `asyncThresholdBytes` on a background thread that posts a
   `LoadOutcome` to a second queue (`loadQ`); `beginLoading`/`endLoading` toggle
@@ -972,7 +1072,10 @@ in `README.md`; the cross-cutting structure that matters when editing:
 
 - **Image view mode (`Cmedit.Image`, `edImage`/`docImage`).** A third,
   read-only view mode, structured exactly like CSV but sharing none of its
-  machinery (it does *not* go through the line buffer at all). `Cmedit.Image` is
+  machinery (it does *not* go through the line buffer at all, except for an
+  SVG's picture, the one image view over a live buffer: see the
+  vector-pictures bullet; its geometry is `imageDims`, never `idImage`).
+  `Cmedit.Image` is
   a self-contained, IO-free module that decodes BMP, Netpbm, GIF, PNG, JPEG
   (baseline **and** progressive) and WebP (lossless VP8L **and** lossy VP8,
   incl. the ALPH alpha chunk and an animation's first frame) from raw bytes
@@ -1171,6 +1274,272 @@ in `README.md`; the cross-cutting structure that matters when editing:
   sweeps every truncation and two bit flips at every offset of each fixture).
   There is no colour management: XYB renders to sRGB, other samples are shown
   as stored, as every other decoder here does.
+- **Vector pictures (SVG; `Cmedit.VecView`, `idVec`, `Cmedit.FontProvider`).**
+  An `.svg`/`.svgz` whose content sniffs as SVG (`Svg.sniffSvgText`: the
+  first element is `<svg>`; the extension only makes a file a *candidate*, so
+  an XML file that mentions `<svg` is never a picture and a broken `.svg`
+  opens as its source with a note) is shown **in the image view as a derived
+  picture of its text buffer**: the RTF view's one-way model on the image
+  view's machinery. Four decisions carry it.
+  **(1) The buffer stays the document.** `edImage = Just idoc` with `idVec =
+  Just VecDoc`, but the document is an ordinary editable text document:
+  Save/Save As/Revert/journal/session/recents/undo see only the buffer, in
+  either view. The "image means no buffer" checks therefore ask
+  `bufferlessImage` (an image *without* `idVec`), never `isJust edImage`:
+  `isPlainDoc`, `journalableDoc`, `snapshotableDoc`, the save fixups,
+  `saveAsRefusal` and the workspace replace all do. The picture view swallows
+  what would edit the buffer through a cursor it does not show (typing,
+  paste, cut, line ops: `svgPictureDisabled` + `handleImageKey`) but keeps
+  Undo/Redo, whose effect re-derives the picture. **Alt+T** (`MAToggleSvg`,
+  View ▸ SVG Picture) swaps to the highlighted source; the picture model
+  waits in `edSvgStash`/`docSvgStash` (per document, through
+  `captureDoc`/`restoreDoc`) and is reused outright when nothing was edited.
+  A `.svgz` is decompressed into a **read-only** buffer (`classifyBytes`), so
+  nothing can write text over the gzip stream.
+  **(2) Staleness is a counter plus an epoch, and parsing is the driver's.**
+  The scene is stamped with the `edDocSeq` it was parsed from (`vdSeq`),
+  never compared by `ptrEq` (the RTF lesson), and with the picture model's
+  **epoch** (`vdEpoch`, from the session clock `edVecClock`, fresh for every
+  new model: open, re-open, Revert, fonts arriving). The epoch is not
+  optional: a document's counter restarts at 0 on every load, so a request
+  keyed (path, seq) alone let a parse begun before a Revert land afterwards
+  as the reverted file's picture. Parsing needs IO (fonts, external images)
+  and `parseSvg` is pure, so the pure `svgParseWant` names an `SvgWant`
+  (path, epoch, seq) for the *showing* picture only (a stash is re-parsed
+  when Alt+T brings it back, so typing in the source queues nothing); the
+  driver's `vectorUpkeep`, run at the top of **every** `renderNow`, starts
+  `JSvgParse` for it unless that key is already in flight, and **cancels**
+  the parse, cell and overlay jobs whose target is no longer showing; the job runs the
+  pure pre-pass (`Svg.svgFontQueries`, `svgExternalRefs`), loads what it
+  lists, parses with a pure `SvgEnv`, **forces and measures the scene**
+  (`VecView.measureScene`; lazily built glyph outlines would otherwise be
+  decoded on the UI thread) and posts `SMSvgParsed` with a session-unique scene id; `svgParsed`
+  installs it only if path, epoch and counter all still match. A parse that
+  ran before font discovery finished (`providerFiles` returned `Nothing`, as
+  opposed to `Just []`) is marked `vdFontless`; `SMFontsReady` → `fontsReady`
+  gives every such picture a fresh epoch, so it is redrawn with its fonts. A failure leaves for the
+  source view with the reason, and Alt+T on an unchanged failure stays there.
+  Opening to land on a search match shows the source (`setLoaded`'s
+  `jumpingHere`, `applyPendingJump`), as for RTF.
+  **(3) A virtual pixel grid, so the image geometry is reused unchanged.**
+  A picture presents `imageDims` = `vecDims`: longer side 2^24 virtual
+  pixels (so at the deepest zoom the window is still 65 536 units across, and
+  a 1000:1 picture still has a short side of 16 777), so `idCrop`, `viewFit`, `wheelZoom`, `cellRectToCrop` and `gfxFit`
+  all work in integers exactly as for a bitmap, and `vecView` maps a virtual
+  crop straight to the scene → device `Affine`. Nothing allocates the grid;
+  `idImage`/`idFrames` hold a 1×1 placeholder that **nothing may sample**
+  (`drawImage`, `refreshImage` and `gfxOverlay` branch on `idVec` first).
+  Vectors have no native size (`imageFitCap` is `Nothing`, the overlay always
+  fills) and zoom to `vecMaxZoom` (256×) of the fit rather than to four
+  source pixels.
+  **(4) Rasters are made at exactly the size shown, off the UI thread.**
+  `rasterVec` draws *only the visible crop* at exactly the requested pixels,
+  capped at `maxVecRasterPixels`, with `RenderOpts` built through
+  `defaultRenderOpts` and record update (never positionally: the raster
+  workstream extends it). Two consumers, one key type (`VecKey` = scene id,
+  crop, w, h). The **cell picture** is the fitted sub-pixel box
+  (`vecCellKey`), drawn by `Image.renderImagePlaced` with every sub-pixel one
+  raster pixel; scenes under `vecSyncCostMax` (`szCost`; measured ≤ ~5 ms
+  at 118×76 for every system icon of that cost) rasterise synchronously in
+  `refreshVec` under the small `vecSyncBudget` (2M work units: the cost
+  cannot see dash expansion or tiling fan-out, so a scene that runs out is
+  shown truncated, `vdCellsPartial`, and redone by the job), dearer ones go
+  `vecCellWant` → `JVecCells` → `SMVecCells` → `vecCellsRendered` (a failure
+  is recorded against its key, `vdCellsFailed`, so it is not re-requested
+  every frame). The **overlay** is sized by `Gfx.gfxFitVector`, *not*
+  `gfxFit`: the payload is the display's size, never capped at the crop's
+  (at deep zoom that cap upscaled a coarse raster), kitty held to
+  `maxGfxPixels` and sixel, which draws 1:1, given the full box up to
+  `maxSixelVectorPixels` (past it the box shrinks with the payload). It is
+  requested by `vectorUpkeep` (`vecGfxTarget`), rendered by `JVecGfx`,
+  cached driver-side (`vdrGfx`: the last two payloads; a late result for a
+  scene no longer showing is dropped rather than evicting one) and placed by
+  `vecPlacement`. **The cells stay painted until that placement exists**:
+  `imageOverlayWanted` is the driver's "a placement is wanted" and
+  `imageOverlayActive` (the renderer's blanking, the cell-job gate) adds,
+  for a vector picture, `edVecGfxReady`, mirrored by `vectorUpkeep` from the
+  cache before each frame; so a slow first raster shows the cell picture and
+  a refused one says so on the status line instead of leaving a blank view.
+  While a raster is pending the previous placement stays up only if it is
+  the same document's at the same geometry and cell size; anything else is
+  deleted at once. **Inactive pictures keep their scenes only within a
+  policy** (`VecView.keepScenes`, generic over (last-used, cost) so the PDF
+  page view can reuse it): `trimVecScenes` in `restoreDoc` keeps the
+  `vecKeepScenes` most recently shown within `vecKeepCost`, and the rest drop
+  scene, raster and grid and re-parse when shown. Every job goes
+  through `startJob` (one per kind, the newest kills the previous, so a zoom
+  burst never queues work), its in-flight marker is cleared only by the
+  result for the same key, and `trySync` re-throws asynchronous exceptions so
+  a killed job posts nothing (and `fontFor` never blacklists a font because
+  its job was killed). **A scene is measured once, on the job, and by identity**
+  (`VecView.measureScene` → `SceneSize`, carried in `SMSvgParsed`/
+  `SMPageParsed` into `vdCost`/`vdBytes`/`psSize`; nothing on the UI
+  thread walks a scene). Sharing is what makes this necessary: a scene
+  shares sub-scenes through `CTransform`, nesting multiplies, and a 10 KB
+  PDF of Type 3 glyphs drawing each other fifteen deep is a small heap and
+  an astronomically large tree. The old plain walk of it never finished and,
+  looping over evaluated data without allocating, could not even be killed
+  (Ctrl+Q hung). So each command list is visited once per heap object
+  (`StableName`), its drawing cost memoised and re-added per reference (so
+  `szCost` stays the *expanded* cost, saturating at `sceneCostCap`, in time
+  linear in the heap), an image counts towards `szBytes` once however often
+  it is drawn, the walk is fuelled, and `VecView` is compiled with
+  `-fno-omit-yields` so a kill always lands. `sceneSize` is the same walk
+  sharing-blind, for tests. `pty_pdf.py`'s hostile scenario
+  (`docs/plans/bench/pdf/hostile/`) pins it: views switch and Ctrl+Q quits
+  within a second. **`Cmedit.Jobs` forks every job unmasked**
+  (`forkIOWithUnmask`): the table update runs under `mask_`, and a plain
+  `forkIO` there made the child inherit the mask, so `killThread` waited for
+  the old job to *finish* (measured 2.6 s for a busy pure loop; 1 µs after).
+  Every job kind (search walkers, loads, replace, journal) is now genuinely
+  cancellable; the walker's worker pool is bracketed, the journal never
+  supersedes itself, and a replace's handler still posts its completion. A budget-truncated raster says so
+  (`vecTruncatedNote`; "(truncated)" in the status bar).
+  **Fonts** are discovered once on a startup thread (`startFontDiscovery`:
+  `FontSys.fontDirectories` for the host OS, a bounded walk that follows
+  symlinked directories once each by canonical path and charges its entry
+  budget before stat-ing a listing; it posts `SMFontsReady` when done) and
+  loaded on demand, inside jobs only,
+  through a bounded LRU cache (12 faces, 96 MB; files that failed to parse
+  are remembered). The API the PDF page view should reuse is `fontFor ::
+  FontProvider -> [FilePath] -> FontRequest -> IO (Maybe (Int, Font))` (a
+  family as written plus PDF's descriptor flags; the key is unique per loaded
+  face, for glyph-cache keys) with `providerFiles` (waits for discovery with a
+  timeout; no fonts ⇒ the front-end omits the text with a note). The SVG
+  layer is `facesForQueries` over it plus the `fontFace` adapter (ascent and
+  descent scaled from ems into glyph units). External `<image>` references
+  are local files only, against the SVG's directory, never the network,
+  count- and size-capped (`loadSvgRefs`). Config `svg-view = picture|source`
+  (a Settings row); the explorer marks `.svg` as an image; the converter
+  prints the source; `asyncThresholdFor` sends any `.svg` over
+  `imageAsyncBytes` to the background loader. `docs/plans/bench/pty_svg.py`
+  drives it over a PTY (portable floor, fake kitty, a 40 000-path picture,
+  fonts, `.svgz`); `SvgViewBench.hs` has the timings.
+- **The vector stack's contract (`Cmedit.Geom`, `Cmedit.Scene`).** Two leaf
+  modules every vector module builds on, and the reason a zoom re-rasterises
+  sharply: **a front-end parses once into a `Scene` (a display list), and the
+  rasteriser draws that scene at any size and crop**, the crop being only a
+  different scene → device `Affine`. `Affine` is PDF's `[a b c d e f]`
+  (`composeA outer inner` reads like composition); scene space is **y-down**,
+  one unit per CSS px or PDF point, origin top-left; every `Cmd` carries its
+  own user → parent matrix; colours are straight-alpha sRGB doubles; clips,
+  groups and transforms *contain* their children (`CClip`, `CGroup`,
+  `CTransform`), so an unbalanced scene is unrepresentable and one sub-scene
+  (a form, a Type 3 glyph, an SVG `<use>`) is built once and shared through
+  `CTransform`. `Glyph`, `SoftMask` and `PTiling` carry front-end cache keys
+  (equal keys promise equal content; negative = never cache). Nothing in
+  either module knows about pixels or devices, and nothing a front-end builds
+  may depend on one. Changes to the contract are coordinated, never local:
+  four modules build on it at once.
+- **Vector rasteriser (`Cmedit.Raster` over `RasterCore`/`RasterGeom`/
+  `RasterFilter`).** `renderScene :: RenderOpts -> Scene -> (Image,
+  RenderStats)`, pure (`ST` inside), always built through
+  `defaultRenderOpts` plus record update (fields are added over time).
+  **Coverage is exact-area signed accumulation, kept sparse**: edges deposit
+  the exact area they sweep into a band-high buffer (never a full-resolution
+  mask per path), a prefix sum gives each pixel the integral of the winding,
+  and non-zero/even-odd are applied to it; where the integral is not enough
+  (a winding of ±2 or a sign change inside one pixel: a rectangle drawn twice
+  under even-odd, abutting opposite-winding shapes) two cheap per-row signals
+  flag the row and only that row is resolved on 4, then 16 sub-scanlines.
+  Text never gets that far. Compositing is premultiplied `Float` in sRGB
+  values (no gamma, as PDF/SVG specify), all 16 blend modes, knockout and
+  non-isolated groups. **Layers only when the semantics need one**: a
+  `defaultGroup` is drawn straight into its parent, and a group around a
+  single leaf folds its opacity into the leaf's coverage, which is how PDF's
+  per-object `ca` and SVG's `fill-opacity` cost nothing. Strokes are made in
+  user space (elliptical pens under a non-uniform scale) and thinner-than-a-
+  pixel strokes become one-device-pixel hairlines; glyph runs are filled
+  glyph by glyph under non-zero (TrueType and CFF wind oppositely) through a
+  per-render glyph cache keyed by the front-end's keys; images are
+  area-averaged when minified; tiling patterns render one period into a
+  wrapped texture. **Bounds and memory accounting**: output pixels
+  (`rasterMaxPixels`), group depth and container nesting, a work budget
+  (`roBudget`, one unit per flattened edge and per covered pixel, checked
+  inside every per-element loop; exhaustion returns what was drawn with
+  `rsExhausted`) and **live layer memory** (`roMaxLayerBytes`, which
+  `defaultRenderOpts` sets to about three canvases' worth, at least 16 MB
+  and never over 512 MB; a group that would exceed it is drawn without its
+  layer and counted in `rsSkipped`). The editor never sets it explicitly.
+  Non-finite coordinates skip their command; nothing throws.
+  `docs/plans/bench/rastercheck.sh` holds it against resvg.
+- **Fonts (`Cmedit.Font` over `FontCore`/`FontTT`/`FontCFF`/`FontT1`,
+  `Cmedit.FontSys`, `Cmedit.FontProvider`).** `parseFont` sniffs TrueType,
+  OpenType-CFF, collections, bare CFF (name- and CID-keyed, PDF's `Type1C`/
+  `CIDFontType0C`) and Type 1 (PFA/PFB/PDF `FontFile`), and a `Font` is a
+  **record of closures over its own tables**: opening reads offsets and small
+  per-glyph arrays only (a 65 000-glyph CJK face opens in the time it takes to
+  read its table directory) and `glyphPath` decodes one glyph program on
+  demand, which callers memoise per (font, GID). Every reader is **total**
+  (a read past the end returns 0, so "check every offset" becomes "bound
+  every loop"), and every interpreter is fuelled: Type 2 charstrings with
+  subroutine depth and operator budgets and hintmask byte counting, Type 1
+  with eexec found by keyword (PDF's `Length1` is often wrong) and the four
+  standard OtherSubrs (flex, hint replacement) run natively, TrueType
+  composites bounded by depth and by a total point budget. The format
+  readers decide none of PDF's or CSS's addressing rules: they expose cmaps,
+  glyph names, built-in encodings and CID maps, and the front-ends choose.
+  **Substitution is by well-known file names** (`FontSys.substituteFor`:
+  URW base35/Nimbus, Liberation, DejaVu, Noto, the Windows/macOS core
+  fonts, style-ranked with the design honoured before the style), never by
+  opening hundreds of fonts to read their name tables. Discovery, loading and
+  the bounded LRU are `FontProvider`'s (see the vector-pictures bullet).
+- **PDF page rendering (`Cmedit.PdfRender` over `PdfRenderFont`/
+  `PdfRenderShade`, `PdfObj`, `PdfImage`, `PdfFunc`, `Ccitt`).** The page
+  view's front-end: `renderPage :: RenderEnv -> PdfFile -> Fuel -> Dict ->
+  (Scene, Fuel)`, pure, held against `pdftoppm` by
+  `docs/plans/bench/pdfrendercheck.sh`. The decisions that carry it:
+  **fonts are a pre-pass** (`pageFontNeeds` lists every font that is not
+  embedded or whose program does not parse, as a `FontRequest` carrying the
+  descriptor's flags; the driver answers each through `FontProvider.fontFor`,
+  and `reFonts` is the pure lookup the render runs against, the shape
+  `Svg.svgFontQueries` + `SvgEnv` already had); **text positioning is PDF's
+  arithmetic exactly** with the widths from the font dictionary, never the
+  program's, so a substitute's glyphs are **stretched horizontally to the
+  PDF's widths** (clamped to ¼–4×, past which the substitute is plainly the
+  wrong design) and text lands where `pdftoppm` puts it whatever face draws
+  it; codes reach a substitute by glyph name, then Unicode (AGL, `ToUnicode`,
+  Latin-1). **The first command is the paper** (opaque white over the crop
+  box, `/Rotate` applied, scene bounds `Rect 0 0 w h`), and **blending is
+  against what the page has drawn, not against the paper** (poppler,
+  Ghostscript and cairo agree: Screen over an empty page shows the source
+  colour), so a page that blends is one isolated group over the paper, and
+  one whose blends come out the same against white (`noteBlend`) needs no
+  layer at all. **Every sub-stream is built once in its own
+  coordinates and shared through `CTransform`**: form XObjects memoised per
+  object and inherited state, Type 3 glyph procedures per font, code and
+  state (what makes TeX's bitmap fonts cheap), tiling cells, soft-mask
+  groups. Clips are tracked as a chain of ids rather than replayed, so
+  consecutive objects under one clip share one `CClip`; transparency is per
+  object (one-leaf `CGroup`s the rasteriser paints without a layer). Shadings
+  sample their functions into stops (simplified where a line through the
+  neighbours reproduces them), function-of-two shadings become a sampled
+  image, and meshes become (ramp-)Gouraud triangles at a resolution chosen in
+  shading space. Annotations are drawn from their appearance streams (fitted to
+  `/Rect` per §12.5.5), and **appearances are generated** for the kinds
+  poppler draws without one (link borders, squares and circles, text markup,
+  lines, ink: `generatedAppearance`, from the annotation's own colour,
+  border and opacity); optional content off by default is skipped. **What it will not
+  decode it says**: JPEG 2000 and JBIG2 images are drawn as labelled grey
+  placeholders and counted in `scNotes`, and a predefined CJK CMap that
+  cannot be bundled is read as UCS-2 (exact) or two-byte Identity (noted).
+  **Bounds**: a `Fuel` pays for every token and decode, and in the page
+  view it is **per page, not per document**: the driver gives each page
+  parse (`App.startPageParse`, the font pre-pass and the render) a fresh
+  `PdfObj.fuelDefault` (256 MB decoded, 64M tokens). Deliberately: a
+  reader turns pages back and forth, the cache drops scenes that are
+  re-parsed on return, and prefetch parses pages nobody looks at, so one
+  document-wide budget would be spent by reading *time* and leave page 300
+  blank for reasons that have nothing to do with page 300; and a parse is a
+  killable job with nowhere to hand unspent fuel back to. What fuel bounds
+  is one parse's work, which is the thing that must not run away. (The
+  reflow view's extraction, `Pdf.parsePdf`, is the one document-wide spend.)
+  Beside it, `maxPageCmds`/`maxPageGlyphs` per page, `maxNest` with a cycle guard for
+  forms, patterns, Type 3 glyphs and masks, `maxGsDepth` saved states; a page
+  that stops early keeps what it drew and says why. Image XObjects go through
+  `Cmedit.PdfImage` (every colour space and filter the reader knows, CCITT
+  fax in `Cmedit.Ccitt`, CMYK JPEG via `Image.decodeJPEG`), functions through
+  `Cmedit.PdfFunc` (types 0, 2, 3 and a bounded PostScript calculator).
 - **Editing QoL cluster (all pure `Editor` logic).** Line ops (duplicate /
   Alt+↑↓ move / delete / Alt+J join; `EKMoveLine` coalesces held moves into
   one undo) work on `selLineSpan` (a selection ending at col 0 excludes that
@@ -1432,7 +1801,16 @@ in `README.md`; the cross-cutting structure that matters when editing:
   (`detectLinters`: `findExecutable`, plus `node_modules/.bin` under the
   workspace root for node tools), re-probing on `EffDetectLinters` (Settings
   opening) and folder open; `SMLintAvail` → `lintersDetected`, which also
-  refreshes an open Settings dialog's notes in place. Linting is
+  refreshes an open Settings dialog's notes in place. **Detection executes
+  nothing**: a tool on `PATH` is often a package-runner shim (a `pyright`
+  that is `exec corepack yarn pyright`, PyPI's `pyright` wrapper), and
+  running one is a download, so startup used to fetch Yarn into `~/.cache`
+  when a PDF was merely opened. Only the Settings probe
+  (`forkDetectLinters drv True`) runs `--version`, and never for an
+  executable `Lint.mayFetchTool` recognises (inside a corepack/npm/pnpm/yarn
+  tree, a runner by name, or a script naming one); those show
+  `versionUnchecked`. A Spec test drives `detectLinters` over a fake `PATH`
+  and `pty_pdf.py` checks that opening a PDF runs no program. Linting is
   **driver-initiated like `pollFs`**: after any batch that changes the
   fingerprint (path, `edEditSeq`, lint config, availability; `edEditSeq` is a
   counter bumped wherever the modified flag is recomputed) the loop arms a 500 ms

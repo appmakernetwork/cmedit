@@ -100,8 +100,8 @@ windows-check: app/Main.hs $(SRC) $(PLATFORM_WINDOWS)
 # -with-rtsopts=-T turns on the RTS stat counters so the suite's memory-
 # retention guards (GHC.Stats.getRTSStats) can measure live bytes. It costs
 # nothing at runtime and needs no profiling libraries.
-cmedit-test: test/Spec.hs $(SRC) $(PLATFORM_POSIX) cbits/cmedit_term.c
-	$(GHC) --make test/Spec.hs -isrc -iplatform/posix cbits/cmedit_term.c -o $@ \
+cmedit-test: test/Spec.hs $(wildcard test/*Spec.hs) $(SRC) $(PLATFORM_POSIX) cbits/cmedit_term.c
+	$(GHC) --make test/Spec.hs -isrc -itest -iplatform/posix cbits/cmedit_term.c -o $@ \
 	    -threaded -O0 -rtsopts "-with-rtsopts=-T" -outputdir $(TESTDIR) \
 	    $(PKGS_POSIX) $(EXTS) $(WARN)
 

@@ -6,12 +6,12 @@ module Cmedit.EditorDoc where
 
 import Data.Char (isAlpha, isAlphaNum, isSpace, isDigit)
 import Data.Foldable (toList)
-import Data.List (findIndex, intercalate, isPrefixOf, isSuffixOf, sortBy)
+import Data.List (findIndex, intercalate, isPrefixOf, isSuffixOf, sortBy, sortOn)
 import Data.Ord (Down(..), comparing)
 import Data.Sequence (Seq, (|>))
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
-import Data.Maybe (fromMaybe, isJust, isNothing, mapMaybe)
+import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
 import Data.Char (toLower)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -23,7 +23,7 @@ import Cmedit.Types
 import Cmedit.TextBuffer
 import Cmedit.Width (colToDisplay, displayToCol, wrapLine)
 import Cmedit.ConfigFile
-  ( Config(..), ThemeName(..), defaultConfig, RecentEntry(..)
+  ( Config(..), ThemeName(..), PdfViewMode(..), defaultConfig, RecentEntry(..)
   , maxRecentEntries, maxHistoryEntries, Session(..), SessionFile(..)
   , SessionSummary(..), maxSessionFiles )
 import Cmedit.Menu
@@ -44,7 +44,12 @@ import qualified Cmedit.Csv as Csv
 import Cmedit.About (aboutCanvasH, aboutCanvasMinW, aboutTotalFrames)
 import Cmedit.Manual (manualPath, manualText)
 import Cmedit.Clipboard (CopyOutcome(..))
-import Cmedit.Image (Image(..), ImgMode(..), renderImage, viewFit)
+import Cmedit.Image (Image(..), ImgMode(..), renderImage, renderImagePlaced, viewFit)
+import Cmedit.Geom (Rect(..), rectW, rectH)
+import Cmedit.Scene (Scene(..))
+import Cmedit.Svg (sniffSvgText)
+import Cmedit.Raster (RenderStats(..))
+import Cmedit.VecView
 import Cmedit.Syntax (HlCache, CommentSyntax(..), langComment, langForPath)
 
 import Cmedit.History (pushHist)
@@ -54,6 +59,7 @@ import Cmedit.Pager (PagerDoc(..))
 import Cmedit.Rtf (RtfDoc(..))
 import Cmedit.Pdf (PdfDoc(..))
 import qualified Cmedit.Pdf as Pdf
+import qualified Cmedit.PdfObj as PO
 import qualified Cmedit.Rtf as Rtf
 import Cmedit.Xlsx (Workbook(..))
 import qualified Cmedit.Xlsx as Xlsx
@@ -98,7 +104,7 @@ setLoaded path lr ed =
         , edFocus = FEdit, edDialog = Nothing, edSearchMode = False
         , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
         , edCsv = Nothing, edCsvStash = Nothing
-        , edImage = Nothing, edRtf = Nothing, edSheets = Nothing, edPdf = Nothing
+        , edImage = Nothing, edSvgStash = Nothing, edPdfView = Nothing, edRtf = Nothing, edSheets = Nothing, edPdf = Nothing
         , edDiags = []                        -- a reloaded file's stale diags must not survive
         , edEditSeq = edEditSeq ed + 1         -- fresh buffer: the driver must re-lint (also covers Revert)
         }
@@ -118,6 +124,10 @@ setLoaded path lr ed =
       ed2 | isCsvPath path                  = enterCsv ed1
           | isRtfPath path && jumpingHere   = restoreRecentPos path ed1
           | isRtfPath path                  = enterRtf ed1
+          -- An SVG opens as its picture (svg-view = picture), except when we
+          -- are landing on a position in its markup, as for RTF above.
+          | isSvgPath path && not jumpingHere && cfgSvgPicture (edConfig ed)
+                                            = enterSvg (restoreRecentPos path ed1)
           | otherwise                       = restoreRecentPos path ed1
   in touchRecent path ed2
 
@@ -279,7 +289,7 @@ blankReadOnly path status ed = ed
   , edFocus = if edFocus ed == FExplorer then FExplorer else FEdit
   , edDialog = Nothing, edSearchMode = False
   , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
-  , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edRtf = Nothing
+  , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edSvgStash = Nothing, edPdfView = Nothing, edRtf = Nothing
   , edSheets = Nothing, edPager = Nothing, edPdf = Nothing
   , edHlCache = Nothing, edDiags = []
   }
@@ -295,7 +305,7 @@ blankReadOnlyDoc path = Document
   , docFinalNewline = True, docReadOnly = True
   , docUndo = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone, docOverwrite = False
   , docDiscard = False, docCsv = Nothing, docCsvStash = Nothing
-  , docImage = Nothing, docRtf = Nothing, docSheets = Nothing, docPager = Nothing
+  , docImage = Nothing, docSvgStash = Nothing, docPdfView = Nothing, docRtf = Nothing, docSheets = Nothing, docPager = Nothing
   , docPdf = Nothing
   , docHlCache = Nothing
   , docDiags = []
@@ -305,13 +315,15 @@ blankReadOnlyDoc path = Document
 
 -- | Install a parsed PDF as the active document.
 pdfLoaded :: FilePath -> PdfDoc -> Editor -> Editor
-pdfLoaded path pd ed = touchRecent path $ refreshPdf $ ensureVisible $
-  (blankReadOnly path status ed) { edPdf = Just pd }
+pdfLoaded path pd ed = touchRecent path $ refreshImage $ refreshPdf $ ensureVisible $
+  (blankReadOnly path status ed1)
+    { edPdf = Just pd, edPdfView = Just (newPdfView epoch (edConfig ed) (edGfxCaps ed) pd) }
   where
     status = "Viewing " ++ takeFileName path ++ "  "
                ++ show (Pdf.pdfPageCount pd) ++ " page" ++ plural (Pdf.pdfPageCount pd)
                ++ (if T.null (pdNote pd) then "" else "  \x2014 " ++ T.unpack (pdNote pd))
                ++ "  \x2014 read-only"
+    (epoch, ed1) = tickVecClock ed
 
 -- | Open a parsed PDF as a new document (reusing a pristine empty buffer if
 -- present), mirroring 'setLoadedNew' for text.
@@ -327,7 +339,9 @@ pdfLoadedNew path pd ed = case switchToOpen path ed of
 -- | Append a PDF to the open-files list (startup, 2nd+ file).
 addPdfDocument :: FilePath -> PdfDoc -> Editor -> Editor
 addPdfDocument path pd ed =
-  touchRecent path ed { edAfter = edAfter ed ++ [pdfDocSnapshot path pd] }
+  let (epoch, ed1) = tickVecClock ed
+      d = (pdfDocSnapshot path pd) { docPdfView = Just (newPdfView epoch (edConfig ed) (edGfxCaps ed) pd) }
+  in touchRecent path ed1 { edAfter = edAfter ed1 ++ [d] }
 
 pdfDocSnapshot :: FilePath -> PdfDoc -> Document
 pdfDocSnapshot path pd = (blankReadOnlyDoc path) { docPdf = Just pd }
@@ -424,6 +438,8 @@ goToSheetIn k ed = case (edSheets ed, edCsv ed) of
 
 -- | Jump the reading view to a page (the Go To command in this mode).
 pdfGoToPageIn :: Int -> Editor -> Editor
+pdfGoToPageIn n ed
+  | pageViewOn ed = (pdfTurnTo n ed) { edStatus = "" }
 pdfGoToPageIn n ed = case edPdf ed of
   Nothing -> ed
   Just pd -> ed { edPdf = Just (Pdf.pdfGoToPage (pdfHeight ed) n pd), edStatus = "" }
@@ -442,7 +458,13 @@ captureDoc ed = Document
   , docOverwrite = edOverwrite ed, docDiscard = edDiscard ed
   , docCsv = edCsv ed
   , docCsvStash = edCsvStash ed
-  , docImage = edImage ed
+    -- (stamped with the clock: 'trimVecScenes' keeps the most recently shown)
+  , docImage = fmap (stampVecUse (edVecClock ed)) (edImage ed)
+  , docSvgStash = fmap (stampVecUse (edVecClock ed)) (edSvgStash ed)
+    -- A page view keeps no scenes while its document is not showing: they
+    -- are the expensive part, and re-parsing the page on return is cheap
+    -- next to holding every open PDF's pages.
+  , docPdfView = fmap dropPageScenes (edPdfView ed)
   , docPager = edPager ed
   , docRtf = edRtf ed
   , docSheets = edSheets ed
@@ -454,7 +476,7 @@ captureDoc ed = Document
 
 -- Make a saved 'Document' the active one.
 restoreDoc :: Document -> Editor -> Editor
-restoreDoc d ed = refreshPdf $ refreshRtf $ refreshImage $ ensureVisible ed
+restoreDoc d ed0 = refreshPdf $ refreshRtf $ refreshImage $ trimVecScenes $ ensureVisible ed
   { edBuffer = docBuffer d, edSavedBuffer = docSavedBuffer d, edCursor = docCursor d, edSelAnchor = docSelAnchor d
   , edDesiredCol = docDesiredCol d, edTop = docTop d, edLeft = docLeft d
   , edPath = docPath d, edModified = docModified d
@@ -466,7 +488,7 @@ restoreDoc d ed = refreshPdf $ refreshRtf $ refreshImage $ ensureVisible ed
   , edOverwrite = docOverwrite d, edDiscard = docDiscard d
   , edCsv = docCsv d
   , edCsvStash = docCsvStash d
-  , edImage = docImage d
+  , edImage = docImage d, edSvgStash = docSvgStash d, edPdfView = docPdfView d
   , edPager = docPager d
   , edRtf = docRtf d
   , edSheets = docSheets d
@@ -477,6 +499,13 @@ restoreDoc d ed = refreshPdf $ refreshRtf $ refreshImage $ ensureVisible ed
   , edFocus = FEdit, edDialog = Nothing, edSearchMode = False
   , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
   }
+  -- Every switch moves the vector clock on, so the picture captured just
+  -- before this is the most recent one 'trimVecScenes' sees.
+  where ed = ed0 { edVecClock = edVecClock ed0 + 1 }
+
+-- | Record when a picture model was last the active document's.
+stampVecUse :: Int -> ImageDoc -> ImageDoc
+stampVecUse t im = im { idVec = fmap (\vd -> vd { vdUsed = t }) (idVec im) }
 
 -- | Number of open files.
 fileCount :: Editor -> Int
@@ -524,7 +553,12 @@ setLoadedNew path lr ed = case switchToOpen path ed of
 revertLoaded :: FilePath -> LoadResult -> Editor -> Editor
 revertLoaded path lr ed =
   let cur = edCursor ed
-      ed1 = setLoaded path lr ed
+      -- An SVG reverted from its source view stays in its source view
+      -- (setLoaded would otherwise re-enter the picture).
+      ed1 = keepSvgSource (setLoaded path lr ed)
+      keepSvgSource e
+        | isSvgPath path, isNothing (edImage ed), isJust (activeVec e) = toggleSvg e
+        | otherwise = e
       pos = clampPos cur (edBuffer ed1)
   in ensureVisible ed1
        { edCursor = pos
@@ -568,7 +602,15 @@ noteDiskMtimes stats ed =
 -- the second and subsequent files named on the command line).
 addDocument :: FilePath -> LoadResult -> Editor -> Editor
 addDocument path lr ed =
-  touchRecent path ed { edAfter = edAfter ed ++ [docFromLoad (edEditSeq ed) path lr] }
+  touchRecent path ed { edAfter = edAfter ed ++ [svgDocView (docFromLoad (edEditSeq ed) path lr)]
+                      , edVecClock = edVecClock ed + 1 }
+  where
+    -- A second (third, ...) SVG on the command line opens as a picture too;
+    -- the first parse happens when it becomes the active document.
+    svgDocView d
+      | isSvgPath path && cfgSvgPicture (edConfig ed) && svgBufferLooksSvg (lrBuffer lr) =
+          d { docImage = Just (mkVectorDoc (edVecClock ed)) }
+      | otherwise = d
 
 -- The edit counter is threaded in so an RTF document parsed here is stamped
 -- with the same value 'refreshRtf' will compare against when it first becomes
@@ -585,7 +627,7 @@ docFromLoad seqNow path lr = Document
   , docUndo = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone, docOverwrite = False
   , docDiscard = False
   , docCsvStash = Nothing
-  , docImage = Nothing
+  , docImage = Nothing, docSvgStash = Nothing, docPdfView = Nothing
   , docPager = Nothing
   , docPdf = Nothing
   , docSheets = Nothing
@@ -631,7 +673,7 @@ imageLoaded path frames ed = touchRecent path $ refreshImage $ ensureVisible ed
   , edDialog = Nothing, edSearchMode = False
   , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
   , edCsv = Nothing, edCsvStash = Nothing
-  , edImage = Just (mkImageDoc frames)
+  , edImage = Just (mkImageDoc frames), edSvgStash = Nothing, edPdfView = Nothing
   }
   where img = case frames of ((i, _) : _) -> i
                              []           -> error "imageLoaded: empty frame list"
@@ -670,7 +712,7 @@ pagerLoaded pg ed = touchRecent (pgPath pg) ed
   , edFocus = if edFocus ed == FExplorer then FExplorer else FEdit
   , edDialog = Nothing, edSearchMode = False
   , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
-  , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edRtf = Nothing, edSheets = Nothing
+  , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edSvgStash = Nothing, edPdfView = Nothing, edRtf = Nothing, edSheets = Nothing
   , edPdf = Nothing
   , edPager = Just pg
   , edHlCache = Nothing, edDiags = []
@@ -720,7 +762,7 @@ imageDocSnapshot path frames = Document
   , docFinalNewline = True, docReadOnly = True
   , docUndo = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone, docOverwrite = False
   , docDiscard = False, docCsv = Nothing, docCsvStash = Nothing
-  , docImage = Just (mkImageDoc frames)
+  , docImage = Just (mkImageDoc frames), docSvgStash = Nothing, docPdfView = Nothing
   , docPager = Nothing, docRtf = Nothing, docSheets = Nothing, docPdf = Nothing
   , docHlCache = Nothing
   , docDiags = []
@@ -742,7 +784,7 @@ pagerDocSnapshot pg = Document
   , docFinalNewline = True, docReadOnly = True
   , docUndo = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone, docOverwrite = False
   , docDiscard = False, docCsv = Nothing, docCsvStash = Nothing
-  , docImage = Nothing, docRtf = Nothing, docSheets = Nothing, docPdf = Nothing
+  , docImage = Nothing, docSvgStash = Nothing, docPdfView = Nothing, docRtf = Nothing, docSheets = Nothing, docPdf = Nothing
   , docPager = Just pg
   , docHlCache = Nothing
   , docDiags = []
@@ -754,8 +796,9 @@ pagerDocSnapshot pg = Document
 -- mode or cell pixel geometry has changed. Cheap (a key comparison) when
 -- nothing changed.
 refreshImage :: Editor -> Editor
-refreshImage ed = case edImage ed of
+refreshImage ed = case activePicture ed of
   Nothing -> ed
+  Just idoc | Just vd <- idVec idoc -> refreshVec idoc vd ed
   Just idoc ->
     let lo   = computeLayout ed
         cols = loTextWidth lo
@@ -767,9 +810,9 @@ refreshImage ed = case edImage ed of
                                                || cr /= crop || px /= pxk || fr /= idFrame idoc
                   Nothing                 -> True
     in if stale && cols > 0 && rows > 0
-         then ed { edImage = Just idoc
+         then modPicture (const idoc
                      { idCache = Just (cols, rows, idMode idoc, crop, pxk, idFrame idoc
-                                      , renderImage (cellAspect ed) (imageFitCap ed idoc) (idMode idoc) cols rows crop (idImage idoc)) } }
+                                      , renderImage (cellAspect ed) (imageFitCap ed idoc) (idMode idoc) cols rows crop (idImage idoc)) }) ed
          else ed
 
 -- | Advance the animation one frame (driver tick; a no-op unless the editor
@@ -796,13 +839,11 @@ setCellPx wh ed = refreshImage ed { edCellPx = Just wh }
 imageCrop :: ImageDoc -> (Int, Int, Int, Int)
 imageCrop idoc = case idCrop idoc of
   Just r  -> r
-  Nothing -> (0, 0, imgW (idImage idoc), imgH (idImage idoc))
+  Nothing -> let (w, h) = imageDims idoc in (0, 0, w, h)
 
 -- Update the active image doc (no-op if there isn't one).
 modImage :: (ImageDoc -> ImageDoc) -> Editor -> Editor
-modImage f ed = case edImage ed of
-  Just d  -> ed { edImage = Just (f d) }
-  Nothing -> ed
+modImage f ed = modPicture f ed
 
 -- Reset to the full-image fit.
 zoomFull :: Editor -> Editor
@@ -814,7 +855,7 @@ cellRectToCrop :: Editor -> ImageDoc -> (Int,Int,Int,Int) -> (Int,Int,Int,Int)
 cellRectToCrop ed idoc (r0,c0,r1,c1) =
   let lo = computeLayout ed
       cols = loTextWidth lo; rows = loTextHeight lo
-      img = idImage idoc
+      (iw, ih) = imageDims idoc
       (cx,cy,cw,ch) = imageCrop idoc
       (outW,outH,offX,offY) = viewFit (cellAspect ed) (imageFitCap ed idoc) cols rows cw ch
       fx k = fromIntegral cx + fromIntegral (k - offX) * fromIntegral cw / fromIntegral outW
@@ -826,10 +867,10 @@ cellRectToCrop ed idoc (r0,c0,r1,c1) =
       y1d = clampD (fromIntegral cy) (fromIntegral (cy+ch)) (fy (2*r1+2))
       -- (a drag wholly right of or below the picture clamps to its far edge,
       -- which is one past the last pixel: keep the origin on the image)
-      x0 = min (imgW img - 1) (floor x0d); x1 = ceiling x1d
-      y0 = min (imgH img - 1) (floor y0d); y1 = ceiling y1d
-      nw = max 1 (min (imgW img - x0) (x1 - x0))
-      nh = max 1 (min (imgH img - y0) (y1 - y0))
+      x0 = min (iw - 1) (floor x0d); x1 = ceiling x1d
+      y0 = min (ih - 1) (floor y0d); y1 = ceiling y1d
+      nw = max 1 (min (iw - x0) (x1 - x0))
+      nh = max 1 (min (ih - y0) (y1 - y0))
   in (max 0 x0, max 0 y0, nw, nh)
 
 -- | One scroll-wheel notch of zoom in the image view, anchored on the text-area
@@ -849,22 +890,24 @@ cellRectToCrop ed idoc (r0,c0,r1,c1) =
 -- scale, and any crop lifts the cap, so the first notch on a small image
 -- jumps to fill the window rather than growing by one step.
 wheelZoom :: Bool -> Int -> Int -> Editor -> Editor
-wheelZoom zoomIn row col ed = case edImage ed of
+wheelZoom zoomIn row col ed = case activePicture ed of
   Nothing -> ed
   Just idoc ->
     let lo = computeLayout ed
         cols = max 1 (loTextWidth lo)
         subH = 2 * max 1 (loTextHeight lo)
         a = cellAspect ed
-        img = idImage idoc
-        iw = imgW img; ih = imgH img
+        (iw, ih) = imageDims idoc
         (cx, cy, cw, ch) = imageCrop idoc
         (outW, outH, offX, offY) = viewFit a (imageFitCap ed idoc) cols (subH `div` 2) cw ch
         (fullW, _, _, _) = viewFit a (imageFitCap ed idoc { idCrop = Nothing }) cols (subH `div` 2) iw ih
         sCur  = fromIntegral outW / fromIntegral (max 1 cw) :: Double
         sFull = fromIntegral fullW / fromIntegral (max 1 iw) :: Double
-        -- never closer than four source pixels across the text area
-        sMax  = max sFull (fromIntegral cols / 4)
+        -- never closer than four source pixels across the text area; a
+        -- vector picture re-rasterises sharply at any zoom, so it is held to
+        -- a multiple of its fit instead ('vecMaxZoom')
+        sMax | isJust (idVec idoc) = sFull * vecMaxZoom
+             | otherwise = max sFull (fromIntegral cols / 4)
         s' | zoomIn    = min sMax (sCur * wheelZoomStep)
            | otherwise = sCur / wheelZoomStep
         -- the source point under the pointer (the centre of its cell; a cell
@@ -912,12 +955,567 @@ wheelZoomStep :: Double
 wheelZoomStep = 1.25
 
 setImgMode :: ImgMode -> Editor -> Editor
-setImgMode m ed = case edImage ed of
-  Just d  -> ed { edImage = Just d { idMode = m }
-                , edStatus = T.pack ("Image view: " ++ modeName m) }
+setImgMode m ed = case activePicture ed of
+  Just d  -> (modPicture (const d { idMode = m }) ed)
+                { edStatus = T.pack ("Image view: " ++ modeName m) }
   Nothing -> ed
   where modeName HalfBlock = "colour (half-block)"
         modeName Ascii     = "ASCII"
+
+------------------------------------------------------------------------------
+-- Vector pictures (SVG). The RTF view's one-way model on the image view's
+-- machinery: the text buffer stays the document (Save, Save As, Revert, the
+-- journal, the session, undo all see only it), and the picture is a
+-- /derived/ view of it — parsed by the driver (fonts and external images are
+-- IO, see "Cmedit.FontProvider"), stamped with the document's own edit
+-- counter, and re-derived whenever that counter moves. Rasters are made at
+-- exactly the size they are shown at, from the scene ("Cmedit.VecView").
+
+-- | Does this buffer begin like an SVG document (first element @<svg>@)?
+-- Looks at the first 8 KiB only.
+svgBufferLooksSvg :: Buffer -> Bool
+svgBufferLooksSvg buf = sniffSvgText (bufferHead 8192 buf)
+
+-- The first @n@ characters of a buffer, without joining the whole of it.
+bufferHead :: Int -> Buffer -> Text
+bufferHead n buf = go n (toList (Seq.take 512 (bufLines buf))) []
+  where
+    go _ [] acc = T.concat (reverse acc)
+    go k (l : ls) acc
+      | k <= 0 = T.concat (reverse acc)
+      | otherwise = let t = T.take k l in go (k - T.length t - 1) ls ("\n" : t : acc)
+
+-- | Show the active SVG as its picture: on open (svg-view = picture) and
+-- from the source view (Alt+T). The stashed picture model is reused, so a
+-- toggle with no edit in between costs nothing; an edited buffer keeps
+-- showing the old picture until the driver's re-parse lands. A fresh model
+-- takes a fresh epoch ('vdEpoch'), so nothing parsed for an earlier model of
+-- this path (before a Revert, a re-open) can be installed into it.
+enterSvg :: Editor -> Editor
+enterSvg ed
+  | not (svgBufferLooksSvg (edBuffer ed)) =
+      ed { edStatus = "This file does not look like SVG (no <svg> root element) \x2014 showing the source" }
+  | Just st <- edSvgStash ed, Just vd <- idVec st, Just err <- vdError vd, vdSeq vd == edDocSeq ed =
+      ed { edStatus = T.pack ("Cannot show this SVG: " ++ err ++ " \x2014 edit the source and press Alt+T to try again") }
+  | otherwise =
+      let (epoch, ed1) = tickVecClock ed
+          idoc = (fromMaybe (mkVectorDoc epoch) (edSvgStash ed1)) { idDrag = Nothing }
+      in refreshImage ed1 { edImage = Just idoc, edSvgStash = Nothing, edComplete = Nothing
+                          , edStatus = svgPictureStatus (fromMaybe (emptyVecDoc epoch) (idVec idoc)) }
+
+-- | Alt+T / View \x25b8 SVG Picture: swap between the picture and the source.
+-- Leaving the picture comes first and asks nothing of the path: a document
+-- can be showing its picture under a name that is no longer an SVG's (a
+-- rename), and the way back to its text must never be refused.
+toggleSvg :: Editor -> Editor
+toggleSvg ed
+  | Just idoc <- edImage ed, isJust (idVec idoc) =
+      ensureVisible ed { edImage = Nothing, edSvgStash = Just idoc { idDrag = Nothing }
+                       , edStatus = "SVG source \x2014 editable; Alt+T shows the picture" }
+  | not (isSvgFile ed) = ed { edStatus = "The picture view is only for .svg files" }
+  | isJust (edImage ed) = ed
+  | otherwise = enterSvg ed
+
+-- | A picture view under a path that is no longer an SVG's (Save As
+-- @notes.txt@, an explorer rename) goes back to its text, for good: Alt+T on
+-- a .txt would have nowhere to come back to.
+leaveSvgIfRenamed :: Editor -> Editor
+leaveSvgIfRenamed ed
+  | isJust (activeVec ed), not (isSvgFile ed) =
+      ensureVisible ed { edImage = Nothing, edSvgStash = Nothing }
+  | otherwise = ed
+
+svgPictureStatus :: VecDoc -> Text
+svgPictureStatus vd = case vdScene vd of
+  Nothing -> "Rendering SVG\x2026"
+  Just _  -> T.pack ("SVG " ++ svgSizeLabel vd ++ " \x2014 scroll or drag to zoom, Alt+T edits the source"
+                     ++ concatMap ("; " ++) (vdNotes vd))
+
+-- | The cell raster the vector picture needs right now: the virtual crop at
+-- exactly the fitted sub-pixel size of the text area.
+vecCellKey :: Editor -> Maybe VecKey
+vecCellKey ed = do
+  idoc <- activePicture ed
+  vd <- idVec idoc
+  _ <- vdScene vd
+  let lo = computeLayout ed
+      cols = loTextWidth lo; rows = loTextHeight lo
+      crop@(_, _, cw, ch) = imageCrop idoc
+      (outW, outH, _, _) = viewFit (cellAspect ed) Nothing cols rows cw ch
+  if cols <= 0 || rows <= 0 then Nothing else Just (VecKey (vdSceneId vd) crop outW outH)
+
+-- | The cell raster to render on a background job: wanted and not held (or
+-- held only as a truncated synchronous raster), and not already known to
+-- fail. The driver checks this before every frame. Not requested while a
+-- pixel placement actually covers the cells ('imageOverlayActive', which for
+-- a vector picture means the placement exists, not merely that one is
+-- wanted), so a slow or refused overlay still leaves the cell picture.
+vecCellWant :: Editor -> Maybe (VecKey, Scene)
+vecCellWant ed = do
+  if imageOverlayActive ed then Nothing else Just ()
+  vd <- activePicVec ed
+  sc <- vdScene vd
+  k <- vecCellKey ed
+  if vdCellsFailed vd == Just k then Nothing else Just ()
+  case vdCells vd of
+    Just (k', _) | k' == k, not (vdCellsPartial vd) -> Nothing
+    _ -> Just (k, sc)
+
+-- Re-derive the vector picture's cell grid: rasterise synchronously when the
+-- scene is cheap (under a small work budget: a scene that runs out of it is
+-- shown truncated and redone by the job), otherwise keep the grid it has
+-- (stale but on screen) and let the driver's job deliver the new raster
+-- ('vecCellsRendered').
+refreshVec :: ImageDoc -> VecDoc -> Editor -> Editor
+refreshVec idoc vd ed =
+  let lo   = computeLayout ed
+      cols = loTextWidth lo
+      rows = loTextHeight lo
+      pxk  = cellPxKey ed
+      vd1 = case (vecCellKey ed, vdScene vd) of
+        (Just k, Just sc)
+          | maybe True ((/= k) . fst) (vdCells vd), vdCost vd <= vecSyncCostMax
+          , Just (img, st) <- rasterVecWith vecSyncBudget sc (vkCrop k) (vkW k) (vkH k) ->
+              vd { vdCells = Just (k, img), vdCellsPartial = rsExhausted st, vdExhausted = False
+                 , vdRasterNotes = filter (/= vecTruncatedText) (rasterNoteList st) }
+        _ -> vd
+      grid = case vdCells vd1 of
+        Just (k, img) ->
+          let offX = (cols - vkW k) `div` 2; offY = (2 * rows - vkH k) `div` 2
+              key = (cols, rows, idMode idoc, vkCrop k, pxk, vkScene k)
+              fresh = case idCache idoc of
+                Just (c, r, m, cr, px, fr, _) -> (c, r, m, cr, px, fr) == key
+                Nothing -> False
+          in if fresh then idCache idoc
+             else Just (cols, rows, idMode idoc, vkCrop k, pxk, vkScene k
+                       , renderImagePlaced (idMode idoc) cols rows (vkW k, vkH k, offX, offY)
+                                           (0, 0, vkW k, vkH k) img)
+        Nothing -> idCache idoc
+  in if cols <= 0 || rows <= 0 then ed
+     else modPicture (const idoc { idVec = Just vd1, idCache = grid }) ed
+
+-- | The identity of one parse request: path, picture epoch, edit counter.
+data SvgWant = SvgWant
+  { swPath  :: !FilePath
+  , swEpoch :: !Int
+  , swSeq   :: !Int
+  } deriving (Eq, Show)
+
+-- | What the driver should parse, if anything: the active document's
+-- picture, when it is showing and the buffer has moved past the version it
+-- was parsed from. Only the showing picture: a stash (the source is on
+-- screen) is re-parsed when Alt+T brings it back, so typing in the source
+-- never queues parses nobody is looking at.
+svgParseWant :: Editor -> Maybe SvgWant
+svgParseWant ed = do
+  p <- edPath ed
+  vd <- activeVec ed
+  if vdSeq vd /= edDocSeq ed then Just (SvgWant p (vdEpoch vd) (edDocSeq ed)) else Nothing
+
+-- | A parse finished (driver callback): the request it answers, the scene id
+-- the driver gave it, whether it had to be drawn before font discovery
+-- finished, and the scene or the reason there is none. Applied only to the
+-- very picture model that asked (same path, epoch and edit counter). A
+-- failure leaves the picture view for the source, with the reason.
+svgParsed :: SvgWant -> Int -> Bool -> Either String (Scene, SceneSize, [String]) -> Editor -> Editor
+svgParsed w sceneId fontless res ed
+  | edPath ed /= Just (swPath w) || edDocSeq ed /= swSeq w = ed
+  | otherwise = case edImage ed of
+      Just idoc | Just vd <- idVec idoc, vdEpoch vd == swEpoch w -> case res of
+        Right (sc, sz, notes) ->
+          let b = scBounds sc
+              size = (rectW b, rectH b)
+              -- Drawn without fonts because discovery had not finished: if it
+              -- has finished since, redraw now (a fresh epoch, so this one is
+              -- not mistaken for the redraw); otherwise 'fontsReady' will.
+              (redo, ed1) = if fontless && edFontsReady ed then let (e, ed') = tickVecClock ed in (Just e, ed')
+                            else (Nothing, ed)
+              vd' = vd { vdScene = Just sc, vdSceneId = sceneId
+                       , vdSeq = if isJust redo then -1 else swSeq w
+                       , vdEpoch = fromMaybe (vdEpoch vd) redo
+                       , vdFontless = fontless && isNothing redo
+                       , vdSize = size, vdCost = szCost sz, vdBytes = szBytes sz, vdNotes = notes, vdError = Nothing
+                       , vdCellsFailed = Nothing }
+              keepCrop = vecDims size == vecDims (vdSize vd) && isJust (vdScene vd)
+              idoc' = idoc { idVec = Just vd', idCrop = if keepCrop then idCrop idoc else Nothing }
+          in refreshImage ed1 { edImage = Just idoc', edStatus = svgPictureStatus vd' }
+        Left err ->
+          let vd' = vd { vdSeq = swSeq w, vdError = Just err }
+          in ensureVisible ed { edImage = Nothing, edSvgStash = Just idoc { idVec = Just vd', idDrag = Nothing }
+                              , edStatus = T.pack ("Cannot show this SVG: " ++ err ++ " \x2014 showing the source") }
+      _ -> ed
+
+-- | Font discovery finished (driver callback): every picture that was drawn
+-- without its fonts, active, stashed or in the zipper, is redrawn when it is
+-- next shown. Each gets a fresh epoch, and keeps its old scene on screen
+-- until the redraw lands.
+fontsReady :: Editor -> Editor
+fontsReady ed0 =
+  let ed = ed0 { edFontsReady = True }
+      bump e mid = case mid >>= \i -> fmap ((,) i) (idVec i) of
+        Just (i, vd) | vdFontless vd ->
+          let (ep, e') = tickVecClock e
+          in (e', Just i { idVec = Just vd { vdEpoch = ep, vdSeq = -1, vdFontless = False } })
+        _ -> (e, mid)
+      (ed1, img') = bump ed (edImage ed)
+      (ed2, st')  = bump ed1 (edSvgStash ed1)
+      goDocs e [] = (e, [])
+      goDocs e (d : ds) =
+        let (e1, di) = bump e (docImage d)
+            (e2, ds') = bump e1 (docSvgStash d)
+            (e3, rest) = goDocs e2 ds
+        in (e3, d { docImage = di, docSvgStash = ds' } : rest)
+      (ed3, before) = goDocs ed2 (edBefore ed2)
+      (ed4, after) = goDocs ed3 (edAfter ed3)
+  in ed4 { edImage = img', edSvgStash = st', edBefore = before, edAfter = after
+          , edPdfView = fmap pdfFontsReady (edPdfView ed4) }
+
+-- | A background cell raster finished (driver callback). Kept when it is of
+-- the scene still showing; the grid is rebuilt from it.
+vecCellsRendered :: VecKey -> Image -> Bool -> [String] -> Editor -> Editor
+vecCellsRendered k img exhausted notes ed = case activePicture ed of
+  Just idoc | Just vd <- idVec idoc, vdSceneId vd == vkScene k, imgW img == vkW k, imgH img == vkH k ->
+    -- (the grid is rebuilt even for the same key: this raster may replace a
+    -- truncated synchronous one)
+    let ed1 = refreshImage (modPicture (const idoc { idCache = Nothing
+                                                    , idVec = Just vd { vdCells = Just (k, img), vdExhausted = exhausted
+                                                                      , vdRasterNotes = filter (/= vecTruncatedText) notes
+                                                                      , vdCellsPartial = False, vdCellsFailed = Nothing } }) ed)
+    in if null notes then ed1 else ed1 { edStatus = T.pack (intercalate "; " notes) }
+  _ -> ed
+
+-- | A background cell raster failed (driver callback): remember the key, so
+-- the request is not repeated every frame, and say so.
+vecCellsFailed :: VecKey -> Editor -> Editor
+vecCellsFailed k ed = case activePicture ed of
+  Just idoc | Just vd <- idVec idoc, vdSceneId vd == vkScene k ->
+    (modPicture (const idoc { idVec = Just vd { vdCellsFailed = Just k } }) ed)
+       { edStatus = "This view of the picture could not be drawn" }
+  _ -> ed
+
+-- | What the status line says when a raster ran out of budget.
+vecTruncatedNote :: Text
+vecTruncatedNote = T.pack vecTruncatedText
+
+-- | Bound the memory the inactive SVG documents hold: only the
+-- 'vecKeepScenes' most recently shown keep their scenes (within
+-- 'vecKeepCost'); the rest drop their scene, cell raster and grid and
+-- re-parse when next shown. The active document is never trimmed. Run after
+-- every document switch ('restoreDoc').
+trimVecScenes :: Editor -> Editor
+trimVecScenes ed =
+  let slots = [ (i, which, vd) | (i, d) <- zip [0 :: Int ..] (edBefore ed ++ edAfter ed)
+                               , (which, Just im) <- [(0 :: Int, docImage d), (1, docSvgStash d)]
+                               , Just vd <- [idVec im], isJust (vdScene vd) ]
+      keep = keepScenes vecKeepScenes vecKeepCost [ (vdUsed vd, vdCost vd) | (_, _, vd) <- slots ]
+      dropSet = [ (i, which) | ((i, which, _), k) <- zip slots keep, not k ]
+      dropIm im = im { idCache = Nothing
+                     , idVec = fmap (\vd -> vd { vdScene = Nothing, vdCells = Nothing, vdSeq = -1 }) (idVec im) }
+      fixDoc (i, d) =
+        d { docImage = if (i, 0) `elem` dropSet then fmap dropIm (docImage d) else docImage d
+          , docSvgStash = if (i, 1) `elem` dropSet then fmap dropIm (docSvgStash d) else docSvgStash d }
+      nb = length (edBefore ed)
+      docs' = map fixDoc (zip [0 ..] (edBefore ed ++ edAfter ed))
+  in if null dropSet then ed else ed { edBefore = take nb docs', edAfter = drop nb docs' }
+
+
+
+------------------------------------------------------------------------------
+-- PDF page view. A mode of the PDF view, not an image document: the
+-- document stays 'edPdf', and 'edPdfView' adds a vector picture of one page
+-- ('pvPic') that the picture machinery reaches through 'activePicture'. The
+-- page's scene comes from the driver (a background job runs
+-- 'Cmedit.PdfRender.renderPage', fonts first), keyed by (path, epoch, page),
+-- exactly as an SVG's parse is keyed by (path, epoch, edit counter); a PDF
+-- has no edit counter, but it has pages.
+
+-- | The identity of one page-scene request.
+data PageWant = PageWant
+  { pwPath  :: !FilePath
+  , pwEpoch :: !Int
+  , pwPage  :: !Int
+  } deriving (Eq, Show)
+
+-- | How many page dictionaries the file has (the page view's page count:
+-- extraction may have stopped short of them on a budget, rendering need not).
+pdfSourcePages :: PdfDoc -> Int
+pdfSourcePages pd = max 1 (Seq.length (Pdf.srcPages (pdSource pd)))
+
+-- | A page's displayed size in points: its crop box, with @/Rotate@ applied.
+-- Cheap (a dictionary lookup), so a page's picture has its true aspect from
+-- the first frame, before its scene exists.
+pdfPageSize :: PdfDoc -> Int -> (Double, Double)
+pdfPageSize pd n = case Pdf.pdfPageSource pd n of
+  Nothing -> (612, 792)
+  Just (f, d) ->
+    let Rect x0 y0 x1 y1 = PO.pageCropBox f d
+        w = max 1 (x1 - x0); h = max 1 (y1 - y0)
+    in if PO.pageRotation f d `elem` [90, 270] then (h, w) else (w, h)
+
+-- A page's picture with no scene yet.
+pagePicture :: Int -> PdfDoc -> Int -> ImageDoc
+pagePicture epoch pd n =
+  let im = mkVectorDoc epoch
+  in im { idVec = fmap (\vd -> vd { vdSize = pdfPageSize pd n }) (idVec im) }
+
+-- | The page view's initial state for a freshly opened PDF. @pdf-view =
+-- auto@ shows pages when the terminal draws pixels; when it chose reflow for
+-- want of them it remembers that ('pvAutoPending'), because the probe
+-- replies arrive after the first frame.
+newPdfView :: Int -> Config -> Bool -> PdfDoc -> PdfView
+newPdfView epoch cfg gfx pd =
+  let (on, pending) = case cfgPdfView cfg of
+        PdfViewPage   -> (True, False)
+        PdfViewReflow -> (False, False)
+        PdfViewAuto   -> (gfx, not gfx)
+  in PdfView { pvOn = on, pvManual = False, pvAutoPending = pending
+             , pvPage = 1, pvPages = pdfSourcePages pd, pvEpoch = epoch
+             , pvPic = pagePicture epoch pd 1, pvScenes = []
+             , pvFailed = [], pvNoFit = [], pvLeftAt = Nothing }
+
+-- | Drop every scene a page view holds (an inactive document keeps none);
+-- the current page re-parses when the document is shown again.
+dropPageScenes :: PdfView -> PdfView
+dropPageScenes pv =
+  let pic = pvPic pv
+  in pv { pvScenes = []
+        , pvPic = pic { idCache = Nothing
+                      , idVec = fmap (\vd -> vd { vdScene = Nothing, vdCells = Nothing, vdSeq = -1
+                                                , vdCellsPartial = False, vdCellsFailed = Nothing }) (idVec pic) } }
+
+-- | Alt+T / View ▸ Page View in a PDF: switch reflow ↔ page, keeping the
+-- place. Reflow → page lands on the page holding the reflow window's top
+-- line; page → reflow lands on that page's first line. A manual choice
+-- sticks: @pdf-view = auto@ never switches this document again.
+togglePdfPage :: Editor -> Editor
+togglePdfPage ed = case (edPdf ed, edPdfView ed) of
+  (Just pd, Just pv)
+    | pvOn pv ->
+        let pd' = Pdf.pdfGoToPage (pdfHeight ed) (min (Pdf.pdfPageCount pd) (pvPage pv)) pd
+        in ed { edPdf = Just pd', edPdfView = Just pv { pvOn = False, pvManual = True, pvAutoPending = False
+                                                       , pvLeftAt = Just (pdTop pd') }
+              , edStatus = "Reflow view \x2014 select, copy and find the text; Alt+T shows the pages" }
+    | otherwise -> enterPageView True ed
+  _ -> ed { edStatus = "The page view is only for PDF files" }
+
+-- Show the page view on the reflow view's current page.
+enterPageView :: Bool -> Editor -> Editor
+enterPageView manual ed = case (edPdf ed, edPdfView ed) of
+  (Just pd, Just pv) ->
+    -- 'pvPage' stays authoritative while the reflow window is where leaving
+    -- put it; only a window the user (or a find) has moved since says
+    -- which page to show.
+    let n | pvLeftAt pv == Just (pdTop pd) = pvPage pv
+          | otherwise = max 1 (min (pvPages pv) (reflowPageAt pd))
+        pv1 = pv { pvOn = True, pvManual = pvManual pv || manual, pvAutoPending = False, pvLeftAt = Nothing }
+        ed1 = ed { edPdfView = Just pv1, edComplete = Nothing }
+        ed2 = if n == pvPage pv then ed1 else pdfTurnTo n ed1
+    in refreshImage ed2 { edStatus = pageStatusNote ed2 }
+  _ -> ed
+
+-- The page the reflow window is showing, for the page view to open on.
+-- 'Pdf.pdfCurrentPage' counts every page whose first line is at or above the
+-- window's top, which is right for reading but wrong here when pages have no
+-- text: a cover image and the page after it start on the same laid-out line,
+-- and a fresh document then opened its page view on page 2. Of the pages
+-- starting on that line, the first is the one the window shows.
+reflowPageAt :: PdfDoc -> Int
+reflowPageAt pd =
+  let cur = Pdf.pdfCurrentPage pd
+      start = Pdf.pdfPageLine cur pd
+  in case [ k | k <- [1 .. cur], Pdf.pdfPageLine k pd == start ] of
+       (k : _) -> k
+       [] -> cur
+
+-- The status-line note on entering the page view: on a terminal that cannot
+-- draw pixels the page is a thumbnail in cells, and reading it means reflow.
+pageStatusNote :: Editor -> Text
+pageStatusNote ed
+  | edGfxCaps ed = "Page view \x2014 PgUp/PgDn turn pages, Ctrl+wheel or +/- zoom, Alt+T for text"
+  | otherwise = "Page view (thumbnail: this terminal shows no pixels) \x2014 Alt+T to read the text"
+
+-- | Caps arrived (driver callback, after 'setGfxCaps'): every PDF that
+-- @pdf-view = auto@ opened in reflow for want of pixels switches to the
+-- page view, once, unless its user already chose a mode.
+pdfCapsArrived :: Editor -> Editor
+pdfCapsArrived ed0
+  | not (edGfxCaps ed0) = ed0
+  | otherwise =
+      let ed1 = case edPdfView ed0 of
+            Just pv | pvAutoPending pv && not (pvManual pv) && isJust (edPdf ed0) -> enterPageView False ed0
+            _ -> ed0
+          fixDoc d = case (docPdf d, docPdfView d) of
+            (Just pd, Just pv) | pvAutoPending pv && not (pvManual pv) ->
+              let n = max 1 (min (pvPages pv) (reflowPageAt pd))
+              in d { docPdfView = Just pv { pvOn = True, pvAutoPending = False, pvPage = n
+                                          , pvPic = pagePicture (pvEpoch pv) pd n, pvScenes = [] } }
+            _ -> d
+      in ed1 { edBefore = map fixDoc (edBefore ed1), edAfter = map fixDoc (edAfter ed1) }
+
+-- | Turn to page @n@ (clamped). The page being left goes into the scene
+-- cache, the page arriving comes out of it when it is there (so a
+-- prefetched PgDn is instant) and otherwise waits for its parse; the cache
+-- is then held to the new page ±1 within 'vecKeepCost'. The view returns to
+-- the fit on every turn.
+pdfTurnTo :: Int -> Editor -> Editor
+pdfTurnTo n0 ed = case (edPdf ed, edPdfView ed) of
+  (Just pd, Just pv) | pvOn pv ->
+    let n = max 1 (min (pvPages pv) n0)
+        cur = pvPage pv
+        old = pvPic pv
+        leaving = case idVec old of
+          Just vd | Just sc <- vdScene vd, vdSeq vd == cur ->
+            [(cur, PageScene (vdSceneId vd) sc (vdNotes vd) (vdFontless vd) (SceneSize (vdCost vd) (vdBytes vd)))]
+          _ -> []
+        pool = leaving ++ filter ((/= cur) . fst) (pvScenes pv)
+        fresh = (pagePicture (pvEpoch pv) pd n) { idMode = idMode old }
+        pic = case (lookup n pool, lookup n (pvFailed pv)) of
+          (Just ps, _) -> fresh { idVec = fmap (\vd -> installPageScene n ps vd) (idVec fresh) }
+          -- a page that already failed in this opening shows its error at
+          -- once, rather than being parsed (and failing) again
+          (_, Just err) -> fresh { idVec = fmap (\vd -> vd { vdSeq = n, vdError = Just err }) (idVec fresh) }
+          _ -> fresh
+        cache = trimPageCache n (filter ((/= n) . fst) pool)
+        note = case lookup n (pvFailed pv) of
+          Just err -> T.pack ("Page " ++ show n ++ " could not be drawn: " ++ err)
+          Nothing -> edStatus ed
+    in if n == cur then ed
+       else refreshImage ed { edPdfView = Just pv { pvPage = n, pvPic = pic, pvScenes = cache, pvNoFit = [] }
+                            , edStatus = note }
+  _ -> ed
+
+installPageScene :: Int -> PageScene -> VecDoc -> VecDoc
+installPageScene n ps vd =
+  let b = scBounds (psScene ps)
+  in vd { vdScene = Just (psScene ps), vdSceneId = psSceneId ps, vdSeq = n
+        , vdSize = (rectW b, rectH b), vdCost = szCost (psSize ps), vdBytes = szBytes (psSize ps)
+        , vdNotes = psNotes ps, vdFontless = psFontless ps, vdError = Nothing
+        , vdCells = Nothing, vdCellsPartial = False, vdCellsFailed = Nothing }
+
+-- Hold the scene cache to the pages beside @n@ (at most 'vecKeepScenes')
+-- within 'vecKeepCost', nearest first: 'keepScenes' with recency = closeness.
+trimPageCache :: Int -> [(Int, PageScene)] -> [(Int, PageScene)]
+trimPageCache n pool =
+  let near = [ e | e@(p, _) <- pool, abs (p - n) <= 1 ]
+      -- the next page ranks above the previous (reading goes forward), so
+      -- when only one fits the choice is deterministic, not "the newest";
+      -- and the budget is the scenes' /memory/ ('szBytes', measured by the job), which for a
+      -- real page is its decoded images, with no exception for the first:
+      -- a neighbour too big for 'pageKeepBytes' is simply not kept
+      ranked = sortOn (\(p, _) -> 2 * abs (p - n) + (if p < n then 1 else 0)) near
+      pick _ [] = []
+      pick used (e@(_, ps) : rest)
+        | used + b <= pageKeepBytes = e : pick (used + b) rest
+        | otherwise = pick used rest
+        where b = szBytes (psSize ps)
+      kept = map fst (pick 0 ranked)
+  in [ e | e@(p, _) <- near, p `elem` kept ]
+
+-- | The current page's scene to request, when it has none.
+pdfPageWant :: Editor -> Maybe PageWant
+pdfPageWant ed = do
+  p <- edPath ed
+  pv <- edPdfView ed
+  if pageViewOn ed then Just () else Nothing
+  vd <- idVec (pvPic pv)
+  if vdSeq vd /= pvPage pv then Just (PageWant p (pvEpoch pv) (pvPage pv)) else Nothing
+
+-- | The page to prefetch, once the current one is settled (its scene is in
+-- and its cell picture drawn): the next page, then the previous, if not
+-- cached already. The driver adds its own condition (no job in flight).
+pdfPrefetchWant :: Editor -> Maybe PageWant
+pdfPrefetchWant ed = do
+  p <- edPath ed
+  pv <- edPdfView ed
+  if pageViewOn ed then Just () else Nothing
+  vd <- idVec (pvPic pv)
+  _ <- vdScene vd
+  if vdSeq vd == pvPage pv && isNothing (vecCellWant ed) then Just () else Nothing
+  n <- listToMaybe [ k | k <- [pvPage pv + 1, pvPage pv - 1], k >= 1, k <= pvPages pv
+                       , isNothing (lookup k (pvScenes pv))
+                       , isNothing (lookup k (pvFailed pv))   -- failed: never again
+                       , k `notElem` pvNoFit pv ]              -- did not fit: not for this page
+  pure (PageWant p (pvEpoch pv) n)
+
+-- | A page scene arrived (driver callback): installed when it is the
+-- current page of the very view that asked for it, cached when it is a
+-- neighbour, dropped otherwise (another document, another opening of this
+-- one, a page since left behind).
+pdfPageParsed :: PageWant -> Int -> Bool -> Either String (Scene, SceneSize, [String]) -> Editor -> Editor
+pdfPageParsed w sid fontless res ed = case edPdfView ed of
+  Just pv | edPath ed == Just (pwPath w), pvEpoch pv == pwEpoch w, isJust (edPdf ed) -> case res of
+    Right (sc, sz, notes)
+      | pwPage w == pvPage pv ->
+          let pic = pvPic pv
+              ps = PageScene sid sc notes fontless sz
+              -- Drawn before font discovery finished, but the fonts have
+              -- arrived since: show it, and redraw at once (as 'svgParsed').
+              redo = fontless && edFontsReady ed
+              install vd = (installPageScene (pwPage w) ps vd)
+                             { vdSeq = if redo then -1 else pwPage w, vdFontless = fontless && not redo }
+              pic' = pic { idCache = idCache pic, idVec = fmap install (idVec pic) }
+              ed1 = refreshImage ed { edPdfView = Just pv { pvPic = pic' } }
+          in if null notes || not (pvOn pv) then ed1
+             else ed1 { edStatus = T.pack ("Page " ++ show (pwPage w) ++ ": " ++ intercalate "; " notes) }
+      | abs (pwPage w - pvPage pv) <= 1 ->
+          let pool = (pwPage w, PageScene sid sc notes fontless sz) : filter ((/= pwPage w) . fst) (pvScenes pv)
+              -- a fontless neighbour, once fonts are known, is not worth keeping
+              pool' = if fontless && edFontsReady ed then filter ((/= pwPage w) . fst) pool else pool
+              kept = trimPageCache (pvPage pv) pool'
+              -- whatever the budget could not keep (the arrival or a page it
+              -- displaced) is not prefetched again for this page
+              lost = [ q | (q, _) <- pool, abs (q - pvPage pv) <= 1, isNothing (lookup q kept) ]
+          in ed { edPdfView = Just pv { pvScenes = kept, pvNoFit = lost ++ filter (`notElem` lost) (pvNoFit pv) } }
+      | otherwise -> ed
+    Left err ->
+      let pv1 = pv { pvFailed = (pwPage w, err) : filter ((/= pwPage w) . fst) (pvFailed pv) }
+      in if pwPage w == pvPage pv
+           then let pic = pvPic pv
+                    pic' = pic { idVec = fmap (\vd -> vd { vdSeq = pwPage w, vdError = Just err }) (idVec pic) }
+                in ed { edPdfView = Just pv1 { pvPic = pic' }
+                      , edStatus = T.pack ("Page " ++ show (pwPage w) ++ " could not be drawn: " ++ err) }
+           else ed { edPdfView = Just pv1 }
+  _ -> ed
+
+-- | The next page's overlay as a turn would ask for it, without turning: its
+-- cached scene id and size, at the fit. The driver sizes the payload from
+-- this ('gfxFitVector') and prefetches it; nothing is rasterised here (the
+-- first version simulated the turn, which re-ran the synchronous cell
+-- raster for the next page on every frame).
+pdfNextPageFit :: Editor -> Maybe (Int, Scene, (Int, Int, Int, Int))
+pdfNextPageFit ed = do
+  pv <- edPdfView ed
+  if pageViewOn ed && isNothing (idCrop (pvPic pv)) then Just () else Nothing
+  ps <- lookup (pvPage pv + 1) (pvScenes pv)
+  let b = scBounds (psScene ps)
+      (vw, vh) = vecDims (rectW b, rectH b)
+  pure (psSceneId ps, psScene ps, (0, 0, vw, vh))
+
+-- | Fonts arrived: a page drawn without them (and any cached one) is redrawn.
+pdfFontsReady :: PdfView -> PdfView
+pdfFontsReady pv =
+  let pic = pvPic pv
+      stale = maybe False vdFontless (idVec pic) || any (psFontless . snd) (pvScenes pv)
+  in if not stale then pv
+     else pv { pvScenes = filter (not . psFontless . snd) (pvScenes pv)
+             , pvPic = pic { idVec = fmap (\vd -> if vdFontless vd then vd { vdSeq = -1, vdFontless = False } else vd) (idVec pic) } }
+
+-- | Pan a zoomed page by a fraction of the view (arrow keys), clamped to the
+-- page.
+pdfPan :: Double -> Double -> Editor -> Editor
+pdfPan fx fy ed = case activePicture ed of
+  Just pic | Just (x, y, w, h) <- idCrop pic ->
+    let (iw, ih) = imageDims pic
+        nx = max 0 (min (iw - w) (x + round (fx * fromIntegral w)))
+        ny = max 0 (min (ih - h) (y + round (fy * fromIntegral h)))
+    in refreshImage (modPicture (\p -> p { idCrop = Just (nx, ny, w, h) }) ed)
+  _ -> ed
+
+-- | Zoom one step about the centre of the text area (+ and - keys).
+pdfZoomCentre :: Bool -> Editor -> Editor
+pdfZoomCentre zin ed =
+  let lo = computeLayout ed
+  in wheelZoom zin (loTextHeight lo `div` 2) (loTextWidth lo `div` 2) ed
 
 -- Cycle to the next open file, wrapping around at the end.
 nextFile :: Editor -> Editor
@@ -1388,7 +1986,7 @@ doNew ed0 = ensureVisible ed
   , edUndo = Seq.empty, edRedo = Seq.empty, edLastEdit = EKNone
   , edStatus = "New file", edFocus = FEdit, edDialog = Nothing, edSearchMode = False
   , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
-  , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edRtf = Nothing, edSheets = Nothing
+  , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edSvgStash = Nothing, edPdfView = Nothing, edRtf = Nothing, edSheets = Nothing
   , edPdf = Nothing
   }
   where ed = freshDocId ed0
@@ -1424,7 +2022,7 @@ openManual ed0 = case findOpenIndex manualPath ed of
          , edStatus = manualStatus
          , edFocus = FEdit, edDialog = Nothing, edSearchMode = False
          , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
-         , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edRtf = Nothing, edSheets = Nothing
+         , edCsv = Nothing, edCsvStash = Nothing, edImage = Nothing, edSvgStash = Nothing, edPdfView = Nothing, edRtf = Nothing, edSheets = Nothing
          , edPdf = Nothing
          }
   where
@@ -1493,7 +2091,7 @@ exportSuggestion ed
 saveAsRefusal :: Editor -> Maybe String
 saveAsRefusal ed
   | isJust (exportSuggestion ed) = Nothing
-  | isJust (edImage ed)  = Just "There is no text in an image to save"
+  | bufferlessImage (edImage ed) = Just "There is no text in an image to save"
   | isJust (edPager ed)  = Just "This file is open read-only \x2014 it is already on disk as it is"
   | otherwise            = Nothing
 
@@ -1524,7 +2122,7 @@ exportOverSourceMsg = "That is the file this view came from \x2014 choose anothe
 saveAsTo :: FilePath -> Editor -> (Editor, [Effect])
 saveAsTo p ed0 = case exportSuggestion ed of
   Just (_, txt) -> (ed, [EffExportTo p txt])
-  Nothing       -> (ed { edPath = Just p }, [EffSaveTo p])
+  Nothing       -> (leaveSvgIfRenamed ed { edPath = Just p }, [EffSaveTo p])
   where ed = ed0 { edSaveAsTarget = Nothing }
 
 -- | Save As named a file that already exists and is not this document's own:
@@ -1591,7 +2189,7 @@ openPathsList = mapMaybe docPath . allOpenDocs
 -- | Move the cursor to a match once its file is the active document. Kept as a
 -- pending action so it also works after an async (large-file) load completes.
 applyPendingJump :: Editor -> Editor
-applyPendingJump ed = case edPendingJump ed of
+applyPendingJump ed0 = case edPendingJump ed of
   Just (p, l, c, len) | edPath ed == Just p, isNothing (edImage ed), isNothing (edPdf ed) ->
     let buf = edBuffer ed
         a = clampPos (Pos l c) buf
@@ -1600,6 +2198,12 @@ applyPendingJump ed = case edPendingJump ed of
                         , edDesiredCol = colToDisplay (tabWidthOf ed) (posCol b) (getLine' (posLine b) buf)
                         , edFocus = FEdit }
   _ -> ed
+  where
+    -- A match is a position in an SVG's markup, which the picture does not
+    -- show: land in the source view, the way an RTF match opens its markup.
+    ed = case edPendingJump ed0 of
+      Just (p, _, _, _) | edPath ed0 == Just p, isJust (activeVec ed0) -> toggleSvg ed0
+      _ -> ed0
 
 -- Open the file for a match and jump to it (already-open files switch instantly;
 -- others load via EffOpen and the jump applies on completion). Records the
@@ -1918,7 +2522,7 @@ recoveredDoc it = Document
   , docFinalNewline = jFinalNewline j, docReadOnly = jReadOnly j
   , docUndo = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone
   , docOverwrite = False, docDiscard = False
-  , docCsvStash = Nothing, docImage = Nothing, docPager = Nothing
+  , docCsvStash = Nothing, docImage = Nothing, docSvgStash = Nothing, docPdfView = Nothing, docPager = Nothing
   , docPdf = Nothing, docSheets = Nothing, docHlCache = Nothing, docDiags = []
     -- 'Csv.markUnsaved' for exactly the reason 'docSavedBuffer' is empty above,
     -- and it has to be said twice because the table carries its own baseline:

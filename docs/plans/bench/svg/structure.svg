@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="200">
+<switch><rect requiredExtensions="http://example.org/ext" x="10" y="10" width="40" height="40" fill="red"/><rect systemLanguage="fr" x="10" y="10" width="40" height="40" fill="red"/><rect x="10" y="10" width="40" height="40" fill="green"/></switch>
+<g display="none"><rect x="60" y="10" width="40" height="40" fill="red"/></g>
+<g visibility="hidden"><rect x="60" y="10" width="40" height="40" fill="red"/><rect x="110" y="10" width="40" height="40" fill="blue" visibility="visible"/></g>
+<a href="https://example.org"><rect x="160" y="10" width="30" height="40" fill="purple"/></a>
+<rect x="10" y="60" width="40" height="40" fill="orange" stroke="black" stroke-width="8" paint-order="stroke"/>
+<rect x="60" y="60" width="40" height="40" fill="orange" stroke="black" stroke-width="8"/>
+<g transform="scale(3 1)"><rect x="40" y="60" width="15" height="40" fill="none" stroke="black" stroke-width="2" vector-effect="non-scaling-stroke"/></g>
+<g style="mix-blend-mode: multiply"><circle cx="40" cy="150" r="30" fill="cyan"/></g>
+<circle cx="70" cy="150" r="30" fill="magenta" style="mix-blend-mode: multiply"/>
+<g opacity="0.5" style="isolation: isolate"><circle cx="140" cy="140" r="25" fill="red"/><circle cx="160" cy="160" r="25" fill="blue"/></g>
+<foreignObject x="0" y="0" width="10" height="10"><div xmlns="http://www.w3.org/1999/xhtml">x</div></foreignObject>
+</svg>

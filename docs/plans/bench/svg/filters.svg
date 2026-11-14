@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="200">
+<defs>
+<filter id="blur"><feGaussianBlur stdDeviation="3"/></filter>
+<filter id="shadow" x="-20%" y="-20%" width="150%" height="150%"><feOffset in="SourceAlpha" dx="4" dy="4" result="o"/><feGaussianBlur in="o" stdDeviation="2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+<filter id="flood"><feFlood flood-color="gold" flood-opacity="0.5"/><feComposite in2="SourceGraphic" operator="in"/></filter>
+<filter id="cm"><feColorMatrix type="saturate" values="0"/></filter>
+<filter id="hue"><feColorMatrix type="hueRotate" values="120"/></filter>
+<filter id="ds"><feDropShadow dx="3" dy="3" stdDeviation="2" flood-color="navy"/></filter>
+<filter id="blend"><feFlood flood-color="red" result="f"/><feBlend in="SourceGraphic" in2="f" mode="multiply"/></filter>
+<filter id="arith"><feFlood flood-color="blue" result="f"/><feComposite in="SourceGraphic" in2="f" operator="arithmetic" k1="0" k2="0.5" k3="0.5" k4="0"/></filter>
+<filter id="sub" filterUnits="userSpaceOnUse" x="0" y="0" width="200" height="200"><feFlood flood-color="pink" x="150" y="150" width="40" height="40"/></filter>
+<filter id="ct"><feComponentTransfer><feFuncR type="linear" slope="0.5"/><feFuncG type="table" tableValues="1 0"/></feComponentTransfer></filter>
+</defs>
+<rect x="10" y="10" width="40" height="40" fill="red" filter="url(#blur)"/>
+<rect x="70" y="10" width="40" height="40" fill="green" filter="url(#shadow)"/>
+<circle cx="150" cy="30" r="20" fill="blue" filter="url(#flood)"/>
+<rect x="10" y="70" width="40" height="40" fill="orange" filter="url(#cm)"/>
+<rect x="70" y="70" width="40" height="40" fill="orange" filter="url(#hue)"/>
+<rect x="130" y="70" width="40" height="40" fill="lime" filter="url(#ds)"/>
+<rect x="10" y="130" width="40" height="40" fill="yellow" filter="url(#blend)"/>
+<rect x="70" y="130" width="40" height="40" fill="yellow" filter="url(#arith)"/>
+<rect x="130" y="130" width="10" height="10" fill="none" filter="url(#sub)"/>
+<rect x="100" y="180" width="40" height="15" fill="teal" filter="url(#ct)"/>
+<rect x="10" y="180" width="40" height="15" fill="black" filter="url(#missing)"/>
+<rect x="55" y="180" width="40" height="15" fill="purple" style="filter: blur(2px)"/>
+</svg>

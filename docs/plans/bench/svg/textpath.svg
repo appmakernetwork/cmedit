@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="200" font-family="DejaVu Sans, sans-serif">
+<defs><path id="arc" d="M20 120 A80 80 0 0 1 180 120"/><path id="wave" d="M10 170 C 60 130 100 210 190 160"/></defs>
+<use href="#arc" fill="none" stroke="#ccc"/>
+<text font-size="16" fill="navy"><textPath href="#arc">Text along an arc path</textPath></text>
+<text font-size="14" text-anchor="middle"><textPath xlink:href="#wave" startOffset="50%">middle of a wave</textPath></text>
+<text x="20" y="30" font-size="12" text-decoration="underline">underlined <tspan font-weight="bold">bold</tspan></text>
+</svg>

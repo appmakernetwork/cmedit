@@ -48,6 +48,8 @@ data MenuAction
   | MAToggleExplorer           -- ^ Show/focus/hide the file-explorer panel.
   | MAToggleCsv                -- ^ Toggle CSV table view (for .csv files).
   | MAToggleRtf                -- ^ Toggle the formatted RTF view (for .rtf files); shares Alt+T with 'MAToggleCsv', which no file can also be.
+  | MATogglePdfPage            -- ^ Switch a PDF between its page view (the pages as pictures) and its reflow view (Alt+T).
+  | MAToggleSvg                -- ^ Swap an SVG between the picture it draws and its source (Alt+T, for .svg/.svgz files; no file is also a CSV, RTF or container).
   | MAArchiveView              -- ^ Swap a ZIP container (.docx/.xlsx/.epub) between its rendered reading view and its archive listing. Shares Alt+T with the two toggles above for the same reason they share it: Alt+T means "show this file as the other thing it is", and a file is only ever one kind of container.
   | MAToggleFreezeHeader       -- ^ Freeze the first table row while scrolling.
   | MASortColumn               -- ^ Sort the table by the current column (toggles asc/desc).
@@ -138,6 +140,10 @@ menuBar =
       -- Mutually exclusive with the table rows above: a file is .csv or .rtf,
       -- so at most one of these groups survives 'Cmedit.Editor.pruneEntries'.
       , MEItem "For&matted View (RTF)" "Alt+T" MAToggleRtf
+      -- Likewise for .svg: the picture/source toggle.
+      , MEItem "SVG &Picture" "Alt+T" MAToggleSvg
+      -- And for a PDF: relabelled "Reflow View" while the pages show.
+      , MEItem "&Page View (PDF)" "Alt+T" MATogglePdfPage
       -- Relabelled per document ("Document View" when the listing is what is
       -- showing) and pruned unless the active file is a container that has
       -- both views.

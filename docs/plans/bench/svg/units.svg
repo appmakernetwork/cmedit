@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2in" height="54mm" viewBox="0 0 400 400">
+<rect x="10%" y="5%" width="30%" height="20%" fill="steelblue"/>
+<circle cx="75%" cy="25%" r="10%" fill="orange"/>
+<g font-size="20"><rect x="1em" y="10em" width="5em" height="3ex" fill="green"/></g>
+<rect x="1in" y="1in" width="72pt" height="6pc" fill="purple" fill-opacity="0.5"/>
+<rect x="20mm" y="70mm" width="2cm" height="10mm" fill="maroon"/>
+<line x1="0" y1="95%" x2="100%" y2="95%" stroke="black" stroke-width="1%"/>
+</svg>

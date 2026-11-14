@@ -20,10 +20,15 @@ module Cmedit.Image
   ( Image(..)
   , ImgMode(..)
   , decodeImage
+  , decodeJPEG
+  , JpegSamples(..)
+  , decodeJPEGSamples
+  , maxPixels
   , decodeFrames
   , decodeGIFFrames
   , sniffImage
   , renderImage
+  , renderImagePlaced
   , viewFit
   , scaleRGBA
   ) where
@@ -43,6 +48,7 @@ import Data.Array.Unboxed (UArray, (!), bounds)
 import qualified Data.Array.Unboxed as U
 import Data.Bits
 import Data.Char (ord)
+import Data.Maybe (fromMaybe, isJust)
 import Data.STRef
 import Data.Word (Word8, Word16, Word32)
 import Data.Int (Int16)
@@ -1206,8 +1212,58 @@ emptyHuff = Huff (A.listArray (0,16) (replicate 17 0)) (A.listArray (0,0) [0]) 1
 emptyJHuff :: JHuff
 emptyJHuff = mkJHuff emptyHuff
 
+-- | Decode a JPEG to RGBA for display.
+--
+-- Four-component (CMYK and YCCK) files are converted with the multiplicative
+-- formula @R = (1 - C)(1 - K)@, ImageMagick's (no ICC profile is
+-- interpreted; a PDF's CMYK images go through "Cmedit.PdfImage" and
+-- poppler's conversion instead), after undoing the
+-- Adobe convention when the file carries an Adobe APP14 marker: Photoshop
+-- writes CMYK /inverted/ (0 = full ink), and every reader that honours the
+-- marker (libjpeg's users, GIMP, pdf.js) un-inverts it. One- and
+-- three-component files decode exactly as they always have; in particular a
+-- three-component file is always YCbCr here, whatever its APP14 transform
+-- flag says.
 decodeJPEG :: BS.ByteString -> Either String Image
 decodeJPEG bs = do
+  (w, h, comps) <- jpegFrame bs
+  let adobe = jpegAdobeTransform bs
+      mode | length comps == 4 = JView4 (adobe == Just 2) (isJust adobe)
+           | otherwise         = JView
+  Right (decodeJpegImage mode bs w h comps)
+
+-- | A JPEG's decoded component samples, before any colour conversion beyond
+-- the JPEG-level transform: what a PDF @DCTDecode@ filter produces.
+data JpegSamples = JpegSamples
+  { jsWidth  :: !Int
+  , jsHeight :: !Int
+  , jsComps  :: !Int                  -- ^ 1, 3 or 4.
+  , jsAdobe  :: !(Maybe Int)          -- ^ The Adobe APP14 transform code (0 none, 1 YCbCr, 2 YCCK), when the marker is present.
+  , jsData   :: !(UArray Int Word8)
+      -- ^ Four bytes per pixel, row-major: component @i@ at byte @i@, unused
+      -- bytes 255. Samples are as stored (CMYK from an Adobe file is still
+      -- inverted: in a PDF the image's @\/Decode@ says what they mean).
+  }
+
+-- | Decode a JPEG to its component samples. Whether the colour transform
+-- (YCbCr to RGB for three components, YCCK to CMYK for four) is applied
+-- follows pdf.js and libjpeg: the Adobe marker's flag when there is one,
+-- else the caller's override (PDF's @\/ColorTransform@), else "yes" for three
+-- components and "no" for four.
+decodeJPEGSamples :: Maybe Bool -> BS.ByteString -> Either String JpegSamples
+decodeJPEGSamples override bs = do
+  (w, h, comps) <- jpegFrame bs
+  let n = length comps
+      adobe = jpegAdobeTransform bs
+      transform = case adobe of
+        Just t  -> t /= 0
+        Nothing -> fromMaybe (n == 3) override
+      img = decodeJpegImage (JRaw (transform && n >= 3)) bs w h comps
+  Right (JpegSamples w h n adobe (imgPix img))
+
+-- The checked frame header: dimensions and components.
+jpegFrame :: BS.ByteString -> Either String (Int, Int, [JComp])
+jpegFrame bs = do
   when' (BS.length bs < 2 || at bs 0 /= 0xFF || at bs 1 /= 0xD8) "not a JPEG file"
   fr <- findFrame bs 2
   let w = jfW fr; h = jfH fr; comps = jfComps fr
@@ -1217,8 +1273,34 @@ decodeJPEG bs = do
   when' (any (\c -> jcH c < 1 || jcH c > 4 || jcV c < 1 || jcV c > 4 || jcTq c > 3) comps)
         "bad JPEG frame header"
   when' (null comps) "JPEG missing frame header"
-  when' (not (length comps `elem` [1,3])) "unsupported JPEG component count"
-  Right (decodeJpegImage bs w h comps)
+  when' (not (length comps `elem` [1,3,4])) "unsupported JPEG component count"
+  Right (w, h, comps)
+
+-- | The transform code of an Adobe APP14 segment before the first scan, if
+-- there is one.
+jpegAdobeTransform :: BS.ByteString -> Maybe Int
+jpegAdobeTransform bs = go 2 (0 :: Int)
+  where
+    n = BS.length bs
+    go pos k
+      | k > 512 || pos + 3 >= n = Nothing
+      | at bs pos /= 0xFF = go (pos + 1) (k + 1)
+      | otherwise =
+          let m = at bs (pos + 1) in
+          if m == 0xFF then go (pos + 1) (k + 1)
+          else if m == 0xD8 || (m >= 0xD0 && m <= 0xD7) then go (pos + 2) (k + 1)
+          else if m == 0xDA || m == 0xD9 then Nothing
+          else
+            let len = be16 bs (pos + 2); seg = pos + 4 in
+            if m == 0xEE && len >= 12 && BS.take 5 (BS.drop seg bs) == fourCC "Adobe"
+              then Just (at bs (seg + 11))
+              else if len < 2 then Nothing else go (pos + 2 + len) (k + 1)
+
+-- What 'decodeJpegImage' writes into its four bytes per pixel.
+data JOut
+  = JView               -- ^ RGBA for display (one or three components).
+  | JView4 !Bool !Bool  -- ^ RGBA from four components: YCCK?, Adobe-inverted?
+  | JRaw !Bool          -- ^ Component samples; apply the YCbCr/YCCK transform?
 
 -- Walk markers to the frame (SOF) header, rejecting unsupported variants.
 findFrame :: BS.ByteString -> Int -> Either String JFrame
@@ -1468,8 +1550,8 @@ ctK i = case i of
   62 -> 0.38268343236508956
   _ -> -0.19509032201612858
 
-decodeJpegImage :: BS.ByteString -> Int -> Int -> [JComp] -> Image
-decodeJpegImage bs w h comps =
+decodeJpegImage :: JOut -> BS.ByteString -> Int -> Int -> [JComp] -> Image
+decodeJpegImage mode bs w h comps =
   buildImage "JPEG" w h $ \img -> do
     let hmax = maximum (map jcH comps)
         vmax = maximum (map jcV comps)
@@ -1789,7 +1871,61 @@ decodeJpegImage bs w h comps =
         -- 'jSample' computes it (the planes are MCU-padded, so the column
         -- clamp never binds for x < w).
         rowOf ph pw y = min (ph-1) y * pw
-    if | ncomp == 1 && f0 ->
+    let isView = case mode of JView -> True; _ -> False
+    unless isView $ do
+        -- Four components, or raw samples for a PDF. Off the display path's
+        -- tuned branches on purpose: those stay exactly as they were.
+        let ((pw3,ph3,pl3), (f3,xa3,xb3,xd3,ya3,yb3,yd3)) = tabsOf (min 3 (ncomp-1))
+            -- What to do per pixel, decided once: apply the colour transform
+            -- (YCbCr / YCCK), produce RGB for display (and from inverted
+            -- Adobe CMYK), or hand back the samples.
+            (!doTr, !toView, !inverted) = case mode of
+              JRaw tr -> (tr, False, False)
+              JView4 ycck inv -> (ycck, True, inv)
+              JView -> (False, False, False)
+            !four = ncomp >= 4
+            byte v = clamp8 (roundD v)
+            {-# INLINE byte #-}
+            put !o !a !b !c !d = do
+              unsafeWrite img o       (fromIntegral a)
+              unsafeWrite img (o + 1) (fromIntegral b)
+              unsafeWrite img (o + 2) (fromIntegral c)
+              unsafeWrite img (o + 3) (fromIntegral d)
+            {-# INLINE put #-}
+        forLoop 0 (h-1) $ \y -> forLoop 0 (w-1) $ \x -> do
+          let !o = (y*w + x)*4
+          v0 <- jSample pw0 ph0 pl0 f0 xa0 xb0 xd0 ya0 yb0 yd0 x y
+          if ncomp == 1
+            then put o (byte v0) 255 255 255
+            else do
+              v1 <- jSample pw1 ph1 pl1 f1 xa1 xb1 xd1 ya1 yb1 yd1 x y
+              v2 <- jSample pw2 ph2 pl2 f2 xa2 xb2 xd2 ya2 yb2 yd2 x y
+              v3 <- if four then jSample pw3 ph3 pl3 f3 xa3 xb3 xd3 ya3 yb3 yd3 x y
+                            else pure 255
+              -- The transform as 'ycc' computes it; YCCK's CMY is the
+              -- complement of the RGB that YCbCr would give.
+              let !cb = v1 - 128; !cr = v2 - 128
+                  !r0 = if doTr then clamp8 (roundD (v0 + 1.402*cr)) else byte v0
+                  !g0 = if doTr then clamp8 (roundD (v0 - 0.344136*cb - 0.714136*cr)) else byte v1
+                  !b0 = if doTr then clamp8 (roundD (v0 + 1.772*cb)) else byte v2
+                  !c0 = if doTr && four then 255 - r0 else r0
+                  !m0 = if doTr && four then 255 - g0 else g0
+                  !y0 = if doTr && four then 255 - b0 else b0
+                  !k0 = byte v3
+              if toView
+                then do
+                  -- Ink amounts, then the multiplicative CMYK to RGB
+                  -- (R = (1-C)(1-K)), which is ImageMagick's: measured on
+                  -- its own CMYK JPEGs, within 1 code value, where the
+                  -- naive 1-min(1,C+K) is off by 21 on average and the PDF
+                  -- renderer's sixteen-corner blend by 13.
+                  let ink v = if inverted then 255 - v else v
+                      !k = ink k0
+                      chan v = ((255 - ink v) * (255 - k) + 127) `div` 255
+                  put o (chan c0) (chan m0) (chan y0) 255
+                else put o c0 m0 y0 k0
+    when isView $ if
+       | ncomp == 1 && f0 ->
            -- A full-resolution gray sample is already a clamped byte, which
            -- the Double round trip would hand back unchanged.
            forLoop 0 (h-1) $ \y -> do
@@ -3608,13 +3744,23 @@ viewFit aspect maxScale cols rows cropW cropH =
 renderImage :: Double -> Maybe Double -> ImgMode -> Int -> Int
             -> (Int, Int, Int, Int) -> Image
             -> Array (Int, Int) Cell
-renderImage aspect maxScale mode cols rows (cropX, cropY, cropW, cropH) img =
+renderImage aspect maxScale mode cols rows crop@(_, _, cropW, cropH) img =
+  renderImagePlaced mode cols rows (viewFit aspect maxScale cols rows (max 1 cropW) (max 1 cropH)) crop img
+
+-- | 'renderImage' with the placement given rather than fitted: the crop is
+-- drawn into the @outW x outH@ sub-pixel box at @(offX, offY)@ of the
+-- @cols x 2*rows@ canvas. The vector view ("Cmedit.VecView") rasterises its
+-- scene at exactly the fitted sub-pixel size and passes that placement with
+-- the whole raster as the crop, so every sub-pixel is one rasterised pixel
+-- and nothing is resampled.
+renderImagePlaced :: ImgMode -> Int -> Int -> (Int, Int, Int, Int)
+                  -> (Int, Int, Int, Int) -> Image -> Array (Int, Int) Cell
+renderImagePlaced mode cols rows (outW, outH, offX, offY) (cropX, cropY, cropW, cropH) img =
   listArray ((0,0),(rows-1,cols-1))
     [ cellAt r c | r <- [0 .. rows-1], c <- [0 .. cols-1] ]
   where
     iw = imgW img
     cw = max 1 cropW; ch = max 1 cropH
-    (outW, outH, offX, offY) = viewFit aspect maxScale cols rows cw ch
     pix  = imgPix img
 
     -- Average source RGBA over the box that output sub-pixel (sx,sy) maps from

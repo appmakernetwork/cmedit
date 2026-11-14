@@ -15,13 +15,31 @@
 --     reader that cannot fail cannot refuse to open someone's book because
 --     one chapter has a stray @&@ in it.
 --
---   * __Namespaces by local name.__ OOXML and EPUB files disagree about
+--   * __Namespaces by local name__ (for the formats that want it). OOXML and EPUB files disagree about
 --     prefixes constantly — @w:p@ in one producer's output, a default
 --     namespace and a bare @p@ in another's — so 'localName' throws the
 --     prefix away and every consumer matches on the local part. This is what
 --     every pragmatic OOXML reader does, and it costs a namespace-resolution
 --     table that would buy nothing here: the three formats have no local-name
 --     collisions we care about.
+--
+-- "Cmedit.Svg" is the one consumer that cannot live with that: an Inkscape
+-- file puts @sodipodi:cx@ on the very elements whose @cx@ matters, and an
+-- Illustrator file wraps its fallback artwork in a namespace switch. It uses
+-- 'parseXmlQualified', the same parser with names left exactly as written,
+-- and resolves namespaces itself.
+--
+-- __Internal entities.__ A @\<!DOCTYPE\>@'s internal subset is skipped as
+-- markup but its @\<!ENTITY name \"value\"\>@ declarations are kept:
+-- Illustrator exports declare @ns_svg@ and friends there and then write
+-- @xmlns=\"&ns_svg;\"@. Expansion is one level deep (an entity value is
+-- decoded with the built-in table only), which makes the billion-laughs
+-- construction inert, but one level is still amplification: a 64 KiB entity
+-- referenced a dozen times per attribute, on every element, turns a 20 KB
+-- file into gigabytes. So expansion is metered twice: per value (an
+-- attribute may grow by at most 'maxXmlAttrExpansion', a text node is held to
+-- 'maxXmlTextChars') and per document ('maxEntityExpansion', a budget threaded
+-- through the whole parse; past it, references are left as written).
 --
 -- The event list is __lazy__, deliberately. Consumers bound their own output
 -- (a cell count, a character budget) and simply stop demanding events; the
@@ -38,6 +56,7 @@ module Cmedit.Xml
     -- * Parsing
   , parseXml
   , parseXmlBytes
+  , parseXmlQualified
   , decodeXmlBytes
     -- * Reading events
   , localName
@@ -47,6 +66,8 @@ module Cmedit.Xml
     -- * Bounds
   , maxXmlDepth
   , maxXmlTextChars
+  , maxXmlAttrExpansion
+  , maxEntityExpansion
   ) where
 
 import Data.Char (chr, isAlpha, isDigit, isHexDigit, isSpace, digitToInt)
@@ -118,87 +139,133 @@ parseXmlBytes = parseXml . decodeXmlBytes
 -- The parser
 
 -- | Parse a document into its event stream. Never fails; see the module
--- header for what that costs and buys.
+-- header for what that costs and buys. Element and attribute names are local
+-- names (see 'localName').
 parseXml :: Text -> [XmlEvent]
-parseXml = content 0
+parseXml = parseXmlWith localName
+
+-- | 'parseXml' with element and attribute names exactly as written,
+-- prefixes included (@xlink:href@, @sodipodi:cx@, @xmlns:svg@), for a
+-- consumer that resolves namespaces itself.
+parseXmlQualified :: Text -> [XmlEvent]
+parseXmlQualified = parseXmlWith id
+
+-- The parser's running state for entities: the document's declared
+-- entities and what is left of its expansion budget.
+data Ents = Ents [(Text, Text)] !Int
+
+parseXmlWith :: (Text -> Text) -> Text -> [XmlEvent]
+parseXmlWith qname = content (Ents [] maxEntityExpansion) 0
   where
-    content :: Int -> Text -> [XmlEvent]
-    content !d t
+    content :: Ents -> Int -> Text -> [XmlEvent]
+    content ents !d t
       | T.null t  = []
       | otherwise =
           let (txt, rest) = T.break (== '<') t
-          in withText txt (markup d rest)
+          in withText ents txt (\e -> markup e d rest)
 
-    withText txt k
-      | T.null txt = k
-      | otherwise  = XText (decodeEntities (T.take maxXmlTextChars txt)) : k
+    withText ents txt k
+      | T.null txt = k ents
+      | otherwise  = let (v, ents') = expand ents maxXmlTextChars (T.take maxXmlTextChars txt)
+                     in XText v : k ents'
 
     -- At a '<' (or at end of input).
-    markup !d t
+    markup ents@(Ents es bud) !d t
       | T.null t                       = []
-      | "<!--"      `T.isPrefixOf` t   = content d (after "-->" (T.drop 4 t))
-      | "<![CDATA[" `T.isPrefixOf` t   = cdata d (T.drop 9 t)
-      | "<!"        `T.isPrefixOf` t   = content d (skipDecl (T.drop 2 t))
-      | "<?"        `T.isPrefixOf` t   = content d (after "?>" (T.drop 2 t))
-      | "</"        `T.isPrefixOf` t   = closeTag d (T.drop 2 t)
-      | otherwise                      = openTag d (T.drop 1 t)
+      | "<!--"      `T.isPrefixOf` t   = content ents d (after "-->" (T.drop 4 t))
+      | "<![CDATA[" `T.isPrefixOf` t   = cdata ents d (T.drop 9 t)
+      | "<!"        `T.isPrefixOf` t   = let (es', r) = skipDecl (T.drop 2 t)
+                                         in content (Ents (take maxEntities (es ++ es')) bud) d r
+      | "<?"        `T.isPrefixOf` t   = content ents d (after "?>" (T.drop 2 t))
+      | "</"        `T.isPrefixOf` t   = closeTag ents d (T.drop 2 t)
+      | otherwise                      = openTag ents d (T.drop 1 t)
 
-    cdata !d t =
+    cdata ents !d t =
       let (cd, rest) = T.breakOn "]]>" t
-      in withRaw cd (content d (T.drop 3 rest))
+      in withRaw cd (content ents d (T.drop 3 rest))
 
     withRaw txt k
       | T.null txt = k
       | otherwise  = XText (T.take maxXmlTextChars txt) : k
 
-    closeTag !d t =
+    closeTag ents !d t =
       let (nm, rest) = T.span isNameChar t
           rest'      = T.drop 1 (T.dropWhile (/= '>') rest)
       in if T.null nm
-           then content d rest'
-           else XEnd (localName nm) : content (max 0 (d - 1)) rest'
+           then content ents d rest'
+           else XEnd (qname nm) : content ents (max 0 (d - 1)) rest'
 
-    openTag !d t =
+    openTag ents !d t =
       let (nm, rest) = T.span isNameChar t
       in if T.null nm
            -- A bare '<' that starts no tag: XML forbids it, real documents
            -- contain it, and the honest rendering is the character itself.
-           then XText "<" : content d t
+           then XText "<" : content ents d t
            else if d >= maxXmlDepth
                   then []
-                  else let (as, selfClose, rest') = attrs [] rest
-                           nm' = localName nm
+                  else let (as, selfClose, rest', ents') = attrs ents [] rest
+                           nm' = qname nm
                        in XStart nm' as
                             : if selfClose
-                                then XEnd nm' : content d rest'
-                                else content (d + 1) rest'
+                                then XEnd nm' : content ents' d rest'
+                                else content ents' (d + 1) rest'
 
     -- Attributes up to '>' or '/>'. Returns them in document order.
-    attrs acc s =
+    attrs ents acc s =
       let s1 = T.dropWhile isSpace s
       in case T.uncons s1 of
-           Nothing        -> (reverse acc, True, T.empty)   -- truncated file
-           Just ('>', r)  -> (reverse acc, False, r)
-           Just ('/', r)  -> (reverse acc, True, T.drop 1 (T.dropWhile (/= '>') r))
+           Nothing        -> (reverse acc, True, T.empty, ents)   -- truncated file
+           Just ('>', r)  -> (reverse acc, False, r, ents)
+           Just ('/', r)  -> (reverse acc, True, T.drop 1 (T.dropWhile (/= '>') r), ents)
            Just _         ->
              let (nm, s2) = T.span isNameChar s1
              in if T.null nm
-                  then attrs acc (T.drop 1 s1)             -- junk byte: step over it
+                  then attrs ents acc (T.drop 1 s1)        -- junk byte: step over it
                   else let s3 = T.dropWhile isSpace s2
                        in case T.uncons s3 of
                             Just ('=', s4) ->
-                              let (v, s5) = attrValue (T.dropWhile isSpace s4)
-                              in attrs ((localName nm, v) : acc) s5
+                              let (v, s5, ents') = attrValue ents (T.dropWhile isSpace s4)
+                              in attrs ents' ((qname nm, v) : acc) s5
                             -- A valueless attribute is an HTML habit, not XML;
                             -- accept it as the empty string rather than losing
                             -- the rest of the tag to a parse error.
-                            _ -> attrs ((localName nm, T.empty) : acc) s2
+                            _ -> attrs ents ((qname nm, T.empty) : acc) s2
 
-    attrValue s = case T.uncons s of
+    attrValue ents s = case T.uncons s of
       Just (q, r) | q == '"' || q == '\'' ->
-        let (v, r') = T.break (== q) r in (decodeEntities v, T.drop 1 r')
+        let (v, r') = T.break (== q) r
+            (v', ents') = attrExpand ents v
+        in (v', T.drop 1 r', ents')
       _ -> let (v, r) = T.break (\c -> isSpace c || c == '>' || c == '/') s
-           in (decodeEntities v, r)
+               (v', ents') = attrExpand ents v
+           in (v', r, ents')
+    -- An attribute may be as long as the input makes it (a map's path data
+    -- runs to megabytes, and costs nothing it did not already cost to read),
+    -- but entities may grow it by at most 'maxXmlAttrExpansion'.
+    attrExpand ents v = expand ents (T.length v + maxXmlAttrExpansion) v
+
+    -- Resolve references in one value, capped at @cap@ characters, charging
+    -- the document's own entities to the budget.
+    expand (Ents es bud) cap v =
+      let (out, used) = decodeEntitiesBudget es bud cap v
+      in (out, Ents es (bud - used))
+
+-- | How many characters entity expansion may add to one attribute value. Far
+-- below a text node's cap: every element can carry several attributes, so
+-- this is the figure a hostile document multiplies.
+maxXmlAttrExpansion :: Int
+maxXmlAttrExpansion = 64 * 1024
+
+-- | Total characters a document's /own/ entities may expand to, across the
+-- whole document. Built-in references (@&amp;@, @&#38;@) are not charged:
+-- they never produce more than they consume. Past the budget a reference is
+-- left as written, which is what an unknown one already does.
+maxEntityExpansion :: Int
+maxEntityExpansion = 8 * 1024 * 1024
+
+-- | Most internal entities one document may declare.
+maxEntities :: Int
+maxEntities = 256
 
 -- Everything after the first occurrence of @pat@, or nothing if it is absent
 -- (an unterminated comment ends the document, which is what it means).
@@ -207,17 +274,46 @@ after pat t = let (_, rest) = T.breakOn pat t
               in if T.null rest then T.empty else T.drop (T.length pat) rest
 
 -- @\<!DOCTYPE ...\>@, possibly with an internal subset in brackets that may
--- itself contain '>'. Everything here is declaration, never content.
-skipDecl :: Text -> Text
-skipDecl = go
+-- itself contain '>'. Everything here is declaration, never content; the
+-- general entities the subset declares come back alongside the rest of the
+-- input (see the module header).
+skipDecl :: Text -> ([(Text, Text)], Text)
+skipDecl = go []
   where
-    go t = case T.uncons t of
-      Nothing         -> T.empty
-      Just ('>', r)   -> r
-      Just ('[', r)   -> go (T.drop 1 (T.dropWhile (/= ']') r))
-      Just ('"', r)   -> go (T.drop 1 (T.dropWhile (/= '"') r))
-      Just ('\'', r)  -> go (T.drop 1 (T.dropWhile (/= '\'') r))
-      Just (_, r)     -> go r
+    go es t = case T.uncons t of
+      Nothing         -> (reverse es, T.empty)
+      Just ('>', r)   -> (reverse es, r)
+      Just ('[', r)   -> let (es', r') = subset es r in go es' r'
+      Just ('"', r)   -> go es (T.drop 1 (T.dropWhile (/= '"') r))
+      Just ('\'', r)  -> go es (T.drop 1 (T.dropWhile (/= '\'') r))
+      Just (_, r)     -> go es r
+    -- The internal subset, up to its closing ']'. Quoted literals and
+    -- comments may contain ']' and are stepped over whole.
+    subset es t = case T.uncons t of
+      Nothing        -> (es, T.empty)
+      Just (']', r)  -> (es, r)
+      Just ('"', r)  -> subset es (T.drop 1 (T.dropWhile (/= '"') r))
+      Just ('\'', r) -> subset es (T.drop 1 (T.dropWhile (/= '\'') r))
+      _ | "<!--" `T.isPrefixOf` t -> subset es (after "-->" (T.drop 4 t))
+        | "<!ENTITY" `T.isPrefixOf` t ->
+            let (e, r) = entityDecl (T.drop 8 t) in subset (maybe es (: es) e) r
+        | otherwise -> subset es (T.drop 1 t)
+    -- @name "value"@ or @name 'value'@; parameter (%) and external (SYSTEM,
+    -- PUBLIC) entities are skipped, since nothing here can fetch them.
+    entityDecl t0 =
+      let t1 = T.dropWhile isSpace t0
+          (nm, t2) = T.span isNameChar t1
+          t3 = T.dropWhile isSpace t2
+          skipRest r = T.drop 1 (T.dropWhile (/= '>') r)
+      in case T.uncons t3 of
+           Just (q, r) | not (T.null nm), q == '"' || q == '\'' ->
+             let (v, r') = T.break (== q) r
+             in (Just (nm, T.take maxEntityChars (decodeEntities v)), skipRest (T.drop 1 r'))
+           _ -> (Nothing, skipRest t3)
+
+-- | Longest replacement text an internal entity may have.
+maxEntityChars :: Int
+maxEntityChars = 64 * 1024
 
 isNameChar :: Char -> Bool
 isNameChar c = isAlpha c || isDigit c || c `elem` (":_-." :: String) || c > '\x7f'
@@ -288,18 +384,35 @@ elemText = go 0 []
 -- unrecognised reference is left alone: showing @&foo;@ is honest, and
 -- swallowing it would silently delete text.
 decodeEntities :: Text -> Text
-decodeEntities t
-  | not (T.any (== '&') t) = t
-  | otherwise              = T.concat (go t)
+decodeEntities t = fst (decodeEntitiesBudget [] 0 maxBound t)
+
+-- | Expand references with a document's own entities (consulted after the
+-- built-in names): at most @cap@ characters of output, and at most @budget@
+-- of them produced by the document's entities. Returns the text and the
+-- budget used.
+decodeEntitiesBudget :: [(Text, Text)] -> Int -> Int -> Text -> (Text, Int)
+decodeEntitiesBudget ents budget cap t
+  | not (T.any (== '&') t) = (T.take cap t, 0)
+  | otherwise              = let (parts, used) = go 0 0 t in (T.take cap (T.concat parts), used)
   where
-    go s =
+    -- @n@ counts the output so far, @u@ the budget spent.
+    go :: Int -> Int -> Text -> ([Text], Int)
+    go !n !u s
+      | n >= cap = ([], u)
+      | otherwise =
       let (pre, rest) = T.break (== '&') s
       in if T.null rest
-           then [pre]
+           then ([pre], u)
            else let (ent, after') = T.break (\c -> c == ';' || c == '&' || isSpace c) (T.drop 1 rest)
+                    n' = n + T.length pre
                 in case T.uncons after' of
-                     Just (';', r) | Just c <- resolve ent -> pre : c : go r
-                     _ -> pre : "&" : go (T.drop 1 rest)
+                     Just (';', r)
+                       | Just c <- resolve ent -> cons2 pre c (go (n' + T.length c) u r)
+                       | Just c <- lookup ent ents
+                       , let len = min (T.length c) (cap - n')
+                       , u + len <= budget -> cons2 pre (T.take len c) (go (n' + len) (u + len) r)
+                     _ -> cons2 pre "&" (go (n' + 1) u (T.drop 1 rest))
+    cons2 a b (xs, u) = (a : b : xs, u)
 
 resolve :: Text -> Maybe Text
 resolve e = case T.uncons e of

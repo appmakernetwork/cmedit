@@ -39,6 +39,12 @@
 -- embedded images, vector graphics and any attempt at page fidelity. The
 -- view reflows to the terminal width, which is the point — it is for reading
 -- a document, not for reproducing its typesetting.
+--
+-- The object layer (lexer, object scan, filters, the page tree, the content
+-- tokenizer, encodings, 'Fuel') lives in "Cmedit.PdfObj", shared with the
+-- page renderer; this module is text extraction and the reading view. A
+-- 'PdfDoc' keeps the parsed file and its page dictionaries ('pdSource') so a
+-- page view can render the same document without parsing it again.
 module Cmedit.Pdf
   ( -- * The document model
     PdfDoc(..)
@@ -49,6 +55,9 @@ module Cmedit.Pdf
   , PdfKind(..)
   , PdfAlign(..)
   , defaultPdfFmt
+    -- * The parsed file (for a page renderer)
+  , PdfSource(..)
+  , pdfPageSource
     -- * Parsing
   , parsePdf
   , sniffPdf
@@ -121,7 +130,9 @@ import qualified Data.IntMap.Strict as IM
 import qualified Data.IntSet as IS
 import qualified Data.Map.Strict as M
 
-import Cmedit.Inflate (inflateDyn)
+import Cmedit.Geom (Affine(..), identityA, composeA, translateA)
+import qualified Cmedit.IntervalMap as IV
+import Cmedit.PdfObj
 import Cmedit.Types (Pos(..), origin)
 import Cmedit.Width (colToDisplay, displayToCol, lineDisplayWidth, wrapLine)
 
@@ -214,7 +225,32 @@ data PdfDoc = PdfDoc
   , pdTitle  :: !Text   -- ^ @\/Info \/Title@, when the file names one.
   , pdVer    :: !Text   -- ^ The @%PDF-1.x@ header version.
   , pdNote   :: !Text   -- ^ A warning to show on opening (truncation, no extractable text), or empty.
+  , pdSource :: PdfSource
+      -- ^ The parsed file and its pages, for a page renderer. Deliberately
+      -- lazy: it is the very object graph extraction walked, so building it
+      -- costs nothing, but it does keep the file's bytes alive (every stream
+      -- is a slice of them) for as long as the document is open.
   } deriving (Show)
+
+-- | A PDF's object graph and page dictionaries (inherited attributes merged
+-- in, in reading order: what 'Cmedit.PdfObj.pdfPages' returns). Page @k@ of
+-- the text view (@pgNumber k@) is @srcPages !! (k - 1)@; there may be more
+-- page dictionaries than extracted pages when extraction stopped on a budget.
+data PdfSource = PdfSource
+  { srcFile  :: PdfFile
+  , srcPages :: Seq Dict
+  }
+
+instance Show PdfSource where
+  show _ = "PdfSource"
+
+-- | The file and page dictionary of page @k@ (1-based, as 'pdfCurrentPage'
+-- counts), for rendering it.
+pdfPageSource :: PdfDoc -> Int -> Maybe (PdfFile, Dict)
+pdfPageSource pd k = do
+  let src = pdSource pd
+  d <- Seq.lookup (k - 1) (srcPages src)
+  Just (srcFile src, d)
 
 ------------------------------------------------------------------------------
 -- Limits.
@@ -222,22 +258,9 @@ data PdfDoc = PdfDoc
 -- Every one of these bounds work that a *malformed or hostile* file could
 -- otherwise make unbounded; none of them is reached by an ordinary document.
 
--- | Largest PDF this view will parse. The object scan and the extracted text
--- both cost memory linear in the file.
-maxPdfBytes :: Int
-maxPdfBytes = 128 * 1024 * 1024
-
--- | Most pages extracted; beyond this the view says it stopped.
-maxPdfPages :: Int
-maxPdfPages = 2000
-
 -- | Most characters extracted across the whole document.
 maxPdfChars :: Int
 maxPdfChars = 4 * 1024 * 1024
-
--- | Largest single decompressed stream.
-maxStreamBytes :: Int
-maxStreamBytes = 64 * 1024 * 1024
 
 -- | Content-stream operators executed per page, and form-XObject nesting.
 -- A form that draws itself would otherwise not terminate.
@@ -245,52 +268,12 @@ maxOpsPerPage, maxFormDepth :: Int
 maxOpsPerPage = 400000
 maxFormDepth  = 8
 
--- | Bytes of stream data the whole document may have decoded for it: every
--- filter step's input and output, counted each time a stream is decoded.
---
--- 'maxStreamBytes' bounds one stream and nothing bounded how many: 2000 pages
--- may all name the same 60 KB stream that inflates to 64 MB, a page may @Do@
--- one form 400 000 times, a file may hold hundreds of object streams, and
--- every one of those was a fresh 64 MB inflate (measured: minutes, from a
--- 400 KB file). This is what a /document/ can spend. A real text PDF decodes
--- a few megabytes in all — the most in a 159-file corpus was 6 MB, and a
--- 2000-page book is some tens — so a quarter of a gigabyte is forty times
--- anything seen and about three seconds of inflating. Past it the remaining
--- pages are not read, and the note says so.
-maxPdfDecoded :: Int
-maxPdfDecoded = 256 * 1024 * 1024
-
--- | Content-stream tokens (operators and their operands) interpreted across
--- the whole document, with the two expensive operators weighted. The same
--- idea as 'maxOpsPerPage' one level up: that limit times 'maxPdfPages' is 800
--- million operators, which is most of a minute. A page of prose is a few
--- thousand tokens (the corpus's largest document was 0.9 million in all), so
--- this is reached only by a file built to reach it.
-maxPdfTokens :: Int
-maxPdfTokens = 64 * 1000 * 1000
-
--- | @\/ToUnicode@ entries kept across all of a document's fonts. One CMap is
--- already capped ('maxCMapEntries'); a file can carry thousands of them.
-maxPdfCMapEntries :: Int
-maxPdfCMapEntries = 4 * 1024 * 1024
-
 -- | Entries in one @\/ToUnicode@ CMap, and in one CID font's @\/W@ table.
 -- A range is three short tokens that can stand for 65536 entries, so twenty
 -- kilobytes could otherwise ask for hundreds of millions. No real font maps
 -- more than a few tens of thousands.
 maxCMapEntries :: Int
 maxCMapEntries = 1048576
-
--- | Nesting of arrays and dictionaries inside one object. Real objects nest a
--- handful deep; 64 MB of @[@ is a recursion 64 million frames deep.
-maxObjDepth :: Int
-maxObjDepth = 256
-
--- | Elements kept from one array. The rest are still parsed (the parser has
--- to find the closing bracket) but dropped: one 64 MB array operand is
--- otherwise 32 million boxed numbers.
-maxArrayElems :: Int
-maxArrayElems = 1048576
 
 -- | Operands kept for one operator. Every operator this view implements reads
 -- at most its first six, so the ones dropped are ones nothing looks at —
@@ -305,806 +288,8 @@ maxOperands = 64
 maxGlyphChars :: Int
 maxGlyphChars = 256
 
--- | Does this file start like a PDF? Producers are allowed to put junk before
--- the header, so the marker is looked for in the first kilobyte rather than at
--- offset zero — and that tolerance is also what makes this safe to run before
--- the binary-file refusal, which a PDF would otherwise always fail.
-sniffPdf :: BS.ByteString -> Bool
-sniffPdf bs = BS.isInfixOf (BC.pack "%PDF-") (BS.take 1024 bs)
-
-------------------------------------------------------------------------------
--- Objects
-
-type Dict = M.Map BS.ByteString Obj
-
-data Obj
-  = ONull
-  | OBool !Bool
-  | ONum !Double
-  | OStr !BS.ByteString
-  | OName !BS.ByteString
-  | OArr [Obj]
-  | ODict !Dict
-  | OStream !Dict !BS.ByteString   -- ^ Dictionary plus the raw, still-encoded bytes.
-  | ORef !Int                      -- ^ Generation numbers are dropped: the scan already resolves duplicates by position.
-  deriving (Eq, Show)
-
--- | A parsed file: every object found, and the trailer that names the catalog.
-data PdfFile = PdfFile
-  { pfObjs    :: !(IM.IntMap Obj)
-  , pfTrailer :: !Dict
-  }
-
-isWsB :: Word8 -> Bool
-isWsB c = c == 32 || c == 10 || c == 13 || c == 9 || c == 12 || c == 0
-
-isDelimB :: Word8 -> Bool
-isDelimB c = c `elem` [40, 41, 60, 62, 91, 93, 123, 125, 47, 37]  -- ()<>[]{}/%
-
-isRegB :: Word8 -> Bool
-isRegB c = not (isWsB c) && not (isDelimB c)
-
-byteAt :: BS.ByteString -> Int -> Word8
-byteAt bs i = if i >= 0 && i < BS.length bs then BS.index bs i else 0
-
--- | Advance past whitespace and @%@ comments.
-skipWs :: BS.ByteString -> Int -> Int
-skipWs bs = go
-  where
-    n = BS.length bs
-    go !i
-      | i >= n = i
-      | isWsB (BS.index bs i) = go (i + 1)
-      | BS.index bs i == 37 = go (eol i)   -- '%'
-      | otherwise = i
-    eol !i | i >= n = i
-           | BS.index bs i == 10 || BS.index bs i == 13 = i
-           | otherwise = eol (i + 1)
-
--- | Parse one object at @i@, returning it and the position just after.
--- Never fails destructively: an unrecognised token is consumed as 'ONull', so
--- a malformed region costs the objects inside it and nothing more.
-parseObj :: BS.ByteString -> Int -> Maybe (Obj, Int)
-parseObj = parseObjD 0
-
--- 'parseObj' at a nesting depth. Past 'maxObjDepth' an opening bracket is
--- stepped over like any other stray delimiter, so the recursion is bounded
--- and the scan still moves forward.
-parseObjD :: Int -> BS.ByteString -> Int -> Maybe (Obj, Int)
-parseObjD depth bs i0
-  | i0 < 0 = Nothing                        -- an offset the file made up
-  | i >= n = Nothing
-  | depth >= maxObjDepth && (c == 91 || (c == 60 && byteAt bs (i + 1) == 60)) =
-      Just (ONull, i + 1)
-  | c == 47 = let (nm, j) = readName bs (i + 1) in Just (OName nm, j)
-  | c == 40 = let (s, j) = readLitStr bs (i + 1) in Just (OStr s, j)
-  | c == 60 && byteAt bs (i + 1) == 60 = parseDictAt (depth + 1) bs (i + 2)
-  | c == 60 = let (s, j) = readHexStr bs (i + 1) in Just (OStr s, j)
-  | c == 91 = parseArrAt (depth + 1) bs (i + 1) 0 []
-  | c == 93 || c == 62 = Nothing            -- a closer: the caller handles it
-  | isNumStart c = parseNumAt bs i
-  | otherwise =
-      let (kw, j) = readRegular bs i
-      in if BS.null kw
-           then Just (ONull, i + 1)         -- an unexpected delimiter: step over it
-           else Just (keyword kw, j)
-  where
-    n = BS.length bs
-    i = skipWs bs i0
-    c = byteAt bs i
-    isNumStart b = (b >= 48 && b <= 57) || b == 43 || b == 45 || b == 46
-    keyword k
-      | k == BC.pack "true"  = OBool True
-      | k == BC.pack "false" = OBool False
-      | otherwise            = ONull
-
-readRegular :: BS.ByteString -> Int -> (BS.ByteString, Int)
-readRegular bs i = (BS.take len (BS.drop i bs), i + len)
-  where len = go 0
-        n = BS.length bs
-        go !k | i + k < n && isRegB (BS.index bs (i + k)) = go (k + 1)
-              | otherwise = k
-
--- | A name, with @#xx@ escapes decoded.
-readName :: BS.ByteString -> Int -> (BS.ByteString, Int)
-readName bs i =
-  let (raw, j) = readRegular bs i
-  in (if BS.elem 35 raw then BS.pack (unhash (BS.unpack raw)) else raw, j)
-  where
-    unhash (35 : a : b : rest)
-      | isHexDigit (w2c a) && isHexDigit (w2c b) =
-          fromIntegral (16 * digitToInt (w2c a) + digitToInt (w2c b)) : unhash rest
-    unhash (x : rest) = x : unhash rest
-    unhash [] = []
-
 w2c :: Word8 -> Char
 w2c = chr . fromIntegral
-
--- | A @(...)@ string: balanced parentheses, backslash escapes, octal escapes,
--- and a backslash-newline line continuation.
-readLitStr :: BS.ByteString -> Int -> (BS.ByteString, Int)
-readLitStr bs i0
-  | not hasEsc = (BS.take (end - i0) (BS.drop i0 bs), after)
-  | otherwise  = (fst (BS.unfoldrN (end - i0) step i0), after)
-  where
-    n = BS.length bs
-    -- First where the string ends, without building anything: the closing
-    -- parenthesis that balances the opener, or the end of the input. An
-    -- escape hides exactly the byte after its backslash, which is all that
-    -- finding the end needs to know about escapes. Most strings have none,
-    -- and are then a slice; the rest are decoded in one pass into a buffer no
-    -- larger than the source. (Accumulating a list of bytes, as this once
-    -- did, cost 7 GB for a 64 MB string.)
-    (end, after, hasEsc) = scan i0 (1 :: Int) False
-    scan !i !depth !e
-      | i >= n = (n, n, e)
-      | otherwise = case BS.index bs i of
-          92 -> if i + 1 >= n then (i, n, True) else scan (i + 2) depth True
-          40 -> scan (i + 1) (depth + 1) e
-          41 | depth <= 1 -> (i, i + 1, e)
-             | otherwise  -> scan (i + 1) (depth - 1) e
-          _  -> scan (i + 1) depth e
-    step !i
-      | i >= end = Nothing
-      | otherwise = case BS.index bs i of
-          92 -> esc (i + 1)
-          b  -> Just (b, i + 1)
-    esc !i
-      | i >= end = Nothing
-      | otherwise = case BS.index bs i of
-          110 -> Just (10, i + 1)   -- n
-          114 -> Just (13, i + 1)   -- r
-          116 -> Just (9, i + 1)    -- t
-          98  -> Just (8, i + 1)    -- b
-          102 -> Just (12, i + 1)   -- f
-          10  -> step (i + 1)       -- line continuation
-          13  -> step (if byteAt bs (i + 1) == 10 then i + 2 else i + 1)
-          b | b >= 48 && b <= 55 ->
-                let ds = takeWhile (\k -> let x = byteAt bs (i + k)
-                                          in k < 3 && x >= 48 && x <= 55) [0, 1, 2]
-                    v = foldl' (\a k -> a * 8 + fromIntegral (byteAt bs (i + k)) - 48) 0 ds
-                in Just (fromIntegral (v .&. 0xff :: Int), i + length ds)
-            | otherwise -> Just (b, i + 1)
-
--- | A @<...>@ hex string; an odd final digit is padded with zero, per spec.
-readHexStr :: BS.ByteString -> Int -> (BS.ByteString, Int)
-readHexStr bs i0 = (fst (BS.unfoldrN ((end - i0 + 1) `div` 2) step i0), after)
-  where
-    n = BS.length bs
-    end = maybe n (i0 +) (BS.elemIndex 62 (BS.drop i0 bs))
-    after = if end < n then end + 1 else n
-    -- The next hex digit at or after @i@, and where it is.
-    digit !i
-      | i >= end = Nothing
-      | isHexDigit (w2c (BS.index bs i)) = Just (digitToInt (w2c (BS.index bs i)), i + 1)
-      | otherwise = digit (i + 1)
-    step i = case digit i of
-      Nothing -> Nothing
-      Just (a, j) -> case digit j of
-        Nothing     -> Just (fromIntegral (a * 16), end)
-        Just (b, k) -> Just (fromIntegral (a * 16 + b), k)
-
--- | A number — or an indirect reference, which is three tokens (@int int R@)
--- and so can only be recognised here, by lookahead.
-parseNumAt :: BS.ByteString -> Int -> Maybe (Obj, Int)
-parseNumAt bs i =
-  let (tok, j) = readRegular bs i
-      v = readNumber tok
-  in case asInt tok of
-       Just num | num >= 0 ->
-         let k = skipWs bs j
-             (gtok, k2) = readRegular bs k
-             k3 = skipWs bs k2
-         in case asInt gtok of
-              Just _ | byteAt bs k3 == 82                       -- 'R'
-                     , not (isRegB (byteAt bs (k3 + 1))) -> Just (ORef num, k3 + 1)
-              _ -> Just (ONum v, j)
-       _ -> Just (ONum v, j)
-
-asInt :: BS.ByteString -> Maybe Int
-asInt s
-  | BS.null s = Nothing
-  | BS.all (\c -> c >= 48 && c <= 57) s && BS.length s <= 10 =
-      Just (BS.foldl' (\a c -> a * 10 + fromIntegral c - 48) 0 s)
-  | otherwise = Nothing
-
--- | Tolerant decimal read: PDF reals have no exponent, but broken producers
--- emit things like @--3@ or @4.@, and a viewer should not stop for those.
-readNumber :: BS.ByteString -> Double
-readNumber s0 = sign * (whole + frac)
-  where
-    -- Straight off the bytes, in the same order of floating-point operations
-    -- a digit-list fold would use: numbers are most of a content stream.
-    (ss, s1) = BS.span (\c -> c == 43 || c == 45) s0
-    sign = if odd (BS.count 45 ss) then -1 else 1 :: Double
-    isDig c = c >= 48 && c <= 57
-    (ip, rest) = BS.span isDig s1
-    fp = if not (BS.null rest) && BS.head rest == 46 then BS.takeWhile isDig (BS.drop 1 rest)
-                                                      else BS.empty
-    dig c = fromIntegral (c - 48) :: Double
-    whole = BS.foldl' (\a d -> a * 10 + dig d) 0 (BS.take 12 ip)
-    frac = BS.foldr (\d a -> (a + dig d) / 10) 0 (BS.take 10 fp)
-
-parseArrAt :: Int -> BS.ByteString -> Int -> Int -> [Obj] -> Maybe (Obj, Int)
-parseArrAt depth bs = go
-  where
-    go !i !cnt acc =
-      let j = skipWs bs i
-      in if j >= BS.length bs then Just (OArr (reverse acc), j)
-         else if byteAt bs j == 93 then Just (OArr (reverse acc), j + 1)
-         else case parseObjD depth bs j of
-                Just (o, k) | k > j ->
-                  -- Forced, so a long array is its elements and not a chain
-                  -- of thunks each holding a slice of the stream.
-                  o `seq` (if cnt + 1 < maxArrayElems then go k (cnt + 1) (o : acc)
-                                                      else skipRest k (o : acc))
-                _ -> Just (OArr (reverse acc), j + 1)
-    -- Past 'maxArrayElems': find the closing bracket without building
-    -- anything. Tokens are stepped over exactly as 'parseObjD' would consume
-    -- them (a string or a nested container still has to be read to know
-    -- where it ends), so the array ends where it always did.
-    skipRest !i acc =
-      let j = skipWs bs i
-          c = byteAt bs j
-      in if j >= BS.length bs then Just (OArr (reverse acc), j)
-         else if c == 93 then Just (OArr (reverse acc), j + 1)
-         else if isRegB c then skipRest (snd (readRegular bs j)) acc
-         else if c == 47 then skipRest (snd (readRegular bs (j + 1))) acc
-         else case parseObjD depth bs j of
-                Just (_, k) | k > j -> skipRest k acc
-                _ -> Just (OArr (reverse acc), j + 1)
-
--- | A dictionary, and — if @stream@ follows it — the stream it heads.
-parseDictAt :: Int -> BS.ByteString -> Int -> Maybe (Obj, Int)
-parseDictAt depth bs i0 = go i0 M.empty
-  where
-    n = BS.length bs
-    go !i !acc
-      | j >= n = Just (ODict acc, j)
-      | byteAt bs j == 62 && byteAt bs (j + 1) == 62 = afterDict acc (j + 2)
-      | byteAt bs j == 47 =
-          let (k, j1) = readName bs (j + 1)
-          in case parseObjD depth bs j1 of
-               Just (v, j2) -> go j2 (M.insert k v acc)
-               Nothing      -> Just (ODict acc, j1)
-      -- Junk where a key belongs: step over it rather than abandoning the
-      -- dictionary, which may still hold the /Type or /Font we need.
-      | otherwise = go (j + 1) acc
-      where j = skipWs bs i
-
-    afterDict d j
-      | BS.isPrefixOf (BC.pack "stream") (BS.drop j' bs) = stream d (j' + 6)
-      | otherwise = Just (ODict d, j)
-      where j' = skipSpaceOnly j
-    -- Only spaces may separate ">>" from "stream"; a comment cannot.
-    skipSpaceOnly !k | k < n && (BS.index bs k == 32 || BS.index bs k == 13
-                                 || BS.index bs k == 10 || BS.index bs k == 9) = skipSpaceOnly (k + 1)
-                     | otherwise = k
-
-    stream d j =
-      let dataStart = case (byteAt bs j, byteAt bs (j + 1)) of
-                        (13, 10) -> j + 2
-                        (10, _)  -> j + 1
-                        (13, _)  -> j + 1
-                        _        -> j
-          declared = case M.lookup (BC.pack "Length") d of
-                       Just (ONum v) | v >= 0 -> Just (truncate v)
-                       _                      -> Nothing
-          okDeclared len =
-            let e = skipWs bs (dataStart + len)
-            in dataStart + len <= n && BS.isPrefixOf (BC.pack "endstream") (BS.drop e bs)
-          -- /Length is often an indirect reference (unresolvable here) or
-          -- simply wrong; searching for the terminator always works, so the
-          -- declared length is used only when it agrees with one.
-          len = case declared of
-                  Just l | okDeclared l -> l
-                  _ -> searchEnd
-          searchEnd =
-            let hay = BS.drop dataStart bs
-                (pre, post) = BS.breakSubstring (BC.pack "endstream") hay
-            in if BS.null post then BS.length hay else trimEol pre
-          trimEol p
-            | BS.length p >= 2, BS.index p (BS.length p - 2) == 13
-                              , BS.index p (BS.length p - 1) == 10 = BS.length p - 2
-            | BS.length p >= 1, let c = BS.index p (BS.length p - 1)
-                              , c == 10 || c == 13 = BS.length p - 1
-            | otherwise = BS.length p
-          raw = BS.take len (BS.drop dataStart bs)
-          after = let e = skipWs bs (dataStart + len)
-                  in if BS.isPrefixOf (BC.pack "endstream") (BS.drop e bs) then e + 9 else dataStart + len
-      in Just (OStream d raw, after)
-
-------------------------------------------------------------------------------
--- Finding every object in the file
-
--- | Scan for @N G obj@ and parse what follows each one.
---
--- Objects are keyed by number and carry the offset they were defined at, so a
--- later definition wins — which is what an incrementally-updated file means.
--- Scanning resumes after the object just parsed, so an @obj@ that happens to
--- occur inside a compressed stream's bytes is never mistaken for a definition.
-scanObjects :: BS.ByteString -> IM.IntMap (Int, Obj)
-scanObjects bs = go 0 IM.empty
-  where
-    n = BS.length bs
-    marker = BC.pack "obj"
-    go !i !acc
-      | i >= n = acc
-      | otherwise =
-          let hay = BS.drop i bs
-              (pre, post) = BS.breakSubstring marker hay
-          in if BS.null post then acc
-             else
-               let at = i + BS.length pre
-               in if isRegB (byteAt bs (at + 3))
-                    then go (at + 3) acc          -- "object", "objects", ...
-                    else case objHeader bs at of
-                      Nothing -> go (at + 3) acc
-                      Just (num, start) -> case parseObj bs (at + 3) of
-                        Just (o, j) | j > at ->
-                          go (skipEndobj j) (IM.insertWith later num (start, o) acc)
-                        _ -> go (at + 3) acc
-    later new old = if fst new >= fst old then new else old
-    skipEndobj j =
-      let k = skipWs bs j
-      in if BS.isPrefixOf (BC.pack "endobj") (BS.drop k bs) then k + 6 else max j 0
-
--- | Read the @N G@ that must precede an @obj@ keyword, walking backwards.
--- Returns the object number and the offset its definition starts at.
-objHeader :: BS.ByteString -> Int -> Maybe (Int, Int)
-objHeader bs at = do
-  g1 <- backWs (at - 1)
-  (_, g0) <- backDigits g1
-  n1 <- backWs (g0 - 1)
-  (num, n0) <- backDigits n1
-  if n0 == 0 || not (isRegB (byteAt bs (n0 - 1))) then Just (num, n0) else Nothing
-  where
-    -- Skip whitespace backwards; at least one byte of it is required.
-    backWs i | i >= 0 && isWsB (byteAt bs i) = Just (skipBack i)
-             | otherwise = Nothing
-    skipBack i | i >= 0 && isWsB (byteAt bs i) = skipBack (i - 1)
-               | otherwise = i
-    -- Read a decimal number backwards, returning it and its first byte.
-    backDigits i
-      | i < 0 = Nothing
-      | not (isDig (byteAt bs i)) = Nothing
-      | otherwise =
-          let s = start i
-              len = i - s + 1
-          in if len > 10 then Nothing
-             else Just (fromMaybe 0 (asInt (BS.take len (BS.drop s bs))), s)
-      where start k | k > 0 && isDig (byteAt bs (k - 1)) = start (k - 1)
-                    | otherwise = k
-    isDig c = c >= 48 && c <= 57
-
--- | Objects that live inside compressed object streams, which the scan cannot
--- see. Expanded after it, and folded in by the same later-definition-wins
--- rule (an @\/ObjStm@'s own offset stands for the objects inside it).
---
--- Returns what is left of the decoding budget as well: a file may carry any
--- number of these, each inflating to 'maxStreamBytes'.
-expandObjStms :: BS.ByteString -> Int -> IM.IntMap (Int, Obj) -> (IM.IntMap (Int, Obj), Int)
-expandObjStms _bs left0 found = foldl' step (found, left0) (IM.toList found)
-  where
-    base = PdfFile (IM.map snd found) M.empty
-    step (!acc, !left) (_, (off, OStream d raw))
-      | M.lookup (BC.pack "Type") d == Just (OName (BC.pack "ObjStm")) =
-          case decodeStream base left d raw of
-            (Right dat, spent) -> (unpack acc off d dat, left - spent)
-            (Left _, spent)    -> (acc, left - spent)
-    step acc _ = acc
-    unpack acc off d dat =
-          let cnt = intOf base (M.lookup (BC.pack "N") d)
-              first = intOf base (M.lookup (BC.pack "First") d)
-              hdr = readPairs dat 0 (min cnt 100000)
-              len = BS.length dat
-              -- Offsets come from the stream's own header, so each is checked
-              -- against the stream, and the bytes parsed are budgeted: N
-              -- entries may all point at one long unterminated string, and
-              -- parsing it N times is N copies of the stream.
-              budget0 = 8 * len + 4096
-          in fst (foldl' (\(a, left) (num, rel) ->
-                        let at0 = first + rel
-                        in if left <= 0 || at0 < 0 || at0 >= len then (a, left)
-                           else case parseObj dat at0 of
-                             Just (o, j) -> (IM.insertWith later num (off, o) a, left - max 1 (j - at0))
-                             Nothing     -> (a, left - 1))
-                    (acc, budget0) hdr)
-    later new old = if fst new >= fst old then new else old
-    -- The header is 2N integers: object number, then offset from /First.
-    readPairs dat = goPairs
-      where
-        goPairs !i !k
-          | k <= 0 = []
-          | otherwise =
-              let i1 = skipWs dat i
-                  (a, i2) = readRegular dat i1
-                  i3 = skipWs dat i2
-                  (b, i4) = readRegular dat i3
-              in case (asInt a, asInt b) of
-                   (Just x, Just y) -> (x, y) : goPairs i4 (k - 1)
-                   _ -> []
-
-intOf :: PdfFile -> Maybe Obj -> Int
-intOf f o = truncate (numOf f o)
-
-numOf :: PdfFile -> Maybe Obj -> Double
-numOf f o = case resolve f (fromMaybe ONull o) of
-  ONum v -> v
-  _      -> 0
-
--- | Follow indirect references, with a depth limit so a self-referential file
--- cannot loop.
-resolve :: PdfFile -> Obj -> Obj
-resolve f = go (16 :: Int)
-  where
-    go 0 o = o
-    go k (ORef r) = go (k - 1) (IM.findWithDefault ONull r (pfObjs f))
-    go _ o = o
-
-dictOf :: PdfFile -> Obj -> Dict
-dictOf f o = case resolve f o of
-  ODict d     -> d
-  OStream d _ -> d
-  _           -> M.empty
-
-lookD :: PdfFile -> Dict -> String -> Obj
-lookD f d k = resolve f (M.findWithDefault ONull (BC.pack k) d)
-
-arrOf :: PdfFile -> Obj -> [Obj]
-arrOf f o = case resolve f o of
-  OArr xs -> xs
-  ONull   -> []
-  x       -> [x]
-
-nameOf :: Obj -> BS.ByteString
-nameOf (OName n) = n
-nameOf _ = BS.empty
-
-------------------------------------------------------------------------------
--- Stream filters
-
--- | Decode a stream through its @\/Filter@ chain. Image codecs are reported
--- rather than attempted: the caller (content-stream loading) simply skips
--- what it cannot read.
---
--- @left@ is what remains of the document's 'maxPdfDecoded', and the second
--- result is what this decode spent of it: each filter step's input plus its
--- output (LZW's input counted eight times over, because it is that much
--- slower per byte than everything else here). No step may produce more than
--- what is left, so the budget cannot be overshot by more than one step's
--- input — and a document inside its budget decodes exactly as it would with
--- no budget at all. An unfiltered stream is charged its length: the budget is
--- on bytes handed onward to be interpreted, however they were arrived at.
-decodeStream :: PdfFile -> Int -> Dict -> BS.ByteString -> (Either String BS.ByteString, Int)
-decodeStream f left0 d raw
-  | left0 <= 0   = (Left "the document's decoding budget is spent", 0)
-  | null filters = (Right raw, BS.length raw)
-  | otherwise    = go (zip filters parms) raw 0
-  where
-    filters = map nameOf (arrOf f (lookD f d "Filter"))
-    parmList = case lookD f d "DecodeParms" of
-                 OArr xs -> map (dictOf f) xs
-                 ONull   -> []
-                 o       -> [dictOf f o]
-    parms = parmList ++ repeat M.empty
-    go [] dat !spent = (Right dat, spent)
-    go ((nm, pd) : rest) dat !spent
-      | left <= 0 = (Left "the document's decoding budget is spent", spent)
-      | otherwise = case applyFilter (min maxStreamBytes left) (BC.unpack nm) dat of
-          Left e    -> (Left e, spent + cin)
-          Right out ->
-            let out' = applyPredictor f pd out
-            -- (the filter's own output is what is charged: the predictor
-            -- only ever shrinks it, and its work is in proportion to it)
-            in go rest out' (spent + cin + BS.length out)
-      where
-        left = left0 - spent
-        cin | nm == BC.pack "LZWDecode" || nm == BC.pack "LZW" = 8 * BS.length dat
-            | otherwise = BS.length dat
-
--- One filter, producing at most @lim@ bytes.
-applyFilter :: Int -> String -> BS.ByteString -> Either String BS.ByteString
-applyFilter lim nm dat = case nm of
-  "FlateDecode"     -> flate
-  "Fl"              -> flate
-  "LZWDecode"       -> Right (lzwDecode lim dat)
-  "LZW"             -> Right (lzwDecode lim dat)
-  "ASCIIHexDecode"  -> Right (hexDecode dat)
-  "AHx"             -> Right (hexDecode dat)
-  "ASCII85Decode"   -> Right (a85Decode lim dat)
-  "A85"             -> Right (a85Decode lim dat)
-  "RunLengthDecode" -> Right (rleDecode lim dat)
-  "RL"              -> Right (rleDecode lim dat)
-  "Crypt"           -> Right dat        -- the Identity crypt filter
-  ""                -> Right dat
-  other             -> Left (other ++ ": not a text filter")
-  where
-    -- A zlib wrapper is the norm; a few producers emit raw DEFLATE, so a
-    -- failed header check retries from byte zero rather than giving up.
-    flate =
-      let hdr2 = BS.length dat >= 2
-                   && (fromIntegral (BS.index dat 0) .&. (0x0f :: Int)) == 8
-                   && ((fromIntegral (BS.index dat 0) * 256
-                        + fromIntegral (BS.index dat 1)) `mod` (31 :: Int)) == 0
-      in case inflateDyn dat (if hdr2 then 2 else 0) lim of
-           Right out -> Right out
-           Left _ | hdr2 -> inflateDyn dat 0 lim
-           Left e -> Left e
-
--- | Undo a PNG or TIFF predictor. Used by cross-reference streams and by any
--- stream whose producer thought it would compress better; harmless (identity)
--- when @\/Predictor@ is absent or 1.
---
--- Both run over an unboxed buffer the size of their output. They were list
--- pipelines once, and a list of bytes is forty times the size of the bytes:
--- a 64 MB stream with a predictor on it took over 10 GB.
-applyPredictor :: PdfFile -> Dict -> BS.ByteString -> BS.ByteString
-applyPredictor f pd dat
-  | pred' < 2 = dat
-  | pred' == 2 = tiff
-  | otherwise = png
-  where
-    pred'   = intOf f (M.lookup (BC.pack "Predictor") pd)
-    colors  = maxI 1 (intOf f (M.lookup (BC.pack "Colors") pd))
-    bpc     = maxI 1 (intOf f (M.lookup (BC.pack "BitsPerComponent") pd))
-    columns = maxI 1 (intOf f (M.lookup (BC.pack "Columns") pd))
-    maxI a b = if b <= 0 then a else b
-    bpp = max 1 ((colors * bpc + 7) `div` 8)
-    -- Clamped to the data: a row longer than the stream is one short row
-    -- either way, and /Columns is whatever the file says.
-    rowLen = max 1 (min len ((colors * bpc * columns + 7) `div` 8))
-    len = BS.length dat
-
-    fromArr :: Int -> UArray Int Word8 -> BS.ByteString
-    fromArr k ua = fst (BS.unfoldrN k (\i -> Just (ua ! i, i + 1)) 0)
-
-    -- TIFF predictor 2 at 8 bits: each component is a delta from the one
-    -- @bpp@ bytes earlier in the same row.
-    tiff | bpc /= 8 = dat
-         | otherwise = fromArr len $ runSTUArray $ do
-             out <- newArray (0, max 0 (len - 1)) 0
-             let go !i
-                   | i >= len = pure ()
-                   | otherwise = do
-                       let col = i `mod` rowLen
-                       a <- if col >= bpp then readArray out (i - bpp) else pure 0
-                       writeArray out i (BS.index dat i + a)
-                       go (i + 1)
-             go 0
-             pure out
-
-    -- PNG: every row is a filter-type byte and then up to @rowLen@ samples
-    -- (the last row may be short). @a@ is the sample @bpp@ to the left, @b@
-    -- the one above, @c@ the one above and to the left; all zero off the edge.
-    png = fromArr outLen $ runSTUArray $ do
-        out <- newArray (0, max 0 (outLen - 1)) 0
-        let row !r
-              | r * stride >= len = pure ()
-              | otherwise = do
-                  let src = r * stride
-                      ft = fromIntegral (BS.index dat src) :: Int
-                      k = min rowLen (len - src - 1)
-                      o0 = r * rowLen
-                      at i = readArray out i
-                      px !col
-                        | col >= k = pure ()
-                        | otherwise = do
-                            let v = BS.index dat (src + 1 + col)
-                            a <- if col >= bpp then at (o0 + col - bpp) else pure 0
-                            b <- if r > 0 then at (o0 - rowLen + col) else pure 0
-                            c <- if r > 0 && col >= bpp then at (o0 - rowLen + col - bpp) else pure 0
-                            let x = case ft of
-                                      0 -> v
-                                      1 -> v + a
-                                      2 -> v + b
-                                      3 -> v + fromIntegral ((fromIntegral a + fromIntegral b :: Int) `div` 2)
-                                      4 -> v + paeth a b c
-                                      _ -> v
-                            writeArray out (o0 + col) x
-                            px (col + 1)
-                  px 0
-                  row (r + 1)
-        row (0 :: Int)
-        pure out
-      where
-        stride = rowLen + 1
-        (q, rm) = len `divMod` stride
-        outLen = q * rowLen + max 0 (rm - 1)
-        paeth :: Word8 -> Word8 -> Word8 -> Word8
-        paeth a b c =
-          let p = fromIntegral a + fromIntegral b - fromIntegral c :: Int
-              pa = abs (p - fromIntegral a); pb = abs (p - fromIntegral b); pc = abs (p - fromIntegral c)
-          in if pa <= pb && pa <= pc then a else if pb <= pc then b else c
-
-hexDecode :: BS.ByteString -> BS.ByteString
-hexDecode = fst . readHexStr'
-  where readHexStr' bs = readHexStr (BS.snoc bs 62) 0
-
--- ASCII85, at most @lim@ bytes of it. Whitespace is skipped anywhere; a @z@
--- where a group would start is four zero bytes; a final group of @k@ digits
--- yields @k - 1@ bytes.
-a85Decode :: Int -> BS.ByteString -> BS.ByteString
-a85Decode lim bs0 = fst (BS.unfoldrN (max 0 (min lim (4 * n))) step (0, 0 :: Int, 0 :: Int))
-  where
-    -- Some producers include the "<~" introducer even though PDF's variant
-    -- does not use it.
-    body = let b = if BS.isPrefixOf (BC.pack "<~") bs0 then BS.drop 2 bs0 else bs0
-               (pre, _) = BS.breakSubstring (BC.pack "~>") b
-           in pre
-    n = BS.length body
-    skip !i | i < n && isWsB (BS.index body i) = skip (i + 1)
-            | otherwise = i
-    -- State: position, bytes of the current group still to emit, and those
-    -- bytes (the next one in bits 24-31).
-    step (!i, !pend, !v)
-      | pend > 0 = Just (fromIntegral ((v `shiftR` 24) .&. 0xff), (i, pend - 1, (v `shiftL` 8) .&. 0xffffffff))
-      | j >= n = Nothing
-      | BS.index body j == 122 = step (j + 1, 4, 0)      -- 'z'
-      | otherwise =
-          let (k, acc, j') = group j (0 :: Int) (0 :: Int)
-          in if k < 2 then Nothing
-             else step (j', k - 1, (acc * 85 ^ (5 - k) + pad k) .&. 0xffffffff)
-      where j = skip i
-    -- Up to five digits, skipping whitespace between them.
-    group !j !k !acc
-      | k >= 5 = (k, acc, j)
-      | j' >= n = (k, acc, j')
-      | otherwise = group (j' + 1) (k + 1) (acc * 85 + (fromIntegral (BS.index body j') - 33))
-      where j' = skip j
-    -- A short final group is padded with 'u' (84) digits.
-    pad k = sum [ 84 * 85 ^ e | e <- [0 .. 4 - k] ] :: Int
-
--- RunLength, at most @lim@ bytes of it: a length byte below 128 copies that
--- many plus one literal bytes, one above 128 repeats the next byte, and 128
--- ends the data.
-rleDecode :: Int -> BS.ByteString -> BS.ByteString
-rleDecode lim bs = fst (BS.unfoldrN (max 0 (min lim (128 * n))) step (0, 0 :: Int, 0 :: Int))
-  where
-    n = BS.length bs
-    -- State: position of the next length byte, then either a literal run in
-    -- progress (@lit > 0@ bytes left, read from @i@) or a repeat (@rep > 0@
-    -- copies left of the byte at @i@).
-    step (!i, !lit, !rep)
-      | lit > 0 = if i < n then Just (BS.index bs i, (i + 1, lit - 1, 0))
-                           else Nothing
-      | rep > 0 = Just (byteAt bs i, if rep == 1 then (i + 1, 0, 0) else (i, 0, rep - 1))
-      | i >= n = Nothing
-      | l == 128 = Nothing
-      | l < 128 = step (i + 1, l + 1, 0)
-      | otherwise = step (i + 1, 0, 257 - l)
-      where l = fromIntegral (BS.index bs i) :: Int
-
--- | PDF's LZW: MSB-first codes, and the code width grows one entry *early*
--- (the @\/EarlyChange@ default), which is the one place it differs from GIF's
--- — hence a separate implementation from the one in "Cmedit.Image".
-lzwDecode :: Int -> BS.ByteString -> BS.ByteString
-lzwDecode lim bs = BS.concat (map BS.concat (groupsOf 4096 (go 0 9 initTable 256 Nothing 0)))
-  where
-    nbits = 8 * BS.length bs
-    initTable = IM.fromList [ (i, BS.singleton (fromIntegral i)) | i <- [0 .. 255] ]
-    -- The entries come out as a lazy list and are joined a few thousand at a
-    -- time, so what is live is the output and one group — not a list cell
-    -- for every code in the stream, which was 2 GB for a 64 MB one.
-    groupsOf :: Int -> [a] -> [[a]]
-    groupsOf _ [] = []
-    groupsOf k xs = let (a, b) = splitAt k xs in a : groupsOf k b
-    getCode p w
-      | p + w > nbits = Nothing
-      | otherwise =
-          -- The code straddles at most three bytes; read them as one number
-          -- and cut the code out of it.
-          let b0 = p `shiftR` 3
-              three = (fromIntegral (byteAt bs b0) `shiftL` 16)
-                        .|. (fromIntegral (byteAt bs (b0 + 1)) `shiftL` 8)
-                        .|. fromIntegral (byteAt bs (b0 + 2)) :: Int
-          in Just ((three `shiftR` (24 - (p .&. 7) - w)) .&. ((1 `shiftL` w) - 1))
-    -- @out@ is the running output length. @tn@ is the table's size, carried
-    -- because asking an 'IM.IntMap' for it walks the whole map, and this
-    -- asked twice per code.
-    go :: Int -> Int -> IM.IntMap BS.ByteString -> Int -> Maybe BS.ByteString -> Int -> [BS.ByteString]
-    go !p !w !table !tn prev !out
-      | out > lim = []
-      | otherwise = case getCode p w of
-          Nothing -> []
-          Just 257 -> []
-          Just 256 -> go (p + w) 9 initTable 256 Nothing out
-          Just code ->
-            let next = tn + 2
-                entry = case IM.lookup code table of
-                  Just e  -> e
-                  -- The one self-referential case: a code for an entry that
-                  -- this very step is about to define.
-                  Nothing -> case prev of
-                               Just pv -> pv `BS.snoc` BS.head pv
-                               Nothing -> BS.empty
-                (table', tn') = case prev of
-                  -- 4096 codes is all a 12-bit stream has; past that the
-                  -- encoder owes us a clear code, and adding entries anyway
-                  -- would only desynchronise the two tables.
-                  Just pv | not (BS.null entry), next < 4096 ->
-                              (IM.insert next (pv `BS.snoc` BS.head entry) table, tn + 1)
-                  _ -> (table, tn)
-                sz = tn' + 2
-                -- PDF's default /EarlyChange widens the code one entry before
-                -- the table actually needs it.
-                w' | sz >= 2047 = 12
-                   | sz >= 1023 = 11
-                   | sz >= 511  = 10
-                   | otherwise  = 9
-            in if BS.null entry then []
-               else entry : go (p + w) w' table' tn' (Just entry) (out + BS.length entry)
-
-------------------------------------------------------------------------------
--- The document: trailer, catalog, page tree
-
--- | Find the trailer dictionary — the one naming @\/Root@.
---
--- Both spellings are looked for: the classic @trailer \<\<...\>\>@ keyword and
--- the cross-reference *stream* whose own dictionary is the trailer (PDF 1.5+).
--- Failing both, any object that calls itself a catalog will do; a file whose
--- trailer was truncated away still has its page tree.
-findTrailer :: BS.ByteString -> IM.IntMap Obj -> Dict
-findTrailer bs objs
-  | not (null withRoot) = last withRoot
-  | not (null xrefDicts) = last xrefDicts
-  | otherwise = case [ num | (num, o) <- IM.toList objs
-                     , M.lookup (BC.pack "Type") (plainDict o) == Just (OName (BC.pack "Catalog")) ] of
-      (num : _) -> M.singleton (BC.pack "Root") (ORef num)
-      []        -> M.empty
-  where
-    plainDict (ODict d) = d
-    plainDict (OStream d _) = d
-    plainDict _ = M.empty
-    hasRoot d = M.member (BC.pack "Root") d
-    withRoot = filter hasRoot (trailerKeywords ++ xrefDicts)
-    xrefDicts = [ d | (_, o) <- IM.toList objs, let d = plainDict o
-                , M.lookup (BC.pack "Type") d == Just (OName (BC.pack "XRef")) ]
-    trailerKeywords = go 0
-      where
-        go i =
-          let hay = BS.drop i bs
-              (pre, post) = BS.breakSubstring (BC.pack "trailer") hay
-          in if BS.null post then []
-             else let at = i + BS.length pre + 7
-                  in case parseObj bs at of
-                       Just (ODict d, _) -> d : go at
-                       _                 -> go at
-
--- | Walk the page tree, carrying the attributes a page inherits from its
--- ancestors. Cycles (a malformed tree pointing back at itself) are cut by the
--- visited set; a file with no usable tree falls back to every object that
--- calls itself a page, in object-number order.
-collectPages :: PdfFile -> [Dict]
-collectPages f
-  | not (null viaTree) = viaTree
-  | otherwise = [ d | (_, o) <- IM.toAscList (pfObjs f), let d = dictOf f o
-                , M.lookup (BC.pack "Type") d == Just (OName (BC.pack "Page")) ]
-  where
-    root = dictOf f (M.findWithDefault ONull (BC.pack "Root") (pfTrailer f))
-    pagesRef = M.findWithDefault ONull (BC.pack "Pages") root
-    viaTree = take maxPdfPages (reverse (fst (walk 0 M.empty ([], IS.empty) pagesRef)))
-    inheritable = map BC.pack ["Resources", "MediaBox", "CropBox", "Rotate"]
-    -- The visited set is global, not the ancestor path: a page tree is a
-    -- tree, so no node is reached twice, and with only the path checked a
-    -- file listing the same child several times per level made the walk
-    -- exponential in the depth (4^40 visits from 3 KB, and no pages at the
-    -- end of them for 'take' to stop on).
-    walk depth inh (acc, seen) node
-      | depth > (64 :: Int) = (acc, seen)
-      | ORef r <- node, r `IS.member` seen = (acc, seen)
-      | length acc >= maxPdfPages = (acc, seen)
-      | otherwise =
-          let seen' = case node of ORef r -> IS.insert r seen; _ -> seen
-              d = dictOf f node
-              inh' = foldl' (\a k -> case M.lookup k d of
-                                       Just v  -> M.insert k v a
-                                       Nothing -> a) inh inheritable
-              ty = M.lookup (BC.pack "Type") d
-              kids = arrOf f (M.findWithDefault ONull (BC.pack "Kids") d)
-          in if ty == Just (OName (BC.pack "Page")) || (null kids && M.member (BC.pack "Contents") d)
-               then (M.union d inh' : acc, seen')
-               else foldl' (walk (depth + 1) inh') (acc, seen') kids
 
 ------------------------------------------------------------------------------
 -- Fonts
@@ -1121,7 +306,9 @@ data FontInfo = FontInfo
   , fiTwoByte :: !Bool                 -- ^ Composite font with 2-byte codes (Identity-H and friends).
   , fiToUni   :: !(IM.IntMap Text)     -- ^ From a @\/ToUnicode@ CMap: authoritative when present.
   , fiEnc     :: !(IM.IntMap Char)     -- ^ Simple-font encoding, base plus @\/Differences@.
-  , fiWidths  :: !(IM.IntMap Double)   -- ^ Glyph widths, in the units 'fiWScale' converts.
+  , fiWidths  :: !(IV.IntervalMap Double)
+      -- ^ Glyph widths, in the units 'fiWScale' converts. Intervals: a CID
+      -- font's @cFirst cLast w@ range is one entry, not one per CID.
   , fiDefW    :: !Double
   , fiWScale  :: !Double
       -- ^ What one unit of 'fiWidths' is worth in text space. A thousandth of
@@ -1133,22 +320,21 @@ data FontInfo = FontInfo
   }
 
 emptyFont :: FontInfo
-emptyFont = FontInfo False False False False IM.empty winAnsiMap IM.empty 500 0.001
+emptyFont = FontInfo False False False False IM.empty winAnsiMap IV.empty 500 0.001
 
--- | What the document as a whole may still spend, and what it has already
--- worked out and need not work out again. Threaded through every page, so the
--- limits it carries are on the file and not on any one part of it.
+-- | What the document as a whole may still spend ('Fuel', the budgets
+-- "Cmedit.PdfObj" defines), and what it has already worked out and need not
+-- work out again. Threaded through every page, so the limits it carries are
+-- on the file and not on any one part of it.
 --
--- The two caches are what make the budget safe for real documents rather than
--- only tight for hostile ones. A font is selected (@Tf@) hundreds of times a
--- page and its @\/ToUnicode@ map used to be inflated and parsed on every one;
--- a letterhead or watermark form is drawn (@Do@) on every page. Charging
--- those per use would spend an ordinary document's budget on repetition, so
--- each is charged once, when it is first read.
-data Fuel = Fuel
-  { fuBytes   :: !Int   -- ^ Left of 'maxPdfDecoded'.
-  , fuTokens  :: !Int   -- ^ Left of 'maxPdfTokens'.
-  , fuEntries :: !Int   -- ^ Left of 'maxPdfCMapEntries'.
+-- The three caches are what make the budget safe for real documents rather
+-- than only tight for hostile ones. A font is selected (@Tf@) hundreds of
+-- times a page and its @\/ToUnicode@ map used to be inflated and parsed on
+-- every one; a letterhead or watermark form is drawn (@Do@) on every page.
+-- Charging those per use would spend an ordinary document's budget on
+-- repetition, so each is charged once, when it is first read.
+data XFuel = XFuel
+  { xfFuel    :: !Fuel
   , fuFonts   :: !(IM.IntMap FontInfo)
       -- ^ Fonts already loaded, by object number.
   , fuCMaps   :: !(IM.IntMap (IM.IntMap Text))
@@ -1161,12 +347,20 @@ data Fuel = Fuel
       -- change nothing but that count, so it is not run again.
   }
 
-fuel0 :: Int -> Int -> Fuel
-fuel0 bytes tokens = Fuel bytes tokens maxPdfCMapEntries IM.empty IM.empty IM.empty
+xfuel0 :: Int -> Int -> XFuel
+xfuel0 bytes tokens = XFuel (fuel0 bytes tokens) IM.empty IM.empty IM.empty
+
+-- | Change the budgets, keeping the caches.
+onFuel :: (Fuel -> Fuel) -> XFuel -> XFuel
+onFuel g x = x { xfFuel = g (xfFuel x) }
+
+xBytes :: XFuel -> Int
+xBytes = fuBytes . xfFuel
 
 -- | Has the document spent any of its budgets?
-fuelSpent :: Fuel -> Bool
-fuelSpent fu = fuBytes fu <= 0 || fuTokens fu <= 0
+xSpent :: XFuel -> Bool
+xSpent = fuelSpent . xfFuel
+
 
 -- | The font a resource dictionary's entry names, loading it if this is the
 -- first time it has been asked for.
@@ -1176,7 +370,7 @@ fuelSpent fu = fuBytes fu <= 0 || fuTokens fu <= 0
 -- 'isFonts'). Either way a load is charged to the token budget by the size of
 -- what it had to read, because the tables are the file's: a width array may
 -- hold a million entries, and a three-number @\/W@ range stands for 65536.
-fontFor :: PdfFile -> Fuel -> Obj -> (FontInfo, Fuel)
+fontFor :: PdfFile -> XFuel -> Obj -> (FontInfo, XFuel)
 fontFor f fu o = case o of
   ORef r -> case IM.lookup r (fuFonts fu) of
     Just fi -> (fi, fu)
@@ -1186,8 +380,8 @@ fontFor f fu o = case o of
   where
     d = dictOf f o
     load = let (fi, fu') = loadFont f fu d
-               cost = objWeight f (ODict d) + IM.size (fiWidths fi)
-           in (fi, fu' { fuTokens = fuTokens fu' - cost })
+               cost = objWeight f (ODict d) + IV.coveredCount (fiWidths fi)
+           in (fi, onFuel (spendTokens cost) fu')
 
 -- | Roughly how many values an object holds, following references a few
 -- levels (a font's @\/Widths@ and @\/Encoding@ are usually objects of their
@@ -1205,7 +399,7 @@ objWeight f o0 = ceiling' - go (3 :: Int) ceiling' o0
       ORef r | hops > 0 -> go (hops - 1) (left - 1) (IM.findWithDefault ONull r (pfObjs f))
       _        -> left - 1
 
-loadFont :: PdfFile -> Fuel -> Dict -> (FontInfo, Fuel)
+loadFont :: PdfFile -> XFuel -> Dict -> (FontInfo, XFuel)
 loadFont f fu0 d = (FontInfo
   { fiBold = bold, fiItalic = italic, fiMono = mono
   , fiTwoByte = twoByte
@@ -1214,7 +408,7 @@ loadFont f fu0 d = (FontInfo
   , fiWidths = widths
   , fiDefW = defW
   , fiWScale = wScale
-  }, fu1 { fuTokens = fuTokens fu1 - 2 * wWork })
+  }, onFuel (spendTokens (2 * wWork)) fu1)
   where
     subtype = nameOf (lookD f d "Subtype")
     isType3 = subtype == BC.pack "Type3"
@@ -1245,10 +439,9 @@ loadFont f fu0 d = (FontInfo
     (toUni, fu1) = case (M.lookup (BC.pack "ToUnicode") d, lookD f d "ToUnicode") of
       (Just (ORef r), _) | Just m <- IM.lookup r (fuCMaps fu0) -> (m, fu0)
       (ref, OStream sd raw) ->
-        let (res, spent) = decodeStream f (fuBytes fu0) sd raw
-            m = either (const IM.empty) (parseToUnicode (fuEntries fu0)) res
-            fu = fu0 { fuBytes = fuBytes fu0 - spent
-                     , fuEntries = fuEntries fu0 - IM.size m }
+        let (res, spent) = decodeStream f (xBytes fu0) sd raw
+            m = either (const IM.empty) (parseToUnicode (fuEntries (xfFuel fu0))) res
+            fu = onFuel (spendEntries (IM.size m) . spendBytes spent) fu0
         in case ref of
              Just (ORef r) -> (m, fu { fuCMaps = IM.insert r m (fuCMaps fu) })
              _             -> (m, fu)
@@ -1284,8 +477,8 @@ loadFont f fu0 d = (FontInfo
                -- Only the standard 14 have metrics to fall back on; a Type3
                -- font's glyphs are procedures we do not run, so an unlisted
                -- code simply does not advance.
-               then (if isType3 then IM.empty else builtinWidths faceName)
-               else IM.fromList (zip [first ..] ws)
+               then (if isType3 then IV.empty else IV.fromKeys (IM.toList (builtinWidths faceName)))
+               else IV.fromKeys (zip [first ..] ws)
     defW
       | isType0 = case lookD f descendant "DW" of
                     ONum v | v > 0 -> v
@@ -1303,23 +496,28 @@ loadFont f fu0 d = (FontInfo
 --
 -- The second result is how many entries were written, which is the work done
 -- and not the size of the result: a repeated range rewrites the same keys.
-cidWidths :: PdfFile -> Obj -> (IM.IntMap Double, Int)
-cidWidths f o = go maxCMapEntries (arrOf f o) IM.empty
+cidWidths :: PdfFile -> Obj -> (IV.IntervalMap Double, Int)
+cidWidths f o = go maxCMapEntries (arrOf f o) IV.empty
   where
-    go :: Int -> [Obj] -> IM.IntMap Double -> (IM.IntMap Double, Int)
+    -- The budget is still spent per CID covered, exactly as when every CID
+    -- was its own map entry (the extractor's output, and when it stops,
+    -- are unchanged); only the storage is per range.
+    go :: Int -> [Obj] -> IV.IntervalMap Double -> (IV.IntervalMap Double, Int)
     go left _ acc | left <= 0 = (acc, maxCMapEntries)
     go left (a : rest) acc = case (resolve f a, rest) of
       (ONum c, (b : more)) -> case resolve f b of
         OArr ws ->
           let ws' = take left ws
           in go (left - length ws') more
-                (foldl' (\m (i, v) -> IM.insert i (numOf f (Just v)) m)
+                (foldl' (\m (i, v) -> IV.insertKey i (numOf f (Just v)) m)
                         acc (zip [truncate c ..] ws'))
         ONum c2 -> case more of
           (wv : more') ->
-            let is = take left [truncate c .. min (truncate c2) (truncate c + 65535)]
-            in go (left - max 1 (length is)) more'
-                  (foldl' (\m i -> IM.insert i (numOf f (Just wv)) m) acc is)
+            let lo = truncate c :: Int
+                hi = min (truncate c2) (lo + 65535)
+                taken = min left (max 0 (hi - lo + 1))
+            in go (left - max 1 taken) more'
+                  (if taken > 0 then IV.insertRange lo (lo + taken - 1) (numOf f (Just wv)) acc else acc)
           [] -> (acc, maxCMapEntries - left)
         _ -> go (left - 1) more acc
       _ -> (acc, maxCMapEntries - left)
@@ -1403,126 +601,6 @@ decodeUtf16BE s = T.pack (go (BS.unpack s))
            else chr u : go rest
     go _ = []
 
--- | Apply a @\/Differences@ array (@code \/name code \/name …@) over a base
--- encoding.
-applyDifferences :: PdfFile -> Obj -> IM.IntMap Char -> IM.IntMap Char
-applyDifferences f enc base = case enc of
-  ODict d -> go (arrOf f (M.findWithDefault ONull (BC.pack "Differences") d)) 0 base
-  _       -> base
-  where
-    go (o : rest) !cur acc = case resolve f o of
-      ONum v  -> go rest (truncate v) acc
-      OName n -> go rest (cur + 1) (case glyphChar (BC.unpack n) of
-                                      Just c  -> IM.insert cur c acc
-                                      Nothing -> acc)
-      _       -> go rest cur acc
-    go [] _ acc = acc
-
--- | A glyph name to the character it draws. The Adobe glyph list proper runs
--- to four thousand names; this covers the Latin text set plus the @uniXXXX@
--- convention, which between them is what a Differences array in a text
--- document actually uses.
-glyphChar :: String -> Maybe Char
-glyphChar nm = case nm of
-  [c] -> Just c
-  ('u' : 'n' : 'i' : hx) | length hx >= 4, all isHexDigit (take 4 hx) ->
-    Just (chr (foldl' (\a c -> a * 16 + digitToInt c) 0 (take 4 hx)))
-  ('u' : hx) | length hx >= 4, all isHexDigit hx ->
-    Just (chr (foldl' (\a c -> a * 16 + digitToInt c) 0 (take 6 hx)))
-  _ -> lookup nm glyphNames
-
-glyphNames :: [(String, Char)]
-glyphNames =
-  [ ("space", ' '), ("exclam", '!'), ("quotedbl", '"'), ("numbersign", '#')
-  , ("dollar", '$'), ("percent", '%'), ("ampersand", '&'), ("quotesingle", '\'')
-  , ("quoteright", '\x2019'), ("quoteleft", '\x2018'), ("parenleft", '(')
-  , ("parenright", ')'), ("asterisk", '*'), ("plus", '+'), ("comma", ',')
-  , ("hyphen", '-'), ("period", '.'), ("slash", '/'), ("zero", '0'), ("one", '1')
-  , ("two", '2'), ("three", '3'), ("four", '4'), ("five", '5'), ("six", '6')
-  , ("seven", '7'), ("eight", '8'), ("nine", '9'), ("colon", ':')
-  , ("semicolon", ';'), ("less", '<'), ("equal", '='), ("greater", '>')
-  , ("question", '?'), ("at", '@'), ("bracketleft", '['), ("backslash", '\\')
-  , ("bracketright", ']'), ("asciicircum", '^'), ("underscore", '_')
-  , ("grave", '`'), ("braceleft", '{'), ("bar", '|'), ("braceright", '}')
-  , ("asciitilde", '~'), ("quotedblleft", '\x201c'), ("quotedblright", '\x201d')
-  , ("quotedblbase", '\x201e'), ("quotesinglbase", '\x201a'), ("bullet", '\x2022')
-  , ("endash", '\x2013'), ("emdash", '\x2014'), ("fi", '\xfb01'), ("fl", '\xfb02')
-  , ("ff", '\xfb00'), ("ffi", '\xfb03'), ("ffl", '\xfb04')
-  , ("dagger", '\x2020'), ("daggerdbl", '\x2021'), ("ellipsis", '\x2026')
-  , ("perthousand", '\x2030'), ("guilsinglleft", '\x2039'), ("guilsinglright", '\x203a')
-  , ("guillemotleft", '\xab'), ("guillemotright", '\xbb'), ("trademark", '\x2122')
-  , ("minus", '\x2212'), ("fraction", '\x2044'), ("florin", '\x192')
-  , ("dotlessi", '\x131'), ("circumflex", '\x2c6'), ("tilde", '\x2dc')
-  , ("macron", '\xaf'), ("breve", '\x2d8'), ("dotaccent", '\x2d9')
-  , ("dieresis", '\xa8'), ("ring", '\x2da'), ("cedilla", '\xb8')
-  , ("hungarumlaut", '\x2dd'), ("ogonek", '\x2db'), ("caron", '\x2c7')
-  , ("exclamdown", '\xa1'), ("cent", '\xa2'), ("sterling", '\xa3')
-  , ("currency", '\xa4'), ("yen", '\xa5'), ("brokenbar", '\xa6'), ("section", '\xa7')
-  , ("copyright", '\xa9'), ("ordfeminine", '\xaa'), ("logicalnot", '\xac')
-  , ("registered", '\xae'), ("degree", '\xb0'), ("plusminus", '\xb1')
-  , ("mu", '\xb5'), ("paragraph", '\xb6'), ("periodcentered", '\xb7')
-  , ("onesuperior", '\xb9'), ("ordmasculine", '\xba'), ("onequarter", '\xbc')
-  , ("onehalf", '\xbd'), ("threequarters", '\xbe'), ("questiondown", '\xbf')
-  , ("Agrave", '\xc0'), ("Aacute", '\xc1'), ("Acircumflex", '\xc2')
-  , ("Atilde", '\xc3'), ("Adieresis", '\xc4'), ("Aring", '\xc5'), ("AE", '\xc6')
-  , ("Ccedilla", '\xc7'), ("Egrave", '\xc8'), ("Eacute", '\xc9')
-  , ("Ecircumflex", '\xca'), ("Edieresis", '\xcb'), ("Igrave", '\xcc')
-  , ("Iacute", '\xcd'), ("Icircumflex", '\xce'), ("Idieresis", '\xcf')
-  , ("Eth", '\xd0'), ("Ntilde", '\xd1'), ("Ograve", '\xd2'), ("Oacute", '\xd3')
-  , ("Ocircumflex", '\xd4'), ("Otilde", '\xd5'), ("Odieresis", '\xd6')
-  , ("multiply", '\xd7'), ("Oslash", '\xd8'), ("Ugrave", '\xd9'), ("Uacute", '\xda')
-  , ("Ucircumflex", '\xdb'), ("Udieresis", '\xdc'), ("Yacute", '\xdd')
-  , ("Thorn", '\xde'), ("germandbls", '\xdf'), ("agrave", '\xe0'), ("aacute", '\xe1')
-  , ("acircumflex", '\xe2'), ("atilde", '\xe3'), ("adieresis", '\xe4')
-  , ("aring", '\xe5'), ("ae", '\xe6'), ("ccedilla", '\xe7'), ("egrave", '\xe8')
-  , ("eacute", '\xe9'), ("ecircumflex", '\xea'), ("edieresis", '\xeb')
-  , ("igrave", '\xec'), ("iacute", '\xed'), ("icircumflex", '\xee')
-  , ("idieresis", '\xef'), ("eth", '\xf0'), ("ntilde", '\xf1'), ("ograve", '\xf2')
-  , ("oacute", '\xf3'), ("ocircumflex", '\xf4'), ("otilde", '\xf5')
-  , ("odieresis", '\xf6'), ("divide", '\xf7'), ("oslash", '\xf8')
-  , ("ugrave", '\xf9'), ("uacute", '\xfa'), ("ucircumflex", '\xfb')
-  , ("udieresis", '\xfc'), ("yacute", '\xfd'), ("thorn", '\xfe')
-  , ("ydieresis", '\xff'), ("Euro", '\x20ac'), ("Scaron", '\x160')
-  , ("scaron", '\x161'), ("Zcaron", '\x17d'), ("zcaron", '\x17e')
-  , ("Ydieresis", '\x178'), ("OE", '\x152'), ("oe", '\x153')
-  ]
-
-namedEncoding :: String -> IM.IntMap Char
-namedEncoding n = case n of
-  "WinAnsiEncoding"  -> winAnsiMap
-  "MacRomanEncoding" -> macRomanMap
-  _                  -> winAnsiMap
-
--- | WinAnsi is Windows-1252: Latin-1 apart from 0x80–0x9F, which is where the
--- curly quotes and dashes live — the bytes that decide whether a document's
--- punctuation reads correctly.
-winAnsiMap :: IM.IntMap Char
-winAnsiMap = IM.fromList $
-  [ (i, chr i) | i <- [32 .. 126] ]
-  ++ zip [128 ..] cp1252High
-  ++ [ (i, chr i) | i <- [160 .. 255] ]
-
-cp1252High :: String
-cp1252High =
-  "\x20ac\xfffd\x201a\x0192\x201e\x2026\x2020\x2021\
-  \\x02c6\x2030\x0160\x2039\x0152\xfffd\x017d\xfffd\
-  \\xfffd\x2018\x2019\x201c\x201d\x2022\x2013\x2014\
-  \\x02dc\x2122\x0161\x203a\x0153\xfffd\x017e\x0178"
-
-macRomanMap :: IM.IntMap Char
-macRomanMap = IM.fromList $
-  [ (i, chr i) | i <- [32 .. 126] ] ++ zip [128 ..] macRomanHigh
-
-macRomanHigh :: String
-macRomanHigh =
-  "\xc4\xc5\xc7\xc9\xd1\xd6\xdc\xe1\xe0\xe2\xe4\xe3\xe5\xe7\xe9\xe8\
-  \\xea\xeb\xed\xec\xee\xef\xf1\xf3\xf2\xf4\xf6\xf5\xfa\xf9\xfb\xfc\
-  \\x2020\xb0\xa2\xa3\xa7\x2022\xb6\xdf\xae\xa9\x2122\xb4\xa8\x2260\xc6\xd8\
-  \\x221e\xb1\x2264\x2265\xa5\xb5\x2202\x2211\x220f\x3c0\x222b\xaa\xba\x3a9\xe6\xf8\
-  \\xbf\xa1\xac\x221a\x192\x2248\x2206\xab\xbb\x2026\xa0\xc0\xc3\xd5\x152\x153\
-  \\x2013\x2014\x201c\x201d\x2018\x2019\xf7\x25ca\xff\x178\x2044\x20ac\x2039\x203a\xfb01\xfb02\
-  \\x2021\xb7\x201a\x201e\x2030\xc2\xca\xc1\xcb\xc8\xcd\xce\xcf\xcc\xd3\xd4\
-  \\xf8ff\xd2\xda\xdb\xd9\x131\x2c6\x2dc\xaf\x2d8\x2d9\x2da\xb8\x2dd\x2db\x2c7"
 
 -- | Approximate metrics for the standard 14 fonts, which a file may use
 -- without supplying @\/Widths@ at all. Getting these roughly right matters
@@ -1578,7 +656,7 @@ decodeGlyphs fi s
                 | otherwise -> T.empty
 
 glyphWidth :: FontInfo -> Int -> Double
-glyphWidth fi c = IM.findWithDefault (fiDefW fi) c (fiWidths fi)
+glyphWidth fi c = fromMaybe (fiDefW fi) (IV.lookupKey c (fiWidths fi))
 
 -- | Spell the Latin typographic ligatures out.
 --
@@ -1606,19 +684,17 @@ expandLigatures t
 -- The content-stream interpreter
 
 -- | @[a b c d e f]@, the affine matrix PDF writes as a six-element array.
-type Mat = (Double, Double, Double, Double, Double, Double)
+type Mat = Affine
 
 identityMat :: Mat
-identityMat = (1, 0, 0, 1, 0, 0)
+identityMat = identityA
 
+-- | @matMul m n@ is @m@ then @n@: PDF's row-vector product @m × n@, which
+-- is why @cm@ reads @matMul new ctm@. (The same floating-point operations in
+-- the same order as the tuple version this view had before the split.)
 matMul :: Mat -> Mat -> Mat
-matMul (a, b, c, d, e, f) (a', b', c', d', e', f') =
-  ( a * a' + b * c'
-  , a * b' + b * d'
-  , c * a' + d * c'
-  , c * b' + d * d'
-  , e * a' + f * c' + e'
-  , e * b' + f * d' + f' )
+matMul m n = composeA n m
+
 
 -- | A positioned run of text.
 --
@@ -1660,52 +736,17 @@ data IState = IState
   , isRuns  :: ![Run]        -- ^ Reversed.
   , isOps   :: !Int
   , isChars :: !Int
-  , isFuel  :: !Fuel       -- ^ The document's budgets and caches, passing through.
+  , isFuel  :: !XFuel      -- ^ The document's budgets and caches, passing through.
   , isFonts :: !(M.Map BS.ByteString FontInfo)
       -- ^ Inline fonts of the resource dictionary in force, by name: they
       -- have no object number for 'fuFonts' to know them by, and a page
       -- selects the same one hundreds of times.
   }
 
-data Tok = TObj !Obj | TOp !BS.ByteString
-
--- | Split a content stream into operands and operators.
---
--- Inline images (@BI … ID …binary… EI@) are the one construct that cannot be
--- tokenised as objects, since the bytes after @ID@ are raw samples that may
--- contain anything. They are skipped whole.
-contentTokens :: BS.ByteString -> [Tok]
-contentTokens bs = go 0
-  where
-    n = BS.length bs
-    go !i
-      | j >= n = []
-      | startsObj (BS.index bs j) = case parseObj bs j of
-          Just (o, k) | k > j -> TObj o : go k
-          _ -> go (j + 1)
-      | otherwise =
-          let (kw, k) = readRegular bs j
-          in if BS.null kw then go (j + 1)
-             else if kw == BC.pack "BI" then go (skipInlineImage k)
-             else TOp kw : go k
-      where j = skipWs bs i
-    startsObj c = c == 47 || c == 40 || c == 60 || c == 91
-                    || (c >= 48 && c <= 57) || c == 43 || c == 45 || c == 46
-    -- After ID comes one whitespace byte and then the samples; EI ends them.
-    skipInlineImage i =
-      let (_, post) = BS.breakSubstring (BC.pack "ID") (BS.drop i bs)
-      in if BS.null post then n
-         else findEI (i + (n - i - BS.length post) + 3)
-    findEI !k
-      | k >= n = n
-      | BS.index bs k == 69 && byteAt bs (k + 1) == 73          -- "EI"
-      , isWsB (byteAt bs (k - 1))
-      , k + 2 >= n || isWsB (byteAt bs (k + 2)) = k + 2
-      | otherwise = findEI (k + 1)
 
 -- | Run a page's content, collecting positioned text runs, and hand back
 -- what the document has left to spend.
-runContent :: PdfFile -> Fuel -> Dict -> BS.ByteString -> ([Run], Fuel)
+runContent :: PdfFile -> XFuel -> Dict -> BS.ByteString -> ([Run], XFuel)
 runContent f fuIn res0 dat = (reverse (isRuns end), isFuel end)
   where
     end = exec 0 res0 (contentTokens dat) st0 0 []
@@ -1715,20 +756,22 @@ runContent f fuIn res0 dat = (reverse (isRuns end), isFuel end)
     -- not the length of @ops@: only the first 'maxOperands' are kept.
     exec :: Int -> Dict -> [Tok] -> IState -> Int -> [Obj] -> IState
     exec _ _ [] st _ _ = st
+    -- ('contentTokens' never produces an inline image; it skips them.)
+    exec depth res (TInline _ _ : ts) st !k ops = exec depth res ts st k ops
     exec depth res (TObj o : ts) st !k ops
       | k < maxOperands = exec depth res ts st (k + 1) (o : ops)
       -- Operands nothing will read. They are still charged, a block at a
       -- time, or a stream of them with no operator would cost nothing.
       | k .&. 4095 /= 0 = exec depth res ts st (k + 1) ops
-      | fuelSpent (isFuel st) = st
+      | xSpent (isFuel st) = st
       | otherwise =
           let fu = isFuel st
-          in exec depth res ts st { isFuel = fu { fuTokens = fuTokens fu - 4096 } } (k + 1) ops
+          in exec depth res ts st { isFuel = onFuel (spendTokens 4096) fu } (k + 1) ops
     exec depth res (TOp op : ts) st !k ops
-      | isOps st > maxOpsPerPage || isChars st > maxPdfChars || fuelSpent fu = st
+      | isOps st > maxOpsPerPage || isChars st > maxPdfChars || xSpent fu = st
       | otherwise =
           let st1 = st { isOps = isOps st + 1
-                       , isFuel = fu { fuTokens = fuTokens fu - min k maxOperands - weight } }
+                       , isFuel = onFuel (\x -> x { fuTokens = fuTokens x - min k maxOperands - weight }) fu }
               st' = apply depth res (BC.unpack op) (reverse ops) st1
           in exec depth res ts st' 0 []
       where
@@ -1749,7 +792,7 @@ runContent f fuIn res0 dat = (reverse (isRuns end), isFuel end)
                 (g : gs) -> st { isG = g, isStack = gs }
                 []       -> st
       "cm" | [a, b, c, d, e, ff] <- map num (take 6 args) ->
-               st { isG = g { gCTM = matMul (a, b, c, d, e, ff) (gCTM g) } }
+               st { isG = g { gCTM = matMul (Affine a b c d e ff) (gCTM g) } }
       "BT" -> st { isTm = identityMat, isTlm = identityMat }
       "ET" -> st
       "Tf" -> case args of
@@ -1757,10 +800,10 @@ runContent f fuIn res0 dat = (reverse (isRuns end), isFuel end)
           let (fi, st') = fontNamed res fn st
           in st' { isG = g { gFont = Just fi, gSize = num sz } }
         _ -> st
-      "Td" | [tx, ty] <- map num (take 2 args) -> setLine (matMul (1, 0, 0, 1, tx, ty) (isTlm st)) st
+      "Td" | [tx, ty] <- map num (take 2 args) -> setLine (matMul (translateA tx ty) (isTlm st)) st
       "TD" | [tx, ty] <- map num (take 2 args) ->
-               setLine (matMul (1, 0, 0, 1, tx, ty) (isTlm st)) st { isG = g { gLead = -ty } }
-      "Tm" | [a, b, c, d, e, ff] <- map num (take 6 args) -> setLine (a, b, c, d, e, ff) st
+               setLine (matMul (translateA tx ty) (isTlm st)) st { isG = g { gLead = -ty } }
+      "Tm" | [a, b, c, d, e, ff] <- map num (take 6 args) -> setLine (Affine a b c d e ff) st
       "T*" -> nextLine st
       "TL" | (v : _) <- args -> st { isG = g { gLead = num v } }
       "Tc" | (v : _) <- args -> st { isG = g { gChar = num v } }
@@ -1777,13 +820,13 @@ runContent f fuIn res0 dat = (reverse (isRuns end), isFuel end)
       where g = isG st
 
     setLine m st = st { isTm = m, isTlm = m }
-    nextLine st = setLine (matMul (1, 0, 0, 1, 0, negate (gLead (isG st))) (isTlm st)) st
+    nextLine st = setLine (matMul (translateA 0 (negate (gLead (isG st)))) (isTlm st)) st
 
     tjItem st (OStr s) = showStr s st
     tjItem st (ONum v) =
       let gs = isG st
           tx = negate v / 1000 * gSize gs * gHScale gs
-      in st { isTm = matMul (1, 0, 0, 1, tx, 0) (isTm st) }
+      in st { isTm = matMul (translateA tx 0) (isTm st) }
     tjItem st _ = st
 
     -- Draw a string: one run, positioned by where the text matrix starts and
@@ -1803,12 +846,12 @@ runContent f fuIn res0 dat = (reverse (isRuns end), isFuel end)
                         * gHScale gs
                       | (c, _) <- glyphs ]
             base = matMul (isTm st) (gCTM gs)
-            (a, b, c', d, e, ff) = base
+            Affine a b c' d e ff = base
             scaleY = sqrt (abs (c' * c' + d * d))
             scaleX = sqrt (abs (a * a + b * b))
             x0 = e; y0 = ff
-            tm' = matMul (1, 0, 0, 1, adv, 0) (isTm st)
-            (_, _, _, _, e2, f2) = matMul tm' (gCTM gs)
+            tm' = matMul (translateA adv 0) (isTm st)
+            Affine _ _ _ _ e2 f2 = matMul tm' (gCTM gs)
             fmt = PdfFmt (fiBold fi) (fiItalic fi) (fiMono fi) (gSize gs * scaleY)
             run = Run x0 y0 e2 f2 (max 0.01 (gSize gs * scaleY)) txt fmt
         in if T.null txt || T.all (== ' ') txt || scaleX <= 0
@@ -1843,11 +886,11 @@ runContent f fuIn res0 dat = (reverse (isRuns end), isFuel end)
                _ -> case resolve f entry of
                  OStream sd raw
                    | nameOf (lookD f sd "Subtype") == BC.pack "Form" ->
-                       case decodeStream f (fuBytes fu) sd raw of
-                         (Left _, spent) -> st { isFuel = fu { fuBytes = fuBytes fu - spent } }
+                       case decodeStream f (xBytes fu) sd raw of
+                         (Left _, spent) -> st { isFuel = onFuel (spendBytes spent) fu }
                          (Right body, spent) ->
                            runForm depth res key (known == Nothing) sd body
-                                   st { isFuel = fu { fuBytes = fuBytes fu - spent } }
+                                   st { isFuel = onFuel (spendBytes spent) fu }
                  _ -> st
 
     runForm depth res key unseen sd body st
@@ -1858,15 +901,15 @@ runContent f fuIn res0 dat = (reverse (isRuns end), isFuel end)
       | unseen, Just r <- key = case plainOps (contentTokens body) 0 0 of
           Just (nOps, nToks) ->
             st { isOps = isOps st + nOps
-               , isFuel = fu { fuTokens = fuTokens fu - nToks
-                             , fuPlain = IM.insert r nOps (fuPlain fu) } }
+               , isFuel = (onFuel (spendTokens nToks) fu)
+                             { fuPlain = IM.insert r nOps (fuPlain fu) } }
           Nothing -> run st { isFuel = fu { fuPlain = IM.insert r (-1) (fuPlain fu) } }
       | otherwise = run st
       where
         fu = isFuel st
         run st1 =
           let mtx = case map (numOf f . Just) (arrOf f (lookD f sd "Matrix")) of
-                      [a, b, c, d, e, ff] -> (a, b, c, d, e, ff)
+                      [a, b, c, d, e, ff] -> Affine a b c d e ff
                       _ -> identityMat
               (inner, own) = case lookD f sd "Resources" of
                         ODict rd -> (rd, True)
@@ -1885,6 +928,7 @@ runContent f fuIn res0 dat = (reverse (isRuns end), isFuel end)
     -- form; 'Nothing' at the first operator that does either.
     plainOps :: [Tok] -> Int -> Int -> Maybe (Int, Int)
     plainOps [] !nOps !nToks = Just (nOps, nToks)
+    plainOps (TInline _ _ : ts) !nOps !nToks = plainOps ts nOps nToks
     plainOps (TObj _ : ts) !nOps !nToks = plainOps ts nOps (nToks + 1)
     plainOps (TOp op : ts) !nOps !nToks
       | op `elem` drawing = Nothing
@@ -2210,12 +1254,14 @@ parsePdf = parsePdfWithin maxPdfDecoded maxPdfTokens
 -- meet them in reasonable time; this is how the tests reach the code that
 -- runs when one is met.
 parsePdfWithin :: Int -> Int -> BS.ByteString -> Either String PdfDoc
-parsePdfWithin decodeBudget tokenBudget bs
-  | not (sniffPdf bs) = Left "not a PDF"
-  | BS.length bs > maxPdfBytes =
-      Left ("PDF too large to read (" ++ show (BS.length bs `div` (1024 * 1024)) ++ " MB)")
-  | M.member (BC.pack "Encrypt") trailer =
-      Left "encrypted PDF \x2014 this view cannot decrypt it"
+parsePdfWithin decodeBudget tokenBudget bs = case openPdfFile decodeBudget bs of
+  Left e -> Left e
+  Right (file, bytesLeft) -> extractPdf tokenBudget bs file bytesLeft
+
+-- | The text view of an opened file, starting from what its object streams
+-- left of the decoding budget.
+extractPdf :: Int -> BS.ByteString -> PdfFile -> Int -> Either String PdfDoc
+extractPdf tokenBudget bs file bytesLeft
   | null pageDicts = Left "PDF has no pages"
   | otherwise = Right PdfDoc
       { pdPages = Seq.fromList pages
@@ -2226,24 +1272,22 @@ parsePdfWithin decodeBudget tokenBudget bs
       , pdTitle = title
       , pdVer = version
       , pdNote = note
+      , pdSource = PdfSource file (Seq.fromList pageDicts)
       }
   where
-    (scanned, bytesLeft) = expandObjStms bs decodeBudget (scanObjects bs)
-    objs = IM.map snd scanned
-    trailer = findTrailer bs objs
-    file = PdfFile objs trailer
+    trailer = pfTrailer file
     pageDicts = collectPages file
     truncated = length pageDicts >= maxPdfPages
 
-    (rawPages, fuEnd) = goPages 1 0 (fuel0 bytesLeft tokenBudget) pageDicts
+    (rawPages, fuEnd) = goPages 1 0 (xfuel0 bytesLeft tokenBudget) pageDicts
     pages = markHeadings rawPages
     -- Did the document run out of budget ('maxPdfDecoded', 'maxPdfTokens')
     -- before it ran out of pages?
-    spent = fuelSpent fuEnd
-    goPages :: Int -> Int -> Fuel -> [Dict] -> ([PdfPage], Fuel)
+    spent = xSpent fuEnd
+    goPages :: Int -> Int -> XFuel -> [Dict] -> ([PdfPage], XFuel)
     goPages _ _ fu [] = ([], fu)
     goPages !k !chars fu (d : ds)
-      | chars > maxPdfChars || fuelSpent fu = ([], fu)
+      | chars > maxPdfChars || xSpent fu = ([], fu)
       | otherwise =
           let (pars, fu') = pageOf fu d
               n = sum [ T.length (psText s) | p <- pars, s <- ppRuns p ]
@@ -2254,7 +1298,8 @@ parsePdfWithin decodeBudget tokenBudget bs
       let res = dictOf file (M.findWithDefault ONull (BC.pack "Resources") d)
           box = mediaBox file d
           rot = ((intOf file (M.lookup (BC.pack "Rotate") d) `mod` 360) + 360) `mod` 360
-          (dat, fu1) = contentsOf file fu d
+          (dat, core1) = contentsOf file (xfFuel fu) d
+          fu1 = fu { xfFuel = core1 }
           (runs, fu2) = runContent file fu1 res dat
       in (assemblePage box rot runs, fu2)
 
@@ -2314,37 +1359,6 @@ bodySize ps
     add m (sz, n) | sz <= 0 = m
                   | otherwise = IM.insertWith (+) (round (sz * 2)) n m
 
-mediaBox :: PdfFile -> Dict -> (Double, Double, Double, Double)
-mediaBox f d = case map (numOf f . Just) (arrOf f box) of
-  [a, b, c, e] | abs (c - a) > 1 && abs (e - b) > 1 -> (min a c, min b e, max a c, max b e)
-  _ -> (0, 0, 612, 792)   -- US Letter, PDF's default
-  where
-    box = case M.lookup (BC.pack "CropBox") d of
-      Just b  -> resolve f b
-      Nothing -> M.findWithDefault ONull (BC.pack "MediaBox") d
-
--- | A page's content: one stream, or an array of them that must be
--- concatenated (producers split content at arbitrary points, including in the
--- middle of an operator's operands).
---
--- Each stream is charged to the document's decoding budget, and a page stops
--- taking more once it holds 'maxStreamBytes' of content: the array is the
--- file's, and may name one stream any number of times.
-contentsOf :: PdfFile -> Fuel -> Dict -> (BS.ByteString, Fuel)
-contentsOf f fu0 d = (BS.intercalate (BC.pack "\n") (reverse parts), fuEnd)
-  where
-    (parts, _, fuEnd) = foldl' one ([], 0 :: Int, fu0) streams
-    streams = case M.findWithDefault ONull (BC.pack "Contents") d of
-      OArr xs -> map (resolve f) xs
-      o       -> [resolve f o]
-    one (acc, !tot, !fu) (OStream sd raw)
-      | tot < maxStreamBytes =
-          let (r, used) = decodeStream f (fuBytes fu) sd raw
-              fu' = fu { fuBytes = fuBytes fu - used }
-          in case r of
-               Right b -> (b : acc, tot + BS.length b, fu')
-               Left _  -> (acc, tot, fu')
-    one st _ = st
 
 ------------------------------------------------------------------------------
 -- Layout

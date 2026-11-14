@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="200" font-family="DejaVu Sans, sans-serif">
+<text x="10" y="30" font-size="20">Hello, SVG</text>
+<text x="100" y="60" font-size="16" text-anchor="middle" fill="blue">centred</text>
+<text x="190" y="90" font-size="16" text-anchor="end" font-weight="bold">end bold</text>
+<text x="10" y="120" font-size="14">a<tspan fill="red" dy="-5">b</tspan><tspan dy="5" font-style="italic">c</tspan> spaced   out</text>
+<text x="10 30 50 70" y="150" font-size="18" rotate="0 15 30 45">ABCD</text>
+<text x="10" y="180" font-size="18" fill="none" stroke="green" letter-spacing="3">Stroke</text>
+</svg>

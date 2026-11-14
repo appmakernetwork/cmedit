@@ -15,6 +15,7 @@ module Cmedit.ConfigFile
   ( -- * Configuration
     Config(..)
   , ThemeName(..)
+  , PdfViewMode(..)
   , defaultConfig
   , parseConfigText
   , updateConfigText
@@ -86,6 +87,11 @@ data ThemeName = ThemeDark | ThemeLight | ThemeAuto | ThemeCherryBlossom
                | ThemeFlashbang | ThemeMidnight | ThemeGraphite
   deriving (Eq, Show)
 
+-- | How a PDF opens: its page as a picture, its text reflowed, or the page
+-- when the terminal can show pixels and the reflow otherwise.
+data PdfViewMode = PdfViewAuto | PdfViewPage | PdfViewReflow
+  deriving (Eq, Show)
+
 data Config = Config
   { cfgTabWidth       :: !Int
   , cfgTabsToSpaces   :: !Bool
@@ -102,6 +108,8 @@ data Config = Config
   , cfgRestoreSession :: !Bool   -- ^ Reopen the last session (folder + files) when started with no arguments; @--restore@ forces it.
   , cfgTheme          :: !ThemeName
   , cfgPagedView      :: !Bool   -- ^ Offer the read-only paged view for files too large to load, instead of refusing them.
+  , cfgSvgPicture     :: !Bool   -- ^ @svg-view = picture@: open an SVG as its picture (Alt+T shows the source); @source@ opens the markup.
+  , cfgPdfView        :: !PdfViewMode -- ^ @pdf-view@: how a PDF opens (Alt+T switches either way).
   , cfgDebugStats     :: !Bool   -- ^ Show live session counters (frames, heap, jobs) on the status bar.
   , cfgLint           :: !Bool                -- ^ Master switch for external-linter diagnostics.
   , cfgLintOn         :: ![(LinterId, Bool)]  -- ^ Per-linter enable flags, one entry per 'Cmedit.Lint.linters' row.
@@ -124,6 +132,8 @@ defaultConfig = Config
   , cfgRestoreSession = False   -- opt-in: a bare `cmedit` should stay a blank page
   , cfgTheme          = ThemeAuto   -- follow the terminal background; dark when undetectable
   , cfgPagedView      = True
+  , cfgSvgPicture     = True
+  , cfgPdfView        = PdfViewAuto
   , cfgDebugStats     = False
   , cfgLint           = True
   , cfgLintOn         = [ (linId l, linDefaultOn l) | l <- linters ]
@@ -184,6 +194,15 @@ applyKey key val cfg = case key of
     "graphite"       -> Right cfg { cfgTheme = ThemeGraphite }
     _ -> Left "theme expects 'auto', 'dark-terminal', 'light-terminal', 'cherry-blossom', 'flashbang', 'midnight' or 'graphite'"
   "paged-view" -> boolKey (\b -> cfg { cfgPagedView = b })
+  "svg-view" -> case map toLower val of
+    "picture" -> Right cfg { cfgSvgPicture = True }
+    "source"  -> Right cfg { cfgSvgPicture = False }
+    _         -> Left "svg-view expects 'picture' or 'source'"
+  "pdf-view" -> case map toLower val of
+    "auto"   -> Right cfg { cfgPdfView = PdfViewAuto }
+    "page"   -> Right cfg { cfgPdfView = PdfViewPage }
+    "reflow" -> Right cfg { cfgPdfView = PdfViewReflow }
+    _        -> Left "pdf-view expects 'auto', 'page' or 'reflow'"
   "debug-stats" -> boolKey (\b -> cfg { cfgDebugStats = b })
   "lint" -> boolKey (\b -> cfg { cfgLint = b })
   _ | Just suffix <- stripPrefix' "lint-" key
@@ -252,6 +271,16 @@ configKeysHelp =
   , "                     lint-shellcheck (each = on|off)."
   , "paged-view = BOOL    Open files too large to edit in a read-only paged"
   , "                     viewer instead of refusing them (default true)."
+  , "svg-view = picture|source"
+  , "                     Open .svg files as the picture they draw (default)"
+  , "                     or as their markup. Alt+T switches either way; the"
+  , "                     file itself is always the text, whichever shows."
+  , "pdf-view = auto|page|reflow"
+  , "                     Open a PDF as its pages (drawn as pictures) or as"
+  , "                     reflowed text for reading, selecting and finding."
+  , "                     'auto' (default) shows pages when the terminal can"
+  , "                     draw pixels (kitty graphics or sixel) and reflow"
+  , "                     otherwise. Alt+T switches either way."
   , "debug-stats = BOOL   Show live session counters (frame time, heap, jobs)"
   , "                     on the status bar (default off). For a one-shot"
   , "                     summary instead, run with --stats-on-exit."
@@ -281,6 +310,9 @@ configFields =
   , ("restore-session",          renderBool . cfgRestoreSession)
   , ("theme",                    renderTheme . cfgTheme)
   , ("paged-view",               renderBool . cfgPagedView)
+  , ("svg-view",                 \c -> if cfgSvgPicture c then "picture" else "source")
+  , ("pdf-view",                 \c -> case cfgPdfView c of
+                                         PdfViewAuto -> "auto"; PdfViewPage -> "page"; PdfViewReflow -> "reflow")
   , ("debug-stats",              renderBool . cfgDebugStats)
   , ("lint",                     renderBool . cfgLint)
   ] ++

@@ -116,7 +116,12 @@ escape sequences and the POSIX `termios` API.
   hits and every match highlighted while the dialog is open; the hit becomes the
   selection, so finding something and copying it are one gesture.
   The view is read-only: there is no serialiser back to PDF and there could not
-  be. Encrypted files say so rather than showing noise.
+  be. Encrypted files say so rather than showing noise. **Alt+T** switches to
+  the **page view**: the pages themselves, drawn by the from-scratch vector
+  rasteriser in real pixels on kitty/sixel terminals (as a half-block
+  thumbnail elsewhere), with PgDn/PgUp, zoom (+/-, Ctrl+wheel, drag), and the
+  next page drawn in the background so turning to it is instant.
+  `pdf-view = auto|page|reflow` (default: pages when the terminal shows pixels).
 - **Paged view for huge files**: a file too large to load as an editable buffer
   (over 100 MB) used to be refused outright. It now opens in a read-only paged
   viewer whose memory does not depend on the file's size — a 281 MB, 4-million
@@ -126,6 +131,15 @@ escape sequences and the POSIX `termios` API.
   Ctrl+Home/End and **Go To Line** (jump straight to line 2 000 000 of a log)
   are all instant. Syntax highlighting still applies per visible line. Turn it
   off with `paged-view = off` to get the old refusal back.
+- **SVG pictures**: an `.svg` / `.svgz` opens as the picture it draws, in the
+  image view (fit, wheel and drag zoom, half-block or ASCII cells, kitty/sixel
+  pixels where the terminal has them), re-rasterised from its vector scene at
+  every zoom so it stays sharp. The picture is a view of the text, which stays
+  the document: **Alt+T** edits the source (highlighted) and back redraws it;
+  Save, undo, Revert and crash recovery all work on the text. Text is drawn
+  with the installed system fonts; large pictures render in the background.
+  `svg-view = source` opens the markup instead. The rasteriser, the SVG
+  front-end and the font readers are all from scratch (plan 0034).
 - **Image view mode**: opening a `.bmp`, `.gif`, `.jpg`/`.jpeg`, `.png`,
   `.webp`, or `.ppm`/`.pgm`/`.pbm` (detected by magic bytes) shows a read-only,
   scaled rendering of the picture — useful for glancing at images over SSH where
@@ -552,6 +566,13 @@ logic unit-testable without a terminal.
 | `Cmedit.JxlBits` / `JxlEntropy` | JPEG XL bit reader; ANS/prefix codes, LZ77, hybrid integers, clustered contexts |
 | `Cmedit.JxlModular` / `JxlVarDct` | JPEG XL modular mode (MA trees, weighted predictor, RCT/palette/squeeze); DCT family, dequantisation, gaborish, EPF, HF coefficients |
 | `Cmedit.JxlPar` | The decoder's one parallel primitive: ordered, deterministic, cancellation-safe worker jobs (`parOrdered`) |
+| `Cmedit.Geom` / `Cmedit.Scene` | Plane geometry and the vector display list shared by the rasteriser and its front-ends |
+| `Cmedit.Raster` (+ `RasterCore`, `RasterGeom`, `RasterFilter`) | From-scratch anti-aliased vector rasteriser: scene → RGBA at any size and crop |
+| `Cmedit.Svg` (+ `SvgTree`, `SvgCss`, `SvgPath`) | SVG → scene: the element tree, CSS cascade, paths, paint servers, text layout; plus the font/image pre-pass |
+| `Cmedit.Font` (+ `FontTT`, `FontCFF`, `FontT1`, `FontCore`) | TrueType/OpenType/CFF/Type 1 font programs → glyph outlines |
+| `Cmedit.FontSys` | Which installed font file substitutes for a requested family (pure ranking) |
+| `Cmedit.FontProvider` | Driver-side system-font discovery and a bounded on-demand font cache; the SVG `Face` adapter (and the PDF page view's font source) |
+| `Cmedit.VecView` | The vector-picture view model: virtual pixel grid, crop → device matrix, exact-size rasters, render keys |
 | `Cmedit.Pdf` | From-scratch PDF reader: object scan, filters, content-stream interpreter, fonts, and page→document reconstruction |
 | `Cmedit.Pager` | Read-only paged view of files too large to load: sparse line index + windowed reads |
 | `Cmedit.Rtf` | RTF parser + document layout for the read-only formatted view of `.rtf` files |
@@ -562,8 +583,15 @@ logic unit-testable without a terminal.
 | `Cmedit.Formula` | Spreadsheet formula parser and evaluator, for the cells a workbook left uncalculated |
 | `Cmedit.Epub` | Container/package/spine plumbing + a minimal XHTML → paragraph mapper |
 | `Cmedit.Odf` | OpenDocument `.odt`/`.ods`: the automatic-style table, then the same two targets |
+| `Cmedit.History` | Bounded `Seq` histories (`pushHist`): undo/redo, navigation trail, find history |
+| `Cmedit.Journal` | Crash-recovery journal format, naming and the recovery decision (pure) |
+| `Cmedit.HelpCard` / `Cmedit.Manual` | The F1 keyboard card and the built-in Markdown manual |
 | `Cmedit.About` | The About box's animated wordmark (pure frame→cells generation) |
 | `Cmedit.Render` | Model → cell grid, and the diff to escape codes |
+| `Cmedit.PdfRender` (+ `PdfRenderFont`, `PdfRenderShade`) | PDF page → scene for the page view: the graphics state, text with PDF's own widths (substitute fonts stretched to them), forms/Type 3/patterns shared via `CTransform`, shadings and meshes, transparency, annotation appearances |
+| `Cmedit.PdfObj` | The PDF object layer shared by the reading view and the page renderer: lexer, object scan, object streams, filters, content tokenizer, page tree, the document budget (`Fuel`) |
+| `Cmedit.PdfImage` / `Cmedit.PdfFunc` / `Cmedit.Ccitt` | PDF image XObjects and inline images → RGBA (every colour space, masks, CMYK JPEG); PDF functions (sampled, exponential, stitching, PostScript calculator); CCITT fax G3/G4 |
+| `Cmedit.Jobs` | Background-job supervision: one job per kind, newest cancels the previous, forked unmasked so a kill is immediate |
 | `Cmedit.App` | IO driver: setup/teardown, reader thread, event loop |
 
 ## Tests

@@ -14,6 +14,8 @@ module Cmedit.Gfx
     -- * Placement
   , GfxKind(..)
   , gfxFit
+  , gfxFitVector
+  , maxSixelVectorPixels
   , maxGfxPixels
   , maxAnimGfxPixels
   , kittyPlace
@@ -23,12 +25,16 @@ module Cmedit.Gfx
   , sixelPlace
     -- * Encoders (exposed for tests)
   , base64B
+  , base64Strict
   , sixelEncode
   ) where
 
 import Data.Bits ((.&.), (.|.), shiftL, shiftR)
-import Data.ByteString.Builder (Builder, char7, intDec, string7, word8)
+import Data.ByteString.Builder (Builder, byteString, char7, intDec, string7, word8)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Internal as BI
+import qualified Data.ByteString.Unsafe as BU
+import Foreign.Storable (pokeByteOff)
 import Data.Word (Word8)
 import Data.Array.ST (STUArray, newArray, readArray, writeArray)
 import Data.Array.Unboxed (UArray, (!))
@@ -99,6 +105,40 @@ gfxFit (pw0, ph0) (top, left, tw, th) (cw0, ch0) allowUpscale =
       pxW = max 1 (round (fromIntegral dispW * capSc))
       pxH = max 1 (round (fromIntegral dispH * capSc))
   in (row, col, cols, rows, pxW, pxH)
+
+-- | 'gfxFit' for a vector picture, whose "source" is a virtual pixel grid
+-- that can be rasterised at any resolution: the payload is never capped at
+-- the crop's size (at deep zoom the crop is a few hundred virtual units, and
+-- capping at it would upscale a coarse raster, which is exactly what vector
+-- zoom exists to avoid), only at the protocol's own bound. The two
+-- protocols need different bounds. Kitty scales the payload into the cell
+-- box, so a payload held to 'maxGfxPixels' still fills the box. Sixel draws
+-- pixels 1:1, so a capped payload would come out /smaller/ than the box:
+-- sixel gets the full display size up to 'maxSixelVectorPixels', and past
+-- that the cell box itself shrinks (re-centred) to what the payload covers.
+gfxFitVector :: GfxKind -> (Int, Int) -> (Int, Int, Int, Int) -> (Int, Int)
+             -> (Int, Int, Int, Int, Int, Int)
+gfxFitVector kind (pw0, ph0) geom@(top, left, tw, th) crop =
+  let pw = max 1 pw0; ph = max 1 ph0
+      (_, _, cols, rows, _, _) = gfxFit (pw, ph) geom crop True
+      dispW = cols * pw; dispH = rows * ph
+      area = fromIntegral (max 1 (dispW * dispH)) :: Double
+  in case kind of
+       GfxKitty ->
+         let sc = min 1.0 (sqrt (fromIntegral maxGfxPixels / area))
+             pxW = max 1 (floor (fromIntegral dispW * sc))
+             pxH = max 1 (floor (fromIntegral dispH * sc))
+         in (top + (th - rows) `div` 2, left + (tw - cols) `div` 2, cols, rows, pxW, pxH)
+       GfxSixel ->
+         let sc = min 1.0 (sqrt (fromIntegral maxSixelVectorPixels / area))
+             cols' = max 1 (min cols (floor (fromIntegral cols * sc)))
+             rows' = max 1 (min rows (floor (fromIntegral rows * sc)))
+         in (top + (th - rows') `div` 2, left + (tw - cols') `div` 2, cols', rows', cols' * pw, rows' * ph)
+
+-- | The largest sixel payload a vector placement sends (drawn 1:1, so this
+-- is also the largest picture sixel shows): a 1920×1300 text area.
+maxSixelVectorPixels :: Int
+maxSixelVectorPixels = 2500 * 1000
 
 -- | Place raw RGBA pixels (@pxW x pxH@) into a cell box at @(row, col)@ via
 -- the kitty protocol: delete the previous placement, transmit in base64
@@ -212,27 +252,49 @@ sixelPlace (row, col) (pxW, pxH) rgba =
 -- Base64 (Builder over strict ByteString input)
 
 base64B :: BS.ByteString -> Builder
-base64B = go
+base64B = byteString . base64Strict
+
+-- | Base64 of a strict ByteString, as one strict ByteString written in place.
+-- The previous Builder of one 'word8' per output byte allocated a closure
+-- and a boxed byte for every character: a 1.4 MB placement was 1.9 million
+-- of each, 20+ MB of live heap per frame and a peak RSS of 140 MB for one
+-- PDF page. This allocates the output once.
+base64Strict :: BS.ByteString -> BS.ByteString
+base64Strict src
+  | n == 0 = BS.empty
+  | otherwise = BI.unsafeCreate outLen fill
   where
-    go bs = case BS.length bs of
-      0 -> mempty
-      1 -> let a = BS.index bs 0
-               n = fromIntegral a `shiftL` 16 :: Int
-           in enc (n `shiftR` 18) <> enc ((n `shiftR` 12) .&. 63)
-                <> char7 '=' <> char7 '='
-      2 -> let a = BS.index bs 0; b = BS.index bs 1
-               n = (fromIntegral a `shiftL` 16) .|. (fromIntegral b `shiftL` 8) :: Int
-           in enc (n `shiftR` 18) <> enc ((n `shiftR` 12) .&. 63)
-                <> enc ((n `shiftR` 6) .&. 63) <> char7 '='
-      _ -> let a = BS.index bs 0; b = BS.index bs 1; c = BS.index bs 2
-               n = (fromIntegral a `shiftL` 16) .|. (fromIntegral b `shiftL` 8)
-                     .|. fromIntegral c :: Int
-           in enc (n `shiftR` 18) <> enc ((n `shiftR` 12) .&. 63)
-                <> enc ((n `shiftR` 6) .&. 63) <> enc (n .&. 63)
-                <> go (BS.drop 3 bs)
-    enc i = word8 (b64tab `BS.index` i)
-    b64tab = BS.pack (map (fromIntegral . fromEnum)
-               "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+    n = BS.length src
+    outLen = 4 * ((n + 2) `div` 3)
+    tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" :: String
+    tabBS = BS.pack (map (fromIntegral . fromEnum) tab)
+    at k = BU.unsafeIndex src k
+    enc :: Int -> Word8
+    enc i = BU.unsafeIndex tabBS (i .&. 63)
+    fill p = go 0 0
+      where
+        go !i !o
+          | i + 3 <= n = do
+              let v = (fromIntegral (at i) `shiftL` 16) .|. (fromIntegral (at (i + 1)) `shiftL` 8)
+                        .|. fromIntegral (at (i + 2)) :: Int
+              pokeByteOff p o (enc (v `shiftR` 18))
+              pokeByteOff p (o + 1) (enc (v `shiftR` 12))
+              pokeByteOff p (o + 2) (enc (v `shiftR` 6))
+              pokeByteOff p (o + 3) (enc v)
+              go (i + 3) (o + 4)
+          | i + 2 == n = do
+              let v = (fromIntegral (at i) `shiftL` 16) .|. (fromIntegral (at (i + 1)) `shiftL` 8) :: Int
+              pokeByteOff p o (enc (v `shiftR` 18))
+              pokeByteOff p (o + 1) (enc (v `shiftR` 12))
+              pokeByteOff p (o + 2) (enc (v `shiftR` 6))
+              pokeByteOff p (o + 3) (61 :: Word8)
+          | i + 1 == n = do
+              let v = fromIntegral (at i) `shiftL` 16 :: Int
+              pokeByteOff p o (enc (v `shiftR` 18))
+              pokeByteOff p (o + 1) (enc (v `shiftR` 12))
+              pokeByteOff p (o + 2) (61 :: Word8)
+              pokeByteOff p (o + 3) (61 :: Word8)
+          | otherwise = pure ()
 
 ------------------------------------------------------------------------------
 -- Sixel

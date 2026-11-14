@@ -3,20 +3,29 @@
 -- editor update function.
 module Main (main) where
 
-import Control.Monad (forM, when, replicateM, forM_, unless, void)
+import Control.Monad (forM, when, replicateM, forM_, unless, void, join)
 import Text.Read (readMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Bits (shiftR, (.&.), xor)
 import Data.Foldable (toList)
 import Data.IORef
 import Data.Word (Word8, Word64)
 import Data.Either (isLeft)
 import Data.List (foldl', intercalate, isInfixOf, isPrefixOf, isSuffixOf, nub, tails)
-import System.Directory (getTemporaryDirectory, removeFile)
+import System.Directory (getTemporaryDirectory, removeFile, createDirectoryIfMissing, removeDirectoryRecursive, doesDirectoryExist, doesFileExist, getPermissions, setPermissions, setOwnerExecutable, createFileLink)
+import System.Environment (lookupEnv, setEnv)
 import System.FilePath ((</>))
 import Control.Exception (SomeException, evaluate, try, throwIO, ErrorCall(..), AsyncException(..), finally)
 import Control.Concurrent (forkIO, killThread, threadDelay, newEmptyMVar, putMVar, takeMVar, readMVar, tryPutMVar, MVar, ThreadId)
 import GHC.Conc.Sync (listThreads, threadStatus, ThreadStatus(..))
 import Cmedit.JxlPar (parOrdered)
+import RasterSpec (rasterSpec)
+import FontSpec (fontSpec)
+import PdfImageSpec (pdfImageSpec)
+import SvgSpec (svgSpec)
+import SvgViewSpec (svgViewSpec)
+import PdfViewSpec (pdfViewSpec)
+import PdfRenderSpec (pdfRenderSpec)
 import qualified Cmedit.JxlVarDct as JVD
 import qualified Control.Monad.ST as ST
 import qualified Data.Array.ST as STA
@@ -75,7 +84,7 @@ import qualified Cmedit.Epub as Epub
 import qualified Cmedit.Xlsx as Xlsx
 import qualified Cmedit.Formula as Fm
 import qualified Cmedit.Odf as Odf
-import Cmedit.App (convertPath, abbreviateHome)
+import Cmedit.App (convertPath, abbreviateHome, detectLinters)
 import Cmedit.Rtf (RtfDoc(..))
 import Cmedit.Pdf (PdfDoc(..))
 import qualified Cmedit.Pdf as Pdf
@@ -98,7 +107,7 @@ import Cmedit.Syntax (Lang(..), Tok(..), TokRun(..), HlState(..), langForPath, i
 import Cmedit.Lint
   ( LinterId(..), Linter(..), Severity(..), Diag(..)
   , linters, linterById, lintersForPath
-  , parseLintOutput, diagSpans, diagAt, maxDiagsPerFile )
+  , parseLintOutput, diagSpans, diagAt, maxDiagsPerFile, mayFetchTool, versionUnchecked )
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 
 -- | Live heap in MB after a major collection (needs the -T RTS flag, which the
@@ -4703,7 +4712,7 @@ main = do
   checkEq "fileKind: json is data" (fileKind "pkg.json") FKData
   checkEq "fileKind: csv is data" (fileKind "rows.csv") FKData
   checkEq "fileKind: binary blob we cannot open" (fileKind "app.wasm") FKBinary
-  checkEq "fileKind: svg stays markup, not a displayable image" (fileKind "icon.svg") FKMarkup
+  checkEq "fileKind: svg is a displayable (vector) image" (fileKind "icon.svg") FKImage
   checkEq "fileKind: unknown extension is plain" (fileKind "notes.txt") FKPlain
   checkEq "fileKind: no extension is plain" (fileKind "Makefile") FKPlain
 
@@ -7831,6 +7840,55 @@ main = do
     let capOut = T.pack (concat (replicate 600 "foo.py:1:1: E501 x\n"))
     checkEq "lint cap" (length (parseLintOutput LFlake8 "foo.py" capOut)) maxDiagsPerFile
 
+    -- Detection never runs a package-runner shim (release review): a
+    -- `pyright` that is `exec corepack yarn pyright` made corepack download
+    -- Yarn when a PDF was merely opened.
+    check "lint shim: corepack wrapper script" (mayFetchTool "/home/u/.local/bin/pyright" "#!/bin/sh\nexec corepack yarn pyright \"$@\"\n")
+    check "lint shim: a link into corepack" (mayFetchTool "/usr/lib/node_modules/corepack/dist/yarn.js" "#!/usr/bin/env node\n")
+    check "lint shim: npx by name" (mayFetchTool "/usr/lib/node_modules/npm/bin/npx-cli" "")
+    check "lint shim: PyPI pyright wrapper" (mayFetchTool "/venv/bin/pyright" "#!/venv/bin/python\nfrom pyright.cli import entrypoint\n")
+    check "lint shim: a native binary is not one" (not (mayFetchTool "/usr/bin/shellcheck" "\x7f\&ELF\0\0\0corepack"))
+    check "lint shim: an ordinary script is not one" (not (mayFetchTool "/venv/bin/ruff" "#!/venv/bin/python\nfrom ruff.__main__ import find_ruff_bin\n"))
+    -- ... and, on a fake PATH, nothing at all runs until Settings asks, and
+    -- then not the shims.
+    do
+      tmp <- getTemporaryDirectory
+      let dir = tmp </> "cmedit-spec-lintdetect"
+          bin = dir </> "bin"
+          ran = dir </> "ran"
+          cdir = dir </> "lib" </> "corepack" </> "dist"
+          script f body = do
+            writeFile f ("#!/bin/sh\n" ++ body)
+            pm <- getPermissions f
+            setPermissions f (setOwnerExecutable True pm)
+      old <- doesDirectoryExist dir
+      when old (removeDirectoryRecursive dir)
+      mapM_ (createDirectoryIfMissing True) [bin, ran, cdir]
+      script (bin </> "corepack") (": > '" ++ ran </> "corepack" ++ "'\n")
+      script (bin </> "pyright") "exec corepack yarn pyright \"$@\"\n"
+      script (bin </> "ruff") (": > '" ++ ran </> "ruff" ++ "'\necho 'ruff 9.9.9'\n")
+      script (cdir </> "eslint.js") (": > '" ++ ran </> "eslint" ++ "'\n")
+      createFileLink (cdir </> "eslint.js") (bin </> "eslint")
+      oldPath <- lookupEnv "PATH"
+      (av0, av1) <- (do setEnv "PATH" bin
+                        a0 <- detectLinters False Nothing
+                        m0 <- mapM (doesFileExist . (ran </>)) ["corepack", "ruff", "eslint"]
+                        check "lint detect: startup detection runs nothing" (not (or m0))
+                        a1 <- detectLinters True Nothing
+                        pure (a0, a1))
+                     `finally` setEnv "PATH" (fromMaybe "/usr/bin:/bin" oldPath)
+      let found av i = isJust (join (lookup i av))
+          ver av i = fmap snd (join (lookup i av))
+      check "lint detect: tools found without running them"
+        (all (found av0) [LRuff, LPyright, LEslint] && not (found av0 LFlake8))
+      shimRan <- or <$> mapM (doesFileExist . (ran </>)) ["corepack", "eslint"]
+      ruffRan <- doesFileExist (ran </> "ruff")
+      check "lint detect: Settings probes a plain tool's version" (ruffRan && ver av1 LRuff == Just "ruff 9.9.9")
+      check "lint detect: ... but never runs a shim" (not shimRan)
+      check "lint detect: a shim is installed, version unchecked"
+        (ver av1 LPyright == Just versionUnchecked && ver av1 LEslint == Just versionUnchecked)
+      removeDirectoryRecursive dir
+
     -- diagSpans: identifier run, non-ident width 1, past-EOL, empty, overlap order.
     let dg c sv = Diag 0 c sv (T.pack "") (T.pack "") LRuff
     checkEq "span identifier run" (diagSpans (T.pack "foo bar") [dg 0 SevWarning])
@@ -7871,7 +7929,7 @@ main = do
 
     -- settingsSpec / applySettingRow position sync (extends the settings tests).
     checkEq "settingsSpec has editing + master + per-linter rows"
-      (length settingsSpec) (15 + length linters)
+      (length settingsSpec) (17 + length linters)
     check "applySettingRow round-trips every spec row to its default"
       (and [ edConfig (applySettingRow k (ixOf defaultConfig) ed0) == defaultConfig
            | (k, (_, _, _, ixOf, _)) <- zip [0 ..] settingsSpec ])
@@ -7985,16 +8043,16 @@ main = do
 
     -- Master toggle off clears diagnostics everywhere (no future pass will).
     let edDirty = edLR { edDiags = [d0] }                 -- active + zipper both carry diags
-        edMOff  = applySettingRow 14 0 edDirty            -- row 14 = Linting master, 0 = off
+        edMOff  = applySettingRow 16 0 edDirty            -- row 16 = Linting master, 0 = off
     check "master lint off clears active diags" (null (edDiags edMOff))
     check "master lint off clears zipper diags"
       (all (null . docDiags) (edBefore edMOff ++ edAfter edMOff))
-    check "master lint on keeps diags" (edDiags (applySettingRow 14 1 edDirty) == [d0])
+    check "master lint on keeps diags" (edDiags (applySettingRow 16 1 edDirty) == [d0])
 
     -- lintersDetected refreshes an open Settings dialog's per-linter notes.
     let edSettingsNone = openSettings ed0                 -- edLintAvail all Nothing
         edSettingsAv = lintersDetected availAll edSettingsNone
-        ruffRow d = dlgChoices d !! 15                     -- master at 14, ruff (linters!!0) at 15
+        ruffRow d = dlgChoices d !! 17                     -- master at 16, ruff (linters!!0) at 17
     check "settings shows not-installed note before detection"
       (maybe False (\d -> maybe False (T.isInfixOf (T.pack "\x2717")) (chNote (ruffRow d)))
              (edDialog edSettingsNone))
@@ -9179,6 +9237,15 @@ main = do
       (let ed = foldl (\e k -> fst (update k e))
                       (openSessionChangedDialog bare) [KTab, KEnter]
        in edDialog ed == Nothing && not (edModified ed))
+
+  -- Vector stack (plan 0034): one module per workstream -------------------
+  rasterSpec check
+  fontSpec check
+  pdfImageSpec check
+  svgSpec check
+  svgViewSpec check
+  pdfViewSpec check
+  pdfRenderSpec check
 
   -- Report -------------------------------------------------------------------
   (passed, failed) <- readIORef results
