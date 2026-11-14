@@ -20,6 +20,7 @@ module Cmedit.JxlBits
   , u32, u64, f16, readEnum, zeroPad
   , unpackSigned, ceilLog2, floorLog2
   , J, jfail, jguard, liftJ, runJ
+  , tri, quad
   ) where
 
 import Control.Monad.ST (ST)
@@ -190,3 +191,19 @@ liftJ = lift
 
 runJ :: J s a -> ST s (Either String a)
 runJ = runExceptT
+
+-- | Take apart a list the decoder built itself with three (or four) entries:
+-- the colour planes, a channel triple, a fixed-size parameter list. The length
+-- is an invariant of the code, never of the file (every length read from a
+-- file is validated where it is read), so a mismatch is a decoder bug and says
+-- so rather than being a silently partial match. Lazy like the list patterns
+-- these replace.
+tri :: [a] -> (a, a, a)
+tri (a : b : c : _) = (a, b, c)
+tri _ = error "Cmedit.Jxl: internal invariant broken: expected three entries"
+{-# INLINE tri #-}
+
+quad :: [a] -> (a, a, a, a)
+quad (a : b : c : d : _) = (a, b, c, d)
+quad _ = error "Cmedit.Jxl: internal invariant broken: expected four entries"
+{-# INLINE quad #-}

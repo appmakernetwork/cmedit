@@ -360,7 +360,7 @@ main = do
   checkEq "type chars" (getLine' 0 (edBuffer ed1)) (T.pack "hi")
   let edSel = fst (update (KCtrlChar 'a') ed1)
   check "select all" (case getSelection edSel of Just _ -> True; Nothing -> False)
-  let (edCopy, effs) = update (KCtrlChar 'c') edSel
+  let (_edCopy, effs) = update (KCtrlChar 'c') edSel
   check "copy effect" (not (null effs))
   -- Opening Replace with a (single-line) selection seeds the Find field.
   let edReplSel = fst (update (KCtrlChar 'r') edSel)
@@ -1634,7 +1634,7 @@ main = do
             (not (edMouseSelecting edUpText))
 
     -- Scrolling is clamped to the laid-out document.
-    let Just rd = edRtf edFmt
+    let rd = fromMaybe (error "fixture: the formatted RTF view should be open") (edRtf edFmt)
         h = 5
     checkEq "rtf scroll clamps at the top" (rdTop (Rtf.rtfScroll h (-99) rd)) 0
     check "rtf scroll clamps at the bottom"
@@ -6291,7 +6291,7 @@ main = do
         zoomAt b r c e = fst (update (wheelAt b r c) e)
         (r0, c0) = (5, 20)
         edIn = zoomAt MBWheelUp r0 c0 edBig
-        (sx0, sy0) = srcAt edBig r0 c0
+        (_sx0, sy0) = srcAt edBig r0 c0
         (sx1, sy1) = srcAt edIn r0 c0
         nearly a b' = abs (a - b') <= 2.5
     check "wheel up in the image zooms in" ((idCrop =<< edImage edIn) /= Nothing)
@@ -6306,7 +6306,7 @@ main = do
     let edIn2 = iterate (zoomAt MBWheelUp r0 c0) edBig !! 2
         edIn3 = zoomAt MBWheelUp r0 c0 edIn2
         edIn5 = iterate (zoomAt MBWheelUp r0 c0) edIn3 !! 2
-        (sx2, sy2) = srcAt edIn2 r0 c0
+        (sx2, _sy2) = srcAt edIn2 r0 c0
         (sx3, sy3) = srcAt edIn3 r0 c0
         (sx5, sy5) = srcAt edIn5 r0 c0
     check "the pixel under the pointer stays under it (x)" (nearly sx2 sx3 && nearly sx2 sx5)
@@ -8069,7 +8069,7 @@ main = do
 
     -- dialogScroll: fits -> 0; overflow with focus on buttons -> clamped positive
     -- and keeps the buttons row reachable.
-    let Just sdlg = edDialog (openSettings edPy)
+    let sdlg = fromMaybe (error "fixture: Settings should open a dialog") (edDialog (openSettings edPy))
         dbtn = sdlg { dlgFocus = focusCount sdlg - 1 }    -- focus on the last button
         totalFit = length (dialogRows sdlg)
         totalBtn = length (dialogRows dbtn)

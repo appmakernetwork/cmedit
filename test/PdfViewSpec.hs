@@ -189,39 +189,43 @@ navTests check = do
 identityTests :: (String -> Bool -> IO ()) -> IO ()
 identityTests check = do
   let p0 = openPdf defaultConfig True
-      Just w1 = pdfPageWant p0
-  check "the page view asks for its first page" (pwPage w1 == 1 && pwPath w1 == "/tmp/doc.pdf")
-  let p1 = drive 7 p0
-  check "the stub scene is installed" (maybe False ((== 7) . vdSceneId) (activePicVec p1))
-  check "the scene is the page's size" (maybe False ((== (612, 792)) . vdSize) (activePicVec p1))
-  check "no more is asked once it is in" (isNothing (pdfPageWant p1))
-  check "the stub draws paper white first" (length (scCmds (pageScene 1)) >= 1 && scBounds (pageScene 1) == Rect 0 0 612 792)
-  -- stale results
-  let stale = pdfPageParsed w1 { pwEpoch = pwEpoch w1 + 99 } 8 False (okScene (pageScene 1)) p0
-  check "a result for another opening is dropped" (isNothing (activePicVec stale >>= vdScene))
-  let otherDoc = pdfPageParsed w1 { pwPath = "/tmp/other.pdf" } 8 False (okScene (pageScene 1)) p0
-  check "a result for another document is dropped" (isNothing (activePicVec otherDoc >>= vdScene))
-  let far = pdfPageParsed w1 { pwPage = 4 } 9 False (okScene (pageScene 4)) p1
-  check "a result for a far page is dropped" (maybe True null (fmap pvScenes (edPdfView far)))
-  let p2 = pdfLoaded "/tmp/doc.pdf" doc5 p1
-  check "re-opening gives a new epoch" (fmap pwEpoch (pdfPageWant p2) /= Just (pwEpoch w1))
-  -- prefetch: next page first, then the previous
-  check "prefetch asks for the next page once the current is settled"
-    (fmap pwPage (pdfPrefetchWant p1) == Just 2)
-  check "no prefetch before the current page is in" (isNothing (pdfPrefetchWant p0))
-  let Just pw2 = pdfPrefetchWant p1
-      p3 = pdfPageParsed pw2 10 False (okScene (pageScene 2)) p1
-  check "a prefetched neighbour goes into the cache" (fmap (map fst . pvScenes) (edPdfView p3) == Just [2])
-  check "with the next page cached, page 1 has nothing more to prefetch" (isNothing (pdfPrefetchWant p3))
-  let p4 = key (KPageDown noMods) p3
-  check "turning to a prefetched page installs it at once" (isNothing (pdfPageWant p4) && maybe False ((== 10) . vdSceneId) (activePicVec p4))
-  check "the page left behind is cached" (fmap (map fst . pvScenes) (edPdfView p4) == Just [1])
-  check "from page 2 the prefetch is page 3" (fmap pwPage (pdfPrefetchWant p4) == Just 3)
-  -- the cache holds the current page +-1 only
-  let pool = [ (k, PageScene k (pageScene 1) [] False (sceneSize (pageScene 1))) | k <- [1, 2, 4, 5] ]
-  check "the page cache keeps only the neighbours" (map fst (trimPageCache 3 pool) == [2, 4])
-  let p5 = pdfTurnTo 5 p4
-  check "a long jump leaves no stale neighbours" (maybe True (all ((>= 4) . fst) . pvScenes) (edPdfView p5))
+  case pdfPageWant p0 of
+    Nothing -> check "the page view asks for its first page" False
+    Just w1 -> do
+      check "the page view asks for its first page" (pwPage w1 == 1 && pwPath w1 == "/tmp/doc.pdf")
+      let p1 = drive 7 p0
+      check "the stub scene is installed" (maybe False ((== 7) . vdSceneId) (activePicVec p1))
+      check "the scene is the page's size" (maybe False ((== (612, 792)) . vdSize) (activePicVec p1))
+      check "no more is asked once it is in" (isNothing (pdfPageWant p1))
+      check "the stub draws paper white first" (length (scCmds (pageScene 1)) >= 1 && scBounds (pageScene 1) == Rect 0 0 612 792)
+      -- stale results
+      let stale = pdfPageParsed w1 { pwEpoch = pwEpoch w1 + 99 } 8 False (okScene (pageScene 1)) p0
+      check "a result for another opening is dropped" (isNothing (activePicVec stale >>= vdScene))
+      let otherDoc = pdfPageParsed w1 { pwPath = "/tmp/other.pdf" } 8 False (okScene (pageScene 1)) p0
+      check "a result for another document is dropped" (isNothing (activePicVec otherDoc >>= vdScene))
+      let far = pdfPageParsed w1 { pwPage = 4 } 9 False (okScene (pageScene 4)) p1
+      check "a result for a far page is dropped" (maybe True null (fmap pvScenes (edPdfView far)))
+      let p2 = pdfLoaded "/tmp/doc.pdf" doc5 p1
+      check "re-opening gives a new epoch" (fmap pwEpoch (pdfPageWant p2) /= Just (pwEpoch w1))
+      -- prefetch: next page first, then the previous
+      check "prefetch asks for the next page once the current is settled"
+        (fmap pwPage (pdfPrefetchWant p1) == Just 2)
+      check "no prefetch before the current page is in" (isNothing (pdfPrefetchWant p0))
+      case pdfPrefetchWant p1 of
+        Nothing -> check "prefetch asks for the next page once the current is settled" False
+        Just pw2 -> do
+          let p3 = pdfPageParsed pw2 10 False (okScene (pageScene 2)) p1
+          check "a prefetched neighbour goes into the cache" (fmap (map fst . pvScenes) (edPdfView p3) == Just [2])
+          check "with the next page cached, page 1 has nothing more to prefetch" (isNothing (pdfPrefetchWant p3))
+          let p4 = key (KPageDown noMods) p3
+          check "turning to a prefetched page installs it at once" (isNothing (pdfPageWant p4) && maybe False ((== 10) . vdSceneId) (activePicVec p4))
+          check "the page left behind is cached" (fmap (map fst . pvScenes) (edPdfView p4) == Just [1])
+          check "from page 2 the prefetch is page 3" (fmap pwPage (pdfPrefetchWant p4) == Just 3)
+          -- the cache holds the current page +-1 only
+          let pool = [ (k, PageScene k (pageScene 1) [] False (sceneSize (pageScene 1))) | k <- [1, 2, 4, 5] ]
+          check "the page cache keeps only the neighbours" (map fst (trimPageCache 3 pool) == [2, 4])
+          let p5 = pdfTurnTo 5 p4
+          check "a long jump leaves no stale neighbours" (maybe True (all ((>= 4) . fst) . pvScenes) (edPdfView p5))
 
 actionTests :: (String -> Bool -> IO ()) -> IO ()
 actionTests check = do

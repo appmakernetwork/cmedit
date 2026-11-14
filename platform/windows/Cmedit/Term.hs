@@ -104,12 +104,9 @@ utf8CodePage = 65001
 
 -- | Saved console modes and code pages, restored on teardown. A 'Nothing'
 -- mode means the handle wasn't a console (e.g. redirected) and is left alone.
-data SavedTerm = SavedTerm
-  { savedInMode  :: !(Maybe DWORD)
-  , savedOutMode :: !(Maybe DWORD)
-  , savedInCP    :: !DWORD
-  , savedOutCP   :: !DWORD
-  }
+-- Fields, in order: input mode, output mode, input code page, output code
+-- page. Only ever built and taken apart positionally, so no selectors.
+data SavedTerm = SavedTerm !(Maybe DWORD) !(Maybe DWORD) !DWORD !DWORD
 
 getMode :: HANDLE -> IO (Maybe DWORD)
 getMode h = allocaBytes 4 $ \p -> do

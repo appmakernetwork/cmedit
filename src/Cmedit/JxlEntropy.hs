@@ -418,7 +418,7 @@ readAnsHist br logA = do
 
 -- | The 4096-total distribution of one cluster.
 readDist :: BR s -> Int -> Int -> J s [Int]
-readDist br logA tableSize = do
+readDist br _logA tableSize = do
   b1 <- liftJ (readBool br)
   if b1 then do
     b2 <- liftJ (readBool br)

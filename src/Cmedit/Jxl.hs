@@ -86,7 +86,7 @@ codestream bs
 -- Image header (§A.6 metadata)
 
 data ECInfo = ECInfo
-  { ecType, ecBpp, ecExp, ecShift :: !Int
+  { ecType, ecBpp, _ecExp, ecShift :: !Int   -- _ecExp: exponent bits, parsed but unused (8-bit output)
   , ecAssoc :: !Bool
   , ecSpot :: [Float]    -- ^ spot colour: red, green, blue, solidity
   }
@@ -507,8 +507,6 @@ ceilDiv a b = (a + b - 1) `div` b
 
 ------------------------------------------------------------------------------
 -- The codestream
-
-data Decoded s = DecodedModular [Chan s] Int
 
 decodeCodestream :: Int -> Buf -> J s (Int, Int, UArray Int Word8)
 decodeCodestream maxPix buf = do
@@ -1006,10 +1004,10 @@ decodeModularFrame br ih fh toc = do
         forM colourCh $ \c -> intsToFloats c sc
       else do
         -- lossy modular: the channels are quantised XYB (Y, X, B - Y)
-        let [cy, cx, cb] = colourCh
-            [mx, my, mb] = map (/ 128) mlf
+        let (cy, cx, cb) = tri (colourCh)
+            (mx, my, mb) = tri (map (/ 128) mlf)
         planes <- mapM (castSTUArray . chBuf) [cx, cy, cb]
-        let [px, py, pb] = planes
+        let (px, py, pb) = tri (planes)
         forLoopJ 0 (w * h - 1) $ \i -> do
           yv <- rdC (chBuf cy) i
           xv <- rdC (chBuf cx) i
@@ -1174,10 +1172,10 @@ decodeVarDctFrame br ih fh toc lfImg = do
     -- frame supplies the LF image
     when (isNothing lfImg) $ do
      ep <- liftJ (readBits r 2)
-     let [dX, dY, dB] = lfDims
+     let (dX, dY, dB) = tri (lfDims)
      lfq <- modularStream r (gmTree gm) bd (1 + g)
               [ ChInfo (fst d) (snd d) 0 0 | d <- [dY, dX, dB] ]
-     let [qy, qx, qb] = lfq
+     let (qy, qx, qb) = tri (lfq)
          qXyb = [qx, qy, qb]
      liftJ $ forM_ (zip3 [0 :: Int ..] qXyb mlf) $ \(c, q, m) -> do
       let sc = m * fromIntegral ((1 :: Int) `shiftL` (9 - ep)) / (fgs * fromIntegral qlf)
@@ -1233,7 +1231,7 @@ decodeVarDctFrame br ih fh toc lfImg = do
     Nothing -> pure ()
   let kxLf = realToFrac bcx + fromIntegral (xflf - 128) / fromIntegral cfac :: Float
       kbLf = realToFrac bcb + fromIntegral (bflf - 128) / fromIntegral cfac :: Float
-      [lx, ly, lb] = lf
+      (lx, ly, lb) = tri (lf)
   when (isNothing lfImg && not subsampled) $ liftJ $ forLoopJ 0 (bw * bh - 1) $ \i -> do
     yv <- unsafeRead ly i
     xv <- unsafeRead lx i
@@ -1340,7 +1338,7 @@ decodeVarDctFrame br ih fh toc lfImg = do
             unsafeWrite fp pos (v * m * mul)
     -- chroma from luma (not with subsampled chroma)
     unless subsampled $ do
-      let [px, py, pb] = planes
+      let (px, py, pb) = tri (planes)
           pw = head cpw
           ph = 8 * bh
       forLoopJ 0 (ph - 1) $ \y -> forLoopJ 0 (pw - 1) $ \x -> do
@@ -1482,7 +1480,7 @@ renderImg ih img0
       let st = imStride img
           n = imW img * imH img
       forM_ [ (p, e) | (p, e) <- zip (imExtra img) (ihEC ih), ecType e == 2, length (ecSpot e) == 4 ] $ \(sp, e) -> do
-        let [cr, cg, cbl, solid] = ecSpot e
+        let (cr, cg, cbl, solid) = quad (ecSpot e)
         forM_ (zip (imColour img) [cr, cg, cbl]) $ \(p, col) ->
           forLoopJ 0 (imH img - 1) $ \y -> forLoopJ 0 (imW img - 1) $ \x -> do
             let i = y * st + x
@@ -1632,8 +1630,10 @@ toEncoded ih img
           h = imH img
           st = imStride img
           op = map realToFrac (ihOpsin ih) :: [Float]
-          [m00, m01, m02, m10, m11, m12, m20, m21, m22] = take 9 op
-          [b0, b1, b2] = take 3 (drop 9 op)
+          (m00, m01, m02, m10, m11, m12, m20, m21, m22) = case op of
+            (a0 : a1 : a2 : a3 : a4 : a5 : a6 : a7 : a8 : _) -> (a0, a1, a2, a3, a4, a5, a6, a7, a8)
+            _ -> error "Cmedit.Jxl: internal invariant broken: expected the nine opsin entries"
+          (b0, b1, b2) = tri (take 3 (drop 9 op))
           cb0 = cbrtF b0
           cb1 = cbrtF b1
           cb2 = cbrtF b2
@@ -1642,8 +1642,8 @@ toEncoded ih img
                      e = if a <= 0.0031308 then 12.92 * a else 1.055 * a ** (1 / 2.4) - 0.055
                  in if v < 0 then negate e else e
       outs <- replicateM 3 (newArray (0, max 0 (w * h - 1)) 0 :: ST s (FPlane s))
-      let [o0, o1, o2] = outs
-          [p0, p1, p2] = take 3 (imColour img ++ repeat (head (imColour img)))
+      let (o0, o1, o2) = tri (outs)
+          (p0, p1, p2) = tri (take 3 (imColour img ++ repeat (head (imColour img))))
       forLoopJ 0 (h - 1) $ \y -> forLoopJ 0 (w - 1) $ \x -> do
         let i = y * st + x
             o = y * w + x
@@ -1761,7 +1761,7 @@ splineArea qs qa (cx, cb) = sum (map one qs)
     corrX = ceiling (abs cx) :: Int
     corrB = ceiling (abs cb) :: Int
     one q =
-      let [cX, cY, cB] = [ sum (map (divQa . abs) c) | c <- qsXyb q ]
+      let (cX, cY, cB) = tri ([ sum (map (divQa . abs) c) | c <- qsXyb q ])
           logColor = ceilLog2 (maximum [cX + corrX * cY, cY, cB + corrB * cY])
           widthEst = sum [ let wt = 1 + divQa (abs s) in wt * wt * logColor | s <- qsSigma q ]
       in widthEst * qsManhattan q
@@ -1774,7 +1774,7 @@ renderSplines :: FrameHdr -> [QSpline] -> Int -> (Float, Float) -> Img s -> ST s
 renderSplines fh qs qa (corrX, corrB) img = forM_ qs $ \q -> do
   let inv = if qa >= 0 then 1 / (1 + fromIntegral qa / 8) else 1 - fromIntegral qa / 8 :: Float
       wts = [0.0042, 0.075, 0.07] :: [Float]
-      [dx0, dy0, db0] = [ [ fromIntegral v * wc * inv | v <- c ] | (c, wc) <- zip (qsXyb q) wts ]
+      (dx0, dy0, db0) = tri ([ [ fromIntegral v * wc * inv | v <- c ] | (c, wc) <- zip (qsXyb q) wts ])
       dX = zipWith (\a y -> a + corrX * y) dx0 dy0
       dB = zipWith (\a y -> a + corrB * y) db0 dy0
       dSig = [ fromIntegral v * 0.3333 * inv | v <- qsSigma q ]
@@ -1853,7 +1853,7 @@ splineSamples pts = go0 (upsampled pts)
             let ps = [p0, p1, p2, p3]
                 ts = scanl (\acc (a, b) -> acc + (let (dx, dy) = sub b a in (dx * dx + dy * dy) ** 0.25)) 0
                        (zip ps (tail ps))
-                [t0, t1, t2, t3] = ts
+                (t0, t1, t2, t3) = quad (ts)
                 tt = [t0, t1, t2, t3]
                 at k = (tt !! k)
                 pt k = (ps !! k)
@@ -1972,12 +1972,11 @@ noiseRows fh visible invisible lut (corrX, corrB) img ya yb = do
             e <- unsafeRead fld (src + x + 2)
             unsafeWrite ring (dst + x) ((((a + b') + c) + d) + e)
           edge (fw - 2); edge (fw - 1)
-  let [nX, nY, nB] = fields
-      [sX, sY, sB] = rings
+  let (nX, nY, nB) = tri (fields)
+      (sX, sY, sB) = tri (rings)
       !w = imW img
-      !h = imH img
       !st = imStride img
-      [px, py, pb] = imColour img
+      (px, py, pb) = tri (imColour img)
       !corrX' = corrX
       !corrB' = corrB
       !lut' = lut

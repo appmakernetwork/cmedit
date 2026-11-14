@@ -2842,13 +2842,13 @@ naturalOrder oid =
 -- of w x h with stride w), with the per-channel inverse quantisation scales.
 adaptiveLfSmoothing :: [FPlane s] -> Int -> Int -> [Float] -> ST s ()
 adaptiveLfSmoothing planes w h scales = when (w > 2 && h > 2) $ do
-  let [px, py, pb] = planes
-      [lx, ly, lb] = scales
+  let (px, py, pb) = tri (planes)
+      (lx, ly, lb) = tri (scales)
   -- copies of the unsmoothed rows above, current and below
   bufs <- forM planes $ \_ -> newArray (0, 3 * w - 1) 0 :: ST s (FPlane s)
   let copyRow p b slot y = forLoop 0 (w - 1) $ \x -> rd p (y * w + x) >>= wr b (slot * w + x)
   forM_ (zip planes bufs) $ \(p, b) -> do copyRow p b 0 0; copyRow p b 1 1
-  let [bx, by, bb] = bufs
+  let (bx, by, bb) = tri (bufs)
   forLoop 1 (h - 2) $ \y -> do
     let up = (y - 1) `mod` 3
         cu = y `mod` 3
@@ -2971,8 +2971,8 @@ epf planes stride w h sigma sw iters chanScale (s0, s2, borderMul) = do
         {-# INLINE spanRuns #-}
         spans r lo hi f = spanRuns r lo hi $ \l u -> forLoop l u f
         {-# INLINE spans #-}
-    let [cs0, cs1, cs2] = chanScale
-        [p0, p1, p2] = planes
+    let (cs0, cs1, cs2) = tri (chanScale)
+        (p0, p1, p2) = tri (planes)
         mirror n i | i < 0 = mirror n (negate i - 1)
                    | i >= n = mirror n (2 * n - 1 - i)
                    | otherwise = i

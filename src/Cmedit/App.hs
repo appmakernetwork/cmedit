@@ -320,7 +320,7 @@ addOne cfg e f0 = do
 
 -- | Reopen the last session: the workspace folder if it is still a directory,
 -- then every recorded file that still exists, each through the ordinary
--- 'classifyFile' guards — so an image, a workbook, a PDF or a file that grew
+-- 'classifyFileWith' guards — so an image, a workbook, a PDF or a file that grew
 -- past 'maxOpenBytes' lands in the view it would land in today, not the one it
 -- was in last week. Files that are gone are skipped and counted; nothing here
 -- is ever an error, because a session is a convenience and its absence must
@@ -394,7 +394,7 @@ abbreviateHome home f
 
 -- | Install a session onto an editor: the workspace folder if it is still a
 -- directory, then every recorded file that still exists, each through the
--- ordinary 'classifyFile' guards — so an image, a workbook, a PDF or a file that
+-- ordinary 'classifyFileWith' guards — so an image, a workbook, a PDF or a file that
 -- grew past 'maxOpenBytes' lands in the view it would land in /today/, not the
 -- one it was in last week. Files that are gone are skipped and counted; nothing
 -- here is ever an error, because a session is a convenience and its absence must
@@ -935,7 +935,6 @@ data Drv = Drv
 data DrvStats = DrvStats
   { stKeys    :: !(IORef Int)      -- ^ Key events applied.
   , stFrames  :: !(IORef Int)      -- ^ Frames rendered.
-  , stBytes   :: !(IORef Integer)  -- ^ Bytes written to the terminal.
   , stFrameMs :: !(IORef Double)   -- ^ Total time spent rendering.
   , stFrameMax :: !(IORef Double)  -- ^ Slowest single frame.
   , stJobs    :: !(IORef Int)      -- ^ Background jobs started.
@@ -949,7 +948,7 @@ data DrvStats = DrvStats
 newDrvStats :: IO DrvStats
 newDrvStats = DrvStats
   <$> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef 0
-  <*> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef 0
+  <*> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef 0
   <*> getMonotonicTime
 
 bump :: (DrvStats -> IORef Int) -> Drv -> IO ()
@@ -2727,11 +2726,8 @@ data LoadOutcome
 -- text. A missing path becomes a new empty buffer (so opening a not-yet-created
 -- file still works). This runs on the main thread for small files and on a
 -- background thread for large ones.
-classifyFile :: FilePath -> IO LoadOutcome
-classifyFile = classifyFileWith True
-
--- | 'classifyFile', with the paged view for over-large files switchable off
--- (the @paged-view@ config key).
+-- The paged view for over-large files is switchable off (@pagedOK@, the
+-- @paged-view@ config key).
 classifyFileWith :: Bool -> FilePath -> IO LoadOutcome
 classifyFileWith pagedOK path = do
   exists <- doesFileExist path

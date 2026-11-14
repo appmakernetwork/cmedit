@@ -164,7 +164,9 @@ specialise t chan sidx nprev =
 -- | Weighted-predictor parameters: p1, p2, p3a..p3e, w0..w3.
 type WPP = UArray Int Int
 
-data SqParam = SqParam { sqHor, sqInPlace :: !Bool, sqBegin, sqNum :: !Int }
+-- | A squeeze step: horizontal?, in place?, first channel, channel count
+-- (always taken apart positionally, so no field selectors).
+data SqParam = SqParam !Bool !Bool !Int !Int
 
 data Transform
   = TrRct !Int !Int                      -- begin, type
@@ -196,7 +198,7 @@ readModHeader br chans = do
             b <- liftJ (u32 br (0,3) (8,6) (72,10) (1096,13))
             ty <- liftJ (u32 br (6,0) (0,2) (2,4) (10,6))
             jguard (ty < 42 && b + 3 <= length cs) "JPEG XL: bad RCT"
-            let [c0, c1, c2] = take 3 (drop b cs)
+            let (c0, c1, c2) = tri (take 3 (drop b cs))
             jguard (sameSize c0 c1 && sameSize c0 c2) "JPEG XL: bad RCT"
             pure (cs, nbMeta, TrRct b ty : trs)
           1 -> do
@@ -883,7 +885,7 @@ inverseTransformsCompact bitDepth wpp trs chans0 = foldM undo (map DenseChan cha
 
 inverseRct :: Int -> Int -> [Chan s] -> ST s [Chan s]
 inverseRct b ty cs = do
-  let [c0, c1, c2] = take 3 (drop b cs)
+  let (c0, c1, c2) = tri (take 3 (drop b cs))
       a0 = chBuf c0
       a1 = chBuf c1
       a2 = chBuf c2

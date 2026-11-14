@@ -780,7 +780,7 @@ in `README.md`; the cross-cutting structure that matters when editing:
   (minutes on a big wrapped file).
 
 - **File opening: guards + async load.** Every open route funnels through
-  `App.classifyFile`, which refuses files over `maxOpenBytes` and binary files
+  `App.classifyFileWith`, which refuses files over `maxOpenBytes` and binary files
   (`TextBuffer.looksBinary`: a NUL byte in the first 8 KiB), so a huge blob can
   never be decoded into millions of junk lines and hang the loop, sniffs images
   by magic bytes, decompresses an `.svgz` into a read-only text buffer (before
