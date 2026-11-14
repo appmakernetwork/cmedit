@@ -65,6 +65,7 @@ import Data.Sequence (Seq, (|>))
 import qualified Data.Sequence as Seq
 import Data.Text (Text)
 import qualified Data.Text as T
+import Data.Text.Unsafe (lengthWord8)
 
 import Cmedit.Rtf
   (RtfAlign(..), RtfFmt(..), RtfPar(..), RtfRun(..), defaultFmt, defaultPar)
@@ -635,15 +636,24 @@ endRow st
       let cells = trimEnd (reverse (ssCells st))
           left  = max 0 (maxOdfCells - ssCount st)
           wide  = concat [ replicate n v | (v, n, _) <- cells ]
-          !row  = Seq.fromList (take left wide)
+          -- A cell is charged for its text as well as for existing (one more
+          -- per 128 bytes, as "Cmedit.Xlsx" does): a long cell repeated
+          -- sixteen thousand times across a row repeated a million times down
+          -- is otherwise a small file and an unbounded amount of text.
+          cost v = 1 + lengthWord8 v `div` 128
+          fitted = fit left wide
+          fit !b (v : vs) | cost v <= b = v : fit (b - cost v) vs
+          fit _ _ = []
+          !row  = Seq.fromList fitted
           n     = Seq.length row
-          rep   = min (ssRowRep st) (left `div` max 1 n)
-          cut   = rep < ssRowRep st || not (null (drop left wide))
+          !rowCost = sum (map cost fitted)
+          rep   = min (ssRowRep st) (left `div` max 1 rowCost)
+          cut   = rep < ssRowRep st || not (null (drop n wide))
       in st { ssRows = if n == 0 || rep == 0 then ssRows st else (row, rep) : ssRows st
             , ssCells = []
             , ssRowIx = ssRowIx st + ssRowRep st
             , ssRowRep = 1
-            , ssCount = ssCount st + n * rep
+            , ssCount = ssCount st + rowCost * rep
             , ssCut = ssCut st || cut }
   where trimEnd = reverse . dropWhile (\(v, _, keep) -> T.null v && not keep) . reverse
 

@@ -18,7 +18,7 @@ import Control.Exception (ErrorCall, SomeException, evaluate, bracket, bracket_,
 import Control.Monad (filterM, foldM, forM, forM_, unless, void, when)
 import qualified Data.ByteString as BS
 import Data.ByteString.Builder (Builder, char7, hPutBuilder)
-import Data.Foldable (toList)
+import Data.Foldable (toList, foldl')
 import Data.IORef
 import Data.List (dropWhileEnd, isPrefixOf, isSuffixOf, sort, sortOn)
 import Data.Ord (Down(..))
@@ -1665,6 +1665,24 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
         performEffects drv effs ed1
       Left err      -> pure (setError err ed')
 
+  -- Save As, once the dialog has a path. Two things here need the disk: an
+  -- existing file is replaced only after 'DKConfirmOverwrite' says so (unless
+  -- it is the document's own file, which Ctrl+S would overwrite unasked
+  -- anyway), and an export may never land on the file its view came from,
+  -- however the path was spelled.
+  EffSaveAs path -> do
+    exists <- either (const False) id <$>
+                (try (doesFileExist path) :: IO (Either SomeException Bool))
+    own <- case edPath ed of
+      -- An archive's buffer is its listing, so even its own path is not its
+      -- own file in the sense that matters: saving there replaces the archive.
+      Just p | exists, not (isArchivePath p) ->
+        (==) <$> canonicalizeSafe p <*> canonicalizeSafe path
+      _               -> pure False
+    if | own && isJust (exportSuggestion ed) -> pure ed { edStatus = exportOverSourceMsg }
+       | exists && not own -> pure (askOverwrite path ed)
+       | otherwise -> let (ed1, effs) = saveAsTo path ed in performEffects drv effs ed1
+
   -- Save As in a view with no buffer: write a copy of what is on screen and
   -- leave the open document alone. Deliberately not 'onSaved' — nothing about
   -- the workbook or PDF this came from has been saved, and marking it so would
@@ -1783,7 +1801,14 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
         if isDir then pure ed2 else openPath setLoadedNew imageLoadedNew cpath ed2
 
   EffRenamePath old new -> do
-    r <- try (renamePath old new)
+    -- rename(2) replaces an existing destination without a word, so a rename
+    -- onto a taken name is refused, as creating one is. (A change of case
+    -- only is the same file on a case-insensitive filesystem.)
+    taken <- if T.toLower (T.pack old) == T.toLower (T.pack new) then pure False
+             else either (const False) id <$>
+                    (try (doesPathExist new) :: IO (Either SomeException Bool))
+    r <- try (if taken then ioError (userError (takeFileName new ++ " already exists"))
+              else renamePath old new)
     case r :: Either SomeException () of
       Left e   -> pure (setError (fsOpError e) ed)
       Right () -> do
@@ -2875,18 +2900,27 @@ withArchive :: FilePath -> [Z.ZipEntry]
             -> (MemberReader -> IO (Maybe (Either String LoadOutcome)))
             -> IO (Maybe (Either String LoadOutcome))
 withArchive path es act = do
-  r <- try (withBinaryFile path ReadMode (\h -> act (readMember h es)))
+  -- One budget for the whole open ('Z.maxArchiveBytes'), spent by every
+  -- member read from here on.
+  left <- newIORef Z.maxArchiveBytes
+  r <- try (withBinaryFile path ReadMode (\h -> act (readMember left h es)))
          :: IO (Either SomeException (Maybe (Either String LoadOutcome)))
   pure (either (\e -> Just (Left (show e))) id r)
 
 -- Extract one member by name. Two seeks: the local header (whose name and
 -- extra lengths are its own, not the central directory's — see
 -- 'Cmedit.Zip.localDataOffset') and then the data.
-readMember :: Handle -> [Z.ZipEntry] -> T.Text -> IO (Either String BS.ByteString)
-readMember h es nm = case Z.findEntry nm es of
+--
+-- Every read is charged to the archive's budget — the bytes read plus the
+-- bytes they became — and refused once it is gone. Nothing else stops a file
+-- naming the same member any number of times.
+readMember :: IORef Integer -> Handle -> [Z.ZipEntry] -> T.Text -> IO (Either String BS.ByteString)
+readMember budget h es nm = case Z.findEntry nm es of
   Nothing -> pure (Left ("the archive has no \"" ++ T.unpack nm ++ "\""))
   Just e  -> do
-    r <- try $ do
+    left <- readIORef budget
+    if left <= 0 then pure (Left "the archive asks for more to be read than a document needs") else do
+     r <- try $ do
       hSeek h AbsoluteSeek (max 0 (Z.zeOffset e))
       hdr <- BS.hGet h Z.localHeaderBytes
       case Z.localDataOffset hdr of
@@ -2898,8 +2932,13 @@ readMember h es nm = case Z.findEntry nm es of
           let want | Z.zePacked e > 0 = min Z.maxMemberBytes (Z.zePacked e)
                    | otherwise        = Z.maxMemberBytes
           raw <- BS.hGet h (fromInteger want)
-          pure (Z.memberBytes e raw)
-    pure (either (\ex -> Left (show (ex :: SomeException))) id r)
+          let out = Z.memberBytes e raw
+              -- Forcing the result here is what makes the charge honest:
+              -- the inflating has happened by the time it is counted.
+              used = toInteger (BS.length raw) + either (const 0) (toInteger . BS.length) out
+          modifyIORef' budget (subtract (max 1 used))
+          pure out
+     pure (either (\ex -> Left (show (ex :: SomeException))) id r)
 
 type MemberReader = T.Text -> IO (Either String BS.ByteString)
 
@@ -2969,22 +3008,34 @@ epubOutcome path get = do
 -- because a reader who is quietly missing pages should be told.
 readChapters :: MemberReader -> [T.Text]
              -> IO ([(T.Text, Seq.Seq Rtf.RtfPar)], Bool, Int)
-readChapters get = go 0 0 []
+--
+-- Two budgets stop the walk, and both say so. Characters of text that came
+-- out ('Epub.maxEpubChars') is the one a real book could conceivably meet;
+-- bytes of markup that went in ('Epub.maxEpubBytes') is the one that bounds
+-- the work, because a chapter can be sixteen megabytes with no text in it and
+-- a spine can name it five thousand times.
+readChapters get = go 0 0 0 []
   where
-    go _ !bad acc [] = pure (reverse acc, False, bad)
-    go !n !bad acc (hf : rest)
-      | n >= Epub.maxEpubChars = pure (reverse acc, True, bad)
+    go _ _ !bad acc [] = pure (reverse acc, False, bad)
+    go !n !bytes !bad acc (hf : rest)
+      | n >= Epub.maxEpubChars || bytes >= Epub.maxEpubBytes = pure (reverse acc, True, bad)
       | otherwise = do
           r <- get hf
           case r of
-            Left _   -> go n (bad + 1) acc rest
+            Left _   -> go n bytes (bad + 1) acc rest
             Right bs ->
               let ps = Epub.htmlPars bs
+                  bytes' = bytes + BS.length bs
               -- An empty chapter is not an unreadable one: plenty of books
               -- have a cover page whose whole content is an image.
               in if Seq.null ps
-                   then go n bad acc rest
-                   else go (n + parsChars ps) bad ((chapterTitle bs hf ps, ps) : acc) rest
+                   then go n bytes' bad acc rest
+                   else do
+                     -- Forced before the chapter's bytes go out of scope: a
+                     -- lazy title is a thunk holding all sixteen megabytes
+                     -- of them, once per chapter of the book.
+                     title <- evaluate (chapterTitle bs hf ps)
+                     go (n + parsChars ps) bytes' bad ((title, ps) : acc) rest
 
 parsChars :: Seq.Seq Rtf.RtfPar -> Int
 parsChars = sum . map (sum . map (T.length . Rtf.rrText) . Rtf.rpRuns) . toList
@@ -3048,11 +3099,24 @@ xlsxOutcome path get = do
       rels <- either (const []) Xlsx.relTargets <$> get "xl/_rels/workbook.xml.rels"
       strs <- either (const Seq.empty) Xlsx.sharedStrings <$> get "xl/sharedStrings.xml"
       let refs = Xlsx.sheetRefs wbs
+      -- The sheets share one cell budget ('Xlsx.maxWorkbookCells'): each is
+      -- read under what the ones before it left, and once that is nothing
+      -- the rest are not read at all. Each grid is forced as it is built, so
+      -- the count is real and the sheet's XML is not held while the next one
+      -- is read.
+      cellsLeft <- newIORef Xlsx.maxWorkbookCells
       sheets <- forM (zip [0 ..] (take maxSheets refs)) $ \(k, (nm, _)) -> do
-        r <- get (Xlsx.sheetMemberPath refs rels k)
-        pure $ case r of
-          Left _   -> (nm, Seq.empty, M.empty, False)
-          Right bs -> let (g, fs, cut) = Xlsx.sheetGrid strs bs in (nm, g, fs, cut)
+        left <- readIORef cellsLeft
+        if left <= 0 then pure (nm, Seq.empty, M.empty, True) else do
+          r <- get (Xlsx.sheetMemberPath refs rels k)
+          case r of
+            Left _   -> pure (nm, Seq.empty, M.empty, False)
+            Right bs -> do
+              let (g, fs, cut) = Xlsx.sheetGridWithin left strs bs
+              used <- evaluate (foldl' (\ !a r -> foldl' (\ !b c -> b + Xlsx.cellCost c) a r) 0 g)
+              _ <- evaluate (M.size fs)
+              modifyIORef' cellsLeft (subtract used)
+              pure (nm, g, fs, cut)
       -- Formulas the file answered for itself are already in the grid; this
       -- fills in only the ones it left blank (a library-written workbook), and
       -- says how many it could and could not do.

@@ -44,6 +44,7 @@ module Cmedit.Epub
   , htmlTitle
   , maxEpubChapters
   , maxEpubChars
+  , maxEpubBytes
   ) where
 
 import qualified Data.ByteString as BS
@@ -87,6 +88,16 @@ maxEpubChapters = 5000
 -- The loader stops here and says so; a partial book still reads.
 maxEpubChars :: Int
 maxEpubChars = 16 * 1024 * 1024
+
+-- | Most bytes of chapter markup a book will have parsed, across all its
+-- chapters. 'maxEpubChars' counts the text that comes /out/, and a chapter can
+-- be sixteen megabytes of markup with no text in it at all — so a spine of
+-- five thousand of those never reached that limit and took minutes. Four
+-- bytes of XHTML for every character the book may yield is more markup than
+-- real chapters carry (the text is most of them), and about six seconds of
+-- parsing.
+maxEpubBytes :: Int
+maxEpubBytes = 64 * 1024 * 1024
 
 ------------------------------------------------------------------------------
 -- The container

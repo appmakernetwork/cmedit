@@ -296,6 +296,9 @@ module Cmedit.Editor
   , exportSuggestion
   , saveAsRefusal
   , saveAsDialogFlow
+  , saveAsTo
+  , askOverwrite
+  , exportOverSourceMsg
   , isPlainDoc
   , openGoTo
   , gotoLine
@@ -328,7 +331,7 @@ import qualified Cmedit.Xlsx as Xlsx
 import Cmedit.Pdf (PdfDoc(..))
 import qualified Cmedit.Pdf as Pdf
 import Cmedit.TextBuffer
-import Cmedit.Width (colToDisplay, displayToCol, wrapLine)
+import Cmedit.Width (colToDisplay, displayToCol, inputWindow, takeCells, textCells, wrapLine)
 import Cmedit.ConfigFile
   ( Config(..), ThemeName(..), defaultConfig, RecentEntry(..)
   , maxRecentEntries, maxHistoryEntries, SessionSummary(..) )
@@ -1663,15 +1666,19 @@ clickChoice ci innerX clickCol d ed =
 clickField :: Int -> Int -> Int -> Int -> Int -> Int -> Dialog -> Dialog
 clickField fi li visH innerX innerW clickCol d =
   let f          = dlgFields d !! fi
-      labelW     = T.length (fLabel f) + 1
+      labelW     = textCells (fLabel f) + 1
       valStart   = innerX + labelW
       valW       = max 1 (innerW - labelW)
       focusedNow = focusedField d == Just fi
       (cl, cc)   = Csv.cursorLineCol (fText f) (fCur f)
       winTop     = if focusedNow && cl >= visH then cl - visH + 1 else 0
       textLine   = winTop + li
-      off        = if focusedNow && textLine == cl && cc >= valW then cc - valW + 1 else 0
-      textCol    = off + max 0 (clickCol - valStart)
+      lineStr    = case drop textLine (T.splitOn (T.pack "\n") (fText f)) of
+                     (l : _) -> T.unpack l
+                     []      -> ""
+      off        = if focusedNow && textLine == cl then fst (inputWindow valW cc lineStr) else 0
+      -- Cells back to characters: a wide glyph is two cells and one step.
+      textCol    = off + length (takeCells (max 0 (clickCol - valStart)) (drop off lineStr))
   in fieldSetCursorLineCol textLine textCol (setFocus fi d)
 
 -- Index of the button under display column @c@ on one button row (a
@@ -1719,16 +1726,15 @@ dispatchDialog kind btn d ed = case kind of
     | otherwise -> noEff (cancelDialog ed)
   DKSaveAs
     | btn == 0 -> let p = T.unpack (T.strip (fieldValue 0 d))
-                  in if null p then noEff (cancelDialog ed) else case exportSuggestion ed of
-                       -- An export writes a copy: the document keeps its own
-                       -- path, because it is still the workbook (or PDF, or
-                       -- e-book) and a later Ctrl+S must not aim at the CSV.
-                       Just (_, txt)
-                         | Just p == edPath ed ->
-                             noEff (closeDialog ed)
-                               { edStatus = "That is the file this view came from \x2014 choose another name" }
-                         | otherwise -> (closeDialog ed, [EffExportTo p txt])
-                       Nothing -> (closeDialog ed { edPath = Just p }, [EffSaveTo p])
+                  in if null p then noEff (cancelDialog ed)
+                     -- Exporting over the file the view came from would
+                     -- destroy it; the driver repeats this check on the
+                     -- canonical path, for a spelling this one misses.
+                     else if isJust (exportSuggestion ed) && Just p == edPath ed
+                       then noEff (closeDialog ed) { edStatus = exportOverSourceMsg }
+                     -- Whether the target exists is IO, so the save itself
+                     -- waits for the driver: 'saveAsTo' or 'askOverwrite'.
+                     else (closeDialog ed, [EffSaveAs p])
     | otherwise -> noEff (cancelDialog ed)
   DKGoToLine
     | btn == 0 -> noEff (gotoLine (fieldValue 0 d) (closeDialog ed))
@@ -1775,8 +1781,8 @@ dispatchDialog kind btn d ed = case kind of
                      Nothing -> noEff (cancelDialog ed)
     | otherwise -> noEff (cancelDialog ed)
   DKConfirmOverwrite
-    | btn == 0 -> case edPath ed of Just p -> (closeDialog ed, [EffSaveTo p]); Nothing -> noEff (closeDialog ed)
-    | otherwise -> noEff (cancelDialog ed)
+    | btn == 0, Just p <- edSaveAsTarget ed -> saveAsTo p (closeDialog ed)
+    | otherwise -> noEff (cancelDialog ed) { edSaveAsTarget = Nothing }
   DKConfirmReplaceAll
     | btn == 0  -> case edSearch ed of
                      Just ss -> doReplace (S.replaceablePaths ss) (closeDialog ed)
@@ -2098,7 +2104,7 @@ dropdownGeom ed =
       cols = loCols lo
       mi = msMenuIx (edMenu ed)
       entries = entriesFor ed mi
-      labelW = maximum (1 : [ T.length (fst (parseMnemonic l)) | MEItem l _ _ <- entries ])
+      labelW = maximum (1 : [ textCells (fst (parseMnemonic l)) | MEItem l _ _ <- entries ])
       accelW = maximum (0 : [ T.length a | MEItem _ a _ <- entries ])
       innerW = labelW + 2 + accelW + 2
       x0 = min (menuStartCol mi) (max 0 (cols - innerW - 2))

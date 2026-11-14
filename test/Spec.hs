@@ -1817,6 +1817,178 @@ main = do
              :: IO (Either SomeException Int)
       check ("pdf survives " ++ show s) (either (const False) (const True) r)
 
+    -- Document-wide budgets ----------------------------------------------------
+    -- Every stream is capped, and nothing used to cap how many times one is
+    -- decoded: two thousand pages naming one stream, a page drawing one form
+    -- 400 000 times, a font whose CMap is re-read at every Tf. The budgets
+    -- that bound that are sized past any real document, so these tests run
+    -- under small ones (parsePdfWithin) to reach the code that enforces them.
+    let pageObj n contents res =
+          (n, ascii ("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources "
+                     ++ res ++ " /Contents " ++ contents ++ " >>"))
+        docOf nPg contents res extra = mkPdf $
+          [ (1, ascii "<< /Type /Catalog /Pages 2 0 R >>")
+          , (2, ascii ("<< /Type /Pages /Kids ["
+                       ++ unwords [ show (100 + k) ++ " 0 R" | k <- [1 .. nPg] ]
+                       ++ "] /Count " ++ show (nPg :: Int) ++ " >>")) ]
+          ++ [ pageObj (100 + k) contents res | k <- [1 .. nPg] ] ++ extra
+        fontRes = "<< /Font << /F1 5 0 R >> >>"
+        font5 = (5, ascii "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>")
+        pagesRead = either (const (-1)) Pdf.pdfPageCount
+        noteOf = either T.pack pdNote
+        pageTexts = either (const [])
+          (\pd -> [ T.concat [ Pdf.psText r | par <- Pdf.pgPars pg, r <- Pdf.ppRuns par ]
+                  | pg <- toList (pdPages pd) ])
+        shown = "BT /F1 12 Tf 1 0 0 1 72 700 Tm (Shared) Tj ET\n"
+
+    -- One 4 KB stream, fifty pages. Under the real budget that is an ordinary
+    -- document and reads whole; under 20 KB it is five pages and a note.
+    let sharedDoc = docOf 50 "4 0 R" fontRes
+          [ (4, stream "" (ascii (shown ++ replicate 4000 ' '))), font5 ]
+        sharedFull = Pdf.parsePdf sharedDoc
+        sharedCut  = Pdf.parsePdfWithin 20000 Pdf.maxPdfTokens sharedDoc
+    checkEq "pdf pages sharing a stream all read under the real budget"
+      (pageTexts sharedFull) (replicate 50 (T.pack "Shared"))
+    checkEq "and carry no note" (noteOf sharedFull) T.empty
+    check "pdf decoding is budgeted across the document, not per stream"
+      (pagesRead sharedCut >= 1 && pagesRead sharedCut <= 6)
+    check "and the note says the document was cut short"
+      (T.pack "decoding" `T.isInfixOf` noteOf sharedCut)
+    checkEq "what was read before the budget ran out is unchanged"
+      (take 4 (pageTexts sharedCut)) (replicate 4 (T.pack "Shared"))
+    -- The same for a /Contents array naming one stream many times: it is
+    -- one page, and the budget still counts every decode.
+    let arrayDoc = docOf 1 ("[" ++ concat (replicate 400 "4 0 R ") ++ "]") fontRes
+          [ (4, stream "" (ascii (shown ++ replicate 4000 ' '))), font5 ]
+    check "pdf a /Contents array of one stream is charged per entry"
+      (T.pack "decoding" `T.isInfixOf` noteOf (Pdf.parsePdfWithin 20000 Pdf.maxPdfTokens arrayDoc))
+
+    -- Operators are budgeted the same way: 4 000 a page is nothing, but
+    -- fifty such pages under a 20 000-token budget stop at the fifth.
+    let opsDoc = docOf 50 "4 0 R" fontRes
+          [ (4, stream "" (ascii (concat (replicate 2000 "q Q\n") ++ shown))), font5 ]
+    checkEq "pdf an operator-heavy document reads whole under the real budget"
+      (pagesRead (Pdf.parsePdf opsDoc)) 50
+    check "pdf operators are budgeted across the document"
+      (let n = pagesRead (Pdf.parsePdfWithin Pdf.maxPdfDecoded 20000 opsDoc) in n >= 1 && n <= 6)
+    -- Operands with no operator are tokens too, and are not kept.
+    Just pdFlood <- parse "an operand flood" (onePage "Helvetica"
+      (concat (replicate 100000 "0 ") ++ " n\n" ++ shown))
+    checkEq "pdf survives a flood of operands, and reads on" (textOf pdFlood) (T.pack "Shared")
+
+    -- A form that draws no text is decoded once and then only counted: a
+    -- watermark on every page must not spend the budget page after page.
+    -- Twenty pages each drawing an 8 KB form fifty times is 8 MB of decoding
+    -- if every use is charged, and fits in 100 KB if the first one is.
+    let formRes = "<< /Font << /F1 5 0 R >> /XObject << /X 7 0 R /T 8 0 R >> >>"
+        artForm = (7, stream "/Type /XObject /Subtype /Form /BBox [0 0 9 9]"
+                        (ascii (concat (replicate 2000 "q Q\n"))))
+        textForm = (8, stream ("/Type /XObject /Subtype /Form /BBox [0 0 9 9] /Resources " ++ fontRes)
+                        (ascii "BT /F1 9 Tf 1 0 0 1 72 40 Tm (Footer) Tj ET"))
+        formDoc = docOf 20 "4 0 R" formRes
+          [ (4, stream "" (ascii (concat (replicate 50 "/X Do\n") ++ shown ++ "/T Do\n")))
+          , font5, artForm, textForm ]
+        formCut = Pdf.parsePdfWithin 100000 Pdf.maxPdfTokens formDoc
+    checkEq "pdf a text-free form is charged once, however often it is drawn"
+      (pagesRead formCut, noteOf formCut) (20, T.empty)
+    checkEq "pdf a form that does draw text draws it on every page"
+      (length (filter (T.pack "Footer" `T.isInfixOf`) (pageTexts formCut))) 20
+    checkEq "and under the real budget the document is the same"
+      (pageTexts (Pdf.parsePdf formDoc)) (pageTexts formCut)
+
+    -- A /ToUnicode map is parsed once per document, not once per Tf: ten
+    -- pages selecting the font three hundred times each is 18 MB of CMap if
+    -- it is, and one 6 KB stream if it is not. Inline fonts (no object number
+    -- of their own) share the map through the stream's.
+    let cmap = (9, stream "" (ascii ("1 beginbfchar\n<41> <0058>\nendbfchar\n" ++ replicate 6000 ' ')))
+        uniFont = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 9 0 R >>"
+        uniBody = concat (replicate 300 "/F1 12 Tf ") ++ "BT /F1 12 Tf 1 0 0 1 72 700 Tm (A) Tj ET"
+        uniDoc res extra = docOf 10 "4 0 R" res ([ (4, stream "" (ascii uniBody)), cmap ] ++ extra)
+        uniRef = Pdf.parsePdfWithin 100000 Pdf.maxPdfTokens
+                   (uniDoc "<< /Font << /F1 6 0 R >> >>" [(6, ascii uniFont)])
+        uniInline = Pdf.parsePdfWithin 100000 Pdf.maxPdfTokens
+                      (uniDoc ("<< /Font << /F1 " ++ uniFont ++ " >> >>") [])
+    checkEq "pdf a font's ToUnicode map is read once for the document"
+      (pageTexts uniRef, noteOf uniRef) (replicate 10 (T.pack "X"), T.empty)
+    checkEq "pdf an inline font shares it by the stream's number"
+      (pageTexts uniInline, noteOf uniInline) (replicate 10 (T.pack "X"), T.empty)
+
+    -- The filters were rewritten to run in bounded memory; what they decode
+    -- must not have moved. Each of these is the same content stream through
+    -- a different encoder.
+    let chunkBS k b | BS.null b = []
+                    | otherwise = let (x, y) = BS.splitAt k b in x : chunkBS k y
+        a85 raw = ascii (go (BS.unpack raw)) <> ascii "~>"
+          where go [] = []
+                go ws = let (g, rest) = splitAt 4 ws
+                            k = length g
+                            v = foldl (\a w -> a * 256 + fromIntegral w) (0 :: Int)
+                                      (g ++ replicate (4 - k) 0)
+                            ds = [ toEnum (33 + (v `div` (85 ^ e)) `mod` 85) | e <- [4, 3, 2, 1, 0 :: Int] ]
+                        in take (k + 1) ds ++ go rest
+        rle raw = BS.concat (map enc (BS.group raw)) <> BS.pack [128]
+          where enc g | BS.length g >= 2 = BS.pack [fromIntegral (257 - BS.length g), BS.head g]
+                      | otherwise        = BS.cons 0 g
+        -- LZW with no compression: a clear code, then literals, never enough
+        -- of them between clears for the code width to leave nine bits.
+        lzw raw = BS.pack (pack9 (concatMap (\c -> 256 : map fromIntegral (BS.unpack c)) (chunkBS 100 raw) ++ [257]))
+        pack9 codes =
+          let bits = concatMap (\c -> [ (c `div` (2 ^ k)) `mod` 2 | k <- [8, 7 .. 0 :: Int] ]) codes
+              bytes [] = []
+              bytes bs' = let (b, r) = splitAt 8 bs'
+                          in fromIntegral (foldl (\a x -> a * 2 + x) (0 :: Int) (b ++ replicate (8 - length b) 0)) : bytes r
+          in bytes (bits :: [Int])
+        -- PNG predictors None, Sub and Up in rotation, one filter byte a row.
+        pngPred c raw = BS.concat (zipWith3 enc [0 :: Int ..] rows (BS.replicate c 0 : rows))
+          where rows = chunkBS c raw
+                enc i row prev = case i `mod` 3 of
+                  0 -> BS.cons 0 row
+                  1 -> BS.cons 1 (BS.pack (zipWith (-) (BS.unpack row) (0 : BS.unpack row)))
+                  _ -> BS.cons 2 (BS.pack (zipWith (-) (BS.unpack row) (BS.unpack prev ++ repeat 0)))
+        tiffPred c raw = BS.concat [ BS.pack (zipWith (-) (BS.unpack row) (0 : BS.unpack row))
+                                   | row <- chunkBS c raw ]
+        plainBody = ascii ("BT /F1 12 Tf 1 0 0 1 72 700 Tm (Filtered      text, and "
+                           ++ "par\\(en\\)s \\101\\102\\\\ <ok>) Tj ET")
+        wanted = T.pack "Filtered text, and par(en)s AB\\ <ok>"
+        viaFilter label dict body = do
+          r <- parse label (mkPdf
+            [ (1, ascii "<< /Type /Catalog /Pages 2 0 R >>")
+            , (2, ascii "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+            , (3, ascii ("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]"
+                         ++ " /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"))
+            , (4, stream dict body), font5 ])
+          checkEq ("pdf decodes " ++ label) (fmap (T.unwords . T.words . textOf) r) (Just wanted)
+    viaFilter "an unfiltered stream with string escapes" "" plainBody
+    viaFilter "an ASCII85 stream" "/Filter /ASCII85Decode" (a85 plainBody)
+    viaFilter "a RunLength stream" "/Filter /RunLengthDecode" (rle plainBody)
+    viaFilter "an LZW stream" "/Filter /LZWDecode" (lzw plainBody)
+    viaFilter "ASCII85 over Flate" "/Filter [/A85 /Fl]" (a85 (zlibStored plainBody))
+    viaFilter "RunLength over LZW" "/Filter [/LZW /RL]" (lzw (rle plainBody))
+    viaFilter "a PNG-predicted stream"
+      "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 7 /BitsPerComponent 8 >>"
+      (zlibStored (pngPred 7 plainBody))
+    viaFilter "a PNG-predicted stream wider than its data"
+      "/Filter /FlateDecode /DecodeParms << /Predictor 15 /Columns 100000 /BitsPerComponent 8 >>"
+      (zlibStored (pngPred 100000 plainBody))
+    viaFilter "a TIFF-predicted stream"
+      "/Filter /FlateDecode /DecodeParms << /Predictor 2 /Columns 5 /BitsPerComponent 8 >>"
+      (zlibStored (tiffPred 5 plainBody))
+    -- A hex string with an odd digit count and whitespace inside it.
+    Just pdHx <- parse "a hex string" (onePage "Helvetica"
+      "BT /F1 12 Tf 1 0 0 1 72 700 Tm <48 65 6C\n6c 6F 2> Tj (!) Tj ET")
+    checkEq "pdf pads an odd hex string" (textOf pdHx) (T.pack "Hello !")
+
+    -- Shapes that used to cost memory in proportion to a list of bytes, or a
+    -- stack frame per bracket. Small here; the point is that they finish.
+    forM_ [ ("200 000 nested arrays", replicate 200000 '[')
+          , ("200 000 nested dictionaries", concat (replicate 200000 "<</K "))
+          , ("a megabyte string and no font", "(" ++ replicate 1000000 'a' ++ ") Tj")
+          , ("a megabyte hex string", "<" ++ replicate 1000000 '4' ++ "> Tj") ] $ \(label, body) -> do
+      r <- try (evaluate (either length (length . pageTexts . Right)
+                                 (Pdf.parsePdf (onePage "Helvetica" body))))
+             :: IO (Either SomeException Int)
+      check ("pdf survives " ++ label) (either (const False) (const True) r)
+
     -- A multi-page document, which is what page navigation moves between.
     -- Long enough that it overflows a terminal window, since the interactive
     -- assertions below are about scrolling as well as paging.
@@ -3162,6 +3334,110 @@ main = do
       (Fm.parseFormula (T.pack "SUM(A1)") == Fm.parseFormula (T.pack "=SUM(A1)"))
     checkEq "an unknown function makes the whole formula unsupported"
       (Fm.parseFormula (T.pack "=1+XIRR(A1)")) Nothing
+    -- Text is bounded, as it is in Excel: 32 767 characters a cell. A result
+    -- over that is #VALUE! (Excel's own answer for REPT), and it is decided
+    -- from the lengths before the text exists — three nested REPTs used to
+    -- ask for a gigabyte.
+    eq "REPT up to the limit"        "=LEN(REPT(\"x\",32767))"   "32767"
+    eq "REPT over the limit"         "=REPT(\"x\",32768)"         "#VALUE!"
+    eq "REPT by length, not count"   "=REPT(\"abcd\",8192)"       "#VALUE!"
+    eq "REPT of nothing is nothing"  "=LEN(REPT(\"\",1000000000))" "0"
+    eq "nested REPT"                 "=REPT(REPT(REPT(\"x\",1000),1000),1000)" "#VALUE!"
+    eq "an error has no length"      "=LEN(REPT(REPT(\"x\",1000),1000))" "#VALUE!"
+    eq "a huge REPT count"           "=REPT(\"x\",1E+300)"        "#VALUE!"
+    eq "concatenation over the limit" "=REPT(\"x\",20000)&REPT(\"y\",20000)" "#VALUE!"
+    eq "concatenation under it"      "=LEN(REPT(\"x\",20000)&REPT(\"y\",12767))" "32767"
+    eq "CONCATENATE over the limit"  "=CONCATENATE(REPT(\"x\",20000),REPT(\"y\",20000))" "#VALUE!"
+    eq "CONCAT under it"             "=CONCAT(B1:B3,\"-\",A1)"   "row1row2row3-10"
+    eq "TEXTJOIN over the limit"     "=TEXTJOIN(REPT(\"-\",20000),TRUE,B1:B5)" "#VALUE!"
+    eq "TEXTJOIN under it"           "=TEXTJOIN(\", \",TRUE,B1:B3)" "row1, row2, row3"
+    eq "SUBSTITUTE that grows too far" "=SUBSTITUTE(REPT(\"a\",1000),\"a\",REPT(\"b\",1000))" "#VALUE!"
+    eq "SUBSTITUTE that fits"        "=LEN(SUBSTITUTE(REPT(\"a\",100),\"a\",\"bcd\"))" "300"
+    -- A2 = A1&A1, A3 = A2&A2, ...: thirty rows is eight gigabytes if
+    -- nothing stops it. The rows that fit are right; the rest say so.
+    let dbl = [ Fm.SheetIn (T.pack "D")
+                  (Seq.fromList (Seq.fromList [T.pack "abcdefgh"]
+                                 : replicate 30 (Seq.fromList [T.empty])))
+                  (M.fromList [ ((r, 0), T.pack ("=A" ++ show r ++ "&A" ++ show r)) | r <- [1 .. 30] ]) ]
+        (dblOut, dblC, _) = Fm.evalWorkbook dbl
+        dblCell r = case dblOut of ((_, g) : _) -> cellOf g r 0; _ -> T.empty
+    checkEq "doubling by reference fits until it does not"
+      (map (T.length . dblCell) [1, 11], dblCell 12, dblCell 30)
+      ([16, 16384], T.pack "#VALUE!", T.pack "#VALUE!")
+    checkEq "and every one of those cells was answered" dblC 30
+
+    -- Wildcards: the same matches as ever, without the exponential search
+    -- (eight stars against three thousand characters did not finish).
+    eq "a ? matches one character"   "=COUNTIF(B1:B5,\"row?\")"   "5"
+    eq "a * matches any run"         "=COUNTIF(B1:B5,\"*w3\")"    "1"
+    eq "stars and literals interleave" "=COUNTIF(B1:B5,\"r*o*w*5\")" "1"
+    eq "a star may match nothing"    "=COUNTIF(B1:B5,\"row1*\")"  "1"
+    eq "the whole cell must match"   "=COUNTIF(B1:B5,\"ow?\")"    "0"
+    let wild = [ Fm.SheetIn (T.pack "W")
+                   (Seq.fromList [Seq.fromList [T.replicate 3000 (T.pack "a"), T.empty]])
+                   (M.singleton (0, 1) (T.pack "=COUNTIF(A1,\"*a*a*a*a*a*a*a*a*b\")&\"/\"&COUNTIF(A1,\"*a*a*a*a*a*a*a*a\")")) ]
+    checkEq "many stars against a long cell"
+      (case Fm.evalWorkbook wild of (((_, g) : _), _, _) -> cellOf g 0 1; _ -> T.empty)
+      (T.pack "0/1")
+
+    -- Numbers in the grid are read by a fast path now; what they read as
+    -- must be what the general reader always made of them.
+    let nums = [ "007", "1.50", "-3", "+3", ".5", "5.", "1e3", " 12 ", "0.1", "-0.25"
+               , "123456789012345678", "x1", "1,5", "" ]
+        numSheet = [ Fm.SheetIn (T.pack "N")
+                       (Seq.fromList [ Seq.fromList [T.pack n, T.empty] | n <- nums ])
+                       (M.fromList [ ((r, 1), T.pack ("=IF(ISNUMBER(A" ++ show (r + 1) ++ "),A"
+                                                      ++ show (r + 1) ++ "*2,\"text\")"))
+                                   | r <- [0 .. length nums - 1] ]) ]
+    checkEq "cells are read as the numbers they always were"
+      (case Fm.evalWorkbook numSheet of
+         (((_, g) : _), _, _) -> [ T.unpack (cellOf g r 1) | r <- [0 .. length nums - 1] ]
+         _ -> [])
+      [ "14", "3", "-6", "6", "1", "10", "2000", "24", "0.2", "-0.5"
+      , "2.469136e17", "text", "text", "text" ]
+    -- ...and a text of digits too long to be anyone's number is not parsed
+    -- as one on every read.
+    let longNum = [ Fm.SheetIn (T.pack "L")
+                      (Seq.fromList [Seq.fromList [T.replicate 5000 (T.pack "9"), T.empty]])
+                      (M.singleton (0, 1) (T.pack "=ISNUMBER(A1)")) ]
+    checkEq "five thousand digits are text"
+      (case Fm.evalWorkbook longNum of (((_, g) : _), _, _) -> cellOf g 0 1; _ -> T.empty)
+      (T.pack "FALSE")
+
+    -- The step budget is the workbook's, and when it runs out the pass
+    -- stops: the remaining formulas are left as they were and counted, not
+    -- filled with an error they each walked a whole range to earn.
+    let wide = Seq.fromList (replicate 100 (Seq.fromList (map T.pack ["1", "2", ""])))
+        sums n = [ Fm.SheetIn (T.pack "Data") wide M.empty
+                 , Fm.SheetIn (T.pack "F")
+                     (Seq.fromList (replicate n (Seq.fromList [T.empty])))
+                     (M.fromList [ ((r, 0), T.pack "=SUM(Data!A:XFD)") | r <- [0 .. n - 1] ]) ]
+        fCol out n = case out of
+          [_, (_, g)] -> [ cellOf g r 0 | r <- [0 .. n - 1] ]
+          _           -> []
+        (fullOut, fullC, fullU) = Fm.evalWorkbook (sums 40)
+        (cutOut, cutC, cutU) = Fm.evalWorkbookWithin 2000 (sums 40)
+    checkEq "whole-sheet sums under the real budget"
+      (fCol fullOut 40, fullC, fullU) (replicate 40 (T.pack "300"), 40, 0)
+    check "the budget is spent across the workbook, not per formula"
+      (cutC >= 1 && cutC < 10)
+    checkEq "what it did not reach is counted as not computed" (cutC + cutU) 40
+    checkEq "the formulas it reached are right, and the rest are left blank"
+      (fCol cutOut 40) (replicate cutC (T.pack "300") ++ replicate cutU T.empty)
+    -- A sheet built to exhaust a budget many times over: two thousand
+    -- formulas each summing 200 000 cells. Every one of them used to walk
+    -- its whole range whether or not there was budget left to read it with.
+    let bigData = Seq.fromList (replicate 2000 (Seq.fromList (replicate 100 (T.pack "1"))))
+        bigSheets = [ Fm.SheetIn (T.pack "Data") bigData M.empty
+                    , Fm.SheetIn (T.pack "F")
+                        (Seq.fromList (replicate 2000 (Seq.fromList [T.empty])))
+                        (M.fromList [ ((r, 0), T.pack "=SUM(Data!A1:XFD1048576)") | r <- [0 .. 1999] ]) ]
+    t0big <- getMonotonicTime
+    (bigC, bigU) <- evaluate (case Fm.evalWorkbookWithin 1000000 bigSheets of (_, c, u) -> (c, u))
+    t1big <- getMonotonicTime
+    checkEq "a sheet of whole-sheet sums stops at the budget" (bigC, bigU) (4, 1996)
+    check ("and does so promptly (" ++ show (t1big - t0big) ++ "s)") (t1big - t0big < 10)
+
     checkEq "a bare short name is not a cell reference"
       (Fm.parseFormula (T.pack "=VAT*2")) Nothing
     check "a range parses as an area"
@@ -3209,6 +3485,35 @@ main = do
     checkEq "a workbook with no uncached formulas is untouched"
       (Xlsx.resolveFormulas [(T.pack "S", Seq.fromList [Seq.fromList [T.pack "a"]], M.empty)])
       ([(T.pack "S", Seq.fromList [Seq.fromList [T.pack "a"]])], 0, 0)
+
+    -- A workbook's sheets share one cell budget: a sheet is read under what
+    -- the ones before it left, and 256 sheets may all be the same member.
+    let rowsXml n = concat [ "<row r=\"" ++ show r ++ "\"><c r=\"A" ++ show r ++ "\"><v>1</v></c>"
+                             ++ "<c r=\"B" ++ show r ++ "\"><v>2</v></c></row>" | r <- [1 .. n :: Int] ]
+        within k body = let (g, _, cut) = Xlsx.sheetGridWithin k Seq.empty (sheet body)
+                        in (sum (fmap Seq.length g), cut)
+    checkEq "a sheet inside its budget is whole" (within 100 (rowsXml 20)) (40, False)
+    check "a sheet over its budget is cut to it, and says so"
+      (let (n, cut) = within 10 (rowsXml 20) in n <= 10 && cut)
+    checkEq "no budget, no cells" (within 0 (rowsXml 20)) (0, True)
+    check "the budget cannot raise the per-sheet limit"
+      (let (g, _, _) = Xlsx.sheetGridWithin maxBound Seq.empty (sheet (rowsXml 20))
+       in g == (let (g', _, _) = Xlsx.sheetGrid Seq.empty (sheet (rowsXml 20)) in g'))
+    check "a workbook may hold more than one sheet's worth, but not many"
+      (Xlsx.maxWorkbookCells >= Xlsx.maxSheetCells && Xlsx.maxWorkbookCells <= 4 * Xlsx.maxSheetCells)
+
+    -- A cell is charged for its text too: a shared string is stored once and
+    -- may be named by every cell of the sheet.
+    let big = Seq.fromList [T.replicate 12800 (T.pack "x"), T.pack "ok"]
+        sRows ix n = concat [ "<row r=\"" ++ show r ++ "\"><c r=\"A" ++ show r
+                              ++ "\" t=\"s\"><v>" ++ show (ix :: Int) ++ "</v></c></row>" | r <- [1 .. n :: Int] ]
+        withinS k body = let (g, _, cut) = Xlsx.sheetGridWithin k big (sheet body)
+                         in (sum (fmap Seq.length g), cut)
+    checkEq "an ordinary cell costs one" (Xlsx.cellCost (T.pack "ok"), Xlsx.cellCost T.empty) (1, 1)
+    checkEq "a long cell costs its text" (Xlsx.cellCost (Seq.index big 0)) 101
+    checkEq "short shared strings fill the budget cell by cell" (withinS 50 (sRows 1 40)) (40, False)
+    check "one long shared string named by every cell is cut early"
+      (let (n, cut) = withinS 1000 (sRows 0 40) in n <= 10 && n >= 9 && cut)
 
   -- Save As in a view with no buffer: export, not save --------------------------
   -- These views are read-only because nothing can write their format back.
@@ -3270,8 +3575,12 @@ main = do
          Just d  -> T.pack "Export" `T.isInfixOf` dlgTitle d
          Nothing -> False)
     let (edAfter, effs) = update KEnter edDlg
-    checkEq "confirming exports rather than saving"
-      [ (p, t) | EffExportTo p t <- effs ] [("/tmp/book-Data.csv", T.pack "a,\"b,c\"")]
+    checkEq "confirming hands the export path to the driver"
+      [ p | EffSaveAs p <- effs ] ["/tmp/book-Data.csv"]
+    let (_, effsX) = saveAsTo "/tmp/book-Data.csv" edAfter
+    checkEq "which exports rather than saving"
+      [ (p, t) | EffExportTo p t <- effsX ] [("/tmp/book-Data.csv", T.pack "a,\"b,c\"")]
+    checkEq "an export emits no save" (length [ () | EffSaveTo _ <- effsX ]) 0
     checkEq "an export emits no save" (length [ () | EffSaveTo _ <- effs ]) 0
     -- The point of the whole distinction: the document is still the workbook.
     checkEq "the open document keeps its own path" (edPath edAfter) (Just "/tmp/book.xlsx")
@@ -3279,8 +3588,31 @@ main = do
     -- An ordinary document's Save As is unchanged: it writes and retitles.
     let edTxt = setLoaded "/tmp/a.txt" (emptyLoadResult { lrBuffer = fromText (T.pack "hi") }) ed0
         (edTxt2, effsTxt) = update KEnter (saveAsDialogFlow edTxt)
-    checkEq "an ordinary Save As still saves" (length [ () | EffSaveTo _ <- effsTxt ]) 1
-    checkEq "an ordinary Save As still retitles" (edPath edTxt2) (Just "/tmp/a.txt")
+    -- The dialog hands the path to the driver, which is the one that can see
+    -- whether a file is already there; nothing is written or retitled yet.
+    checkEq "Save As asks the driver about the path" [ p | EffSaveAs p <- effsTxt ] ["/tmp/a.txt"]
+    checkEq "and saves nothing by itself" (length [ () | EffSaveTo _ <- effsTxt ]) 0
+    let (edTxt3, effsTo) = saveAsTo "/tmp/b.txt" edTxt2
+    checkEq "a settled Save As saves" [ p | EffSaveTo p <- effsTo ] ["/tmp/b.txt"]
+    checkEq "a settled Save As retitles" (edPath edTxt3) (Just "/tmp/b.txt")
+    -- A target that exists is asked about, with Cancel as the default answer.
+    let edAsk = askOverwrite "/tmp/b.txt" edTxt2
+    checkEq "an existing target raises the overwrite prompt"
+      (dlgKind <$> edDialog edAsk) (Just DKConfirmOverwrite)
+    let (edNo, effsNo) = update KEnter edAsk
+    checkEq "Enter on the prompt is Cancel" (length effsNo) 0
+    checkEq "cancelling keeps the document's path" (edPath edNo) (Just "/tmp/a.txt")
+    checkEq "cancelling forgets the target" (edSaveAsTarget edNo) Nothing
+    let (edEsc, effsEsc) = update KEsc edAsk
+    checkEq "Esc on the prompt writes nothing" (length effsEsc, edPath edEsc) (0, Just "/tmp/a.txt")
+    let toReplace = fst . update (KArrow DLeft noMods)
+        (edYes, effsYes) = update KEnter (toReplace edAsk)
+    checkEq "Replace saves to the asked path" [ p | EffSaveTo p <- effsYes ] ["/tmp/b.txt"]
+    checkEq "Replace retitles" (edPath edYes, edSaveAsTarget edYes) (Just "/tmp/b.txt", Nothing)
+    -- An export that is confirmed is still an export.
+    let (edExp, effsExp) = update KEnter (toReplace (askOverwrite "/tmp/out.csv" edWb))
+    checkEq "a confirmed export exports" [ p | EffExportTo p _ <- effsExp ] ["/tmp/out.csv"]
+    checkEq "and leaves the workbook's path alone" (edPath edExp) (Just "/tmp/book.xlsx")
 
     -- Exporting over the file the view came from would destroy it, and Save As
     -- does not confirm before overwriting.
@@ -3578,6 +3910,40 @@ main = do
     -- Out of range clamps rather than failing: the file is still convertible.
     wc9 <- convertPath cfg 9 xlsxP
     checkEq "a sheet number past the end clamps" (fmap fst wc9) (Right (T.pack "second,1"))
+
+    -- An e-book whose spine names one megabyte chapter five thousand times.
+    -- The chapter is nearly all comment, so it yields four characters and
+    -- the character budget would never stop the walk; the byte budget does.
+    let chapterX = u8t ("<html><body><p>page</p><!--" ++ replicate 1000000 '.' ++ "--></body></html>")
+        spineN = 5000 :: Int
+        epubP = zipOf
+          [ (u8t "META-INF/container.xml", u8t ("<container><rootfiles>"
+              ++ "<rootfile full-path=\"book.opf\"/></rootfiles></container>"))
+          , (u8t "book.opf", u8t ("<package><manifest>"
+              ++ "<item id=\"c\" href=\"c.xhtml\" media-type=\"application/xhtml+xml\"/></manifest><spine>"
+              ++ concat (replicate spineN "<itemref idref=\"c\"/>") ++ "</spine></package>"))
+          , (u8t "c.xhtml", chapterX) ]
+    epubX <- write "cmedit-conv-spine.epub" epubP
+    t0e <- getMonotonicTime
+    ec <- convertPath cfg 1 epubX
+    nPages <- evaluate (either (const (-1)) (T.count (T.pack "page") . fst) ec)
+    t1e <- getMonotonicTime
+    check ("a repeated chapter is read until the byte budget, not to the end of the spine ("
+           ++ show nPages ++ ")")
+      (nPages >= 1 && nPages <= Epub.maxEpubBytes `div` 1000000 + 2)
+    check ("and promptly (" ++ show (t1e - t0e) ++ "s)") (t1e - t0e < 30)
+    -- The same book with a spine of ordinary length reads whole.
+    epubS <- write "cmedit-conv-short.epub" (zipOf
+      [ (u8t "META-INF/container.xml", u8t ("<container><rootfiles>"
+          ++ "<rootfile full-path=\"book.opf\"/></rootfiles></container>"))
+      , (u8t "book.opf", u8t ("<package><manifest>"
+          ++ "<item id=\"c\" href=\"c.xhtml\" media-type=\"application/xhtml+xml\"/></manifest><spine>"
+          ++ concat (replicate 12 "<itemref idref=\"c\"/>") ++ "</spine></package>"))
+      , (u8t "c.xhtml", u8t "<html><body><p>page</p></body></html>") ])
+    es <- convertPath cfg 1 epubS
+    checkEq "a book inside its budgets is every chapter of its spine"
+      (fmap (T.count (T.pack "page") . fst) es) (Right 12)
+    mapM_ removeFile [epubX, epubS]
 
     -- An archive with nothing recognisable inside converts to its listing.
     zipP <- write "cmedit-conv.zip" (zipOf [(u8t "readme.txt", u8t "hi")])
@@ -4501,7 +4867,8 @@ main = do
   -- truly invisible formatting characters.
   let widthSrcs = csvSrcs ++ map T.pack
         [ "", "abc", "ab\ncdef\ng", "\n", "ab\n", "\nabc", "\26085\26412"
-        , "\8505\65039", "a\8203b", "\9888\65039x", "\t", "\1", "e\769" ]
+        , "\8505\65039", "a\8203b", "\9888\65039x", "\t", "\1", "e\769"
+        , "\769e", "e\769\776x", "\3626\3623\3633\3626\3604\3637", "a\ne\769\n\769" ]
       cwBad = [ t | t <- widthSrcs, cellWidth t /= cellWidthRef t ]
   checkEq "cellWidth agrees with the splitOn/unpack reference" (take 1 cwBad) []
   checkEq "cellWidth of a multi-line cell is its widest line"
@@ -5216,6 +5583,95 @@ main = do
     check "wide glyphs: under the menu" (gridOK (renderEditor edCjkMenu))
     check "a wide file name still shows in the status bar"
       (any (T.isInfixOf (T.pack "\27721")) (map T.pack (screenLines (renderEditor edCjk))))
+  -- Combining marks sit on the glyph before them: no cell of their own in the
+  -- grid, no column of their own in the cursor maths, and the two agree.
+  do
+    let acc = T.pack "e\769x"                       -- e + combining acute, then x
+        thai = T.pack "\3626\3623\3633\3626\3604\3637"   -- six code points, two of them marks
+    checkEq "a combining mark adds no display column" (lineDisplayWidth 8 acc) 2
+    checkEq "the column after a mark is the column after its glyph"
+      (map (\k -> colToDisplay 8 k acc) [0, 1, 2, 3]) [0, 1, 1, 2]
+    checkEq "Thai vowel signs take no cells" (lineDisplayWidth 8 thai) 4
+    checkEq "a mark with nothing before it gets a cell" (lineDisplayWidth 8 (T.pack "\769e")) 2
+    checkEq "a click after an accented letter lands past its mark" (displayToCol 8 1 acc) 2
+    checkEq "a line is never wrapped between a glyph and its mark"
+      (wrapLine 8 3 (T.pack "abe\769cd")) [(0, 4), (4, 6)]
+    checkEq "a variation selector keeps its cell" (lineDisplayWidth 8 (T.pack "\10084\65039")) 2
+    checkEq "a zero width space keeps its cell in the text view" (lineDisplayWidth 8 (T.pack "a\8203b")) 3
+    let edAcc = setLoaded "acc.txt" (mkLR "e\769x\n\769y\na\8203b") ed0
+        scrAcc = renderEditor edAcc
+        loAcc = computeLayout edAcc
+        cellA r k = scrCells scrAcc A.! ((loTextTop loAcc + r) * scrW scrAcc + loTextLeft loAcc + k)
+    checkEq "the mark is drawn on its glyph's cell"
+      (cellChar (cellA 0 0), cellComb (cellA 0 0), cellChar (cellA 0 1), cellComb (cellA 0 1))
+      ('e', T.pack "\769", 'x', T.empty)
+    checkEq "a leading mark is drawn on a blank cell"
+      (cellChar (cellA 1 0), cellComb (cellA 1 0), cellChar (cellA 1 1)) (' ', T.pack "\769", 'y')
+    checkEq "an invisible format control is shown, not emitted"
+      (map (cellChar . cellA 2) [0, 1, 2]) "a\65533b"
+    check "the emitted frame carries the glyph and its mark together"
+      (T.pack "e\769x" `T.isInfixOf` T.pack (builderStr (renderFrame plainCaps Nothing scrAcc)))
+    -- The cursor after the whole cluster is one cell along, not two.
+    let edAccEnd = fst (update (KArrow DRight noMods) (fst (update (KArrow DRight noMods) edAcc)))
+    checkEq "the cursor steps over a cluster to the next cell"
+      (fmap snd (scrCursor (renderEditor edAccEnd))) (Just (loTextLeft loAcc + 1))
+
+  -- The chrome measures and cuts in cells. A CJK name is two cells a
+  -- character, and clipping it by its character count let it run past the
+  -- edge of whatever it was drawn in.
+  do
+    let cjk = "\27721\23383\27721\23383"            -- four wide glyphs, eight cells
+    checkEq "strCells counts cells" (strCells cjk, strCells "e\769x", strCells "a\8203b") (8, 2, 2)
+    checkEq "takeCells never splits a wide glyph" (takeCells 5 cjk) "\27721\23383"
+    checkEq "takeCells keeps the last glyph's mark" (takeCells 1 "e\769x") "e\769"
+    checkEq "fitCells pads to the exact width" (fitCells 5 cjk) "\27721\23383 "
+    checkEq "dropCellsEnd keeps the tail that fits" (dropCellsEnd 5 ("ab" ++ cjk)) "\27721\23383"
+    checkEq "an input window scrolls by cells" (inputWindow 6 4 cjk) (2, 4)
+    checkEq "an input window that fits does not scroll" (inputWindow 10 2 cjk) (0, 4)
+    -- every prefix of a window fits the box and holds the cursor
+    check "the cursor always lands inside its box"
+      (and [ cx >= 0 && cx < w && off <= cur && strCells (take (cur - off) (drop off s)) == cx
+           | s <- [cjk, "ab" ++ cjk ++ "cd", "e\769e\769e\769e\769", "a" ++ cjk]
+           , w <- [1 .. 9], cur <- [0 .. length s]
+           , let (off, cx) = inputWindow w cur s
+           , not (cur < length s && isCombining (s !! cur)) ])
+    let gridOK' scr = and
+          [ if c == '\0' then k > 0 && charWidth (rowC !! (k - 1)) == 2
+            else charWidth c /= 2 || (k + 1 < scrW scr && rowC !! (k + 1) == '\0')
+          | r <- [0 .. scrH scr - 1]
+          , let rowC = [ cellChar (scrCells scr A.! (r * scrW scr + c)) | c <- [0 .. scrW scr - 1] ]
+          , (k, c) <- zip [0 ..] rowC ]
+        rowsOf scr = [ filter (/= '\0') [ cellChar (scrCells scr A.! (r * scrW scr + c)) | c <- [0 .. scrW scr - 1] ]
+                     | r <- [0 .. scrH scr - 1] ]
+        longName = concat (replicate 12 cjk)          -- 96 cells: wider than the screen
+        edName = setLoaded ("/w/" ++ longName ++ ".txt") (mkLR "x") ed0
+        -- the overwrite prompt names the file, so its box must be sized in cells
+        scrAsk = renderEditor (askOverwrite ("/w/" ++ cjk ++ cjk ++ ".txt") edName)
+        askRow = [ l | l <- rowsOf scrAsk, "already exists" `isInfixOf` l ]
+    check "a long CJK name leaves the status bar well formed" (gridOK' (renderEditor edName))
+    check "a dialog naming a CJK file is well formed" (gridOK' scrAsk)
+    check "and its box is wide enough for the message"
+      (case askRow of
+         [l] -> (cjk ++ cjk ++ ".txt already exists.") `isInfixOf` l
+                  && length (filter (== '\9474') l) >= 2
+         _   -> False)
+    -- A picker row has a style per character, which is not a cell index.
+    let edQ0 = (newEditor (24, 80) defaultConfig) { edPath = Just "/w/x.txt" }
+        edQ1 = fst (update (KCtrlChar 'p') edQ0)
+        genQ = maybe 0 qoGen (edQuickOpen edQ1)
+        edQ2 = quickFilesFound genQ [T.pack (cjk ++ "/" ++ cjk ++ ".md")] (quickOpenSeed genQ "/w" edQ1)
+        scrQ = renderEditor edQ2
+    check "quick open draws a CJK path whole"
+      (gridOK' scrQ && any ((cjk ++ "/" ++ cjk ++ ".md") `isInfixOf`) (rowsOf scrQ))
+    -- typing wide text into a field keeps the cursor inside the box
+    let edQ3 = foldl (\e c -> fst (update (KChar c) e)) edQ1 (concat (replicate 30 cjk))
+        (_, qx, _, qw) = quickOpenGeom edQ3
+    check "the cursor stays inside a field full of wide text"
+      (case scrCursor (renderEditor edQ3) of
+         Just (_, cx) -> cx > qx && cx < qx + qw - 1
+         Nothing      -> False)
+    check "and the field is well formed" (gridOK' (renderEditor edQ3))
+
   -- Input: a key code past the last code point must not throw, and the
   -- extra mouse buttons are not left clicks.
   kHuge <- parseBytes (map (fromIntegral . fromEnum) "\ESC[1114112u")
@@ -8846,9 +9302,13 @@ csvParsePrev delim = Seq.fromList . rows
 cellWidthRef :: T.Text -> Int
 cellWidthRef = maximum . (0 :) . map lineW . T.splitOn (T.pack "\n")
   where
-    lineW = sum . map effW . T.unpack
-    effW c | isInvisibleFormat c = 0
-           | otherwise           = max 1 (charWidth c)
+    -- A combining mark joins the glyph before it; one with nothing before it
+    -- on its line is drawn on a cell of its own.
+    lineW = snd . foldl effW (False, 0) . T.unpack
+    effW (seen, w) c
+      | isInvisibleFormat c = (seen, w)
+      | isCombining c       = (True, if seen then w else w + 1)
+      | otherwise           = (True, w + max 1 (charWidth c))
 
 -- | The CSV parser as it was before plan 0016 replaced it (String-based), kept
 -- as an oracle so the Text version can be proved identical on a corpus.

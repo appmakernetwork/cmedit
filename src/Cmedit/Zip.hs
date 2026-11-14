@@ -53,6 +53,7 @@ module Cmedit.Zip
   , parseCentral
     -- * Extracting one member
   , maxMemberBytes
+  , maxArchiveBytes
   , localHeaderBytes
   , localDataOffset
   , memberBytes
@@ -331,6 +332,19 @@ dosTime date time
 -- because nothing needs to be: only named members are ever read.
 maxMemberBytes :: Integer
 maxMemberBytes = 16 * 1024 * 1024
+
+-- | Ceiling on everything extracted from one archive for one open: each
+-- member's bytes as read plus its bytes as decompressed.
+--
+-- 'maxMemberBytes' bounds a member and nothing bounded how many are read, or
+-- how often: an e-book's spine may name one 16 MB chapter five thousand
+-- times, and a workbook's 256 sheets may all be the same member. A real
+-- document's XML is a few megabytes in all, and eight members at the cap is
+-- far past any of them; it is also about as much XML as is parsed in ten
+-- seconds. Past it a read is refused like any other unreadable member, and
+-- the reader says what it left out.
+maxArchiveBytes :: Integer
+maxArchiveBytes = 128 * 1024 * 1024
 
 -- | How many bytes of a local file header to read before 'localDataOffset' can
 -- say where the data starts. The fixed part is 30 bytes; the name and extra

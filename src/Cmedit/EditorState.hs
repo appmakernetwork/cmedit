@@ -22,7 +22,7 @@ import Data.Array (Array)
 import Cmedit.Types
 import Cmedit.TextBuffer
 import Cmedit.History (pushHist)
-import Cmedit.Width (colToDisplay, displayToCol, wrapLine)
+import Cmedit.Width (colToDisplay, displayToCol, textCells, wrapLine)
 import qualified Cmedit.Zip as Zip
 import Cmedit.ConfigFile
   ( Config(..), ThemeName(..), defaultConfig, RecentEntry(..)
@@ -236,6 +236,9 @@ data Editor = Editor
   , edAboutTick     :: !Int             -- ^ Frame counter of the About-box animation (reset when the dialog opens).
   , edSearch        :: !(Maybe SearchState) -- ^ Workspace-wide find/replace panel state (global, not per-document).
   , edSearchMode    :: !Bool                 -- ^ The search view occupies the main content area (drawn instead of the document); stays set while a menu/dialog overlays it.
+  , edSaveAsTarget  :: !(Maybe FilePath)
+    -- ^ The path an open 'DKConfirmOverwrite' prompt is asking about: Save As
+    -- named a file that already exists, and the save waits on the answer.
   , edPendingJump   :: !(Maybe (FilePath, Int, Int, Int)) -- ^ After opening a search result: (path, line, col, len) to move the cursor to once loaded.
   , edPendingDoc    :: !(Maybe (FilePath, Int, Text))
     -- ^ After opening a workspace-search result that was found /inside a
@@ -412,6 +415,7 @@ newEditor size cfg = Editor
   , edAboutTick     = 0
   , edSearch        = Nothing
   , edSearchMode    = False
+  , edSaveAsTarget  = Nothing
   , edPendingJump   = Nothing
   , edPendingDoc    = Nothing
   , edDefPick       = Nothing
@@ -1119,6 +1123,10 @@ data Effect
       --   'pagerFilled'). Bounded by construction — a few screens — so this is
       --   a seek and a short read, not a file slurp.
   | EffLintNow               -- ^ Run an immediate lint pass of the active document, save-time tools included (driver runs 'lintRequest' True and replies via 'lintResults'); emitted on save completion / settings change.
+  | EffSaveAs !FilePath
+    -- ^ Save As was confirmed with this path. Whether the path already exists
+    -- is the driver's to find out: it answers with 'askOverwrite' when the
+    -- save would replace some /other/ file, and 'saveAsTo' when it would not.
   | EffExportTo !FilePath !Text
     -- ^ Write this text to this path: what Save As means in a view that has no
     -- buffer to save. Distinct from 'EffSaveTo' on purpose — that one writes
@@ -1416,7 +1424,7 @@ dialogGeom :: Editor -> Dialog -> Layout -> (Int, Int, Int, Int)
 dialogGeom _ d lo =
   let cols = loCols lo; rows = loRows lo
       contentW = maximum (20 : map rowWidth (dialogRows d)
-                            ++ [T.length (dlgTitle d) + 2]
+                            ++ [textCells (dlgTitle d) + 2]
                             ++ [aboutCanvasMinW | dlgKind d == DKAbout]
                             ++ [helpCanvasMinW | dlgKind d == DKHelp])
       w = min (cols - 2) (max 30 (contentW + 4))
@@ -1426,21 +1434,21 @@ dialogGeom _ d lo =
       y = max 1 ((rows - h) `div` 2)
   in (y, x, h, w)
   where
-    rowWidth (DRMsg m) = T.length m
+    rowWidth (DRMsg m) = textCells m
     rowWidth (DRField i 0 _) = fieldLineWidth (dlgFields d !! i)  -- size once, on line 0
     rowWidth (DRField {})    = 0
     rowWidth (DROption i) = T.length (fst (dlgOptions d !! i)) + 4
     rowWidth (DRHeader h') = T.length h'
     rowWidth (DRChoice _)  = choiceRowWidth d
-    rowWidth (DRNote n)    = 2 + choiceIndent + T.length n   -- indented under its choice row
+    rowWidth (DRNote n)    = 2 + choiceIndent + textCells n   -- indented under its choice row
     rowWidth DRBlank = 0
     rowWidth (DRButtons bs) = sum [ T.length b + 4 | (_, b) <- bs ] + 2
 
 -- The field box grows to fit its widest line; longer lines scroll horizontally.
 fieldLineWidth :: Field -> Int
 fieldLineWidth (Field lbl t _) =
-  let widest = maximum (0 : map T.length (T.splitOn (T.pack "\n") t))
-  in T.length lbl + 1 + max 20 (widest + 2)
+  let widest = maximum (0 : map textCells (T.splitOn (T.pack "\n") t))
+  in textCells lbl + 1 + max 20 (widest + 2)
 
 -- The leading blank lines are the canvas the animated wordmark is drawn on
 -- (the renderer overlays 'Cmedit.About.aboutFrameCells' there); the version

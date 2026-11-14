@@ -1507,11 +1507,35 @@ saveAsDialogFlow ed = case saveAsRefusal ed of
     -- The manual's pseudo-path is not writable; offer a plain filename instead.
     -- An archive's buffer is its listing, not its bytes ("Cmedit.Zip"), so
     -- seeding its own path would offer to replace the archive with a
-    -- description of itself — and Save As does not ask before overwriting.
+    -- description of itself. (Typing that name back in is still asked about.)
     seed (Just p) | p == manualPath  = takeFileName manualPath
                   | isArchivePath p  = p ++ ".txt"
                   | otherwise        = p
     seed Nothing  = ""
+
+exportOverSourceMsg :: Text
+exportOverSourceMsg = "That is the file this view came from \x2014 choose another name"
+
+-- | Carry out a Save As whose target is settled (it does not exist, it is the
+-- document's own file, or the user has agreed to replace it). In a view with
+-- no buffer this is an export: a copy is written and the document keeps its
+-- own path, because it is still the workbook (or PDF, or e-book) and a later
+-- Ctrl+S must not aim at the CSV.
+saveAsTo :: FilePath -> Editor -> (Editor, [Effect])
+saveAsTo p ed0 = case exportSuggestion ed of
+  Just (_, txt) -> (ed, [EffExportTo p txt])
+  Nothing       -> (ed { edPath = Just p }, [EffSaveTo p])
+  where ed = ed0 { edSaveAsTarget = Nothing }
+
+-- | Save As named a file that already exists and is not this document's own:
+-- ask before replacing it. The focus starts on Cancel, like the explorer's
+-- delete prompt, so a reflexive Enter cannot destroy a file.
+askOverwrite :: FilePath -> Editor -> Editor
+askOverwrite p ed =
+  openDialog (setFocus 1 (mkConfirm DKConfirmOverwrite "Replace File"
+      (T.pack (takeFileName p ++ " already exists.\nReplace it?"))
+      ["Replace", "Cancel"]))
+    ed { edSaveAsTarget = Just p }
 
 -- | The export dialog's title, which is where the difference from an ordinary
 -- Save As is explained: this writes a copy and leaves the open document alone.

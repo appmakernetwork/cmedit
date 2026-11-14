@@ -28,7 +28,7 @@ import Data.Bits ((.|.))
 import Data.Array (Array, (!), listArray)
 import Data.Array.MArray (freeze, newArray, readArray, writeArray)
 import Data.Array.ST (STArray)
-import Data.ByteString.Builder (Builder, charUtf8, intDec, string7)
+import Data.ByteString.Builder (Builder, charUtf8, stringUtf8, intDec, string7)
 import qualified Data.Map.Strict as Map
 import Data.Char (toLower)
 import Data.List (find, foldl')
@@ -68,7 +68,7 @@ import Cmedit.Syntax
 import Cmedit.TextBuffer
 import Cmedit.Types
 import Cmedit.Image (Image(..), ImgMode(..), renderImage)
-import Cmedit.Width (charWidth, colToDisplay, controlCaret, isControlChar, isInvisibleFormat, windowStart)
+import Cmedit.Width (charWidth, colToDisplay, controlCaret, dropCellsEnd, fitCells, inputWindow, isCombining, strCells, takeCells, textCells, isControlChar, isInvisibleFormat, windowStart)
 
 -- | A rendered frame: a flat row-major grid plus the desired cursor position.
 -- 'scrHint' describes where this frame's scrollable band sat, so the diff can
@@ -881,17 +881,24 @@ sanitizeGrid arr cols rows = forM_ [0 .. rows - 1] $ \r -> row (r * cols) 0
           cell <- readArray arr (base + c)
           let ch = cellChar cell
           if | ch == contChar -> blank base c cell >> row base (c + 1)   -- orphan: heads consume theirs
-             | ch < '\x1100' ->
+             | ch < '\x200B' ->
                  if isUnsafe ch
-                   then writeArray arr (base + c) cell { cellChar = '\xFFFD' } >> row base (c + 1)
+                   then writeArray arr (base + c) cell { cellChar = '\xFFFD', cellComb = T.empty } >> row base (c + 1)
                    else row base (c + 1)
+             -- A format control the terminal prints nothing for, and does not
+             -- advance over: left in a cell of its own it would pull the
+             -- rest of the row one column left. The text view gives it a cell
+             -- on purpose (it is a character you can put the cursor on, and
+             -- an invisible one is worth seeing), so it is shown as a mark.
+             | isInvisibleFormat ch ->
+                 writeArray arr (base + c) cell { cellChar = '\xFFFD', cellComb = T.empty } >> row base (c + 1)
              | charWidth ch == 2 -> do
                  ok <- if c + 1 < cols
                          then (== contChar) . cellChar <$> readArray arr (base + c + 1)
                          else pure False
                  if ok then row base (c + 2) else blank base c cell >> row base (c + 1)
              | otherwise -> row base (c + 1)
-    blank base c cell = writeArray arr (base + c) cell { cellChar = ' ' }
+    blank base c cell = writeArray arr (base + c) cell { cellChar = ' ', cellComb = T.empty }
     -- C0 (the continuation sentinel is handled above), DEL and C1
     isUnsafe ch = ch < ' ' || (ch >= '\DEL' && ch < '\xA0')
 
@@ -925,30 +932,76 @@ drawStr arr cols rows r c0 st = drawStrL arr cols rows r c0 st Nothing
 -- | 'drawStr' with an OSC 8 hyperlink target attached to every cell
 -- ('Nothing' is a plain 'drawStr', so callers can pass a computed target).
 drawStrL :: Surf s -> Int -> Int -> Int -> Int -> Style -> Maybe Text -> String -> ST s ()
-drawStrL arr cols rows r c0 st mlnk = go c0
+drawStrL arr cols rows r c0 st mlnk = go c0 (-1)
   where
     -- Width-aware, like the text view: a wide glyph takes its cell plus a
     -- continuation (carrying its style and link), or the row it is on ends up
-    -- longer than the screen is wide.
-    go _ [] = pure ()
-    go !c (ch : cs) = do
-      let cw = if ch < '\x1100' then 1 else max 1 (charWidth ch)
-      putCell arr cols rows r c (CellL ch st mlnk)
-      when (cw == 2) $ putCell arr cols rows r (c + 1) (CellL contChar st mlnk)
-      go (c + cw) cs
+    -- longer than the screen is wide; a combining mark joins the cell of the
+    -- glyph before it (@prev@), or a blank one when the string starts with it.
+    go _ _ [] = pure ()
+    go !c !prev (ch : cs)
+      | ch < '\x300' = putCell arr cols rows r c (CellL ch st mlnk) >> go (c + 1) c cs
+      | isInvisibleFormat ch = go c prev cs
+      | isCombining ch =
+          if prev >= 0 then addComb arr cols rows r prev ch >> go c prev cs
+          else putCell arr cols rows r c (CellC ' ' st mlnk (T.singleton ch)) >> go (c + 1) c cs
+      | otherwise = do
+          let cw = max 1 (charWidth ch)
+          putCell arr cols rows r c (CellL ch st mlnk)
+          when (cw == 2) $ putCell arr cols rows r (c + 1) (CellL contChar st mlnk)
+          go (c + cw) c cs
+
+-- | Draw individually styled characters into exactly @w@ cells from column
+-- @c0@: clipped at the last whole glyph that fits and padded with @padSty@.
+-- The lists the pickers and the search results build have a style per
+-- /character/, which is not a cell index once a glyph is wide; writing them
+-- one cell apiece left every CJK character without its continuation cell.
+drawStyledW :: Surf s -> Int -> Int -> Int -> Int -> Int -> Style -> [(Char, Style)] -> ST s ()
+drawStyledW arr cols rows r c0 w padSty = go 0 (-1)
+  where
+    go !d _ [] = forM_ [d .. w - 1] $ \k -> putCell arr cols rows r (c0 + k) (Cell ' ' padSty)
+    go !d !prev ((ch, st) : cs)
+      | ch < '\x300' = if d + 1 > w then go d prev []
+                       else putCell arr cols rows r (c0 + d) (Cell ch st) >> go (d + 1) d cs
+      | isInvisibleFormat ch = go d prev cs
+      | isCombining ch, prev >= 0 = addComb arr cols rows r (c0 + prev) ch >> go d prev cs
+      | otherwise = do
+          let lone = isCombining ch
+              a = if lone then 1 else max 1 (charWidth ch)
+          if d + a > w then go d prev [] else do
+            putCell arr cols rows r (c0 + d) (if lone then CellC ' ' st Nothing (T.singleton ch) else Cell ch st)
+            when (a == 2) $ putCell arr cols rows r (c0 + d + 1) (Cell contChar st)
+            go (d + a) d cs
+
+-- | The most combining marks one cell carries; past that they are dropped,
+-- which bounds what a line of stacked diacritics can make a frame emit.
+maxComb :: Int
+maxComb = 8
+
+-- Add a combining mark to the glyph already drawn at a cell.
+addComb :: Surf s -> Int -> Int -> Int -> Int -> Char -> ST s ()
+addComb arr cols rows r c m =
+  when (r >= 0 && r < rows && c >= 0 && c < cols) $ do
+    cell <- readArray arr (r * cols + c)
+    when (T.length (cellComb cell) < maxComb) $
+      writeArray arr (r * cols + c) cell { cellComb = T.snoc (cellComb cell) m }
 
 -- Like 'drawStr' but underlines the character at index @ui@ (the menu
 -- mnemonic). A negative @ui@ underlines nothing.
 drawStrU :: Surf s -> Int -> Int -> Int -> Int -> Style -> Int -> String -> ST s ()
-drawStrU arr cols rows r c0 st ui = go c0 (0 :: Int)
+drawStrU arr cols rows r c0 st ui = go c0 (-1) (0 :: Int)
   where
-    go _ _ [] = pure ()
-    go !c !k (ch : cs) = do
-      let st' = if k == ui then st { styleAttr = styleAttr st .|. attrUnderline } else st
-          cw = if ch < '\x1100' then 1 else max 1 (charWidth ch)
-      putCell arr cols rows r c (Cell ch st')
-      when (cw == 2) $ putCell arr cols rows r (c + 1) (Cell contChar st')
-      go (c + cw) (k + 1) cs
+    go _ _ _ [] = pure ()
+    go !c !prev !k (ch : cs)
+      | ch >= '\x300', isInvisibleFormat ch = go c prev (k + 1) cs
+      | ch >= '\x300', isCombining ch, prev >= 0 = addComb arr cols rows r prev ch >> go c prev (k + 1) cs
+      | otherwise = do
+          let st' = if k == ui then st { styleAttr = styleAttr st .|. attrUnderline } else st
+              lone = ch >= '\x300' && isCombining ch
+              cw = if ch < '\x300' || lone then 1 else max 1 (charWidth ch)
+          putCell arr cols rows r c (if lone then CellC ' ' st' Nothing (T.singleton ch) else Cell ch st')
+          when (cw == 2) $ putCell arr cols rows r (c + 1) (Cell contChar st')
+          go (c + cw) c (k + 1) cs
 
 -- | 'drawStr' but clip characters that would land at a screen column below
 -- @minC@ (used by the CSV table, whose column region is shifted left by
@@ -962,17 +1015,24 @@ drawStrU arr cols rows r c0 st ui = go c0 (0 :: Int)
 -- from the emitted stream — terminals render nothing for them and the
 -- cursor does not advance, so leaving them in would desync the grid.
 drawStrClipL :: Surf s -> Int -> Int -> Int -> Int -> Int -> Style -> String -> ST s ()
-drawStrClipL arr cols rows r c0 minC st = go c0
+drawStrClipL arr cols rows r c0 minC st = go c0 (-1)
   where
-    go _ [] = pure ()
-    go !c (ch:cs)
-      | isInvisibleFormat ch = go c cs
+    go _ _ [] = pure ()
+    go !c !prev (ch:cs)
+      | ch < '\x300' = when (c >= minC) (putCell arr cols rows r c (Cell ch st)) >> go (c + 1) c cs
+      | isInvisibleFormat ch = go c prev cs
+      -- A combining mark joins the glyph before it, when that was drawn.
+      | isCombining ch, prev >= 0 =
+          when (prev >= minC) (addComb arr cols rows r prev ch) >> go c prev cs
+      | isCombining ch = do
+          when (c >= minC) $ putCell arr cols rows r c (CellC ' ' st Nothing (T.singleton ch))
+          go (c + 1) c cs
       | otherwise = do
           let cw = max 1 (charWidth ch)
           when (c >= minC) $ do
             putCell arr cols rows r c (Cell ch st)
             when (cw == 2) $ putCell arr cols rows r (c + 1) (Cell contChar st)
-          go (c + cw) cs
+          go (c + cw) c cs
 
 -- | Trim @s@ to at most @w@ display cells, then pad with trailing spaces to
 -- exactly @w@ cells. A 2-cell glyph that would straddle the boundary is
@@ -982,16 +1042,7 @@ drawStrClipL arr cols rows r c0 minC st = go c0
 -- 'drawStrClipL' drops them at emit time (skipping them here would
 -- silently mutate the cell contents relative to the buffer).
 takeCellsPad :: Int -> String -> String
-takeCellsPad w s = go w s
-  where
-    go !left [] = replicate (max 0 left) ' '
-    go !left _ | left <= 0 = []
-    go !left (c:cs)
-      | isInvisibleFormat c = c : go left cs
-      | otherwise =
-          let cw = max 1 (charWidth c)
-          in if cw <= left then c : go (left - cw) cs
-             else replicate left ' '
+takeCellsPad = fitCells
 
 fillRow :: Surf s -> Int -> Int -> Int -> Style -> ST s ()
 fillRow arr cols rows r st =
@@ -1414,12 +1465,34 @@ expandLineCellsFrom tabw showWS baseAt selSty wsSty msel selEOL overlays diagOve
               cc = take 2 (controlCaret c ++ "  ")
           in (dcol, mkC i (cc !! 0) s) : (dcol + 1, mkC i (cc !! 1) s)
                : go (dcol + 2) (i + 1) cs
+      -- A combining mark that reaches here has no glyph in this run to sit
+      -- on. At the start of a line it is drawn on a blank cell of its own
+      -- ('Width.glyphCells' counts it the same way); anywhere else its glyph
+      -- is a tab, a caret pair, or off the window's left edge, and it is
+      -- dropped rather than stuck onto whatever happens to be in the cell
+      -- before.
+      | c >= '\x300', isCombining c =
+          if dcol == 0
+            then let (marks, rest) = span isCombining cs
+                 in glyph ' ' 1 (c : marks) (1 + length marks) rest
+            else go dcol (i + 1) cs
       | otherwise =
-          let w = max 1 (charWidth c)
-              s = styAt i
-              c' = if showWS && c == ' ' then '\183' else c
+          let c' = if showWS && c == ' ' then '\183' else c
+          in case cs of
+               (m : _) | m >= '\x300', isCombining m ->
+                 let (marks, rest) = span isCombining cs
+                 in glyph c' (max 1 (charWidth c)) marks (1 + length marks) rest
+               _ -> glyph c' (max 1 (charWidth c)) [] 1 cs
+      where
+        -- One glyph: its head cell (carrying any combining marks that follow
+        -- it), its continuation cells if it is wide, then the rest. @used@ is
+        -- how many characters of the line that was.
+        glyph ch w marks used rest =
+          let s = styAt i
+              hd | null marks = mkC i ch s
+                 | otherwise  = CellC ch s (lnkAt i) (T.pack (take maxComb marks))
               cont = [ (dcol + k, mkC i contChar s) | k <- [1 .. w - 1] ]
-          in (dcol, mkC i c' s) : cont ++ go (dcol + w) (i + 1) cs
+          in (dcol, hd) : cont ++ go (dcol + w) (i + used) rest
 
 -- | Group the active document's diagnostics by buffer line for the visible
 -- window, computed **once per frame** and shared by the squiggle overlay and
@@ -1649,12 +1722,12 @@ drawStatus th ed lo arr = do
           Just d  -> diagStatusMsg d
           Nothing -> T.unpack (edStatus ed)
   drawStr arr cols rows r 0 (thStatus th) prefix
-  drawStrL arr cols rows r (length prefix) (thStatus th) nameLink name
-  drawStr arr cols rows r (length prefix + length name) (thStatus th) ro
+  drawStrL arr cols rows r (strCells prefix) (thStatus th) nameLink name
+  drawStr arr cols rows r (strCells prefix + strCells name) (thStatus th) ro
   -- transient status message just after the filename
   when (not (null status)) $
-    drawStr arr cols rows r (length left + 2) (thStatusKey th) status
-  drawStr arr cols rows r (max 0 (cols - length right)) (thStatus th) right
+    drawStr arr cols rows r (strCells left + 2) (thStatusKey th) status
+  drawStr arr cols rows r (max 0 (cols - strCells right)) (thStatus th) right
 
 shortName :: FilePath -> String
 shortName = reverse . takeWhile (/= '/') . reverse
@@ -1737,8 +1810,8 @@ drawDialog th ed lo d arr = do
     then drawAboutTitle arr cols rows y x w
     else do
       let title = " " ++ T.unpack (dlgTitle d) ++ " "
-          tx = x + (w - length title) `div` 2
-      drawStr arr cols rows y tx (thDialogTitle th) title
+          tx = x + max 1 ((w - strCells title) `div` 2)
+      drawStr arr cols rows y tx (thDialogTitle th) (takeCells (w - 2) title)
   -- The body scrolls when it overflows a short terminal. The scroll offset is
   -- derived purely (from focus) by the same 'dialogScroll' the mouse hit-test
   -- uses, so clicks and drawing never disagree: visible window position @p@
@@ -1786,7 +1859,7 @@ drawAboutTitle arr cols rows r x0 w =
 drawDRow :: Theme -> Editor -> Dialog -> Surf s -> Int -> Int -> Int -> Int -> Int -> DRow -> ST s ()
 drawDRow th _ed d arr cols rows r x innerW dr = case dr of
   DRBlank -> pure ()
-  DRMsg m -> drawStr arr cols rows r x (thDialog th) (T.unpack m)
+  DRMsg m -> drawStr arr cols rows r x (thDialog th) (takeCells innerW (T.unpack m))
   DRField i li visH -> do
     -- One visual line of a (possibly multi-line) field. The value box reuses the
     -- table view's 'cellDisplay': the focused field scrolls vertically to keep the
@@ -1794,14 +1867,14 @@ drawDRow th _ed d arr cols rows r x innerW dr = case dr of
     let Field lbl t cur = dlgFields d !! i
         focused  = dlgFocus d == i
         fst'     = if focused then thFieldFocus th else thField th
-        labelW   = T.length lbl + 1
+        labelW   = textCells lbl + 1
         valStart = x + labelW
         valW     = max 1 (innerW - labelW)
         dispLines = cellDisplay valW visH (if focused then Just cur else Nothing) t
         content   = if li < length dispLines then dispLines !! li else ""
     when (li == 0) $ drawStr arr cols rows r x (thDialog th) (T.unpack lbl ++ " ")
     fillRect arr cols rows r valStart 1 valW fst'
-    drawStr arr cols rows r valStart fst' (take valW (content ++ repeat ' '))
+    drawStr arr cols rows r valStart fst' (fitCells valW content)
     -- Mirror the table view's '+': flag a field with more lines than fit.
     when (li == visH - 1 && Csv.cellLineCount t > visH) $
       drawStr arr cols rows r x (thDialog th) "+"
@@ -1895,7 +1968,7 @@ drawBrowser th ed arr = do
             avail = w - 4 - indent - length marker
         fillRect arr cols rows r (x + 1) 1 (w - 2) rowSty
         drawStr arr cols rows r startCol rowSty marker
-        drawStr arr cols rows r (startCol + length marker) nameSty (take (max 0 avail) nameStr)
+        drawStr arr cols rows r (startCol + length marker) nameSty (takeCells (max 0 avail) nameStr)
       -- Footer hint.
       let act = if edBrowserPick ed then "\x21b5 open folder" else "\x21b5 open"
           hint = " \x2191\x2193 move   \x2192 expand   \x2190 up   " ++ act
@@ -1905,9 +1978,9 @@ drawBrowser th ed arr = do
 -- Clip a string to width, keeping the right-hand (most specific) end.
 ellipsizeLeft :: Int -> String -> String
 ellipsizeLeft maxw s
-  | length s <= maxw = s
-  | maxw <= 1        = take maxw s
-  | otherwise        = '\x2026' : drop (length s - maxw + 1) s
+  | strCells s <= maxw = s
+  | maxw <= 1          = takeCells maxw s
+  | otherwise          = '\x2026' : dropCellsEnd (maxw - 1) s
 
 ------------------------------------------------------------------------------
 -- Go-to-definition picker
@@ -1924,8 +1997,8 @@ drawDefPick th ed dp arr = do
   fillRect arr cols rows y x h w (thDialog th)
   drawBox th arr cols rows y x h w (thDialog th)
   let title = " Definitions of \x2018" ++ T.unpack (dpName dp) ++ "\x2019 "
-      tx = x + max 1 ((w - length title) `div` 2)
-  drawStr arr cols rows y tx (thDialogTitle th) (take (w - 2) title)
+      tx = x + max 1 ((w - strCells title) `div` 2)
+  drawStr arr cols rows y tx (thDialogTitle th) (takeCells (w - 2) title)
   let items = dpItems dp
       shown = take vh (drop (dpTop dp) items)
       innerW = w - 2
@@ -1939,16 +2012,15 @@ drawDefPick th ed dp arr = do
           sty = if selected then selSty else thDialog th
           loc = makeRelative (dpRoot dp) (diPath it) ++ ":" ++ show (diLine it + 1)
           snippet = T.unpack (T.map detab (T.strip (diText it)))
-          row = " " ++ padTo pathW (ellipsizeLeft pathW loc) ++ " \x2502 " ++ snippet
-      drawStr arr cols rows r (x + 1) sty (padTo innerW (take innerW row))
+          row = " " ++ fitCells pathW (ellipsizeLeft pathW loc) ++ " \x2502 " ++ snippet
+      drawStr arr cols rows r (x + 1) sty (fitCells innerW row)
   let n = length items
       more | dpRunning dp = "searching\x2026  "
            | otherwise    = show n ++ " definition" ++ (if n == 1 then "" else "s") ++ "  "
       hint = " " ++ more ++ "\x21b5 open   \x2191\x2193 move   Esc cancel "
-  drawStr arr cols rows (y + h - 2) (x + 1) dimSty (padTo (w - 2) (take (w - 2) hint))
+  drawStr arr cols rows (y + h - 2) (x + 1) dimSty (fitCells (w - 2) hint)
   where
     detab c = if c == '\t' then ' ' else c
-    padTo n s = s ++ replicate (n - length s) ' '
 
 -- The Ctrl+P quick-open palette: a query input over a ranked file list, with
 -- the fuzzy-matched characters emphasised.
@@ -1968,10 +2040,9 @@ drawQuickOpen th ed qo arr = do
   -- Query input: "> query", scrolled so the cursor stays visible.
   let SField qtext qcur = qoField qo
       valW = max 1 (w - 6)
-      off = if qcur >= valW then qcur - valW + 1 else 0
-      shown = T.unpack (T.take valW (T.drop off qtext))
-  drawStr arr cols rows (y + 1) (x + 2) (thDialog th) ("> " ++ shown
-    ++ replicate (max 0 (valW - length shown)) ' ')
+      (off, _) = inputWindow valW qcur (T.unpack qtext)
+  drawStr arr cols rows (y + 1) (x + 2) (thDialog th)
+    ("> " ++ fitCells valW (T.unpack (T.drop off qtext)))
   -- Ranked results; matched characters bold+underlined for scannability.
   let items = take vh (drop (qoTop qo) (qoMatches qo))
   if null (qoMatches qo)
@@ -1983,9 +2054,8 @@ drawQuickOpen th ed qo arr = do
           sty = if selected then selSty else thDialog th
           emph = sty { styleAttr = styleAttr sty .|. attrBold .|. attrUnderline }
           disp = ' ' : T.unpack path
-      forM_ (zip [0 ..] (take innerW (disp ++ repeat ' '))) $ \(k, ch) ->
-        let s = if (k - 1) `elem` ps then emph else sty
-        in putCell arr cols rows r (x + 1 + k) (Cell ch s)
+      drawStyledW arr cols rows r (x + 1) innerW sty
+        [ (ch, if (k - 1) `elem` ps then emph else sty) | (k, ch) <- zip [0 :: Int ..] disp ]
   -- Footer: match count / walk progress + key hints.
   let n = qoTotal qo
       cmdMode = Q.qoCommandMode qo
@@ -2012,9 +2082,8 @@ drawComplete th ed cp arr = do
         sty = if selected then thMenuSel th else thMenuItem th
         preSty = sty { styleAttr = styleAttr sty .|. attrBold }
         disp = ' ' : T.unpack wtxt
-    forM_ (zip [0 ..] (take w (disp ++ repeat ' '))) $ \(k, ch) ->
-      let s = if k >= 1 && k <= plen then preSty else sty
-      in putCell arr cols rows r (x + k) (Cell ch s)
+    drawStyledW arr cols rows r x w sty
+      [ (ch, if k >= 1 && k <= plen then preSty else sty) | (k, ch) <- zip [0 :: Int ..] disp ]
 
 ------------------------------------------------------------------------------
 -- File explorer panel (workspace sidebar)
@@ -2107,7 +2176,7 @@ drawExplorerPanel th ed lo arr = do
   forM_ [ptop .. ptop + ph - 1] $ \r -> putCell arr cols rows r dividerCol (Cell '\x2502' divSty)
   -- Header bar: folder name + « collapse + ✕ close.
   fillRect arr cols rows ptop 0 1 pcw hdrSty
-  drawStr arr cols rows ptop 1 hdrSty (take (max 0 (collCol - 2)) (explorerRootName ed))
+  drawStr arr cols rows ptop 1 hdrSty (takeCells (max 0 (collCol - 2)) (explorerRootName ed))
   putCell arr cols rows ptop collCol  (Cell '\xab' btnSty)    -- «
   putCell arr cols rows ptop closeCol (Cell '\x2715' btnSty)  -- ✕
   -- Tree.
@@ -2179,7 +2248,7 @@ drawExplorerPanel th ed lo arr = do
           putCell arr cols rows r startCol (Cell iconCh iconSty)
         -- The name is an OSC 8 hyperlink to the file/folder, so a
         -- terminal that supports links lets Ctrl+Click open it in the OS.
-        drawStrL arr cols rows r nameCol nameSty (filePathUri path) (take avail nameStr)
+        drawStrL arr cols rows r nameCol nameSty (filePathUri path) (takeCells avail nameStr)
         drawStr arr cols rows r sizeCol sizeSty sizeStr
         putCell arr cols rows r statusCol (Cell statusCh statusSty)
 
@@ -2220,7 +2289,7 @@ drawSearchHeader th ss arr cols rows r left w hl = case hl of
         rootNm = let p = ssRoot ss; nm = shortName p in if null nm then p else nm
         title = " " ++ spin ++ "SEARCH  " ++ rootNm
     fillRect arr cols rows r left 1 w sty
-    drawStr arr cols rows r left sty (take w (title ++ repeat ' '))
+    drawStr arr cols rows r left sty (fitCells w title)
   HLFind    -> drawSearchField th ss arr cols rows r left w SFFind "Find"
   HLReplace -> drawSearchField th ss arr cols rows r left w SFReplace "Replace"
   HLInclude -> drawSearchField th ss arr cols rows r left w SFInclude "Files"
@@ -2230,7 +2299,7 @@ drawSearchHeader th ss arr cols rows r left w hl = case hl of
             | T.null (ssMessage ss) && not (ssSearched ss) = "Enter a term and press Enter"
             | otherwise    = T.unpack (ssMessage ss)
         sty = Style BrightBlack Default attrNone
-    drawStr arr cols rows r left sty (take w (" " ++ msg))
+    drawStr arr cols rows r left sty (takeCells w (" " ++ msg))
   HLDivider ->
     forM_ [left .. left + w - 1] $ \c -> putCell arr cols rows r c (Cell '\x2500' (Style BrightBlack Default attrNone))
 
@@ -2244,8 +2313,8 @@ drawSearchField th ss arr cols rows r left w fld label = do
       vcol     = left + searchFieldValueCol
       (valW, ctls) = fieldValueWidth ss left w fld
       -- horizontal scroll so the cursor stays visible when focused
-      off      = if focused && cur >= valW then cur - valW + 1 else 0
-      shownTxt = T.unpack (T.take valW (T.drop off t))
+      off      = if focused then fst (inputWindow valW cur (T.unpack t)) else 0
+      shownTxt = takeCells valW (T.unpack (T.drop off t))
       placeholder = case fld of
         SFFind    | T.null t -> "text to find \x2014 press Enter to search"
         SFReplace | T.null t -> "replacement text \x2014 Alt+R replaces all"
@@ -2257,8 +2326,8 @@ drawSearchField th ss arr cols rows r left w fld label = do
   -- value box
   fillRect arr cols rows r vcol 1 valW fst'
   if null shownTxt && not (null placeholder)
-    then drawStr arr cols rows r vcol (fst' { styleFg = BrightBlack }) (take valW placeholder)
-    else drawStr arr cols rows r vcol fst' (take valW (shownTxt ++ repeat ' '))
+    then drawStr arr cols rows r vcol (fst' { styleFg = BrightBlack }) (takeCells valW placeholder)
+    else drawStr arr cols rows r vcol fst' (fitCells valW shownTxt)
   -- controls (Find line: Aa/W/toggle; Replace line: [Replace All])
   mapM_ (\(c, s, ctl) -> drawStr arr cols rows r c (ctlStyle th ss ctl) s) ctls
 
@@ -2316,14 +2385,14 @@ drawResultRow th ss arr cols rows r left w srow selected = do
             nmSty  = if selected then selSty { styleAttr = attrBold } else Style BrightWhite Default attrBold
             dirSty = if selected then selSty else Style BrightBlack Default attrNone
             cntSty = if selected then selSty else Style BrightBlack Default attrNone
-            cntCol = left + w - length cntS - 1
+            cntCol = left + w - strCells cntS - 1
         putCell arr cols rows r (left + 1) (Cell chev rowBg)
         -- The file header is an OSC 8 hyperlink to the matched file.
         drawStrL arr cols rows r (left + 3) nmSty (filePathUri (frPath fr))
-                 (take (max 0 (cntCol - (left + 3) - 1)) nm)
-        let dirCol = left + 3 + length nm + 1
+                 (takeCells (max 0 (cntCol - (left + 3) - 1)) nm)
+        let dirCol = left + 3 + strCells nm + 1
         when (dirCol < cntCol) $
-          drawStr arr cols rows r dirCol dirSty (take (max 0 (cntCol - dirCol - 1)) dir)
+          drawStr arr cols rows r dirCol dirSty (takeCells (max 0 (cntCol - dirCol - 1)) dir)
         drawStr arr cols rows r cntCol cntSty cntS
       _ -> pure ()
     SRMatch fi mi -> case Seq.lookup fi (ssResults ss) of
@@ -2346,15 +2415,13 @@ drawResultRow th ss arr cols rows r left w srow selected = do
               -- auto-scroll to the first match, plus the user's manual pan
               scroll = ssLeft ss + (if firstC >= availT then firstC - availT `div` 2 else 0)
               snip   = displaySnippet (mText m)
-              seg    = take availT (drop scroll snip)
+              seg    = drop scroll snip
               hiSty  = if selected then selSty { styleAttr = attrBold, styleFg = BrightYellow }
                                    else Style Black Yellow attrNone
               inMatch col = any (\(c, l) -> col >= c && col < c + l) cols0
-          drawStr arr cols rows r lnCol lnSty (take (gutW - 1) (lnS ++ repeat ' '))
-          forM_ (zip [0 ..] seg) $ \(k, ch) ->
-            let srcCol = scroll + k
-                cst = if inMatch srcCol then hiSty else rowBg
-            in putCell arr cols rows r (txtCol + k) (Cell ch cst)
+          drawStr arr cols rows r lnCol lnSty (fitCells (gutW - 1) lnS)
+          drawStyledW arr cols rows r txtCol availT rowBg
+            [ (ch, if inMatch (scroll + k) then hiSty else rowBg) | (k, ch) <- zip [0 :: Int ..] seg ]
         _ -> pure ()
       _ -> pure ()
 
@@ -2380,14 +2447,14 @@ drawLoading th _ed lo (name, frame) arr = do
   let cols = loCols lo; rows = loRows lo
       spin = spinnerFrames !! (frame `mod` length spinnerFrames)
       label = spin : "  Loading " ++ name ++ "\x2026"
-      w = min (cols - 2) (max 24 (length label + 4))
+      w = min (cols - 2) (max 24 (strCells label + 4))
       h = 3
       x = max 0 ((cols - w) `div` 2)
       y = max 0 ((rows - h) `div` 2)
       sty = thDialog th
   fillRect arr cols rows y x h w sty
   drawBox th arr cols rows y x h w sty
-  drawStr arr cols rows (y + 1) (x + 2) sty (take (w - 4) label)
+  drawStr arr cols rows (y + 1) (x + 2) sty (takeCells (w - 4) label)
 
 ------------------------------------------------------------------------------
 -- CSV table view
@@ -2550,10 +2617,19 @@ cellDisplay w visH mCur cellText =
         | idx < 0 || idx >= n = replicate w ' '
         | otherwise = case mLineCol of
             Just (cl, cc) | cl == idx ->
-              let off = if cc < w then 0 else cc - w + 1 in drop off (rawLines !! idx)
+              let ln = rawLines !! idx in drop (fst (inputWindow w cc ln)) ln
             _ -> clipStr w (rawLines !! idx)
   in [ lineAt (winTop + li) | li <- [0 .. visH - 1] ]
   where sani ch = if ch == '\t' then ' ' else ch
+
+-- The window of the line of a (possibly multi-line) value that holds its
+-- cursor: 'inputWindow' over that line, as 'cellDisplay' draws it. Shared by
+-- the three cursors that sit in such a value.
+cursorWindow :: Int -> Text -> Int -> Int -> (Int, Int)
+cursorWindow w t cl cc =
+  inputWindow w cc (case drop cl (T.splitOn (T.pack "\n") t) of
+                      (l : _) -> T.unpack l
+                      []      -> "")
 
 -- Truncate to display cells (not code points): if @s@ overflows the column
 -- width, trim it to @w-1@ cells and append an ellipsis (which is itself
@@ -2563,21 +2639,8 @@ cellDisplay w visH mCur cellText =
 -- the boundary in and eat a real character.
 clipStr :: Int -> String -> String
 clipStr w s
-  | dw <= w  = s
-  | otherwise = takeCells (max 0 (w - 1)) s ++ "\x2026"
-  where
-    dw = sum (map effW s)
-    effW c | isInvisibleFormat c = 0
-           | otherwise           = max 1 (charWidth c)
-    takeCells !n = go n
-      where
-        go _ [] = []
-        go !left _  | left <= 0 = []
-        go !left (c:cs)
-          | isInvisibleFormat c = c : go left cs
-          | otherwise =
-              let cw = max 1 (charWidth c)
-              in if cw <= left then c : go (left - cw) cs else []
+  | strCells s <= w = s
+  | otherwise       = takeCells (max 0 (w - 1)) s ++ "\x2026"
 
 -- Cursor for the cell being edited in CSV mode (on the right line + column of a
 -- multi-line cell). Mirrors the windowing done by 'cellDisplay'.
@@ -2597,9 +2660,9 @@ csvCursor ed v lo
       (_, sl, visH) <- find (\(r, _, _) -> r == csvCurRow v) (csvRowLayout (edFreezeHeader ed) v lo)
       let winTop = if cl >= visH then cl - visH + 1 else 0
           li = cl - winTop
-          off = if cc < w then 0 else cc - w + 1
+          (_, cx) = cursorWindow w (Csv.currentCellText v) cl cc
           srow = sl + li
-          scol = cleft + gut + x - xoff + (cc - off)
+          scol = cleft + gut + x - xoff + cx
       if li >= 0 && li < visH && srow < loTextTop lo + loTextHeight lo
            && scol >= cleft + gut && scol < loCols lo
         then Just (srow, scol) else Nothing
@@ -2618,8 +2681,8 @@ computeCursor ed lo = case edFocus ed of
     let (y, x, _, w) = quickOpenGeom ed
         cur = sfCur (qoField qo)
         valW = max 1 (w - 6)
-        off = if cur >= valW then cur - valW + 1 else 0
-    in Just (y + 1, x + 4 + (cur - off))
+        (_, cx) = inputWindow valW cur (T.unpack (sfText (qoField qo)))
+    in Just (y + 1, x + 4 + cx)
   FSearch -> edSearch ed >>= searchCursor lo
   FDialog -> edDialog ed >>= dialogCursor ed lo
   -- The image view is read-only and has no cursor interaction: falling
@@ -2684,11 +2747,11 @@ searchCursor lo ss = do
       hls = S.headerLines ss
       hlOf SFFind = HLFind; hlOf SFReplace = HLReplace; hlOf SFInclude = HLInclude; hlOf SFExclude = HLExclude
   ri <- lookupIndex (hlOf fld) hls
-  let SField _ cur = fieldOf fld ss
+  let SField t cur = fieldOf fld ss
       (valW, _) = fieldValueWidth ss left w fld
       vcol = left + searchFieldValueCol
-      off  = if cur >= valW then cur - valW + 1 else 0
-  Just (top + ri, vcol + (cur - off))
+      (_, cx) = inputWindow valW cur (T.unpack t)
+  Just (top + ri, vcol + cx)
   where lookupIndex x xs = case [ i | (i, y) <- zip [0 ..] xs, y == x ] of (i : _) -> Just i; [] -> Nothing
 
 dialogCursor :: Editor -> Layout -> Dialog -> Maybe (Int, Int)
@@ -2700,13 +2763,13 @@ dialogCursor ed lo d = case focusedField d of
         j = fieldRowIndex d fi
         f@(Field lbl t cur) = dlgFields d !! fi
         visH     = fieldVisH f
-        labelW   = T.length lbl + 1
+        labelW   = textCells lbl + 1
         valStart = (x + 2) + labelW
         valW     = max 1 (innerW - labelW)
         (cl, cc) = Csv.cursorLineCol t cur
         winTop   = if cl >= visH then cl - visH + 1 else 0
-        off      = if cc < valW then 0 else cc - valW + 1
-    in Just (y + 1 + j + (cl - winTop), valStart + (cc - off))
+        (_, cx)  = cursorWindow valW t cl cc
+    in Just (y + 1 + j + (cl - winTop), valStart + cx)
 
 ------------------------------------------------------------------------------
 -- Diff to escape sequences
@@ -2898,6 +2961,7 @@ cellRun :: RenderCaps -> Screen -> Int -> Int -> Int -> Int -> Cell -> Int
 cellRun caps cur w r c e cell
   | not (rcRep caps) = 1
   | ch < ' ' || ch > '~' = 1
+  | not (T.null (cellComb cell)) = 1   -- REP repeats a character, not a cluster
   | otherwise = go (c + 1)
   where
     ch = cellChar cell
@@ -2909,6 +2973,9 @@ cellRun caps cur w r c e cell
 emitRun :: Cell -> Int -> Builder
 emitRun cell n
   | n >= 4    = charUtf8 (cellChar cell) <> repChar (n - 1)
+  | n == 1    = if T.null (cellComb cell) then charUtf8 (cellChar cell)
+                -- The glyph, then the marks the terminal draws over it.
+                else charUtf8 (cellChar cell) <> stringUtf8 (T.unpack (cellComb cell))
   | otherwise = mconcat (replicate n (charUtf8 (cellChar cell)))
 
 -- Redraw a whole row, skipping wide-glyph continuation sentinels so physical

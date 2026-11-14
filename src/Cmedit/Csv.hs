@@ -116,7 +116,7 @@ import Data.Array.MArray (freeze)
 
 import Cmedit.Types (Dir(..), ptrEq)
 import Cmedit.History (pushHist)
-import Cmedit.Width (charWidth, isInvisibleFormat)
+import Cmedit.Width (strAdvance)
 
 -- | A persistent CSV row. Ordinary loaded cells are source spans in compact
 -- unboxed arrays; edits are a sparse immutable overlay. This removes a Text
@@ -988,8 +988,9 @@ dirtyCell saved d grew r c old new rows'
     diffBit x y = if ptrEq x y || x == y then 0 else 1 :: Int
 
 -- Display width of a cell: its widest line (cells may contain newlines).
--- Uses @max 1@ per glyph to agree with the renderer, which emits at least
--- one grid cell per code point; this matters for emoji whose presentation is
+-- Uses 'strAdvance' per glyph to agree with the renderer, which emits at
+-- least one grid cell per code point other than a combining mark (that one
+-- shares its glyph's cell); this matters for emoji whose presentation is
 -- selected by a following variation selector U+FE0F (e.g. ℹ️, ⚠️, ❤️): the
 -- selector is zero-width but the terminal folds it into a two-cell emoji,
 -- so a column that ignored it would come up one cell short and the whole
@@ -1010,8 +1011,7 @@ cellWidth t = case T.foldl' step (W 0 0) t of W best cur -> max best cur
   where
     step (W best cur) c
       | c == '\n'           = W (max best cur) 0
-      | isInvisibleFormat c = W best cur
-      | otherwise           = W best (cur + max 1 (charWidth c))
+      | otherwise           = W best (cur + strAdvance cur c)
 
 -- Strict accumulator for 'cellWidth': (widest completed line, current line).
 data W = W !Int !Int

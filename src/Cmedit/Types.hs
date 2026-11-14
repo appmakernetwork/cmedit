@@ -35,7 +35,7 @@ module Cmedit.Types
   , hasAttr
   , Style(Style, StyleU, styleFg, styleBg, styleAttr, styleUl)
   , defaultStyle
-  , Cell(Cell, CellL, cellChar, cellStyle, cellLink)
+  , Cell(Cell, CellL, CellC, cellChar, cellStyle, cellLink, cellComb)
   , withLink
   , blankCell
     -- * Negotiated emitter capabilities
@@ -45,6 +45,7 @@ module Cmedit.Types
 
 import Data.Bits (Bits, (.&.), (.|.))
 import Data.Text (Text)
+import qualified Data.Text as T
 import Data.Word (Word8)
 import GHC.Exts (isTrue#, reallyUnsafePtrEquality#)
 
@@ -214,18 +215,31 @@ defaultStyle = Style Default Default attrNone
 -- cells that carry it, and terminals without hyperlink support skip the OSC
 -- string bytes entirely, so it needs no capability gate. Wide-glyph
 -- continuation cells must carry the same link as their head cell.
-data Cell = CellL
+--
+-- 'cellComb' holds the combining marks drawn over this cell's glyph (the
+-- acute of a decomposed "e\x301", a Thai tone mark): terminals attach those
+-- to the preceding character and do not advance, so they belong to its cell
+-- rather than to one of their own. It is empty for nearly every cell, and
+-- like 'cellLink' it stays off the common constructors.
+data Cell = CellC
   { cellChar  :: !Char
   , cellStyle :: !Style
   , cellLink  :: !(Maybe Text)
+  , cellComb  :: !Text
   } deriving (Eq, Show)
+
+-- | A cell with a link target and no combining marks.
+pattern CellL :: Char -> Style -> Maybe Text -> Cell
+pattern CellL c s l <- CellC c s l _ where
+  CellL c s l = CellC c s l T.empty
+{-# COMPLETE CellL #-}
 
 -- | The common no-link cell, in constructor position: almost every cell has
 -- no link target, so construction and matching stay two-field ('cellLink'
 -- participates in Eq regardless, which is what the frame diff needs).
 pattern Cell :: Char -> Style -> Cell
-pattern Cell c s <- CellL c s _ where
-  Cell c s = CellL c s Nothing
+pattern Cell c s <- CellC c s _ _ where
+  Cell c s = CellC c s Nothing T.empty
 {-# COMPLETE Cell #-}
 
 -- | Attach (or clear) a hyperlink target.

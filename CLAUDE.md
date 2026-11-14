@@ -454,7 +454,10 @@ in `README.md`; the cross-cutting structure that matters when editing:
   what no terminal font has. Encrypted files are *reported*, not guessed at;
   every other limit in the module (`maxPdfPages`, `maxPdfChars`,
   `maxStreamBytes`, `maxOpsPerPage`, `maxFormDepth`) bounds work that only a
-  malformed or hostile file could make unbounded. Extraction is at parity with
+  malformed or hostile file could make unbounded. Those are per stream and per
+  page; `maxPdfDecoded` and `maxPdfTokens` are the document-wide pair (`Fuel`,
+  threaded through every page), and the font, CMap and text-free-form caches
+  beside them are what stop a real document spending them on repetition. Extraction is at parity with
   `pdftotext`'s word count across the test corpus, which is the bar to hold if
   the heuristics are ever retuned.
 - **Archive listings (`Cmedit.Zip`).** A `.zip`, and everything built on it
@@ -467,11 +470,10 @@ in `README.md`; the cross-cutting structure that matters when editing:
   Nothing downstream (installers, key handlers, renderer, scroll bars, find,
   wrap) learns a new mode, and there is no serialiser back to ZIP (nor could
   there be), so the archive can never be overwritten by its own table of
-  contents. The one hole that leaves is `Save As`, which seeds `edPath` and
-  does **not** confirm before overwriting (`DKConfirmOverwrite` exists but is
-  never constructed), so `saveAsDialogFlow` seeds `<name>.txt` for an
-  `isArchivePath`; if you ever wire up the overwrite confirmation, that
-  special case can go.
+  contents. The one hole that leaves is `Save As`, so `saveAsDialogFlow` seeds
+  `<name>.txt` for an `isArchivePath`, and typing the archive's own name back
+  in is asked about like any other existing file (see the Save As note under
+  Gotchas: an archive's own path is the one "own file" that still prompts).
   Reading is **size-independent and decompresses nothing**: the central
   directory is at the end of the file and is proportional to the entry count,
   so `findEocd` works on a 128 KiB tail (via the driver's `readAt`, the one
@@ -497,7 +499,10 @@ in `README.md`; the cross-cutting structure that matters when editing:
   (archivers routinely write a timestamp extra in one and not the other; assume
   they match and you land in the middle of the data). Everything it cannot do
   (encrypted, a method other than stored/deflate, over the cap) is a typed
-  `Left`, and every `Left` becomes the listing plus a note.
+  `Left`, and every `Left` becomes the listing plus a note. The cap is per
+  member; `maxArchiveBytes` (charged in `App.readMember`) bounds one open's
+  total, with `Epub.maxEpubBytes` and `Xlsx.maxWorkbookCells` under it, since
+  a spine or a sheet list may name one member any number of times.
 - **Office and e-book reading views (`Cmedit.Docx`, `Cmedit.Xlsx`,
   `Cmedit.Epub`, over `Cmedit.Xml`).** A `.docx`, `.xlsx` and `.epub` are ZIP
   containers full of XML, and the editor already owned everything needed to
@@ -562,7 +567,11 @@ in `README.md`; the cross-cutting structure that matters when editing:
   (measured: a 3 000-deep upward chain resolves; before the split it did not).
   **`maxSteps` counts cell *reads*, not formulas**, because the cost lives
   inside range scans: a sheet of `SUM(A:A)` does millions of reads and only
-  thousands of evaluations. `TODAY`/`NOW`/`RAND` are deliberately absent: this
+  thousands of evaluations. It is one budget for the workbook, and when it runs
+  out the pass stops: the remaining formulas are left as they were and counted
+  as not computed. Text a formula builds is capped at `maxTextLen` (Excel's
+  32 767; `#VALUE!` beyond it, decided from the lengths before the text
+  exists). `TODAY`/`NOW`/`RAND` are deliberately absent: this
   module is pure, and a wrong date is worse than a blank.
   **Save As is an /export/ in every buffer-less view, and that distinction is
   load-bearing.** `EffExportTo` writes a copy of what is on screen (a
@@ -574,8 +583,9 @@ in `README.md`; the cross-cutting structure that matters when editing:
   neither `containerDisabledActions` nor `pdfDisabledActions`, so before it
   existed Save As on a workbook, PDF, DOCX or EPUB wrote the *empty* buffer
   underneath the view and then re-pointed the document at the file it had just
-  emptied. Exporting over the source archive is refused outright, since Save As
-  does not confirm before overwriting. `rtfPlainText`/`pdfPlainText` export the
+  emptied. Exporting over the source archive is refused outright (twice: on the
+  typed path in the dialog, and on the canonical path in the driver's
+  `EffSaveAs`), because that is never what an export means. `rtfPlainText`/`pdfPlainText` export the
   **paragraphs**, not the laid-out lines, the opposite choice from
   `rtfSelText`, deliberately: a selection is a piece of the screen, but a file
   wrapped to whatever width the terminal happened to be is a poor artifact.
@@ -1727,9 +1737,35 @@ in `README.md`; the cross-cutting structure that matters when editing:
   clip edge or an overlay can cut one; the emitter skips a continuation
   without advancing and prints a lone head two columns wide, which shifted
   the row). New draw code may rely on it, but `drawStr`/`drawStrL`/`drawStrU`
-  are width-aware in their own right; their *callers* still clip by `take n`
-  characters, so a CJK name in the chrome can overrun its region by one cell
-  per wide glyph.
+  are width-aware in their own right. It also turns an invisible format
+  control (ZWSP, BOM, bidi marks) into a visible `U+FFFD`: the text view gives
+  those a cell so the cursor can reach them, and emitted raw they print
+  nothing and pull the row one column left.
+- **Chrome strings are measured and cut in cells, never characters
+  (`Width.strCells`/`takeCells`/`fitCells`/`dropCellsEnd`/`inputWindow`).**
+  `take n`/`length` on a string headed for `drawStr` let a CJK file name run
+  past its panel, and an input field scrolled by characters let the cursor
+  leave its box. A row with a style per *character* (quick open, completion,
+  search snippets) goes through `Render.drawStyledW`; one `putCell` per
+  character leaves a wide glyph without its continuation and `sanitizeGrid`
+  blanks it. Geometry shared with hit-testing (`dialogGeom`, `dropdownGeom`,
+  the status zones, `clickField`) uses the same functions.
+- **A combining mark has no cell: it rides on its glyph's (`cellComb`).**
+  Terminals draw a mark over the previous character without advancing, so a
+  mark given its own cell shifted the rest of the row. `Width.glyphCells` is
+  the one rule the cursor maths and `expandLineCellsFrom`/`drawStr*` share:
+  zero cells, except at display column 0 where there is nothing to sit on and
+  it is drawn on a blank. `isCombining` deliberately excludes the joiners and
+  variation selectors, which keep a cell as before (how wide a terminal draws
+  `U+2764 U+FE0F` is terminal-dependent, and that choice was measured). A cell
+  with marks is never part of a REP run, and `displayToCol` skips a glyph's
+  marks so a click or a vertical move cannot land between them.
+- **Save As asks before replacing a file, and only the driver can know.**
+  The dialog emits `EffSaveAs`; the driver answers with `askOverwrite`
+  (`DKConfirmOverwrite`, focus on Cancel, target held in `edSaveAsTarget`) when
+  the path exists and is not the document's own file, else `saveAsTo`. Nothing
+  is retitled until the save is settled. The explorer's rename refuses a taken
+  name for the same reason: `rename(2)` replaces silently.
 - **The search fold is length-preserving (`Search.normCase`, the only one).**
   `T.toLower` turns U+0130 into two code points; replace maps offsets found in
   the folded text back onto the original, so one `İ` before a match made a

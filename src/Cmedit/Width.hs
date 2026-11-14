@@ -6,6 +6,16 @@ module Cmedit.Width
   , isControlChar
   , controlCaret
   , isInvisibleFormat
+  , isCombining
+  , glyphCells
+  , cellAdvance
+  , strAdvance
+  , strCells
+  , textCells
+  , takeCells
+  , fitCells
+  , dropCellsEnd
+  , inputWindow
   , colToDisplay
   , displayToCol
   , windowStart
@@ -42,8 +52,9 @@ isControlChar c =
 -- | Formatting characters that are truly invisible: no glyph AND no modifier
 -- effect on a neighbour. Terminals emit nothing for these and the cursor
 -- does not advance, so the CSV table sizer / renderer treats them as zero
--- cells (unlike, say, VS16, ZWJ, or combining marks, which *do* modify a
--- neighbouring glyph and are worth one cell each). Kept small on purpose:
+-- cells (unlike VS16 or ZWJ, which change how a neighbouring glyph is drawn
+-- and keep a cell each, and combining marks, which 'isCombining' puts on
+-- their glyph's cell). Kept small on purpose:
 -- ZWSP, LTR/RTL marks, the four bidirectional embeddings and overrides,
 -- the word joiner and the invisible arithmetic operators, and the BOM.
 isInvisibleFormat :: Char -> Bool
@@ -65,20 +76,125 @@ controlCaret c =
      else if n >= 0x80 && n < 0xa0 then ['^', '[']  -- approximate
      else [c]
 
+-- | A combining mark: a character the terminal draws over the glyph before
+-- it without advancing the cursor (accents, Thai and Hebrew vowel signs,
+-- enclosing marks). These take no cell of their own; the renderer stores them
+-- on the cell of the glyph they modify. The zero-width characters this
+-- deliberately leaves out keep a cell each, as before: the invisible format
+-- controls ('isInvisibleFormat'), the joiners, and the variation selectors,
+-- which either draw nothing at all or change how wide a terminal draws their
+-- neighbour, and which an editor has to be able to put a cursor on.
+isCombining :: Char -> Bool
+isCombining c =
+  n >= 0x0300 && inRanges zeroWidth n
+    && not (n >= 0x200B && n <= 0x200F) && not (n >= 0x202A && n <= 0x202E)
+    && not (n >= 0x2060 && n <= 0x2064) && not (n >= 0xFE00 && n <= 0xFEFF)
+  where n = fromEnum c
+
+-- | Cells a printable character takes when it starts at display column
+-- @disp@ of its line. A combining mark takes none, except at the very start
+-- of a line, where there is no glyph for it to sit on and it is drawn on a
+-- blank cell of its own; every other code point takes at least one. This is
+-- the one rule the cursor maths here and the renderer's cell emission share.
+glyphCells :: Int -> Char -> Int
+glyphCells disp c
+  | n < 0x0300    = 1
+  | isCombining c = if disp == 0 then 1 else 0
+  | otherwise     = max 1 (charWidth c)
+  where n = fromEnum c
+{-# INLINE glyphCells #-}
+
+-- | 'glyphCells' for the text view, where a control character is drawn as a
+-- two-cell caret pair.
+cellAdvance :: Int -> Char -> Int
+cellAdvance disp c
+  | isControlChar c = 2
+  | otherwise       = glyphCells disp c
+{-# INLINE cellAdvance #-}
+
+------------------------------------------------------------------------------
+-- Strings outside the text view (menus, dialogs, panels, the status bar, table
+-- cells). One convention for all of them, shared by the draw routines in
+-- "Cmedit.Render": an invisible format control takes no cell and is not
+-- drawn, a combining mark joins the glyph before it, a wide glyph takes two.
+-- Clipping or positioning such a string by its /character/ count is what let
+-- a CJK file name run past the edge of its panel, so these are what the
+-- chrome measures and cuts with.
+
+-- | Cells a character of such a string takes, starting at cell @disp@ of it.
+strAdvance :: Int -> Char -> Int
+strAdvance disp c
+  | fromEnum c < 0x0300 = 1
+  | isInvisibleFormat c = 0
+  | otherwise           = glyphCells disp c
+{-# INLINE strAdvance #-}
+
+-- | Display width of a chrome string.
+strCells :: String -> Int
+strCells = go 0
+  where go !d []       = d
+        go !d (c : cs) = go (d + strAdvance d c) cs
+
+-- | 'strCells' of a 'Text', without unpacking it.
+textCells :: Text -> Int
+textCells = T.foldl' (\d c -> d + strAdvance d c) 0
+
+-- | The longest prefix that fits in @w@ cells. A wide glyph that would
+-- straddle the boundary is left out whole; the marks and invisible controls
+-- that follow the last glyph kept stay with it.
+takeCells :: Int -> String -> String
+takeCells w = go 0
+  where
+    go _ [] = []
+    go !d (c : cs)
+      | d + a > w = []
+      | otherwise = c : go (d + a) cs
+      where a = strAdvance d c
+
+-- | 'takeCells', padded with spaces to exactly @w@ cells.
+fitCells :: Int -> String -> String
+fitCells w s = let t = takeCells w s in t ++ replicate (max 0 w - strCells t) ' '
+
+-- | The longest /suffix/ that fits in @w@ cells (for paths, whose specific
+-- end is the right-hand one). Never starts on a combining mark.
+dropCellsEnd :: Int -> String -> String
+dropCellsEnd w s = dropWhile isCombining (go (strCells s) s)
+  where
+    go !total rest@(c : cs)
+      | total > w = go (total - strAdvance 1 c) cs
+      | otherwise = rest
+    go _ [] = []
+
+-- | The horizontal window of a one-line input @w@ cells wide whose cursor is
+-- before character @cur@: @(off, cx)@, the index of the first character to
+-- draw and the cursor's cell within the window. The text scrolls only once
+-- the cursor would leave the box, and then by just enough to keep it in the
+-- last cell, measured in cells so wide text cannot push the cursor outside.
+inputWindow :: Int -> Int -> String -> (Int, Int)
+inputWindow w cur s
+  | before < w = (0, before)
+  | otherwise  = go 0 before s
+  where
+    before = strCells (take cur s)
+    go !off !rest (c : cs)
+      | rest > max 0 (w - 1) || (off < cur && isCombining c) = go (off + 1) (rest - strAdvance 1 c) cs
+    go off rest _ = (off, max 0 rest)
+
 -- | Display column at which character index @col@ begins, given a tab width.
 -- Equivalent to the rendered width of @take col line@. A strict fold over the
 -- text (no intermediate list) — this runs on every cursor move and repaint,
--- including on multi-megabyte single-line files. Uses @max 1@ per glyph to
--- agree with the renderer's own cell emission (@Render.expandLineCells@),
--- which forces at least one grid cell per code point; this keeps zero-width
--- code points — notably the emoji variation selector U+FE0F — accounted for
--- as one column, matching how terminals then fold them into a wide glyph.
+-- including on multi-megabyte single-line files. Uses 'cellAdvance' per
+-- glyph to agree with the renderer's own cell emission
+-- (@Render.expandLineCells@): at least one cell per code point (which keeps
+-- the emoji variation selector U+FE0F accounted for as one column, matching
+-- how terminals then fold it into a wide glyph), except a combining mark,
+-- which shares its glyph's cell.
 colToDisplay :: Int -> Int -> Text -> Int
 colToDisplay tabw col line = T.foldl' step 0 (T.take col line)
   where
     step !disp c
       | c == '\t' = disp + (tabw - disp `mod` tabw)
-      | otherwise = disp + max 1 (renderWidth c)
+      | otherwise = disp + cellAdvance disp c
 
 -- | Character index whose start lies at or just past display column @target@.
 -- Used to translate mouse clicks and to preserve a desired column during
@@ -86,14 +202,18 @@ colToDisplay tabw col line = T.foldl' step 0 (T.take col line)
 displayToCol :: Int -> Int -> Text -> Int
 displayToCol tabw target line = go 0 0 (T.unpack line)
   where
-    go !disp !i _ | disp >= target = i
+    -- A position between a glyph and its combining marks is addressable with
+    -- the arrow keys but is not somewhere a click or a vertical move should
+    -- land: typing there would move the marks onto the new character.
+    go !disp !i cs | disp >= target =
+      if disp > 0 then i + length (takeWhile isCombining cs) else i
     go _     !i []                 = i
     go !disp !i (c:cs)
       | c == '\t' =
           let disp' = disp + (tabw - disp `mod` tabw)
           in if disp' > target then i else go disp' (i + 1) cs
       | otherwise =
-          let w     = max 1 (renderWidth c)
+          let w     = cellAdvance disp c
               disp' = disp + w
           in if disp' > target then i else go disp' (i + 1) cs
 
@@ -107,14 +227,17 @@ windowStart tabw target line = go 0 0 (0, 0) (T.unpack line)
   where
     go !disp _ prev _ | disp >= target = prev
     go _     _ prev []                 = prev
-    go !disp !i _ (c:cs)
+    go !disp !i prev (c:cs)
       | c == '\t' =
           let disp' = disp + (tabw - disp `mod` tabw)
           in if disp' > target then (i, disp) else go disp' (i + 1) (i, disp) cs
       | otherwise =
-          let w     = max 1 (renderWidth c)
+          let w     = cellAdvance disp c
               disp' = disp + w
-          in if disp' > target then (i, disp) else go disp' (i + 1) (i, disp) cs
+          -- A combining mark is never the window's first character: its
+          -- glyph is the one that may straddle the edge.
+          in if disp' > target then (i, disp)
+             else go disp' (i + 1) (if w == 0 then prev else (i, disp)) cs
 
 -- | Total display width of a line.
 lineDisplayWidth :: Int -> Text -> Int
@@ -132,7 +255,7 @@ takeDisplay tabw width line = go 0 0 (T.unpack line) []
           in if disp' > width then (T.pack (reverse acc), disp)
              else go disp' 0 cs (c:acc)
       | otherwise =
-          let w     = max 1 (renderWidth c)
+          let w     = cellAdvance disp c
               disp' = disp + w
           in if disp' > width then (T.pack (reverse acc), disp)
              else go disp' 0 cs (c:acc)
@@ -160,7 +283,7 @@ wrapLine tabw width line
       case rest of
         [] -> [(start, n)]
         (c : cs) ->
-          let w = if c == '\t' then tabw - disp `mod` tabw else max 1 (renderWidth c)
+          let w = if c == '\t' then tabw - disp `mod` tabw else cellAdvance disp c
               disp' = disp + w
           in if disp' - dispStart > width && i > start
                then case lastSp of
@@ -169,12 +292,6 @@ wrapLine tabw width line
                else
                  let lastSp' = if isSpace c then Just (i + 1, disp', cs) else lastSp
                  in seg start dispStart lastSp' (i + 1) disp' cs
-
--- Width used for layout: control chars render as a 2-cell caret.
-renderWidth :: Char -> Int
-renderWidth c
-  | isControlChar c = 2
-  | otherwise       = charWidth c
 
 -- | Membership test over a sorted, non-overlapping list of inclusive ranges.
 inRanges :: [(Int, Int)] -> Int -> Bool

@@ -48,14 +48,18 @@ module Cmedit.Formula
   , SheetIn(..)
   , Grid
   , evalWorkbook
+  , evalWorkbookWithin
   , maxFormulaCells
   , maxSteps
   , maxDepth
+  , maxTextLen
   ) where
 
+import Data.Array.Unboxed (UArray, listArray, (!))
 import Data.Char (isAlpha, isDigit, isSpace, ord, toUpper)
 import Data.Foldable (toList)
-import Data.List (foldl', sortBy, transpose)
+import qualified Data.IntSet as IS
+import Data.List (foldl', intersperse, sortBy, transpose)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe, mapMaybe)
@@ -65,6 +69,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
+import GHC.Real (Ratio((:%)))
 import Numeric (showEFloat, showFFloat)
 
 ------------------------------------------------------------------------------
@@ -79,10 +84,45 @@ maxFormulaCells = 50000
 -- | Total cell reads across the workbook, counted whether they hit the memo or
 -- not. A sheet of whole-column @SUM(A:A)@s is quadratic in the honest case and
 -- worse in a hostile one, and the reads inside a range are where that cost
--- lives — which is why this counts /reads/ and not formulas. A cell that runs
--- the budget out shows @#NUM!@ rather than making the editor hang.
+-- lives — which is why this counts /reads/ and not formulas.
+--
+-- It is one budget for the whole workbook, not one per formula, and when it
+-- runs out the pass __stops__: the formula it ran out in and every formula
+-- after it are left exactly as they were and counted as not computed, the
+-- same outcome as a function this module does not have. (They used to show
+-- @#NUM!@, and each of them still walked its whole range to find that out —
+-- fifty thousand @SUM(A:XFD)@s over a two-million-cell sheet was 10^11 steps
+-- of nothing.)
+--
+-- Reads are not the only work, so they are not the only thing charged. A
+-- read of a long text costs more than a read of a number, a function or an
+-- operator costs one step and more if it builds text, and a scan against a
+-- long criterion is charged for the criterion — all in units of
+-- 'textUnit' characters, so that an ordinary cell (a number, a name, a short
+-- label) is still exactly one step and an ordinary workbook's arithmetic is
+-- what it always was.
 maxSteps :: Int
 maxSteps = 8000000
+
+-- | Characters of text one step pays for.
+textUnit :: Int
+textUnit = 64
+
+-- | Longest text a formula may produce: Excel's limit on a cell's contents.
+--
+-- Without one, text grows without bound in a handful of cells:
+-- @REPT(REPT(REPT(\"x\",1000),1000),1000)@ is a gigabyte, and a column of
+-- @A2 = A1&A1@ doubles every row. A result over the limit is @#VALUE!@, which
+-- is Excel's own answer for @REPT@, and it is decided from the lengths
+-- /before/ the text is built.
+maxTextLen :: Int
+maxTextLen = 32767
+
+-- | Longest text that is read as a number. A double has 17 significant
+-- digits and no spreadsheet writes more than a few dozen characters for one;
+-- converting a 32 000-digit string on every read is milliseconds each.
+maxNumberChars :: Int
+maxNumberChars = 512
 
 -- | Deepest chain of cell-to-cell references followed.
 --
@@ -174,11 +214,34 @@ asBool v = case v of
 readNumber :: Text -> Maybe Double
 readNumber t0
   | T.null t = Nothing
+  | T.compareLength t maxNumberChars == GT = Nothing
+  | Just d <- plainDecimal t = Just d
   | otherwise = case reads (fixup (T.unpack t)) :: [(Double, String)] of
       [(d, rest)] | all isSpace rest -> Just d
       _ -> Nothing
   where
     t = T.strip t0
+    -- The shape nearly every number in a grid has — digits, perhaps a point
+    -- and more digits, perhaps a leading minus — converted directly. A range
+    -- scan reads every cell it covers, and the general reader below goes
+    -- through 'String' and a lexer to reach the same value: the digits as an
+    -- integer over a power of ten, correctly rounded.
+    plainDecimal s = case T.uncons s of
+      Just ('-', r) -> negate <$> unsigned r
+      _             -> unsigned s
+    unsigned s =
+      let (ip, rest) = T.span isDigit s
+      in if T.null ip then Nothing
+         else case T.uncons rest of
+           Nothing -> Just (whole ip)
+           Just ('.', fp) | not (T.null fp), T.all isDigit fp ->
+             Just (fromRational (digitsOf (ip <> fp) :% (10 ^ T.length fp)))
+           _ -> Nothing
+    whole ip
+      | T.length ip <= 15 = fromIntegral (T.foldl' (\ !a c -> a * 10 + (ord c - ord '0')) (0 :: Int) ip)
+      | otherwise         = fromRational (digitsOf ip :% 1)
+    digitsOf :: Text -> Integer
+    digitsOf = T.foldl' (\ !a c -> a * 10 + fromIntegral (ord c - ord '0')) 0
     -- Haskell's reader wants a digit either side of the point and no leading
     -- '+'; spreadsheets write ".5" and "+3" freely.
     fixup s = case s of
@@ -477,6 +540,14 @@ data Env = Env
   { envGrids  :: !(Seq Grid)
   , envByName :: !(Map Text Int)          -- ^ Lower-cased sheet name → index.
   , envForms  :: !(Map Key Expr)
+  , envMax    :: !Int                     -- ^ The pass's step budget ('maxSteps').
+  , envDims   :: !(Seq (Int, Int))
+    -- ^ Each sheet's rows and widest row, which every range is clamped to.
+    -- Worked out once: measuring the grid inside each range read was a walk
+    -- of every row per call.
+  , envFormRows :: !(Seq IS.IntSet)
+    -- ^ Each sheet's rows that hold a formula to evaluate. A range read takes
+    -- every other row straight from the grid, with no lookups at all.
   }
 
 -- Where evaluation currently is: which cell's formula is being evaluated (an
@@ -505,13 +576,24 @@ data St = St
 -- function they call. The two counts are what the status bar reports: the
 -- second is the honest half.
 evalWorkbook :: [SheetIn] -> ([(Text, Grid)], Int, Int)
-evalWorkbook sheets = (zipWith fill [0 ..] sheets, computed, unsupported)
+evalWorkbook = evalWorkbookWithin maxSteps
+
+-- | 'evalWorkbook' with a step budget of the caller's choosing in place of
+-- 'maxSteps' — which is sized past any real workbook, and so past anything a
+-- test could exhaust quickly.
+evalWorkbookWithin :: Int -> [SheetIn] -> ([(Text, Grid)], Int, Int)
+evalWorkbookWithin budget sheets = (zipWith fill [0 ..] sheets, computed, unsupported)
   where
     grids = Seq.fromList (map siGrid sheets)
     env = Env
       { envGrids  = grids
       , envByName = M.fromList (zip (map (T.toLower . siName) sheets) [0 ..])
       , envForms  = parsed
+      , envMax    = budget
+      , envDims   = fmap (\g -> (Seq.length g, maximum (0 : map Seq.length (toList g)))) grids
+      , envFormRows = Seq.fromList
+          [ IS.fromList [ r | (si', r, _) <- M.keys parsed, si' == si ]
+          | si <- [0 .. length sheets - 1] ]
       }
     -- Parse everything first: a formula we cannot read is not attempted, and
     -- is not a reference anything else can resolve through either.
@@ -521,16 +603,23 @@ evalWorkbook sheets = (zipWith fill [0 ..] sheets, computed, unsupported)
                   , ((r, c), src) <- M.toList (siFormulas sh) ]
           taken = take maxFormulaCells cells
           ok    = [ (k, e) | (k, src) <- taken, Just e <- [parseFormula src] ]
-      in (M.fromList ok, length cells - length ok)
+      in (M.fromList ok, length cells - length ok + (length ok - computed))
 
     -- In key order, which is row-major per sheet. Not required for
     -- correctness (anything unresolved is evaluated on demand) but it means
     -- the common downward-accumulating chain is already cached by the time
     -- each link asks for the one above it, so it resolves at depth 1.
+    --
+    -- A formula is recorded only if the budget outlasted it. One that ran
+    -- the budget out is holding whatever its evaluation was cut off with,
+    -- which is not an answer, and nothing after it is attempted at all.
     results = fst (foldl' step (M.empty, St M.empty 0) (M.keys parsed))
-      where step (acc, st) k =
-              let (v, st') = evalCell env ctx0 k st
-              in (M.insert k v acc, st')
+      where step (acc, st) k
+              | stSteps st >= budget = (acc, st)
+              | otherwise =
+                  let (v, st') = evalCell env ctx0 k st
+                  in if stSteps st' >= budget then (acc, st')
+                                                else (M.insert k v acc, st')
 
     computed = M.size results
 
@@ -557,14 +646,14 @@ setCell r c t g = case Seq.lookup r g of
 -- evaluated as the cycle guard.
 evalCell :: Env -> Ctx -> Key -> St -> (Value, St)
 evalCell env ctx k st
-  | stSteps st >= maxSteps = (errNum, st)
+  | stSteps st >= envMax env = (errNum, st)
   | otherwise = case M.lookup k (stCache st1) of
-      Just v  -> (v, st1)
+      Just v  -> (v, charge (textCost v) st1)
       Nothing
         | Set.member k (ctxOpen ctx) -> (errCycle, st1)
         | ctxDepth ctx >= maxDepth   -> (errNum, st1)
         | otherwise -> case M.lookup k (envForms env) of
-            Nothing -> (literalAt env k, st1)
+            Nothing -> let v = literalAt env k in (v, charge (textCost v) st1)
             Just e  ->
               let ctx' = Ctx { ctxHere  = Just k
                              , ctxOpen  = Set.insert k (ctxOpen ctx)
@@ -577,14 +666,33 @@ evalCell env ctx k st
 -- shows, read as a number where it looks like one (the grid is text, because
 -- that is what the view draws).
 literalAt :: Env -> Key -> Value
-literalAt env (si, r, c) = case Seq.lookup si (envGrids env) >>= Seq.lookup r >>= Seq.lookup c of
-  Nothing -> VBlank
-  Just t
-    | T.null t -> VBlank
-    | Just d <- readNumber t -> VNum d
-    | T.toUpper t == "TRUE"  -> VBool True
-    | T.toUpper t == "FALSE" -> VBool False
-    | otherwise -> VText t
+literalAt env (si, r, c) =
+  maybe VBlank literalOf (Seq.lookup si (envGrids env) >>= Seq.lookup r >>= Seq.lookup c)
+
+literalOf :: Text -> Value
+literalOf t
+  | T.null t = VBlank
+  | Just d <- readNumber t = VNum d
+  | T.compareLength t 5 == GT = VText t
+  | T.toUpper t == "TRUE"  = VBool True
+  | T.toUpper t == "FALSE" = VBool False
+  | otherwise = VText t
+
+-- Spend steps.
+charge :: Int -> St -> St
+charge n st = st { stSteps = stSteps st + n }
+
+-- What a value costs beyond the step that read or built it: its length, in
+-- 'textUnit's. Zero for anything but a text longer than one unit.
+textCost :: Value -> Int
+textCost v = case v of
+  VText t -> T.length t `div` textUnit
+  _       -> 0
+
+-- A text result, or @#VALUE!@ if it is longer than a cell may hold.
+capText :: Text -> Value
+capText t | T.compareLength t maxTextLen == GT = errValue
+          | otherwise                          = VText t
 
 evalExpr :: Env -> Ctx -> Expr -> St -> (Value, St)
 evalExpr env ctx expr st0 = case expr of
@@ -607,9 +715,11 @@ evalExpr env ctx expr st0 = case expr of
   EBin op a b ->
     let (va, st1) = evalExpr env ctx a st0
         (vb, st2) = evalExpr env ctx b st1
-    in (binop op va vb, st2)
+        v = binop op va vb
+    in (v, charge (1 + textCost v) st2)
 
-  ECall f as -> callFn env ctx (T.toUpper f) as st0
+  ECall f as -> let (v, st1) = callFn env ctx (T.toUpper f) as st0
+                in (v, charge (1 + textCost v) st1)
   where
     num1 e f = let (v, st1) = evalExpr env ctx e st0
                in (either id (VNum . f) (asNum v), st1)
@@ -623,7 +733,10 @@ binop op a b = case op of
   "&" -> case (a, b) of
            (VErr _, _) -> a
            (_, VErr _) -> b
-           _           -> VText (asText a <> asText b)
+           _           -> let ta = asText a; tb = asText b
+                          in if T.length ta + T.length tb > maxTextLen
+                               then errValue
+                               else VText (ta <> tb)
   "=" -> cmp (== EQ)
   "<>"-> cmp (/= EQ)
   "<" -> cmp (== LT)
@@ -712,8 +825,21 @@ callFn env ctx f as st0 = case f of
   "IFERROR" -> guardErr (\v -> case v of VErr _ -> True; _ -> False)
   "IFNA"    -> guardErr (== errNA)
   _ -> let (args, st1) = evalArgs env ctx as st0
-       in (applyFn f args, st1)
+       in (capValue (applyFn f args), charge (scanCost args) st1)
   where
+    -- Nothing a function returns may be longer than a cell holds. The
+    -- functions that /build/ text check before building it; this is the
+    -- backstop under the ones that only pass it along.
+    capValue v = case v of
+      VText t -> capText t
+      _       -> v
+    -- A scalar text argument is compared or searched against every value of
+    -- a range argument (a criterion, a lookup key, a separator), so a long
+    -- one multiplies the scan. A short one costs nothing extra.
+    scanCost args =
+      let tScal  = sum [ T.length t | AVal (VText t) <- args ]
+          nRange = sum [ length vs | ARange _ vs <- args ]
+      in (tScal `div` 16) * (1 + nRange)
     guardErr isBad = case as of
       [a, b] -> let (v, st1) = evalExpr env ctx a st0
                 in if isBad v then evalExpr env ctx b st1 else (v, st1)
@@ -733,14 +859,37 @@ evalArg env ctx e st = case e of
   EArea sh c0 r0 c1 r1 -> case resolveSheet env ctx sh of
     Nothing -> (AVal errRef, st)
     Just si ->
-      let g  = fromMaybe Seq.empty (Seq.lookup si (envGrids env))
-          nr = Seq.length g
-          nc = maximum (0 : map Seq.length (toList g))
-          rr = [max 0 r0 .. min (nr - 1) (if r1 == maxBound then nr - 1 else r1)]
-          cc = [max 0 c0 .. min (nc - 1) (if c1 == maxBound then nc - 1 else c1)]
-          step (vs, s) (r, c) = let (v, s') = evalCell env ctx (si, r, c) s in (v : vs, s')
-          (vals, st') = foldl' step ([], st) [ (r, c) | r <- rr, c <- cc ]
-      in (ARange (length cc) (reverse vals), st')
+      let g        = fromMaybe Seq.empty (Seq.lookup si (envGrids env))
+          (nr, nc) = fromMaybe (0, 0) (Seq.lookup si (envDims env))
+          formRows = fromMaybe IS.empty (Seq.lookup si (envFormRows env))
+          ra = max 0 r0
+          rb = min (nr - 1) (if r1 == maxBound then nr - 1 else r1)
+          ca = max 0 c0
+          cb = min (nc - 1) (if c1 == maxBound then nc - 1 else c1)
+          -- Row-major, stopping the moment the budget is gone: a formula
+          -- that ran out is discarded whole, so the rest of its range is
+          -- work for nothing.
+          rows !r acc s
+            | r > rb || stSteps s >= envMax env = (acc, s)
+            | IS.member r formRows = let (acc', s') = formCells r ca acc s in rows (r + 1) acc' s'
+            | otherwise =
+                let row = fromMaybe Seq.empty (Seq.lookup r g)
+                    (acc', n') = plainCells row ca acc (stSteps s)
+                in rows (r + 1) acc' s { stSteps = n' }
+          -- A row with a formula in it somewhere: every cell goes through
+          -- the memo and the cycle guard.
+          formCells r !c acc s
+            | c > cb || stSteps s >= envMax env = (acc, s)
+            | otherwise = let (v, s') = evalCell env ctx (si, r, c) s
+                          in formCells r (c + 1) (v : acc) s'
+          -- A row of plain cells: the same values at the same price, read
+          -- straight from the grid.
+          plainCells row !c acc !n
+            | c > cb || n >= envMax env = (acc, n)
+            | otherwise = let v = maybe VBlank literalOf (Seq.lookup c row)
+                          in plainCells row (c + 1) (v : acc) (n + 1 + textCost v)
+          (vals, st') = rows ra [] st
+      in (ARange (max 0 (cb - ca + 1)) (reverse vals), st')
   _ -> let (v, st') = evalExpr env ctx e st in (AVal v, st')
 
 -- Every value an argument stands for (a range flattens, a scalar is itself).
@@ -823,7 +972,11 @@ applyFn f args = case f of
                              else if x > 0 && s < 0 then errNum
                              else VNum (fromIntegral (floor (x / s) :: Integer) * s))
 
-  "LEN"   -> one1 (VNum . fromIntegral . T.length . asText)
+  -- An error has no length: without this the limit above would turn
+  -- LEN(REPT("x",40000)) into 7, the length of the word "#VALUE!".
+  "LEN"   -> one1 (\v -> case v of
+                            VErr _ -> v
+                            _      -> VNum (fromIntegral (T.length (asText v))))
   "UPPER" -> text1 T.toUpper
   "LOWER" -> text1 T.toLower
   "TRIM"  -> text1 (T.unwords . T.words)
@@ -836,16 +989,28 @@ applyFn f args = case f of
                    _      -> errValue)
     _ -> errValue
   "REPT" -> case scalars of
+    -- An error repeated is still that error, not its name written out a
+    -- thousand times: an inner REPT that hit the limit has to say so here.
+    [a@(VErr _), _] -> a
     [a, b] -> withNums [b] (\ns -> case ns of
-                [n] | n < 0 -> errValue
-                    -- Bounded: a file can ask for REPT("x", 1e9).
-                    | otherwise -> VText (T.replicate (min 32768 (truncate n)) (asText a))
+                [n] | n < 0 || isNaN n -> errValue
+                    | T.null ta -> VText T.empty
+                    -- Decided from the lengths, before anything is built: a
+                    -- file can ask for REPT("x", 1e9), or nest three of them.
+                    | n > fromIntegral maxTextLen
+                        || T.length ta * truncate n > maxTextLen -> errValue
+                    | otherwise -> VText (T.replicate (truncate n) ta)
+                  where ta = asText a
                 _ -> errValue)
     _ -> errValue
   "SUBSTITUTE" -> case scalars of
-    [a, b, c] | not (T.null (asText b)) ->
-                  VText (T.replace (asText b) (asText c) (asText a))
-              | otherwise -> VText (asText a)
+    [a, b, c] | not (T.null tb) ->
+                  -- Each match can grow the text by a whole replacement, so
+                  -- the result is sized first and only built if it fits.
+                  let grown = T.length ta + T.count tb ta * (T.length tc - T.length tb)
+                  in if grown > maxTextLen then errValue else VText (T.replace tb tc ta)
+              | otherwise -> VText ta
+      where ta = asText a; tb = asText b; tc = asText c
     -- the fourth argument picks one occurrence to replace
     [a, b, c, n] -> withNums [n] (\ns -> case map truncate ns :: [Int] of
       [k] | k < 1 -> errValue
@@ -853,18 +1018,19 @@ applyFn f args = case f of
           | otherwise ->
               let parts = T.splitOn (asText b) (asText a)
               in if k >= length parts then VText (asText a)
+                   else if T.length (asText a) + T.length (asText c) > maxTextLen then errValue
                    else VText (T.intercalate (asText b) (take k parts) <> asText c
                                <> T.intercalate (asText b) (drop k parts))
       _ -> errValue)
     _ -> errValue
-  "CONCATENATE" -> VText (T.concat (map asText vals))
-  "CONCAT"      -> VText (T.concat (map asText vals))
+  "CONCATENATE" -> concatCap (map asText vals)
+  "CONCAT"      -> concatCap (map asText vals)
   "TEXTJOIN" -> case args of
     (AVal sep : AVal skipV : rest) ->
       let skip = either (const True) id (asBool skipV)
           parts = concatMap argVals rest
           keep v = not skip || v /= VBlank
-      in VText (T.intercalate (asText sep) (map asText (filter keep parts)))
+      in concatCap (intersperse (asText sep) (map asText (filter keep parts)))
     _ -> errValue
 
   "ISBLANK"  -> one1 (VBool . (== VBlank))
@@ -903,6 +1069,16 @@ applyFn f args = case f of
   where
     vals    = concatMap argVals args
     scalars = [ v | AVal v <- args ] ++ [ v | ARange _ (v : _) <- args ]
+
+    -- Join pieces, giving up as soon as they are known not to fit.
+    concatCap = go (0 :: Int) []
+      where
+        go _ acc [] = VText (T.concat (reverse acc))
+        go !n acc (t : ts)
+          | T.null t        = go n acc ts
+          | n' > maxTextLen = errValue
+          | otherwise       = go n' (t : acc) ts
+          where n' = n + T.length t
 
     isNumV v = case v of VNum _ -> True; _ -> False
     numOf v  = case v of VNum d -> Just d; _ -> Nothing
@@ -1042,13 +1218,28 @@ matches crit v = case crit of
       (o : _) -> Just (o, T.strip (T.drop (T.length o) t))
       []      -> Nothing
 
--- Memo-free glob: the patterns are user criteria a handful of characters long,
--- and the subject is one cell.
+-- A glob over one cell's text. Iterative, with the one piece of backtracking
+-- a glob ever needs — back to the most recent star, one character further on
+-- — so it is at worst pattern times subject. (The textbook recursion tries
+-- every way of sharing the subject between the stars, which is exponential
+-- in how many there are: @*a*a*a*a*a*a*a*a*b@ against a long run of @a@ did
+-- not finish.)
 wildcard :: Text -> Text -> Bool
-wildcard pat s = go (T.unpack pat) (T.unpack s)
+wildcard pat s = go 0 0 (-1) 0
   where
-    go [] []             = True
-    go ('*' : ps) xs     = go ps xs || (not (null xs) && go ('*' : ps) (drop 1 xs))
-    go ('?' : ps) (_ : xs) = go ps xs
-    go (p : ps) (x : xs) = p == x && go ps xs
-    go _ _               = False
+    np = T.length pat
+    ns = T.length s
+    -- Indexing a 'Text' is a walk from its start; these are O(1).
+    pa, sa :: UArray Int Char
+    pa = listArray (0, np - 1) (T.unpack pat)
+    sa = listArray (0, ns - 1) (T.unpack s)
+    pc = (pa !)
+    sc = (sa !)
+    -- @star@ is the position of the last star seen and @mark@ the subject
+    -- position it is currently taken to have matched up to.
+    go !p !i !star !mark
+      | i < ns, p < np, pc p == '*' = go (p + 1) i p i
+      | i < ns, p < np, pc p == '?' || pc p == sc i = go (p + 1) (i + 1) star mark
+      | i < ns, star >= 0 = go (star + 1) (mark + 1) star (mark + 1)
+      | i < ns = False
+      | otherwise = T.all (== '*') (T.drop p pat)

@@ -43,10 +43,13 @@ module Cmedit.Xlsx
   , sheetMemberPath
     -- * Sheets
   , sheetGrid
+  , sheetGridWithin
   , resolveFormulas
   , cellRef
   , cellName
   , maxSheetCells
+  , maxWorkbookCells
+  , cellCost
   , maxSheetCols
     -- * The open workbook
   , Workbook(..)
@@ -68,6 +71,7 @@ import Data.Sequence (Seq, (|>))
 import qualified Data.Sequence as Seq
 import Data.Text (Text)
 import qualified Data.Text as T
+import Data.Text.Unsafe (lengthWord8)
 
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as M
@@ -99,6 +103,29 @@ isXlsx names = workbookPath `elem` names
 -- | Most cells one sheet will yield.
 maxSheetCells :: Int
 maxSheetCells = 2000000
+
+-- | Most cells a whole workbook will yield, across its sheets.
+--
+-- 'maxSheetCells' is a sheet's limit, and a workbook has up to 256 of them
+-- (which may all be one archive member, named 256 times): half a billion
+-- cells from forty kilobytes. Two full sheets' worth is more than the table
+-- view is usable with — a sheet at its own limit is already hundreds of
+-- megabytes — so sheets past that open empty and the note says some were
+-- truncated.
+maxWorkbookCells :: Int
+maxWorkbookCells = 2 * maxSheetCells
+
+-- | What a cell takes out of those budgets: one, plus one more for every
+-- 128 bytes of its text. Counting cells alone bounds the grid but not what is
+-- in it: a shared string is stored once and may be named by every cell, so a
+-- 266 KB workbook whose two hundred thousand cells all pointed at one
+-- 32 000-character string was 6.4 GB of text to measure, search and export.
+-- An ordinary cell still costs exactly one, so nothing changes for a real
+-- sheet; at the limit a sheet holds 256 MB of text. The length is the O(1)
+-- byte length, never a count of characters, which would be the very scan
+-- this exists to prevent.
+cellCost :: Text -> Int
+cellCost t = 1 + lengthWord8 t `div` 128
 
 -- | Most columns one sheet will yield. Excel's own limit is 16384, so a
 -- reference past it is a corrupt file rather than a wide sheet — and without
@@ -185,15 +212,22 @@ sharedStrings bs = go Seq.empty (parseXmlBytes bs)
 -- for itself. A formula that came with its value is not in it and is never
 -- recomputed — see "Cmedit.Formula" for why that is the whole design.
 sheetGrid :: Seq Text -> BS.ByteString -> (Seq (Seq Text), Map (Int, Int) Text, Bool)
-sheetGrid strs bs = finish (foldl' step (ss0 strs) (parseXmlBytes bs))
+sheetGrid = sheetGridWithin maxSheetCells
+
+-- | 'sheetGrid' held to a cell budget of the caller's choosing (never more
+-- than 'maxSheetCells'): what is left of 'maxWorkbookCells' once the sheets
+-- before this one have been read.
+sheetGridWithin :: Int -> Seq Text -> BS.ByteString -> (Seq (Seq Text), Map (Int, Int) Text, Bool)
+sheetGridWithin limit0 strs bs = finish (foldl' step (ss0 strs) { ssMax = limit } (parseXmlBytes bs))
   where
+    limit = max 0 (min maxSheetCells limit0)
     finish st =
       let st' = endRow st
           w   = ssWidth st'
           -- Padding makes the grid rectangular, so the budget has to hold
           -- for rows x width and not just for the cells the file spelled out:
           -- one wide row above a long column would otherwise pad to billions.
-          keep = maxSheetCells `div` max 1 w
+          keep = limit `div` max 1 w
           out  = ssOut st'
       in ( fmap (padTo w) (Seq.take keep out)
          , ssForms st'
@@ -248,11 +282,12 @@ data SS = SS
   , ssHasF  :: !Bool         -- ^ It had an @\<f\>@ at all (a shared formula's followers have an empty one).
   , ssCapF  :: !Bool         -- ^ Capturing that formula's text.
   , ssForms :: !(Map (Int, Int) Text)  -- ^ Formulas with no cached value, by @(row, column)@.
+  , ssMax   :: !Int          -- ^ The cell budget this sheet is read under.
   }
 
 ss0 :: Seq Text -> SS
 ss0 strs = SS Seq.empty Seq.empty 0 0 0 0 "n" [] False 0 0 False False strs
-              [] False False M.empty
+              [] False False M.empty maxSheetCells
 
 rowIndex :: [(Text, Text)] -> Int -> Int
 rowIndex as dflt = case xAttr "r" as >>= readNat of
@@ -302,7 +337,7 @@ readNat t
 pushCell :: SS -> SS
 pushCell st
   | ssColAt st >= maxSheetCols        = st
-  | ssCells st >= maxSheetCells       = st { ssCut = True }
+  | ssCells st >= ssMax st            = st { ssCut = True }
   | otherwise =
       let c    = ssColAt st
           gap  = max 0 (c - Seq.length (ssRow st))
@@ -321,7 +356,7 @@ pushCell st
                     M.insert (ssRowAt st, c) (T.concat (reverse (ssFSrc st))) (ssForms st)
                 | otherwise = ssForms st
       in st { ssRow = row', ssCol = c + 1, ssOpen = True
-            , ssCells = ssCells st + gap + 1
+            , ssCells = ssCells st + gap + cellCost v
             , ssForms = forms
             , ssVal = [], ssType = "n", ssFSrc = [], ssHasF = False }
 
@@ -347,7 +382,7 @@ endRow st
   -- A row number is whatever the file says (@r="99999999"@ in a 900-byte
   -- workbook): the rows skipped to reach it count against the budget
   -- /before/ they are materialised, and a row beyond it is dropped.
-  | max 0 (ssRowAt st - Seq.length (ssOut st)) + ssCells st > maxSheetCells =
+  | max 0 (ssRowAt st - Seq.length (ssOut st)) + ssCells st > ssMax st =
       st { ssCut = True, ssRow = Seq.empty, ssCol = 0, ssOpen = False }
   | otherwise =
       let r    = ssRowAt st
@@ -357,7 +392,7 @@ endRow st
             , ssNext = r + 1, ssRowAt = r + 1
             , ssWidth = max (ssWidth st) (Seq.length (ssRow st))
             , ssCells = ssCells st + gap
-            , ssCut = ssCut st || ssCells st >= maxSheetCells }
+            , ssCut = ssCut st || ssCells st >= ssMax st }
 
 ------------------------------------------------------------------------------
 -- The open workbook

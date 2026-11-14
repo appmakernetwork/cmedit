@@ -22,7 +22,7 @@ import Data.Array (Array)
 
 import Cmedit.Types
 import Cmedit.TextBuffer
-import Cmedit.Width (colToDisplay, displayToCol, wrapLine)
+import Cmedit.Width (colToDisplay, displayToCol, strCells, textCells, wrapLine)
 import Cmedit.ConfigFile
   ( Config(..), ThemeName(..), defaultConfig, RecentEntry(..)
   , maxRecentEntries, maxHistoryEntries )
@@ -755,7 +755,7 @@ statusRightInfo ed = flatten segs
       where
         go _ accS accZ [] = (concat (reverse accS), reverse accZ)
         go col accS accZ ((s, mz) : rest) =
-          let len = length s
+          let len = strCells s   -- cells, not characters: a sheet name may be wide
               accZ' = case mz of Just z -> (col, len, z) : accZ; Nothing -> accZ
           in go (col + len) (s : accS) accZ' rest
 
@@ -770,7 +770,7 @@ statusClick :: Int -> Editor -> (Editor, [Effect])
 statusClick col ed =
   let lo = computeLayout ed
       (txt, zones) = statusRightInfo ed
-      rel = col - max 0 (loCols lo - length txt)
+      rel = col - max 0 (loCols lo - strCells txt)
   in case [ z | (s, len, z) <- zones, rel >= s, rel < s + len ] of
        (SZGoTo : _)       -> noEff (openGoTo ed)
        (SZOverwrite : _)  -> noEff ed { edOverwrite = not (edOverwrite ed)
@@ -1232,7 +1232,7 @@ completeGeom ed cp =
             ( loTextTop lo + (l - edTop ed)
             , loTextLeft lo + colToDisplay tabw s line - edLeft ed )
       h = min completeVisRows (length (cpItems cp))
-      w = min (max 12 (2 + maximum (1 : map T.length (take 50 (cpItems cp)))))
+      w = min (max 12 (2 + maximum (1 : map textCells (take 50 (cpItems cp)))))
               (max 12 (loCols lo - 2))
       below = row + 1
       top | below + h <= loTextTop lo + loTextHeight lo = below
