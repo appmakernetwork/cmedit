@@ -9,6 +9,7 @@ module Cmedit.App
   , convertPath
   , abbreviateHome
   , detectLinters
+  , asyncThresholdFor
   ) where
 
 import Control.Concurrent (ThreadId, forkIO, getNumCapabilities, killThread, myThreadId)
@@ -69,7 +70,7 @@ import Cmedit.Definition (DefReq(..))
 import qualified Cmedit.Definition as D
 import Cmedit.Editor
 import Cmedit.Gfx
-import Cmedit.Image (Image, imgW, imgH, sniffImage, decodeFrames, scaleRGBA)
+import Cmedit.Image (Image, imgW, imgH, sniffImage, decodeFrames, scaleRGBA, jpegCostHint)
 import Cmedit.Jobs (JobTable, newJobTable, startJobIn, cancelJobIn)
 import Cmedit.FontProvider (FontProvider, newFontProvider, startFontDiscovery, providerFiles, facesForQueries, fontFor)
 import qualified Cmedit.PdfRender as PR
@@ -3661,17 +3662,37 @@ asyncThresholdBytes = 2 * 1024 * 1024
 imageAsyncBytes :: Integer
 imageAsyncBytes = 64 * 1024
 
+-- | A JPEG whose frame has more pixels than this, or that has more than one
+-- scan, loads on the background thread at any file size, as a JPEG XL does.
+-- A small file can be a big picture (a 657-byte one can declare 6300x6300),
+-- and below 'imageAsyncBytes' only the header says so. One scan of up to 4
+-- MP is at most about one decode's work, a tenth of a second or so here even
+-- for a hostile file with four components, which is what the inline path
+-- can afford; more scans may revisit every block up to
+-- @jpegVisitsPerBlock@ times before "Cmedit.Image" refuses them, which is
+-- seconds at that size, so those go to the background whatever the size.
+jpegAsyncPixels :: Int
+jpegAsyncPixels = 4 * 1000 * 1000
+
 -- | The size above which this file loads on the background thread. A file
 -- that opens into a view that has to *decode* it (an image, a PDF) pays for
 -- its content, not its size, so it crosses at 'imageAsyncBytes'; a JPEG XL
 -- crosses at any size, since its compression ratios are such that a 47 KB
--- file can be a 16-megapixel picture taking seconds to decode.
+-- file can be a 16-megapixel picture taking seconds to decode, and so does
+-- a JPEG whose header says it is big or multi-scan ('jpegAsyncPixels').
 asyncThresholdFor :: FilePath -> IO Integer
 asyncThresholdFor path = do
   -- (never sniffed from a stream: the read would consume its first kilobyte)
   regular <- isRegularFile path
   r <- if regular
-         then try (withBinaryFile path ReadMode (\h -> BS.hGet h 1024))
+         then try (withBinaryFile path ReadMode (\h -> do
+                start <- BS.hGet h 1024
+                -- A JPEG's frame header can sit behind tens of kilobytes of
+                -- metadata; reading up to the threshold covers every file the
+                -- answer matters for (a larger one crosses on size anyway).
+                if sniffImage start == Just "JPEG"
+                  then (start <>) <$> BS.hGet h (fromIntegral imageAsyncBytes - 1024)
+                  else pure start))
          else pure (Right BS.empty)
          :: IO (Either SomeException BS.ByteString)
   -- An archive is here for the container reading views: listing one is two
@@ -3685,6 +3706,8 @@ asyncThresholdFor path = do
     -- parse is a background job either way.
     _ | isSvgPath path -> imageAsyncBytes
     Right bs | sniffImage bs == Just "JPEG XL" -> -1
+             | Just (px, scans) <- jpegCostHint bs
+             , sniffImage bs == Just "JPEG" && (px > jpegAsyncPixels || scans > 1) -> -1
              | isJust (sniffImage bs) || Pdf.sniffPdf bs || Z.zipMagic bs -> imageAsyncBytes
     _ -> asyncThresholdBytes
 

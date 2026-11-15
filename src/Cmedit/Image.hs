@@ -16,6 +16,11 @@
 -- It depends only on "Cmedit.Types" (for 'Cell'/'Color'/'Style'); nothing here
 -- touches IO or the rest of the editor, so it adds no cost unless an image is
 -- actually opened.
+--
+-- The JPEG decoder is written from the published standards (ITU-T T.81,
+-- JFIF 1.02 / T.871, and the IDCT of Loeffler, Ligtenberg and Moschytz, each
+-- cited at its kernel) and reproduces libjpeg-turbo's output exactly. This
+-- software is based in part on the work of the Independent JPEG Group.
 module Cmedit.Image
   ( Image(..)
   , ImgMode(..)
@@ -23,6 +28,7 @@ module Cmedit.Image
   , decodeJPEG
   , JpegSamples(..)
   , decodeJPEGSamples
+  , jpegCostHint
   , maxPixels
   , decodeFrames
   , decodeGIFFrames
@@ -42,20 +48,21 @@ import Data.Array (Array, listArray)
 import qualified Data.Array as A
 import Data.Array.ST (STArray, STUArray, newArray, readArray, writeArray, runSTUArray)
 import Data.Array.MArray (freeze, thaw)
-import Data.Array.Base (STUArray(..), unsafeRead, unsafeWrite, unsafeAt, unsafeNewArray_)
-import GHC.Exts (Int(I#), shrinkMutableByteArray#, copyMutableByteArray#, setByteArray#, (*#))
+import Data.Array.Base (STUArray(..), UArray(..), unsafeRead, unsafeWrite, unsafeAt, unsafeNewArray_)
+import GHC.Exts (Int(I#), Int#, Word(W#), Word#, ByteArray#, MutableByteArray#, shrinkMutableByteArray#, copyMutableByteArray#, setByteArray#, (*#))
 import GHC.ST (ST(..))
 import Data.Array.Unsafe (castSTUArray, unsafeFreeze)
 import Data.Array.Unboxed (UArray, (!), bounds)
 import qualified Data.Array.Unboxed as U
 import Data.Bits
 import Data.Char (ord)
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.STRef
-import Data.Word (Word8, Word16, Word32)
+import Data.Word (Word8, Word16, Word32, Word64)
 import Data.Int (Int16)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
+import GHC.ByteOrder (ByteOrder(..), targetByteOrder)
 
 import Cmedit.Inflate (Huff(..), buildHuff, inflateInto, InflateHuff(..), buildInflateHuffN, decodeSymSlow)
 import Cmedit.Types (Cell(..), Style(..), Color(..), attrNone)
@@ -1195,8 +1202,8 @@ pngChunks bs pos mihdr plte trns idats
 
 ------------------------------------------------------------------------------
 -- DEFLATE lives in "Cmedit.Inflate" (a leaf module), which PNG shares with the
--- PDF view's content streams. 'Huff'/'buildHuff' come from there too: JPEG's
--- scan reader builds the same canonical tables from its own DHT segments.
+-- PDF view's content streams. 'Huff'/'buildHuff' come from there too, for
+-- VP8L's prefix codes (JPEG's tables are 'JFast', below).
 ------------------------------------------------------------------------------
 -- JPEG: baseline AND progressive sequential DCT (Huffman). Arithmetic and
 -- lossless are rejected. Both modes decode their scan(s) into a per-component
@@ -1208,13 +1215,14 @@ data JComp = JComp { jcId :: !Int, jcH :: !Int, jcV :: !Int, jcTq :: !Int }
 
 data JFrame = JFrame { jfW :: !Int, jfH :: !Int, jfComps :: ![JComp] }
 
-emptyHuff :: Huff
-emptyHuff = Huff (A.listArray (0,16) (replicate 17 0)) (A.listArray (0,0) [0]) 16
-
-emptyJHuff :: JHuff
-emptyJHuff = mkJHuff emptyHuff
-
 -- | Decode a JPEG to RGBA for display.
+--
+-- The samples are libjpeg-turbo's (its default decode: the accurate integer
+-- IDCT and the triangle-filter chroma upsampling; see the reconstruction
+-- kernels). A three-component file is YCbCr or RGB by libjpeg's rule: a
+-- JFIF marker means YCbCr; otherwise an Adobe APP14 marker decides (its
+-- transform code 0 is RGB); otherwise component ids @R@, @G@, @B@ mean RGB;
+-- otherwise YCbCr.
 --
 -- Four-component (CMYK and YCCK) files are converted with the multiplicative
 -- formula @R = (1 - C)(1 - K)@, ImageMagick's (no ICC profile is
@@ -1222,15 +1230,16 @@ emptyJHuff = mkJHuff emptyHuff
 -- poppler's conversion instead), after undoing the
 -- Adobe convention when the file carries an Adobe APP14 marker: Photoshop
 -- writes CMYK /inverted/ (0 = full ink), and every reader that honours the
--- marker (libjpeg's users, GIMP, pdf.js) un-inverts it. One- and
--- three-component files decode exactly as they always have; in particular a
--- three-component file is always YCbCr here, whatever its APP14 transform
--- flag says.
+-- marker (libjpeg's users, GIMP, pdf.js) un-inverts it.
 decodeJPEG :: BS.ByteString -> Either String Image
 decodeJPEG bs = do
   (w, h, comps) <- jpegFrame bs
-  let adobe = jpegAdobeTransform bs
-      mode | length comps == 4 = JView4 (adobe == Just 2) (isJust adobe)
+  let (jfif, adobe) = jpegColourMarkers bs
+      rgbCoded = not jfif && maybe (map jcId comps == [82, 71, 66]) (== 0) adobe
+      -- libjpeg reads any non-zero Adobe transform on four components as
+      -- YCCK (2 is the only one defined; it warns about the others).
+      mode | length comps == 4 = JView4 (maybe False (/= 0) adobe) (isJust adobe)
+           | length comps == 3 && rgbCoded = JViewRgb
            | otherwise         = JView
   Right (decodeJpegImage mode bs w h comps)
 
@@ -1251,7 +1260,7 @@ data JpegSamples = JpegSamples
 -- (YCbCr to RGB for three components, YCCK to CMYK for four) is applied
 -- follows pdf.js and libjpeg: the Adobe marker's flag when there is one,
 -- else the caller's override (PDF's @\/ColorTransform@), else "yes" for three
--- components and "no" for four.
+-- components unless their ids are @R@, @G@, @B@, and "no" for four.
 decodeJPEGSamples :: Maybe Bool -> BS.ByteString -> Either String JpegSamples
 decodeJPEGSamples override bs = do
   (w, h, comps) <- jpegFrame bs
@@ -1259,7 +1268,7 @@ decodeJPEGSamples override bs = do
       adobe = jpegAdobeTransform bs
       transform = case adobe of
         Just t  -> t /= 0
-        Nothing -> fromMaybe (n == 3) override
+        Nothing -> fromMaybe (n == 3 && map jcId comps /= [82, 71, 66]) override
       img = decodeJpegImage (JRaw (transform && n >= 3)) bs w h comps
   Right (JpegSamples w h n adobe (imgPix img))
 
@@ -1276,33 +1285,123 @@ jpegFrame bs = do
         "bad JPEG frame header"
   when' (null comps) "JPEG missing frame header"
   when' (not (length comps `elem` [1,3,4])) "unsupported JPEG component count"
+  jpegScanWork bs w h comps
   Right (w, h, comps)
 
--- | The transform code of an Adobe APP14 segment before the first scan, if
--- there is one.
-jpegAdobeTransform :: BS.ByteString -> Maybe Int
-jpegAdobeTransform bs = go 2 (0 :: Int)
+-- | The most scans a JPEG may have. A progressive file has about ten
+-- (libjpeg's default script has ten), so this refuses only files built to
+-- exhaust the decoder: each scan visits every block of the
+-- components it codes, so 2000 empty scans in a 20 KB file at 6000x6000
+-- ran for minutes. libjpeg-turbo grew a scan limit for the same attack.
+maxJpegScans :: Int
+maxJpegScans = 1000
+
+-- | The block visits the scans may make, per block of the frame: ten times
+-- what libjpeg's default progressive script makes (it visits a luma block
+-- six times, a chroma block four). Without it, 999 scans would pass the
+-- scan limit and still take minutes.
+jpegVisitsPerBlock :: Int
+jpegVisitsPerBlock = 64
+
+-- Refuse a JPEG whose scans would exceed 'maxJpegScans' or the block-visit
+-- budget, before decoding any of them. Every scan the decoder's walk can
+-- reach starts at an FF DA byte pair and each pair is reached at most once,
+-- so summing over every such pair in the file bounds the real walk from
+-- above whatever the restart searches skip (a pair inside another segment
+-- only adds its own, bounded, share). A scan's visits are its units times
+-- its blocks per unit, as 'jScanRows' iterates them; the budget is
+-- 'jpegVisitsPerBlock' per frame block plus a fixed million, so a small
+-- picture is never refused for its script.
+jpegScanWork :: BS.ByteString -> Int -> Int -> [JComp] -> Either String ()
+jpegScanWork bs w h comps = go 2 (0 :: Int) (0 :: Int)
   where
     n = BS.length bs
-    go pos k
-      | k > 512 || pos + 3 >= n = Nothing
-      | at bs pos /= 0xFF = go (pos + 1) (k + 1)
+    hmax = maximum (map jcH comps)
+    vmax = maximum (map jcV comps)
+    mpr = (w + 8*hmax - 1) `div` (8*hmax)
+    mpc = (h + 8*vmax - 1) `div` (8*vmax)
+    frameBlocks = sum [ mpr * jcH c * mpc * jcV c | c <- comps ]
+    budget = jpegVisitsPerBlock * frameBlocks + 1000000
+    -- A single-component scan iterates that component's true extent.
+    ownBlocks c = let cw = (w*jcH c + hmax-1) `div` hmax
+                      ch = (h*jcV c + vmax-1) `div` vmax
+                  in ((cw+7) `div` 8) * ((ch+7) `div` 8)
+    visits seg = case jpegScanComps bs seg comps of
+      [(ci, _, _)] -> ownBlocks (comps !! ci)
+      cs -> mpr * mpc * max 1 (sum [ jcH c * jcV c | (ci, _, _) <- cs, let c = comps !! ci ])
+    go !p !k !work = case BS.elemIndex 0xFF (BS.drop p bs) of
+      Nothing -> Right ()
+      Just i
+        | q + 1 >= n -> Right ()
+        | at bs (q+1) /= 0xDA -> go (q+1) k work
+        | k >= maxJpegScans -> Left ("JPEG has more than " ++ show maxJpegScans ++ " scans")
+        | work' > budget -> Left "JPEG scans exceed the decoding work limit"
+        | otherwise -> go (q+2) (k+1) work'
+        where q = p + i
+              work' = work + visits (q+4)
+
+-- | What a JPEG's headers say about its decode cost, from as much of the
+-- file as is given: the frame's pixel count, and how many scans (SOS marker
+-- pairs) the bytes contain. 'Nothing' when no supported frame header is in
+-- them. A cheap header walk; nothing is decoded.
+jpegCostHint :: BS.ByteString -> Maybe (Int, Int)
+jpegCostHint bs = case findFrame bs 2 of
+  Right fr -> Just (jfW fr * jfH fr, scans 0 0)
+  Left _   -> Nothing
+  where
+    n = BS.length bs
+    scans !p !k = case BS.elemIndex 0xFF (BS.drop p bs) of
+      Nothing -> k
+      Just i  -> let q = p + i
+                 in if q + 1 < n && at bs (q+1) == 0xDA then scans (q+2) (k+1 :: Int)
+                    else scans (q+1) k
+
+-- | The transform code of the Adobe APP14 segment before the first scan
+-- that libjpeg honours (see 'jpegColourMarkers'), if there is one.
+jpegAdobeTransform :: BS.ByteString -> Maybe Int
+jpegAdobeTransform = snd . jpegColourMarkers
+
+-- | The markers before the first scan that say what a file's components
+-- are: whether there is a JFIF APP0 segment (identifier @JFIF\0@ and the
+-- full 16-byte fixed part of T.871 section 10.1), and the transform code of
+-- the last Adobe APP14 segment long enough to hold one (libjpeg's
+-- @examine_app14@: 12 payload bytes, the transform the last), since each
+-- one libjpeg reads overwrites the last.
+jpegColourMarkers :: BS.ByteString -> (Bool, Maybe Int)
+jpegColourMarkers bs = go 2 (0 :: Int) False Nothing
+  where
+    n = BS.length bs
+    go pos k jfif adobe
+      | k > 512 || pos + 3 >= n = (jfif, adobe)
+      | at bs pos /= 0xFF = go (pos + 1) (k + 1) jfif adobe
       | otherwise =
           let m = at bs (pos + 1) in
-          if m == 0xFF then go (pos + 1) (k + 1)
-          else if m == 0xD8 || (m >= 0xD0 && m <= 0xD7) then go (pos + 2) (k + 1)
-          else if m == 0xDA || m == 0xD9 then Nothing
+          if m == 0xFF then go (pos + 1) (k + 1) jfif adobe
+          else if m == 0xD8 || (m >= 0xD0 && m <= 0xD7) then go (pos + 2) (k + 1) jfif adobe
+          else if m == 0xDA || m == 0xD9 then (jfif, adobe)
           else
-            let len = be16 bs (pos + 2); seg = pos + 4 in
-            if m == 0xEE && len >= 12 && BS.take 5 (BS.drop seg bs) == fourCC "Adobe"
-              then Just (at bs (seg + 11))
-              else if len < 2 then Nothing else go (pos + 2 + len) (k + 1)
+            let len = be16 bs (pos + 2); seg = pos + 4
+                adobe' | m == 0xEE && len >= 14 && BS.take 5 (BS.drop seg bs) == fourCC "Adobe"
+                       = Just (at bs (seg + 11))
+                       | otherwise = adobe
+                jfif' = jfif || (m == 0xE0 && len >= 16 && BS.take 5 (BS.drop seg bs) == fourCC "JFIF\0")
+            in if len < 2 then (jfif', adobe') else go (pos + 2 + len) (k + 1) jfif' adobe'
 
 -- What 'decodeJpegImage' writes into its four bytes per pixel.
 data JOut
-  = JView               -- ^ RGBA for display (one or three components).
+  = JView               -- ^ RGBA for display (one component, or three that are YCbCr).
+  | JViewRgb            -- ^ RGBA for display from three components that are RGB.
   | JView4 !Bool !Bool  -- ^ RGBA from four components: YCCK?, Adobe-inverted?
   | JRaw !Bool          -- ^ Component samples; apply the YCbCr/YCCK transform?
+
+-- The row kernel a reconstruction state runs (see 'mkConv' in
+-- 'decodeJpegST'): grey for display, one raw sample, YCbCr to RGB, RGB as
+-- stored, and four components with 'cvtFour''s flags added.
+kGray, kRaw1, kYcc, kRgb :: Int
+kGray = 0; kRaw1 = 1; kYcc = 2; kRgb = 3
+
+kFour :: Int -> Int
+kFour fl = 8 + fl
 
 -- Walk markers to the frame (SOF) header, rejecting unsupported variants.
 findFrame :: BS.ByteString -> Int -> Either String JFrame
@@ -1319,7 +1418,12 @@ findFrame bs pos
         let len = be16 bs (pos+2); seg = pos+4; next = pos+2+len in
         -- C0 baseline, C1 extended, C2 progressive: all sequential DCT/Huffman,
         -- decoded by the same coefficient-buffer path.
-        if m == 0xC0 || m == 0xC1 || m == 0xC2 then Right (frameAt seg)
+        if m == 0xC0 || m == 0xC1 || m == 0xC2
+          then if at bs seg == 8 then Right (frameAt seg)
+               -- 12-bit samples (extended and progressive allow them) need
+               -- other tables and arithmetic throughout; refused, not
+               -- decoded as garbage. libjpeg built for 8 bits refuses too.
+               else Left ("unsupported JPEG sample precision (" ++ show (at bs seg) ++ " bits)")
         else if m == 0xC3 then Left "lossless JPEG is not supported"
         else if m `elem` [0xC5,0xC6,0xC7,0xC9,0xCA,0xCB,0xCD,0xCE,0xCF]
                then Left "unsupported JPEG SOF variant"
@@ -1331,145 +1435,14 @@ findFrame bs pos
                    in JComp (at bs o) (hv `shiftR` 4) (hv .&. 15) (at bs (o+2))
       in JFrame (be16 bs (seg+3)) (be16 bs (seg+1)) (map comp [0 .. nf-1])
 
--- Slots of the entropy reader's unboxed state array (see 'decodeJpegImage').
-iPos, iAcc, iNb, iMk, iEob, iRst :: Int
-iPos = 0   -- byte offset of the next byte to load
-iAcc = 1   -- bit accumulator: the low iNb bits are the unread stream, MSB first
-iNb  = 2   -- valid bits in the accumulator
-iMk  = 3   -- marker that stopped the entropy stream (0 = none)
-iEob = 4   -- progressive AC: blocks left in the current end-of-band run
-iRst = 5   -- MCUs since the last restart marker
-
--- The reader keeps up to 64 bits of the entropy stream in an accumulator,
--- unstuffed (0xFF00 is a literal 0xFF) and loaded a byte at a time. It never
--- loads past a marker, and reads beyond one (or beyond EOF) see zero bits:
--- exactly what the old bit-at-a-time reader returned once it hit a marker.
--- Since no marker is ever skipped, iPos stays a valid place to look for the
--- next RST or segment marker ('findRST', 'syncToMarker') even though it can
--- run ahead of the bits consumed.
-fillJ :: BS.ByteString -> STUArray s Int Int -> ST s ()
-fillJ bs st = do
-  mk <- unsafeRead st iMk
-  when (mk == 0) $ do
-    p0   <- unsafeRead st iPos
-    acc0 <- unsafeRead st iAcc
-    nb0  <- unsafeRead st iNb
-    let len = BS.length bs
-        byte i = fromIntegral (BSU.unsafeIndex bs i) :: Int
-        done !p !acc !nb !m = do
-          unsafeWrite st iPos p; unsafeWrite st iAcc acc; unsafeWrite st iNb nb
-          when (m /= 0) $ unsafeWrite st iMk m
-        go !p !acc !nb
-          | nb > 56   = done p acc nb 0
-          | p >= len  = done p acc nb 0xD9
-          | otherwise =
-              let b = byte p in
-              if b /= 0xFF then go (p+1) ((acc `shiftL` 8) .|. b) (nb+8)
-              else if p + 1 >= len then done p acc nb 0xD9
-              else let n = byte (p+1) in
-                   if n == 0 then go (p+2) ((acc `shiftL` 8) .|. 0xFF) (nb+8)
-                   else done p acc nb n
-    go p0 acc0 nb0
-
--- The next n (1..16) bits without consuming them, zero-padded at a marker.
-{-# INLINE peekJ #-}
-peekJ :: BS.ByteString -> STUArray s Int Int -> Int -> ST s Int
-peekJ bs st n = do
-  nb0 <- unsafeRead st iNb
-  when (nb0 < n) $ fillJ bs st
-  nb  <- unsafeRead st iNb
-  acc <- unsafeRead st iAcc
-  let m = (1 `shiftL` n) - 1
-  pure (if nb >= n then (acc `shiftR` (nb - n)) .&. m
-                   else (acc `shiftL` (n - nb)) .&. m)
-
-{-# INLINE consumeJ #-}
-consumeJ :: STUArray s Int Int -> Int -> ST s ()
-consumeJ st n = do
-  nb <- unsafeRead st iNb
-  unsafeWrite st iNb (max 0 (nb - n))
-
-{-# INLINE nextBitJ #-}
-nextBitJ :: BS.ByteString -> STUArray s Int Int -> ST s Int
-nextBitJ bs st = do v <- peekJ bs st 1; consumeJ st 1; pure v
-
--- n bits MSB first. Corrupt data can ask for more than 16 (a DC magnitude
--- category is a whole Huffman symbol); those are read in 16-bit pieces,
--- which wraps exactly like the old one-bit-at-a-time shift.
-{-# INLINE getBitsJ #-}
-getBitsJ :: BS.ByteString -> STUArray s Int Int -> Int -> ST s Int
-getBitsJ bs st n
-  | n <= 0  = pure 0
-  | n <= 16 = do v <- peekJ bs st n; consumeJ st n; pure v
-  | otherwise = getBitsLongJ bs st n
-
-getBitsLongJ :: BS.ByteString -> STUArray s Int Int -> Int -> ST s Int
-getBitsLongJ bs st = go 0
-  where go !acc k | k <= 0 = pure acc
-                  | otherwise = do
-                      let c = min 16 k
-                      v <- peekJ bs st c
-                      consumeJ st c
-                      go ((acc `shiftL` c) .|. v) (k - c)
-
-{-# INLINE recvJ #-}
-recvJ :: BS.ByteString -> STUArray s Int Int -> Int -> ST s Int
-recvJ bs st s
-  | s == 0 = pure 0
-  | otherwise = do v <- getBitsJ bs st s
-                   pure (if v < (1 `shiftL` (s-1)) then v - (1 `shiftL` s) + 1 else v)
-
--- A DHT table plus a 9-bit lookahead: entry @symbolIndex << 4 .|. len@ for
--- every 9-bit prefix whose code is at most 9 bits long, 0 otherwise. Each
--- entry is produced by running the canonical walk itself on that prefix, so
--- even a malformed table decodes exactly as the walk would (a prefix whose
--- walk would index past the symbol list is left to the slow path, which
--- fails the same way the walk did, and only if that code actually occurs).
--- The entry holds the symbol's *index*, not the symbol: a DHT's symbols are
--- read lazily from the file, and on a truncated one, forcing a symbol the
--- stream never uses would fail where the walk did not.
-data JHuff = JHuff !Huff !(UArray Int Int)
-
-mkJHuff :: Huff -> JHuff
-mkJHuff hf@(Huff counts syms _) = JHuff hf (U.listArray (0, 511) (map entry [0 .. 511]))
-  where
-    (_, symHi) = A.bounds syms
-    entry v = go 1 0 0 0
-      where go len code first idx
-              | len > 9 = 0
-              | otherwise =
-                  let b = (v `shiftR` (9 - len)) .&. 1
-                      code1 = (code `shiftL` 1) .|. b
-                      cnt = counts A.! len
-                      k = idx + (code1 - first)
-                  in if code1 - first < cnt
-                       then (if k >= 0 && k <= symHi then (k `shiftL` 4) .|. len else 0)
-                       else go (len+1) code1 ((first+cnt) `shiftL` 1) (idx+cnt)
-
-{-# INLINE decodeHuffJ #-}
-decodeHuffJ :: BS.ByteString -> STUArray s Int Int -> JHuff -> ST s Int
-decodeHuffJ bs st (JHuff hf@(Huff _ syms _) tbl) = do
-  v <- peekJ bs st 9
-  let e = tbl `unsafeAt` v
-  if e /= 0 then do consumeJ st (e .&. 15); pure (syms A.! (e `shiftR` 4))
-            else decodeHuffSlowJ bs st hf
-
--- The canonical walk over a 16-bit peek, for codes longer than 9 bits. An
--- invalid code consumes 16 bits and decodes as 0, as the walk always did.
-decodeHuffSlowJ :: BS.ByteString -> STUArray s Int Int -> Huff -> ST s Int
-decodeHuffSlowJ bs st (Huff counts syms _) = do
-  v <- peekJ bs st 16
-  let go len code first idx
-        | len > 16 = (0, 16)
-        | otherwise =
-            let b = (v `shiftR` (16 - len)) .&. 1
-                code1 = (code `shiftL` 1) .|. b
-                cnt = counts A.! len
-            in if code1 - first < cnt then (syms A.! (idx + (code1 - first)), len)
-               else go (len+1) code1 ((first+cnt) `shiftL` 1) (idx+cnt)
-      (sym, used) = go 1 0 0 0
-  consumeJ st used
-  pure sym
+-- Slots of the entropy reader's unboxed state array (see 'jScanRows', which
+-- carries them in loop arguments and writes them back after each call).
+iPos, iAcc, iNb, iEob, iRst :: Int
+iPos = 0   -- byte offset of the next byte to load (never past a marker)
+iAcc = 1   -- bit accumulator: the next iNb bits of the stream, MSB first
+iNb  = 2   -- valid bits in the accumulator ('jHuge' once at a marker)
+iEob = 3   -- progressive AC: blocks left in the current end-of-band run
+iRst = 4   -- MCUs since the last restart marker
 
 -- The natural-order index for each zig-zag position.
 zigzag :: UArray Int Int
@@ -1479,78 +1452,406 @@ zigzag = U.listArray (0,63)
   ,35,42,49,56,57,50,43,36,29,22,15,23,30,37,44,51
   ,58,59,52,45,38,31,39,46,53,60,61,54,47,55,62,63]
 
--- IDCT cosine factors: ctK (k*8+u) = C(u)*cos((2k+1)*u*pi/16), as literals.
--- In the unrolled IDCT kernels every index is a compile-time constant, so
--- each factor folds to an immediate (as a table, each was a load through a
--- CAF). The literals are 'show' of the values computed by that formula,
--- which read back as the identical Doubles, so the IDCT output is unchanged.
-{-# INLINE ctK #-}
-ctK :: Int -> Double
-ctK i = case i of
-  0 -> 0.7071067811865475
-  1 -> 0.9807852804032304
-  2 -> 0.9238795325112867
-  3 -> 0.8314696123025452
-  4 -> 0.7071067811865476
-  5 -> 0.5555702330196023
-  6 -> 0.38268343236508984
-  7 -> 0.19509032201612833
-  8 -> 0.7071067811865475
-  9 -> 0.8314696123025452
-  10 -> 0.38268343236508984
-  11 -> -0.1950903220161282
-  12 -> -0.7071067811865475
-  13 -> -0.9807852804032304
-  14 -> -0.9238795325112868
-  15 -> -0.5555702330196022
-  16 -> 0.7071067811865475
-  17 -> 0.5555702330196023
-  18 -> -0.3826834323650897
-  19 -> -0.9807852804032304
-  20 -> -0.7071067811865477
-  21 -> 0.1950903220161283
-  22 -> 0.9238795325112865
-  23 -> 0.8314696123025455
-  24 -> 0.7071067811865475
-  25 -> 0.19509032201612833
-  26 -> -0.9238795325112867
-  27 -> -0.5555702330196022
-  28 -> 0.7071067811865474
-  29 -> 0.8314696123025455
-  30 -> -0.3826834323650899
-  31 -> -0.9807852804032307
-  32 -> 0.7071067811865475
-  33 -> -0.1950903220161282
-  34 -> -0.9238795325112868
-  35 -> 0.5555702330196018
-  36 -> 0.7071067811865477
-  37 -> -0.8314696123025451
-  38 -> -0.38268343236509056
-  39 -> 0.9807852804032304
-  40 -> 0.7071067811865475
-  41 -> -0.555570233019602
-  42 -> -0.38268343236509034
-  43 -> 0.9807852804032304
-  44 -> -0.7071067811865467
-  45 -> -0.19509032201612803
-  46 -> 0.9238795325112867
-  47 -> -0.831469612302545
-  48 -> 0.7071067811865475
-  49 -> -0.8314696123025453
-  50 -> 0.38268343236509
-  51 -> 0.19509032201612878
-  52 -> -0.7071067811865471
-  53 -> 0.9807852804032307
-  54 -> -0.9238795325112864
-  55 -> 0.5555702330196015
-  56 -> 0.7071067811865475
-  57 -> -0.9807852804032304
-  58 -> 0.9238795325112865
-  59 -> -0.8314696123025451
-  60 -> 0.7071067811865466
-  61 -> -0.5555702330196015
-  62 -> 0.38268343236508956
-  _ -> -0.19509032201612858
+------------------------------------------------------------------------------
+-- The entropy decoder ('jScanRows'), for every scan kind: baseline and
+-- extended scans (T.81 Annex F), progressive DC and AC first passes (Annex
+-- G.1.2.1, G.1.2.2) and their refinements (G.1.2.3).
+--
+-- Decoding is T.81's DECODE (F.2.2.3), RECEIVE and EXTEND (F.2.2.4,
+-- F.2.2.1), and G.1.2.2's EOBRUN, made fast by three standard techniques:
+--
+-- * The reader state (byte position, a 64-bit accumulator holding the next
+--   bits MSB first, its bit count) is carried in loop arguments for a whole
+--   run of MCU rows and written back once, instead of living in memory.
+-- * The accumulator is refilled several bytes at a time from one 64-bit
+--   big-endian word whenever none of those bytes is 0xFF (no stuffing and
+--   no marker), and a byte at a time otherwise.
+-- * Huffman codes are decoded through a 'jLook'-bit lookahead table, the
+--   canonical-code technique, whose entry also carries the coefficient value
+--   when the code and its magnitude bits both fit in the lookahead, so most
+--   coefficients cost one table read.
+--
+-- It reproduces the plain bit-serial reader it replaced (one bit at a time,
+-- a canonical-code walk per symbol) exactly, corrupt input included, which
+-- the fuzz outcome lists of plan 0035 pin. The reader never loads past a
+-- marker (so the restart and segment searches from
+-- 'iPos' are unchanged); bits past a marker or the end of the data read as
+-- zeros, which the accumulator gives for free because consumed bits are
+-- shifted out at the top and nothing past a marker is ever loaded at the
+-- bottom; and once that point is reached the bit count is set to 'jHuge'
+-- so the reader stops looking. Codes longer than the lookahead take the same
+-- canonical walk as that reader, so a malformed table decodes the same
+-- way, and the rare cases (a DC magnitude category over 16, which only a
+-- corrupt file has; an AC symbol that is an EOB run in a baseline scan) keep
+-- their old meaning.
+
+-- Lookahead width of 'JFast'.
+jLook :: Int
+jLook = 10
+
+-- The bit count once the reader has met a marker or the end of the data:
+-- the accumulator then reads as zeros forever, and no scan consumes this
+-- many bits.
+jHuge :: Int
+jHuge = bit 50
+
+-- A DHT table for the first-scan decoder: the lookahead, the code-length
+-- counts (indices 1..16) and the symbols, all unboxed. A lookahead entry is
+--
+-- >  bits 0..4    code length (1..jLook); 0 = no code that short: walk
+-- >  bits 5..9    code length plus magnitude bits, when resolved
+-- >  bit  10      resolved: the value is in bits 32 and up
+-- >  bits 16..23  the symbol
+-- >  bits 32..    the coefficient (DC: the difference), signed
+--
+-- Like the old table, each entry is made by running the canonical walk on
+-- its prefix, so a malformed table means exactly what the walk makes of it.
+-- Symbols past the segment read as zeros ('at' is total), as before.
+data JFast = JFast !(UArray Int Int) !(UArray Int Int) !(UArray Int Int)
+
+mkJFast :: Bool -> [Int] -> [Int] -> JFast
+mkJFast isDc counts syms = JFast lut cnt sy
+  where
+    cnt = U.listArray (0, 16) (0 : take 16 (counts ++ repeat 0)) :: UArray Int Int
+    nsym = sum counts
+    sy = U.listArray (0, max 0 (nsym - 1)) (syms ++ [0]) :: UArray Int Int
+    lut = U.listArray (0, bit jLook - 1) (map entry [0 .. bit jLook - 1]) :: UArray Int Int
+    entry v = go 1 0 0 0
+      where
+        go len code first idx
+          | len > jLook = 0
+          | otherwise =
+              let b = (v `shiftR` (jLook - len)) .&. 1
+                  code1 = (code `shiftL` 1) .|. b
+                  c = cnt ! len
+                  k = idx + (code1 - first)
+              in if code1 - first < c
+                   then (if k <= nsym - 1 then resolve len (sy ! k) else 0)
+                   else go (len + 1) code1 ((first + c) `shiftL` 1) (idx + c)
+        resolve len sym =
+          let s = if isDc then sym else sym .&. 15
+              ok = (isDc || s /= 0) && s <= 16 && len + s <= jLook
+              mag = (v `shiftR` (jLook - len - s)) .&. (bit s - 1)
+              val = if s == 0 then 0 else jExtend mag s
+          in len .|. (sym `shiftL` 16)
+             .|. (if ok then ((len + s) `shiftL` 5) .|. bit 10 .|. (val `shiftL` 32) else 0)
+
+-- EXTEND (T.81 F.2.2.1) of an s-bit magnitude, s in 1..16.
+{-# INLINE jExtend #-}
+jExtend :: Int -> Int -> Int
+jExtend v s = if v < unsafeShiftL 1 (s - 1) then v - unsafeShiftL 1 s + 1 else v
+
+-- A code longer than the lookahead: the canonical walk over a 16-bit
+-- window, answered in the layout of an unresolved lookahead entry. A window
+-- that is no code at all decodes as symbol 0 and consumes 16 bits, as the
+-- bit-serial reader it replaced did.
+jSlowSym :: UArray Int Int -> UArray Int Int -> Int -> Int
+jSlowSym cnt sy v = go 1 0 0 0
+  where
+    go !len !code !first !idx
+      | len > 16 = 16
+      | otherwise =
+          let b = (v `unsafeShiftR` (16 - len)) .&. 1
+              code1 = (code `unsafeShiftL` 1) .|. b
+              c = cnt `unsafeAt` len
+          in if code1 - first < c
+               then len .|. ((sy `unsafeAt` (idx + (code1 - first))) `unsafeShiftL` 16)
+               else go (len + 1) code1 ((first + c) `unsafeShiftL` 1) (idx + c)
+
+-- Does a word contain a 0xFF byte? (Its complement has a zero byte: the
+-- usual exact test for one.)
+{-# INLINE jHasFF #-}
+jHasFF :: Word -> Bool
+jHasFF w = let z = complement w
+           in ((z - 0x0101010101010101) .&. complement z .&. 0x8080808080808080) /= 0
+
+-- Eight bytes from p, big-endian (p + 8 <= length).
+{-# INLINE jBe64 #-}
+jBe64 :: BS.ByteString -> Int -> Word
+jBe64 bs p =
+  let b i = fromIntegral (BSU.unsafeIndex bs (p + i)) :: Word
+  in (b 0 `unsafeShiftL` 56) .|. (b 1 `unsafeShiftL` 48) .|. (b 2 `unsafeShiftL` 40)
+     .|. (b 3 `unsafeShiftL` 32) .|. (b 4 `unsafeShiftL` 24) .|. (b 5 `unsafeShiftL` 16)
+     .|. (b 6 `unsafeShiftL` 8) .|. b 7
+
+-- Refill the accumulator, which holds nb < 32 bits: at least 57 afterwards,
+-- or 'jHuge' once a marker or the end of the data is reached. A word load
+-- ORs in bytes beyond the ones it counts; those are the same stream bits a
+-- later load puts there (no byte in the word is 0xFF, so none is stuffed),
+-- which is why OR-ing them twice is harmless.
+jFill :: BS.ByteString -> Int -> Word -> Int -> (# Int#, Word#, Int# #)
+jFill bs !pos !acc !nb
+  | pos + 8 <= n, let w = jBe64 bs pos, not (jHasFF w) =
+      let !k = (64 - nb) `unsafeShiftR` 3
+      in ret (pos + k) (acc .|. (w `unsafeShiftR` nb)) (nb + 8 * k)
+  | otherwise = bytes pos acc nb
+  where
+    n = BS.length bs
+    byte i = fromIntegral (BSU.unsafeIndex bs i) :: Word
+    bytes !p !a !c
+      | c > 56 = ret p a c
+      | p >= n = ret p a jHuge
+      | otherwise =
+          let b = byte p in
+          if b /= 0xFF then bytes (p + 1) (a .|. (b `unsafeShiftL` (56 - c))) (c + 8)
+          else if p + 1 >= n then ret p a jHuge
+          else if byte (p + 1) == 0 then bytes (p + 2) (a .|. (0xFF `unsafeShiftL` (56 - c))) (c + 8)
+          else ret p a jHuge
+    ret (I# p) (W# a) (I# c) = (# p, a, c #)
+
+-- RECEIVE of a DC magnitude category over 16, which only corrupt data has:
+-- read in 16-bit pieces and extended with the replaced bit-serial reader's
+-- arithmetic (shifts of 64 or more are 0), so it wraps the same way.
+-- Rare, so it may allocate.
+jRecvLong :: BS.ByteString -> Int -> Word -> Int -> Int -> (Int, Int, Word, Int)
+jRecvLong bs pos0 acc0 nb0 t = go pos0 acc0 nb0 0 t
+  where
+    go !p !a !n !v !k
+      | k <= 0 = (ext v, p, a, n)
+      | n < 32 = case jFill bs p a n of (# p', a', n' #) -> go (I# p') (W# a') (I# n') v k
+      | otherwise =
+          let c = min 16 k
+              bits = fromIntegral (a `unsafeShiftR` (64 - c)) :: Int
+          in go p (a `unsafeShiftL` c) (n - c) ((v `shiftL` c) .|. bits) (k - c)
+    ext v = if v < (1 `shiftL` (t - 1)) then v - (1 `shiftL` t) + 1 else v
+
+-- One scan, resolved for 'jScanRows': its spectral band and
+-- successive-approximation bits, restart interval, and the blocks of one
+-- unit (an MCU of an interleaved scan, a block of a single-component one),
+-- per block: frame component, buffer offset as @(row - base*rowScale) *
+-- rowMul + off + unit*step@, and Huffman tables.
+data JScan = JScan
+  !Int !Int !Int !Int !Int                                  -- Ss Se Ah Al, restart interval
+  !Int !Int !Int !Int                                       -- blocks per unit, units per row, last row, rowScale
+  !(UArray Int Int) !(UArray Int Int) !(UArray Int Int) !(UArray Int Int)  -- per block: component, rowMul, off, step
+  !(Array Int JFast) !(Array Int JFast)                     -- per block: DC and AC tables
+
+-- Decode rows r0..r1 of a scan into @coefA@ (per unit block, the frame
+-- component's buffer, holding rows from @base@ on), continuing from the
+-- reader, EOB-run and restart state in @st@ and the DC predictors in
+-- @preds@, and leaving them there for the next call: the same contract as
+-- 'decodeJpegST''s @decodeRows@. Every loop is a join point; nothing in it
+-- allocates.
+jScanRows :: forall s. BS.ByteString -> STUArray s Int Int -> STUArray s Int Int -> JScan
+          -> Array Int (STUArray s Int Int16) -> Int -> Int -> Int -> ST s ()
+jScanRows bs st preds@(STUArray _ _ npred _)
+          (JScan ss se ah al ri nBlk units rowLast rowScale comp rowMul offs step dcA acA)
+          coefA !base !r0 !r1 = do
+  pos0 <- unsafeRead st iPos
+  acc0 <- unsafeRead st iAcc
+  nb0  <- unsafeRead st iNb
+  eob0 <- unsafeRead st iEob
+  rst0 <- unsafeRead st iRst
+  let !rEnd = min r1 rowLast
+      !acStart = max ss 1
+      !doDc = ss == 0
+      !doAc = acStart <= se
+      !rowBase = base * rowScale
+      -- Refinement's correction bit +1 / -1 at bit al (G.1.2.3).
+      !plus1 = unsafeShiftL 1 al
+      !minus1 = negate plus1
+      finish !pos !acc !nb !eob !rst = do
+        unsafeWrite st iPos pos
+        unsafeWrite st iAcc (fromIntegral (acc :: Word))
+        unsafeWrite st iNb nb
+        unsafeWrite st iEob eob
+        unsafeWrite st iRst rst
+      rows !row !pos !acc !nb !eob !rst
+        | row > rEnd = finish pos acc nb eob rst
+        | otherwise = unitL row 0 pos acc nb eob rst
+      unitL !row !mx !pos !acc !nb !eob !rst
+        | mx >= units = rows (row + 1) pos acc nb eob rst
+        | otherwise = blockL row mx 0 pos acc nb eob rst
+      -- After each unit, the restart count (T.81 F.1.2.3; RST resets the
+      -- reader, the DC predictors and the EOB run). There is no restart
+      -- after the scan's last unit, even when the interval divides the unit
+      -- count: an encoder writes none there, so a search would run on past
+      -- the next scan's header to its first RST and lose that scan.
+      tick !row !mx !pos !acc !nb !eob !rst
+        | ri <= 0 = unitL row (mx + 1) pos acc nb eob rst
+        | rst + 1 /= ri || (row >= rowLast && mx + 1 >= units) =
+            unitL row (mx + 1) pos acc nb eob (rst + 1)
+        | otherwise = do
+            forLoop 0 (npred - 1) $ \i -> unsafeWrite preds i 0
+            unitL row (mx + 1) (findRST bs pos) 0 0 0 0
+      blockL !row !mx !j !pos !acc !nb !eob !rst
+        | j >= nBlk = tick row mx pos acc nb eob rst
+        | otherwise = do
+          let !ci = comp `unsafeAt` j
+              !boff = (row - rowBase) * (rowMul `unsafeAt` j) + offs `unsafeAt` j
+                      + mx * (step `unsafeAt` j)
+              !coef = coefA `unsafeAt` j
+              next !p !a !n !e = blockL row mx (j + 1) p a n e rst
+              ----------------------------------------------------------------
+              -- First scans (Ah = 0).
+              --
+              -- The AC band: an EOB run in progress skips the block
+              -- (G.1.2.2); otherwise decode from 'acStart'.
+              acFirst !p !a !n !e
+                | not doAc = next p a n e
+                | e > 0 = next p a n (e - 1)
+                | otherwise = case acA `unsafeAt` j of
+                    JFast alut acnt asym ->
+                      let acLoop !k !p1 !a1 !n1
+                            | k > se = next p1 a1 n1 0
+                            | n1 < 32 = case jFill bs p1 a1 n1 of
+                                (# p', a', n' #) -> acLoop k (I# p') (W# a') (I# n')
+                            | otherwise =
+                                let !en = alut `unsafeAt` fromIntegral (a1 `unsafeShiftR` (64 - jLook))
+                                in if en .&. 1024 /= 0
+                                  then
+                                    -- Code and magnitude both in the lookahead.
+                                    let !k' = k + ((en `unsafeShiftR` 20) .&. 15) in
+                                    if k' > se
+                                      then let !l = en .&. 31
+                                           in next p1 (a1 `unsafeShiftL` l) (n1 - l) 0
+                                      else do
+                                        wrC16 coef (boff + zigzag `unsafeAt` k')
+                                              ((en `unsafeShiftR` 32) `unsafeShiftL` al)
+                                        let !t = (en `unsafeShiftR` 5) .&. 31
+                                        acLoop (k' + 1) p1 (a1 `unsafeShiftL` t) (n1 - t)
+                                  else
+                                    let !su = if en /= 0 then en
+                                              else jSlowSym acnt asym (fromIntegral (a1 `unsafeShiftR` 48))
+                                        !l = su .&. 31
+                                        !sym = (su `unsafeShiftR` 16) .&. 255
+                                        !r = sym `unsafeShiftR` 4
+                                        !s = sym .&. 15
+                                        !a2 = a1 `unsafeShiftL` l
+                                        !n2 = n1 - l
+                                    in if s == 0
+                                      then if r < 15
+                                        then
+                                          -- EOB (r = 0) or an EOB run of 2^r + extra.
+                                          let !extra = if r == 0 then 0
+                                                       else fromIntegral (a2 `unsafeShiftR` (64 - r))
+                                          in next p1 (a2 `unsafeShiftL` r) (n2 - r)
+                                                  (unsafeShiftL 1 r - 1 + extra)
+                                        else acLoop (k + 16) p1 a2 n2       -- ZRL
+                                      else
+                                        let !k' = k + r in
+                                        if k' > se then next p1 a2 n2 0
+                                        else do
+                                          let !v = jExtend (fromIntegral (a2 `unsafeShiftR` (64 - s))) s
+                                          wrC16 coef (boff + zigzag `unsafeAt` k') (v `unsafeShiftL` al)
+                                          acLoop (k' + 1) p1 (a2 `unsafeShiftL` s) (n2 - s)
+                      in acLoop acStart p a n
+              dcDone !p !a !n !diff = do
+                pv <- unsafeRead preds ci
+                let !dc = pv + diff
+                unsafeWrite preds ci dc
+                wrC16 coef boff (dc `unsafeShiftL` al)
+                acFirst p a n eob
+              dcFirst !p !a !n
+                | n < 32 = case jFill bs p a n of (# p', a', n' #) -> dcFirst (I# p') (W# a') (I# n')
+                | otherwise = case dcA `unsafeAt` j of
+                    JFast dlut dcnt dsym ->
+                      let !en = dlut `unsafeAt` fromIntegral (a `unsafeShiftR` (64 - jLook)) in
+                      if en .&. 1024 /= 0
+                        then let !t = (en `unsafeShiftR` 5) .&. 31
+                             in dcDone p (a `unsafeShiftL` t) (n - t) (en `unsafeShiftR` 32)
+                        else
+                          let !su = if en /= 0 then en
+                                    else jSlowSym dcnt dsym (fromIntegral (a `unsafeShiftR` 48))
+                              !l = su .&. 31
+                              !t = (su `unsafeShiftR` 16) .&. 255
+                              !a2 = a `unsafeShiftL` l
+                              !n2 = n - l
+                          in if t == 0 then dcDone p a2 n2 0
+                             else if t <= 16
+                               then dcDone p (a2 `unsafeShiftL` t) (n2 - t)
+                                           (jExtend (fromIntegral (a2 `unsafeShiftR` (64 - t))) t)
+                             else case jRecvLong bs p a2 n2 t of
+                                    (v, p', a', n') -> dcDone p' a' n' v
+              ----------------------------------------------------------------
+              -- Refinement scans (Ah > 0, G.1.2.3). Every loop reads at most
+              -- one bit per step and refills at its head; the Huffman step
+              -- reads a code plus at most 14 bits.
+              --
+              -- A coefficient already non-zero gets a correction bit,
+              -- applied (away from zero) only when bit al is still clear.
+              refineAt !idx !a = do
+                v <- rdC16 coef idx
+                when (v /= 0 && a `unsafeShiftR` 63 /= 0 && v .&. plus1 == 0) $
+                  wrC16 coef idx (if v > 0 then v + plus1 else v + minus1)
+                pure v
+              acRefine !p !a !n !e
+                | not doAc = next p a n e
+                | e == 0 = case acA `unsafeAt` j of
+                    JFast alut acnt asym ->
+                      let -- The next symbol: a run of zero-history
+                          -- coefficients to skip, and either a new
+                          -- coefficient or an EOB run.
+                          outer !k !p1 !a1 !n1
+                            | k > se = next p1 a1 n1 0
+                            | n1 < 32 = case jFill bs p1 a1 n1 of
+                                (# p', a', n' #) -> outer k (I# p') (W# a') (I# n')
+                            | otherwise =
+                                let !en = alut `unsafeAt` fromIntegral (a1 `unsafeShiftR` (64 - jLook))
+                                    !su = if en /= 0 then en
+                                          else jSlowSym acnt asym (fromIntegral (a1 `unsafeShiftR` 48))
+                                    !l = su .&. 31
+                                    !sym = (su `unsafeShiftR` 16) .&. 255
+                                    !r = sym `unsafeShiftR` 4
+                                    !s = sym .&. 15
+                                    !a2 = a1 `unsafeShiftL` l
+                                    !n2 = n1 - l
+                                in if s == 0
+                                  then if r < 15
+                                    then
+                                      -- An EOB run of 2^r + extra, this block its first.
+                                      let !extra = if r == 0 then 0
+                                                   else fromIntegral (a2 `unsafeShiftR` (64 - r))
+                                      in rest k p1 (a2 `unsafeShiftL` r) (n2 - r) (unsafeShiftL 1 r + extra)
+                                    else adv k 15 0 p1 a2 n2                  -- ZRL
+                                  else
+                                    -- One new coefficient, its sign the next bit.
+                                    adv k r (if a2 `unsafeShiftR` 63 /= 0 then plus1 else minus1)
+                                        p1 (a2 `unsafeShiftL` 1) (n2 - 1)
+                          -- Skip rr zero-history coefficients, correcting
+                          -- the non-zero ones passed on the way.
+                          adv !k !rr !nv !p1 !a1 !n1
+                            | k > se = place k nv p1 a1 n1
+                            | n1 < 32 = case jFill bs p1 a1 n1 of
+                                (# p', a', n' #) -> adv k rr nv (I# p') (W# a') (I# n')
+                            | otherwise = do
+                                let !idx = boff + zigzag `unsafeAt` k
+                                v <- refineAt idx a1
+                                if v /= 0 then adv (k + 1) rr nv p1 (a1 `unsafeShiftL` 1) (n1 - 1)
+                                else if rr == 0 then place k nv p1 a1 n1
+                                else adv (k + 1) (rr - 1) nv p1 a1 n1
+                          place !k !nv !p1 !a1 !n1 = do
+                            when (nv /= 0 && k <= se) $ wrC16 coef (boff + zigzag `unsafeAt` k) nv
+                            outer (k + 1) p1 a1 n1
+                      in outer acStart p a n
+                | otherwise = rest acStart p a n e
+              -- Inside an EOB run: correct the rest of the band.
+              rest !k !p !a !n !e
+                | k > se = next p a n (e - 1)
+                | n < 32 = case jFill bs p a n of (# p', a', n' #) -> rest k (I# p') (W# a') (I# n') e
+                | otherwise = do
+                    v <- refineAt (boff + zigzag `unsafeAt` k) a
+                    if v /= 0 then rest (k + 1) p (a `unsafeShiftL` 1) (n - 1) e
+                    else rest (k + 1) p a n e
+              dcRefine !p !a !n
+                | n < 32 = case jFill bs p a n of (# p', a', n' #) -> dcRefine (I# p') (W# a') (I# n')
+                | otherwise = do
+                    when (a `unsafeShiftR` 63 /= 0) $ do
+                      v <- rdC16 coef boff
+                      wrC16 coef boff (v .|. plus1)
+                    acRefine p (a `unsafeShiftL` 1) (n - 1) eob
+          if | ah == 0 -> if doDc then dcFirst pos acc nb else acFirst pos acc nb eob
+             | doDc -> dcRefine pos acc nb
+             | otherwise -> acRefine pos acc nb eob
+  rows r0 pos0 (fromIntegral acc0) nb0 eob0 rst0
+
+{-# INLINE rdC16 #-}
+rdC16 :: STUArray s Int Int16 -> Int -> ST s Int
+rdC16 a i = fromIntegral <$> unsafeRead a i
+
+{-# INLINE wrC16 #-}
+wrC16 :: STUArray s Int Int16 -> Int -> Int -> ST s ()
+wrC16 a i v = unsafeWrite a i (fromIntegral v)
 
 -- Where reconstruction ('decodeJpegImage''s @runRange@) reads a component's
 -- DCT coefficients for MCU row m: the buffers in 'csArrays' (one per frame
@@ -1603,19 +1904,22 @@ decodeJpegST allowPar mode bs w h comps = do
                    , let cw = (w*jcH c + hmax-1) `div` hmax
                    , let ch = (h*jcV c + vmax-1) `div` vmax ]
         infoOf ci = compInfo !! ci
-        planeDims c = (mpr*jcH c*8, mpc*jcV c*8)
+        planeDims c u = (mpr*jcH c*juDs u, mpc*jcV c*juDs u)
         --
         -- The planes are not the image's height: reconstruction and colour
         -- conversion run one MCU row at a time (see 'sync' in @mkConv@), so
         -- a plane holds a ring of three MCU rows' worth of sample rows, and
-        -- plane row r lives at ring row r `mod` rows. Every row index the
-        -- conversion reads goes through the y tables, which store it reduced.
-        planeRows c = min (snd (planeDims c)) (24 * jcV c)
+        -- plane row r lives at ring row r `mod` rows ('prep' in @mkConv@
+        -- reduces every row it reads). The planes, rings and IDCT geometry
+        -- are written in terms of the component's block size 'juDs' (8, the
+        -- only IDCT so far), so a reduced-size IDCT needs only kernels.
+        planeRows c u = min (snd (planeDims c u)) (3 * juDs u * jcV c)
     -- Mutable decode tables (DQT/DHT may appear or change between scans).
     quantT <- newArray (0,3) (U.listArray (0,63) (replicate 64 1))
                 :: ST s (STArray s Int (UArray Int Int))
-    dcT    <- newArray (0,3) emptyJHuff :: ST s (STArray s Int JHuff)
-    acT    <- newArray (0,3) emptyJHuff :: ST s (STArray s Int JHuff)
+    latched <- newArray (0, ncomp - 1) Nothing :: ST s (STArray s Int (Maybe (UArray Int Int)))
+    dcF    <- newArray (0,3) (mkJFast True [] []) :: ST s (STArray s Int JFast)
+    acF    <- newArray (0,3) (mkJFast False [] []) :: ST s (STArray s Int JFast)
     driRef <- newSTRef 0
     -- Entropy bit reader.
     --
@@ -1626,7 +1930,7 @@ decodeJpegST allowPar mode bs w h comps = do
     -- costs ~110 bytes per iteration (522 MB over 5M iterations) against zero
     -- for the unboxed array; decoding a 603 KiB JPEG churned 830 MB, which at
     -- GHC's allocation rate was most of its 679 ms.
-    st <- newArray (0, 5) 0 :: ST s (STUArray s Int Int)
+    st <- newArray (0, 4) 0 :: ST s (STUArray s Int Int)
     writeArray st iPos 2
     -- After a scan, advance to the next real marker (skipping the entropy
     -- stream's stuffed 0xFF00 and any RST markers).
@@ -1648,11 +1952,9 @@ decodeJpegST allowPar mode bs w h comps = do
                               counts = [ at bs (p+1+i) | i <- [0..15] ]
                               nsym = sum counts
                               syms = [ at bs (p+17+i) | i <- [0..nsym-1] ]
-                              hf = Huff (A.listArray (0,16) (0:counts))
-                                        (A.listArray (0, max 0 (nsym-1)) (syms++[0])) 16
                           when (th <= 3) $                            -- ids are 0..3
-                            if tc == 0 then writeArray dcT th (mkJHuff hf)
-                                       else writeArray acT th (mkJHuff hf)
+                            if tc == 0 then writeArray dcF th (mkJFast True counts syms)
+                                       else writeArray acF th (mkJFast False counts syms)
                           goH (p+17+nsym)
     -- Set up one scan (its band [Ss,Se] at successive-approximation Ah/Al):
     -- reset the reader to the scan's data, resolve its components' tables,
@@ -1668,152 +1970,58 @@ decodeJpegST allowPar mode bs w h comps = do
     let scanSetup :: Int -> Int -> ST s ([STUArray s Int Int16] -> Int -> Int -> Int -> ST s (), Int)
         scanSetup seg next = do
           let ns = at bs seg
-              -- Table selectors are 0..3 and the spectral band 0..63; masked
-              -- and clamped (a no-op for any valid file) so a corrupt scan
-              -- header decodes to noise instead of indexing out of range.
-              ents = [ (at bs o, (at bs (o+1) `shiftR` 4) .&. 3, at bs (o+1) .&. 3)
-                     | i <- [0..ns-1], let o = seg+1+2*i ]
+              -- The spectral band is 0..63; clamped (a no-op for any valid
+              -- file) so a corrupt scan header decodes to noise instead of
+              -- indexing out of range.
               hdr = seg + 1 + 2*ns
               ss = min 63 (at bs hdr); se = min 63 (at bs (hdr+1)); ahal = at bs (hdr+2)
               ah = ahal `shiftR` 4; al = ahal .&. 15
-              -- The refinement's +1 and -1 at bit al, once per scan.
-              !p1 = 1 `shiftL` al; !m1 = negate p1
-              scanComps = [ (ci, td, ta) | (cs,td,ta) <- ents
-                                         , (ci,c) <- zip [0..] comps, jcId c == cs ]
+              scanComps = jpegScanComps bs seg comps
+          -- The first scan that codes a component fixes its quantisation
+          -- table, as libjpeg latches it: a DQT that redefines the table
+          -- later (after the last scan, or between progressive scans) does
+          -- not change that component.
+          forM_ scanComps $ \(ci, _, _) -> do
+            l <- readArray latched ci
+            when (isNothing l) $ readArray quantT (jcTq (comps !! ci)) >>= writeArray latched ci . Just
           writeArray st iPos next
-          writeArray st iAcc 0; writeArray st iNb 0; writeArray st iMk 0
+          writeArray st iAcc 0; writeArray st iNb 0
           preds  <- newArray (0, max 0 (ncomp-1)) 0 :: ST s (STUArray s Int Int)
           writeArray st iEob 0
           ri <- readSTRef driRef
-          let zpos boff k = boff + (zigzag ! k)
-              acFirst coef boff actbl k0 = do
-                eob <- readArray st iEob
-                if eob > 0 then writeArray st iEob (eob-1) else loop k0
-                where loop k | k > se = pure ()
-                             | otherwise = do
-                                 rs <- decodeHuffJ bs st actbl
-                                 let r = rs `shiftR` 4; s = rs .&. 15
-                                 if s == 0
-                                   then if r < 15
-                                          then do extra <- getBitsJ bs st r
-                                                  writeArray st iEob ((1 `shiftL` r) - 1 + extra)
-                                          else loop (k+16)         -- ZRL: 16 zeros
-                                   else do let k' = k + r
-                                           if k' > se then pure () else do
-                                             v <- recvJ bs st s
-                                             wrC coef (zpos boff k') (v `shiftL` al)
-                                             loop (k'+1)
-              -- Successive-approximation AC refinement. Every local function
-              -- is called only in tail position (outer -> adv -> place ->
-              -- outer, ending in finish), so they compile to join points: the
-              -- previous form allocated four STRefs per Huffman symbol.
-              acRefine coef !boff actbl !k0 = do
-                let outer !k
-                      | k > se = finish k
-                      | otherwise = do
-                          rs <- decodeHuffJ bs st actbl
-                          let r = rs `shiftR` 4; s = rs .&. 15
-                          if s == 0
-                            then if r < 15
-                                   then do                      -- start an EOB run
-                                     extra <- getBitsJ bs st r
-                                     writeArray st iEob ((1 `shiftL` r) + extra)
-                                     finish k
-                                   else adv k r 0               -- ZRL
-                            else do b <- nextBitJ bs st         -- one new +-1 coefficient
-                                    adv k r (if b /= 0 then p1 else m1)
-                    -- Skip r zero-valued coefficients, refining the non-zero
-                    -- ones passed on the way.
-                    adv !k !rr !nv
-                      | k > se = place k nv
-                      | otherwise = do
-                          v <- rdC coef (zpos boff k)
-                          if v /= 0
-                            then do b <- nextBitJ bs st
-                                    when (b /= 0 && (v .&. p1) == 0) $
-                                      wrC coef (zpos boff k) (if v > 0 then v+p1 else v+m1)
-                                    adv (k+1) rr nv
-                            else if rr == 0 then place k nv
-                                 else adv (k+1) (rr-1) nv
-                    place !k !nv = do
-                      when (nv /= 0 && k <= se) $ wrC coef (zpos boff k) nv
-                      outer (k+1)
-                    -- Inside an EOB run: refine the rest of the band. The
-                    -- loop ends in the run's decrement rather than being
-                    -- followed by it, so it is a join point too: a 'forLoop'
-                    -- here was a closure allocated for every block.
-                    finish !k = do
-                      eob1 <- readArray st iEob
-                      when (eob1 > 0) $ rest k eob1
-                    rest !kk !eob1
-                      | kk > se = writeArray st iEob (eob1 - 1)
-                      | otherwise = do
-                          v <- rdC coef (zpos boff kk)
-                          when (v /= 0) $ do
-                            b <- nextBitJ bs st
-                            when (b /= 0 && (v .&. p1) == 0) $
-                              wrC coef (zpos boff kk) (if v > 0 then v+p1 else v+m1)
-                          rest (kk+1) eob1
-                eob0 <- readArray st iEob
-                if eob0 == 0 then outer k0 else finish k0
-              -- One block of one component, its buffer and tables already
-              -- resolved for the scan (see @resolved@ below), at coefficient
-              -- offset boff. (The offset, not its parts: with the block's
-              -- coordinates as well, the worker's unboxed arguments passed
-              -- GHC's limit and the coordinates were boxed, an Int per block.)
-              decodeOneBlock !ci coef dctbl actbl !boff = do
-                when (ss == 0) $
-                  if ah == 0
-                    then do t <- decodeHuffJ bs st dctbl                  -- DC first
-                            diff <- recvJ bs st t
-                            pv <- readArray preds ci
-                            let dc = pv + diff
-                            writeArray preds ci dc
-                            wrC coef boff (dc `shiftL` al)
-                    else do b <- nextBitJ bs st                            -- DC refine
-                            when (b /= 0) $ do
-                              v <- rdC coef boff
-                              wrC coef boff (v .|. (1 `shiftL` al))
-                let acStart = max ss 1
-                when (acStart <= se) $
-                  if ah == 0 then acFirst  coef boff actbl acStart
-                             else acRefine coef boff actbl acStart
           writeArray st iRst 0
-          let doRestart = do
-                writeArray st iAcc 0; writeArray st iNb 0; writeArray st iMk 0
-                p <- readArray st iPos; writeArray st iPos (findRST bs p)
-                forM_ [0..ncomp-1] $ \i -> writeArray preds i 0
-                writeArray st iEob 0
-              tick = when (ri > 0) $ do
-                n <- readArray st iRst
-                if n+1 == ri then doRestart >> writeArray st iRst 0
-                else writeArray st iRst (n+1)
           -- Each scan component's geometry and Huffman tables, looked up once
           -- per scan rather than once per block.
           resolved <- forM scanComps $ \(ci,td,ta) -> do
-            dctbl <- readArray dcT td
-            actbl <- readArray acT ta
+            dctbl <- readArray dcF td
+            actbl <- readArray acF ta
             let (bpr,_,bw,bh) = infoOf ci
                 c = comps !! ci
             pure (ci, bpr, bw, bh, jcH c, jcV c, dctbl, actbl)
-          -- Interleaved (>1 scan component) iterates MCUs; a single-component
-          -- scan iterates that component's blocks in raster order.
-          let decodeRows target !base !r0 !r1 = case resolved of
-                [(ci, bpr, bw, bh, _, cv, dctbl, actbl)] -> do
-                  let !coef = target !! ci
-                      !brow0 = base * cv
-                  forLoop r0 (min r1 (bh-1)) $ \by -> forLoop 0 (bw-1) $ \bx -> do
-                    decodeOneBlock ci coef dctbl actbl (((by - brow0)*bpr + bx)*64)
-                    tick
-                _ -> do
-                  let res = [ (ci, target !! ci, bpr, ch, cv, base * cv, dctbl, actbl)
-                            | (ci, bpr, _, _, ch, cv, dctbl, actbl) <- resolved ]
-                  forLoop r0 (min r1 (mpc-1)) $ \my -> forLoop 0 (mpr-1) $ \mx -> do
-                    forM_ res $ \(ci, coef, bpr, ch, cv, brow0, dctbl, actbl) ->
-                      forLoop 0 (cv-1) $ \by -> forLoop 0 (ch-1) $ \bx ->
-                        decodeOneBlock ci coef dctbl actbl
-                          (((my*cv + by - brow0)*bpr + mx*ch + bx)*64)
-                    tick
+          -- The scan's units for 'jScanRows': an interleaved scan (more than
+          -- one scan component) iterates MCUs, every block of each in order;
+          -- a single-component scan iterates that component's blocks in
+          -- raster order, over its true (unpadded) extent.
+          let scanPlan = case resolved of
+                [(ci, bpr, bw, bh, _, cv, df, af)] ->
+                  mkPlan bw (bh - 1) cv [(ci, bpr * 64, 0, 64, df, af)]
+                _ -> mkPlan mpr (mpc - 1) 1
+                       [ (ci, cv * bpr * 64, (by * bpr + bx) * 64, ch * 64, df, af)
+                       | (ci, bpr, _, _, ch, cv, df, af) <- resolved
+                       , by <- [0 .. cv - 1], bx <- [0 .. ch - 1] ]
+              mkPlan nu lastRow scale blks =
+                let nbk = length blks
+                    ua f = U.listArray (0, nbk - 1) (map f blks) :: UArray Int Int
+                    ba f = A.listArray (0, nbk - 1) (map f blks)
+                in JScan ss se ah al ri nbk nu lastRow scale
+                         (ua (\(c,_,_,_,_,_) -> c)) (ua (\(_,m,_,_,_,_) -> m))
+                         (ua (\(_,_,o,_,_,_) -> o)) (ua (\(_,_,_,t,_,_) -> t))
+                         (ba (\(_,_,_,_,d,_) -> d)) (ba (\(_,_,_,_,_,t) -> t))
+              blockComps = case scanPlan of JScan _ _ _ _ _ _ _ _ _ cs _ _ _ _ _ -> U.elems cs
+              decodeRows target !base !r0 !r1 =
+                jScanRows bs st preds scanPlan
+                  (A.listArray (0, length blockComps - 1) [ target !! c | c <- blockComps ])
+                  base r0 r1
               -- Rows per MCU row: a single-component scan's rows are block
               -- rows, V of them to an MCU row.
               unit = case resolved of
@@ -1841,271 +2049,141 @@ decodeJpegST allowPar mode bs w h comps = do
                     more <- onScan seg next
                     when more loop
                   else writeArray st iPos next >> loop                     -- APPn / COM / SOF (already parsed)
-    -- Upsampling tables (centred bilinear), per component.
-    --
-    -- Every coordinate a component's samples depend on (the two source
-    -- columns and the fraction for each output x, likewise for each output y)
-    -- is computed once into a table, by the same expressions in the same
-    -- order, so the per-pixel work is four reads and the interpolation
-    -- itself. A full-resolution component (luma always) needs no
-    -- interpolation at all: it is a single read. The tables depend only on
-    -- the geometry, never on a reconstruction state's buffers.
-    let tabsFor c =
-          let ch = jcH c; cv = jcV c
-              (pw, ph) = planeDims c
-              rr = planeRows c
-              axis n lim sub tot =
-                let f i = (fromIntegral i + 0.5) * fromIntegral sub / fromIntegral tot - 0.5 :: Double
-                    i0s = [ clampI 0 (lim-1) (floor (f i)) | i <- [0 .. n-1] ]
-                in ( U.listArray (0, n-1) i0s :: UArray Int Int
-                   , U.listArray (0, n-1) [ clampI 0 (lim-1) (i0 + 1) | i0 <- i0s ] :: UArray Int Int
-                   , U.listArray (0, n-1) [ let fi = f i in fi - fromIntegral (floor fi :: Int)
-                                          | i <- [0 .. n-1] ] :: UArray Int Double )
-              (xa, xb, xd) = axis w pw ch hmax
-              (ya, yb, yd) = axis h ph cv vmax
-              full = ch == hmax && cv == vmax
-              ring = U.amap (`mod` rr)
-              -- The highest plane row output row y reads (a full-resolution
-              -- component reads row ya only), for the driver loop.
-              need = if full then ya else yb
-          in ((full, xa, xb, xd, ring ya, ring yb, yd), (need, cv))
-        compTabs = map (fst . tabsFor) comps
-        needs = map (snd . tabsFor) comps
-    -- One reconstruction state (the component rings, IDCT scratch, the
-    -- chroma row cache and the driver's progress) writing into @img@, with
-    -- each component's quantisation table as given. Returns
+    -- How each component reaches the output grid (see 'jUpFor'), and which
+    -- row kernel turns the component rows into output bytes.
+    let ups = map (jUpFor w h hmax vmax) comps
+        kernel = case mode of
+          JView | ncomp == 1 -> kGray
+                | otherwise  -> kYcc
+          JViewRgb           -> kRgb
+          JRaw tr | ncomp == 1 -> kRaw1
+                  | ncomp == 3 -> if tr then kYcc else kRgb
+                  | otherwise  -> kFour (if tr then 1 else 0)
+          JView4 ycck inv    -> kFour ((if ycck then 1 else 0) .|. 2 .|. (if inv then 4 else 0))
+    -- One reconstruction state (the component rings, the IDCT workspace,
+    -- the upsampled row buffers and the driver's progress) writing into
+    -- @img@, with each component's quantisation table as given. Returns
     -- @runRange src mLo mHi y0 y1@, which converts output rows y0..y1-1,
     -- reconstructing MCU rows from @src@ on demand: from mLo - 1 (the
-    -- chroma halo above a band) on, as far as the rows need (which may
-    -- reach mHi, the halo below). A full-resolution component is never
-    -- read outside [mLo, mHi), so it is reconstructed only inside it. The
-    -- whole picture is @runRange src 0 mpc 0 h@.
+    -- halo above a band) on, as far as the rows need (which may reach mHi,
+    -- the halo below). Only a component whose upsampling reads neighbouring
+    -- rows ('juHalo') is ever read outside [mLo, mHi), so only those are
+    -- reconstructed outside it. The whole picture is
+    -- @runRange src 0 mpc 0 h@.
     let mkConv :: STUArray s Int Word8 -> [UArray Int Int]
                -> ST s (CoefSrc s -> Int -> Int -> Int -> Int -> ST s ())
-        mkConv img0 qtbls = do
-          -- Rebuilt from its fields so the conversion loops below see a
-          -- known constructor and write through the bare byte array (as a
-          -- parameter, every pixel write would first unpack it).
-          let !(STUArray il iu inn imarr) = img0
-              img = STUArray il iu inn imarr :: STUArray s Int Word8
-          planes <- mapM (\c -> let (pw,_) = planeDims c; rr = planeRows c
-                                in do a <- newArray (0, max 0 (pw*rr-1)) 0 :: ST s (STUArray s Int Word8)
-                                      pure (pw,rr,a)) comps
-          -- Reconstruct: dequantise + IDCT every block into its component
-          -- plane.
-          --
-          -- The IDCT is separable: a 2-D transform is a pass over rows
-          -- followed by a pass over columns, 2x8x8 multiply-adds per block
-          -- instead of the 8^4 the direct double sum needs. The two scratch
-          -- buffers are allocated once and reused for every block (see
-          -- 'jIdctBlockRow').
-          blk <- newArray (0, 63) 0 :: ST s (STUArray s Int Double)   -- dequantised coefficients
-          tmp <- newArray (0, 63) 0 :: ST s (STUArray s Int Double)   -- output of the row pass
-          -- The subsampled branch's row cache (see there).
-          cache1 <- newArray (0, 2*w - 1) 0 :: ST s (STUArray s Int Double)
-          cache2 <- newArray (0, 2*w - 1) 0 :: ST s (STUArray s Int Double)
+        mkConv img qtbls = do
+          planes <- mapM (\(c, u) -> let (pw,_) = planeDims c u; rr = planeRows c u
+                                     in do a <- newArray (0, max 0 (pw*rr-1)) 0 :: ST s (STUArray s Int Word8)
+                                           pure (pw,rr,a)) (zip comps ups)
+          -- The IDCT's workspace: one block's column-pass output.
+          ws <- newArray (0, 63) 0 :: ST s (STUArray s Int Int)
+          -- A subsampled component's current output-resolution row (a
+          -- full-resolution one is read straight from its ring). Rounded to
+          -- 8 bits here, before colour conversion, as libjpeg does.
+          bufs <- mapM (\u -> newArray (0, max w (2 * juDw u) + 7) 0 :: ST s (STUArray s Int Word8)) ups
+          -- The component row each buffer holds, so a box-upsampled row
+          -- shared by several output rows is expanded once.
           tags   <- newArray (0, 3) (-1) :: ST s (STUArray s Int Int)
           mDone  <- newArray (0, 0) 0 :: ST s (STUArray s Int Int)
-          let recon = [ (c, bpr, pl, qtbl, full)
-                      | (c, (bpr,_,_,_), pl, qtbl, (full,_,_,_,_,_,_))
-                          <- zip5 comps compInfo planes qtbls compTabs ]
+          let recon = [ (c, bpr, pl, qtbl, u)
+                      | (c, (bpr,_,_,_), pl, qtbl, u) <- zip5 comps compInfo planes qtbls ups ]
               -- 'idctRow m' reconstructs MCU row m of every component into
               -- its ring (block rows m*V .. m*V+V-1). The ring height is a
-              -- multiple of 8 and every plane is MCU-padded, so a block's
-              -- eight rows are contiguous in the ring and always inside it.
+              -- multiple of the block size and every plane is MCU-padded,
+              -- so a block's rows are contiguous in the ring and always
+              -- inside it.
               idctRow src !mLo !mHi !m = do
                 when (csPerRow src) (csFetch src m)
                 let !base = if csPerRow src then m else csBase src
-                forM_ (zip recon (csArrays src)) $ \((c, bpr, (pw,ph,plane), qtbl, full), coef) ->
-                 unless (full && (m < mLo || m >= mHi)) $ do
+                forM_ (zip recon (csArrays src)) $ \((c, bpr, (pw,rr,plane), qtbl, u), coef) ->
+                 unless (not (juHalo u) && (m < mLo || m >= mHi)) $ do
                   let !by0 = m * jcV c; !by1 = (m+1) * jcV c - 1
                       !brow0 = base * jcV c
                   forLoop by0 by1 $ \by ->
-                    jIdctBlockRow coef qtbl plane blk tmp pw ph ((by - brow0)*bpr*64) ((by*8) `rem` ph)
-              tabsOf ci = (planes !! ci, compTabs !! ci)
-              ((pw0,ph0,pl0), (f0,xa0,xb0,xd0,ya0,yb0,yd0)) = tabsOf 0
-              ((pw1,ph1,pl1), (f1,xa1,xb1,xd1,ya1,yb1,yd1)) = tabsOf (min 1 (ncomp-1))
-              ((pw2,ph2,pl2), (f2,xa2,xb2,xd2,ya2,yb2,yd2)) = tabsOf (min 2 (ncomp-1))
-              ((pw3,ph3,pl3), (f3,xa3,xb3,xd3,ya3,yb3,yd3)) = tabsOf (min 3 (ncomp-1))
-              ycc !o !yf !cbv !crv = do
-                let cb = cbv - 128; cr = crv - 128
-                    r = clamp8 (roundD (yf + 1.402*cr))
-                    g = clamp8 (roundD (yf - 0.344136*cb - 0.714136*cr))
-                    b = clamp8 (roundD (yf + 1.772*cb))
-                unsafeWrite img o       (fromIntegral r)
-                unsafeWrite img (o + 1) (fromIntegral g)
-                unsafeWrite img (o + 2) (fromIntegral b)
-                unsafeWrite img (o + 3) 255
-              {-# INLINE ycc #-}
-              -- A full-resolution plane's row offset for output row y, as
-              -- 'jSample' computes it (the planes are MCU-padded, so the
-              -- column clamp never binds for x < w; for a full-resolution
-              -- component the y table is min (ph-1) y, reduced into the ring).
-              rowOf ya pw y = (ya `unsafeAt` y) * pw
-              ready !m !y = all (\(nt, v) -> nt `unsafeAt` y <= m*8*v - 1) needs
-              isView = case mode of JView -> True; _ -> False
+                    jIdctBlockRow coef qtbl plane ws pw ((by - brow0)*bpr*64) ((by * juDs u) `rem` rr)
+              -- Per component (the last repeated to fill four slots): its
+              -- geometry, ring, row buffer and the array its rows are read
+              -- from by the row kernel.
+              slot k = let ci = min k (ncomp - 1); (pw, rr, pl) = planes !! ci; u = ups !! ci
+                           buf = bufs !! ci
+                       in (u, pw, rr, pl, buf, if juMeth u == jmFull then pl else buf, k)
+              s0 = slot 0; s1 = slot 1; s2 = slot 2; s3 = slot 3
+              srcOf (_, _, _, _, _, a, _) = a
+              -- Make output row y's samples of one component available and
+              -- return where they start in 'srcOf' it: in the ring for a
+              -- full-resolution component, else upsampled into its buffer.
+              -- Neighbour rows clamp to the component's true height.
+              prep (u, pw, rr, pl, buf, _, k) !y = do
+                let !cy = juRow u y
+                    ring r = (r `rem` rr) * pw
+                    far = if odd y then min (juDh u - 1) (cy + 1) else max 0 (cy - 1)
+                    meth = juMeth u
+                if | meth == jmFull -> pure (ring cy)
+                   | meth == jmH2V1 -> upH2V1 pl (ring cy) (juDw u) buf >> pure 0
+                   | meth == jmH2V2 -> upH2V2 pl (ring cy) (ring far) (juDw u) buf >> pure 0
+                   | meth == jmH1V2 -> upH1V2 pl (ring cy) (ring far) w (if odd y then 2 else 1) buf >> pure 0
+                   | otherwise -> do
+                       t <- unsafeRead tags k
+                       when (t /= cy) $ do
+                         upBox pl (ring cy) (juNumX u) (juDenX u) w buf
+                         unsafeWrite tags k cy
+                       pure 0
+              -- With m MCU rows reconstructed, a component's ring holds its
+              -- rows up to m*ds*V - 1.
+              ready !m !y = all (\(c, u) -> juNeed u y <= m * juDs u * jcV c - 1) (zip comps ups)
           let runRange src !mLo !mHi !y0 !y1 = do
-                -- The row cache's tags name ring rows, which a previous
-                -- range's rows alias: start it empty.
+                -- The buffers' tags name component rows of whatever range
+                -- ran last: start them empty.
                 forLoop 0 3 $ \i -> unsafeWrite tags i (-1)
                 unsafeWrite mDone 0 (max 0 (mLo - 1))
                 -- Reconstruction is interleaved with conversion: before
                 -- output row y, 'sync' reconstructs MCU rows until every
-                -- plane row y reads is in (with m rows done, a component's
-                -- ring holds plane rows up to m*8*V - 1). Rows are converted
-                -- in order, so the subsampled branch's row cache sees exactly
-                -- the sequence it would over whole planes. A ring row is
-                -- overwritten only when a later row needs MCU row m+1, and by
-                -- then the oldest row anything pending reads is at most a few
-                -- rows below m*8*V, while the ring keeps two further MCU rows
-                -- behind it: no pending read is ever overwritten. Output is
-                -- identical to reconstructing whole planes first, at a
-                -- fraction of their memory.
+                -- component row y reads is in. A ring row is overwritten
+                -- only when a later row needs MCU row m+1, and by then the
+                -- oldest row anything pending reads is at most one MCU row
+                -- behind m, while the ring keeps two: no pending read is
+                -- ever overwritten. Output is identical to reconstructing
+                -- whole planes first, at a fraction of their memory.
                 let sync !y = do
                       m <- unsafeRead mDone 0
                       unless (m >= mpc || ready m y) $ do
                         idctRow src mLo mHi m
                         unsafeWrite mDone 0 (m+1)
                         sync y
-                    -- Every conversion branch's row loop.
-                    rowsWith f = forLoop y0 (y1-1) $ \y -> sync y >> f y
-                    {-# INLINE rowsWith #-}
-                if not isView then do
-                    -- Four components, or raw samples for a PDF. Off the
-                    -- display path's tuned branches on purpose: those stay
-                    -- exactly as they were.
-                    let -- What to do per pixel, decided once: apply the colour
-                        -- transform (YCbCr / YCCK), produce RGB for display
-                        -- (and from inverted Adobe CMYK), or hand back the
-                        -- samples.
-                        (!doTr, !toView, !inverted) = case mode of
-                          JRaw tr -> (tr, False, False)
-                          JView4 ycck inv -> (ycck, True, inv)
-                          JView -> (False, False, False)
-                        !four = ncomp >= 4
-                        byte v = clamp8 (roundD v)
-                        {-# INLINE byte #-}
-                        put !o !a !b !c !d = do
-                          unsafeWrite img o       (fromIntegral a)
-                          unsafeWrite img (o + 1) (fromIntegral b)
-                          unsafeWrite img (o + 2) (fromIntegral c)
-                          unsafeWrite img (o + 3) (fromIntegral d)
-                        {-# INLINE put #-}
-                    rowsWith $ \y -> forLoop 0 (w-1) $ \x -> do
-                      let !o = (y*w + x)*4
-                      v0 <- jSample pw0 ph0 pl0 f0 xa0 xb0 xd0 ya0 yb0 yd0 x y
-                      if ncomp == 1
-                        then put o (byte v0) 255 255 255
-                        else do
-                          v1 <- jSample pw1 ph1 pl1 f1 xa1 xb1 xd1 ya1 yb1 yd1 x y
-                          v2 <- jSample pw2 ph2 pl2 f2 xa2 xb2 xd2 ya2 yb2 yd2 x y
-                          v3 <- if four then jSample pw3 ph3 pl3 f3 xa3 xb3 xd3 ya3 yb3 yd3 x y
-                                        else pure 255
-                          -- The transform as 'ycc' computes it; YCCK's CMY is
-                          -- the complement of the RGB that YCbCr would give.
-                          let !cb = v1 - 128; !cr = v2 - 128
-                              !r0 = if doTr then clamp8 (roundD (v0 + 1.402*cr)) else byte v0
-                              !g0 = if doTr then clamp8 (roundD (v0 - 0.344136*cb - 0.714136*cr)) else byte v1
-                              !b0 = if doTr then clamp8 (roundD (v0 + 1.772*cb)) else byte v2
-                              !c0 = if doTr && four then 255 - r0 else r0
-                              !m0 = if doTr && four then 255 - g0 else g0
-                              !yv = if doTr && four then 255 - b0 else b0
-                              !k0 = byte v3
-                          if toView
-                            then do
-                              -- Ink amounts, then the multiplicative CMYK to
-                              -- RGB (R = (1-C)(1-K)), which is ImageMagick's:
-                              -- measured on its own CMYK JPEGs, within 1 code
-                              -- value, where the naive 1-min(1,C+K) is off by
-                              -- 21 on average and the PDF renderer's
-                              -- sixteen-corner blend by 13.
-                              let ink v = if inverted then 255 - v else v
-                                  !k = ink k0
-                                  chan v = ((255 - ink v) * (255 - k) + 127) `div` 255
-                              put o (chan c0) (chan m0) (chan yv) 255
-                            else put o c0 m0 yv k0
-                  else if
-                   | ncomp == 1 && f0 ->
-                       -- A full-resolution gray sample is already a clamped
-                       -- byte, which the Double round trip would hand back
-                       -- unchanged.
-                       rowsWith $ \y -> do
-                         let ro = rowOf ya0 pw0 y
-                         forLoop 0 (w-1) $ \x -> do
-                           g <- unsafeRead pl0 (ro + min (pw0-1) x)
-                           let o = (y*w + x)*4
-                           unsafeWrite img o g; unsafeWrite img (o+1) g; unsafeWrite img (o+2) g
-                           unsafeWrite img (o+3) 255
-                   | ncomp == 3 && f0 && f1 && f2 ->
-                       rowsWith $ \y -> do
-                         let r0 = rowOf ya0 pw0 y; r1 = rowOf ya1 pw1 y; r2 = rowOf ya2 pw2 y
-                         forLoop 0 (w-1) $ \x -> do
-                           yf  <- rdDU pl0 (r0 + min (pw0-1) x)
-                           cbv <- rdDU pl1 (r1 + min (pw1-1) x)
-                           crv <- rdDU pl2 (r2 + min (pw2-1) x)
-                           ycc ((y*w + x)*4) yf cbv crv
-                   | ncomp == 3 && f0 && not f1 && not f2 -> do
-                       -- Subsampled chroma: the horizontal half of each
-                       -- bilinear sample depends only on the source row, so
-                       -- each source row is interpolated across once into a
-                       -- row buffer (two per component, reused as the output
-                       -- rows advance) and the per-pixel work is the vertical
-                       -- blend. Same expressions, same operands, so the
-                       -- samples are bit-identical to 'jSample'.
-                       let hrow pl pw xa xb xd cache r slot =
-                             forLoop 0 (w-1) $ \x -> do
-                               let !x0 = xa `unsafeAt` x; !x1 = xb `unsafeAt` x; !dx = xd `unsafeAt` x
-                               p0 <- rdDU pl (r*pw + x0); p1 <- rdDU pl (r*pw + x1)
-                               unsafeWrite cache (slot*w + x) (p0 + (p1-p0)*dx)
-                           -- The slot (0/1) holding source row r,
-                           -- interpolating it into the slot that does not
-                           -- hold @keep@ if neither has it.
-                           slotFor pl pw xa xb xd cache t r keep = do
-                             a0 <- unsafeRead tags t; a1 <- unsafeRead tags (t+1)
-                             if | a0 == r -> pure 0
-                                | a1 == r -> pure 1
-                                | otherwise -> do
-                                    let sl = if a0 == keep then 1 else 0
-                                    hrow pl pw xa xb xd cache r sl
-                                    unsafeWrite tags (t+sl) r
-                                    pure sl
-                       rowsWith $ \y -> do
-                         let r0 = rowOf ya0 pw0 y
-                             ya1' = ya1 `unsafeAt` y; yb1' = yb1 `unsafeAt` y; dy1 = yd1 `unsafeAt` y
-                             ya2' = ya2 `unsafeAt` y; yb2' = yb2 `unsafeAt` y; dy2 = yd2 `unsafeAt` y
-                         t1 <- slotFor pl1 pw1 xa1 xb1 xd1 cache1 0 ya1' yb1'
-                         b1 <- slotFor pl1 pw1 xa1 xb1 xd1 cache1 0 yb1' ya1'
-                         t2 <- slotFor pl2 pw2 xa2 xb2 xd2 cache2 2 ya2' yb2'
-                         b2 <- slotFor pl2 pw2 xa2 xb2 xd2 cache2 2 yb2' ya2'
-                         let o1t = t1*w; o1b = b1*w; o2t = t2*w; o2b = b2*w
-                         forLoop 0 (w-1) $ \x -> do
-                           yf <- rdDU pl0 (r0 + min (pw0-1) x)
-                           tc <- unsafeRead cache1 (o1t + x); bc <- unsafeRead cache1 (o1b + x)
-                           tr <- unsafeRead cache2 (o2t + x); br <- unsafeRead cache2 (o2b + x)
-                           ycc ((y*w + x)*4) yf (tc + (bc-tc)*dy1) (tr + (br-tr)*dy2)
-                   | ncomp == 1 ->
-                       rowsWith $ \y -> forLoop 0 (w-1) $ \x -> do
-                         yv <- jSample pw0 ph0 pl0 f0 xa0 xb0 xd0 ya0 yb0 yd0 x y
-                         let g = clamp8 (roundD yv) in putRGBA img w x y g g g 255
-                   | otherwise ->
-                       rowsWith $ \y -> forLoop 0 (w-1) $ \x -> do
-                         yf  <- jSample pw0 ph0 pl0 f0 xa0 xb0 xd0 ya0 yb0 yd0 x y
-                         cbv <- jSample pw1 ph1 pl1 f1 xa1 xb1 xd1 ya1 yb1 yd1 x y
-                         crv <- jSample pw2 ph2 pl2 f2 xa2 xb2 xd2 ya2 yb2 yd2 x y
-                         ycc ((y*w + x)*4) yf cbv crv
+                forLoop y0 (y1-1) $ \y -> do
+                  sync y
+                  let !io = y*w*4
+                  o0 <- prep s0 y
+                  case kernel of
+                    k | k == kGray -> cvtGray False img io w (srcOf s0) o0
+                      | k == kRaw1 -> cvtGray True img io w (srcOf s0) o0
+                      | otherwise -> do
+                          o1 <- prep s1 y
+                          o2 <- prep s2 y
+                          if | k == kYcc -> cvtYcc img io w (srcOf s0) o0 (srcOf s1) o1 (srcOf s2) o2 jYccTab
+                             | k == kRgb -> cvtRgb img io w (srcOf s0) o0 (srcOf s1) o1 (srcOf s2) o2
+                             | otherwise -> do
+                                 o3 <- prep s3 y
+                                 cvtFour (k - kFour 0) img io w (srcOf s0) o0 (srcOf s1) o1
+                                         (srcOf s2) o2 (srcOf s3) o3 jYccTab
           pure runRange
     -- The output image, unfilled: the fill is dead work, since every
     -- conversion branch writes all four bytes of every pixel (w, h >= 1 and
     -- the component count is 1, 3 or 4, by 'jpegFrame').
     let newImg = unsafeNewArray_ (0, max 0 (w * h * 4 - 1)) :: ST s (STUArray s Int Word8)
-        quantNow = mapM (\c -> readArray quantT (jcTq c)) comps
+        -- Each component's table as latched by its first scan; one no scan
+        -- codes has only zero coefficients, so any table gives the same.
+        quantNow = forM (zip [0 ..] comps) $ \(ci, c) ->
+          readArray latched ci >>= maybe (readArray quantT (jcTq c)) pure
     -- Parallel reconstruction: the picture is cut into bands of kB MCU
     -- rows, each reconstructed and converted by its own reconstruction
     -- state on a worker ('Cmedit.JxlPar.parOrdered'), writing only its own
-    -- output rows. A band also reconstructs the subsampled components of
-    -- the MCU row above it and the one below (centred upsampling reads one
-    -- chroma row past each edge), the same computation the neighbouring
-    -- band does, so every sample is bit-identical to the sequential pass.
+    -- output rows. A band also reconstructs the components whose
+    -- upsampling filters vertically ('juHalo': the 2x2 and 1x2 triangle
+    -- filters read one component row past each edge) for the MCU row above
+    -- it and the one below, the same computation the neighbouring band
+    -- does, so every sample is bit-identical to the sequential pass.
     -- One capability, or a picture too small to be worth it, runs the
     -- sequential code exactly as it was.
     nwAll <- unsafeIOToST parWorkers
@@ -2127,9 +2205,8 @@ decodeJpegST allowPar mode bs w h comps = do
         -- calling thread rather than by whichever worker reaches it first.
         forceShared qtbls = do
           forM_ qtbls $ \q -> q `seq` pure ()
-          forM_ compTabs $ \(f, xa, xb, xd, ya, yb, yd) ->
-            f `seq` xa `seq` xb `seq` xd `seq` ya `seq` yb `seq` yd `seq` pure ()
-          forM_ needs $ \(nt, v) -> nt `seq` v `seq` pure ()
+          forM_ ups $ \u -> u `seq` pure ()
+          jYccTab `seq` pure ()
           forM_ compInfo $ \(a, b, c, d) -> a `seq` b `seq` c `seq` d `seq` pure ()
         noFetch :: Int -> ST s ()
         noFetch _ = pure ()
@@ -2266,22 +2343,28 @@ jpegNextMarker bs = go
 -- pulled in one MCU row at a time by reconstruction, never holding the
 -- whole image's coefficients) and get exactly what the whole-image path
 -- gets. That path decodes every scan into whole-image buffers and then
--- dequantises with the tables as they stand at the end of the walk, so
--- streaming is legal only when one scan is the whole story. Mirroring
--- the decoder's marker walk to its first scan, all of these must hold:
+-- reconstructs, so streaming is legal only when one scan is the whole
+-- story. (Quantisation tables are latched by a component's first scan, so
+-- a DQT after the scan changes nothing on either path.) Mirroring the
+-- decoder's marker walk to its first scan, all of these must hold:
 --
 -- 1. The frame (the first SOF, as 'findFrame' reads it) is baseline or
 --    extended sequential (C0/C1), and comes before the scan.
 -- 2. The scan writes MCU row m's coefficients while reading row m: it is
---    interleaved (any number of matched components but one), or the frame
+--    interleaved (any number of coded components but one), or the frame
 --    is one component, whose block rows m*V .. m*V+V-1 are MCU row m.
--- 3. Nothing after the scan can change the output: no later scan (SOS) and
---    no later quantisation table (DQT) is ever reached. With no restart
---    interval the reader never passes a marker, so the walk resumes at the
---    first non-RST marker after the scan header ('jpegNextMarker'), and the
---    rest of the walk is followed from there to EOI. With one, the restart
---    search can jump over markers in a corrupt file, so no FF DA or FF DB
---    pair may appear anywhere after the scan header.
+-- 3. No later scan (SOS) is ever reached. The reader never loads past a
+--    marker, so with no restart interval the walk resumes at M, the first
+--    non-RST marker after the scan header ('jpegNextMarker'), and the rest
+--    of the walk is followed from there to EOI. With one, a restart search
+--    (from wherever the reader stopped, at or before M until a search has
+--    passed M) jumps to just past the next RST pair, over any markers
+--    between. One that lands at or before M leaves the walk resuming at M,
+--    as before; one that passes M lands past R, the first RST pair at or
+--    after M, and every scan the walk can then reach starts at an FF DA
+--    pair after R. So: the walk from M reaches no SOS, and, with a restart
+--    interval, there is no FF DA pair after R (which holds outright in a
+--    valid file, where no RST follows the scan's data).
 jpegStreamable :: BS.ByteString -> [JComp] -> Bool
 jpegStreamable bs comps = go 2 False 0
   where
@@ -2303,15 +2386,10 @@ jpegStreamable bs comps = go 2 False 0
             else if not sof && (m == 0xC0 || m == 0xC1) then go next True dri
             else if not sof && m == 0xC2 then False
             else go next sof dri
-    shapeOK seg =
-      let ns = at bs seg
-          ids = [ at bs (seg+1+2*i) | i <- [0 .. ns-1] ]
-          matched = length [ () | cs <- ids, c <- comps, jcId c == cs ]
-      in matched /= 1 || length comps == 1
-    afterScan next dri
-      | dri == 0  = rest (jpegNextMarker bs next)
-      | otherwise = noPair next
-    -- The walk after the scan: anything but SOS / DQT until EOI.
+    shapeOK seg = length (jpegScanComps bs seg comps) /= 1 || length comps == 1
+    afterScan next dri =
+      let m0 = jpegNextMarker bs next in rest m0 && (dri == 0 || noScan (findRST bs m0))
+    -- The walk after the scan: anything but SOS until EOI.
     rest !p
       | p + 1 >= n = True
       | at bs p /= 0xFF = rest (p+1)
@@ -2320,12 +2398,41 @@ jpegStreamable bs comps = go 2 False 0
           if m == 0xFF then rest (p+1)
           else if m == 0xD9 then True
           else if m == 0xD8 || (m >= 0xD0 && m <= 0xD7) then rest (p+2)
-          else if m == 0xDA || m == 0xDB then False
+          else if m == 0xDA then False
           else rest (p+2+be16 bs (p+2))
-    noPair !p = case BS.elemIndex 0xFF (BS.drop p bs) of
+    -- No FF DA pair at or after p.
+    noScan !p = case BS.elemIndex 0xFF (BS.drop p bs) of
       Nothing -> True
-      Just i  -> let q = p + i; m = at bs (q+1)
-                 in not (m == 0xDA || m == 0xDB) && noPair (q+1)
+      Just i  -> let q = p + i in at bs (q+1) /= 0xDA && noScan (q+1)
+
+-- | The frame components a scan header (the SOS segment's payload at @seg@)
+-- codes, as (frame component index, DC table, AC table), by libjpeg's rule
+-- (@get_sos@): each selector names the first frame component with that id
+-- not already named by an earlier one, and at most four are read (T.81's
+-- limit). libjpeg refuses a header that breaks the rules; here a selector
+-- naming nothing new is dropped, so a corrupt header decodes to noise, but
+-- a scan never codes a component twice and never more than four, which is
+-- what bounds its work (255 selectors matching four components sharing one
+-- id made 1020 blocks an MCU). Table selectors are masked to 0..3 (a no-op
+-- for any valid file) so they never index outside the tables.
+--
+-- INLINE because 'decodeJpegST' calls it (twice, through the scan setup and
+-- 'jpegStreamable'): a call that passed the ByteString to an out-of-line
+-- function would make GHC's boxity analysis keep @bs@ boxed in the decoder's
+-- worker, and every byte read in the entropy loops then pays for it
+-- (measured: the entropy stage 10-15% slower, the whole decode 4-12%).
+{-# INLINE jpegScanComps #-}
+jpegScanComps :: BS.ByteString -> Int -> [JComp] -> [(Int, Int, Int)]
+jpegScanComps bs seg comps = pick [] [0 .. min 4 (at bs seg) - 1]
+  where
+    pick _ [] = []
+    pick used (i : is) =
+      let o = seg + 1 + 2 * i
+          cs = at bs o
+          tdta = at bs (o + 1)
+      in case [ ci | (ci, c) <- zip [0 ..] comps, jcId c == cs, ci `notElem` used ] of
+           ci : _ -> (ci, (tdta `shiftR` 4) .&. 3, tdta .&. 3) : pick (ci : used) is
+           []     -> pick used is
 
 -- Zero a coefficient buffer.
 zeroCoefs :: STUArray s Int Int16 -> ST s ()
@@ -2346,151 +2453,502 @@ zip5 :: [a] -> [b] -> [c] -> [d] -> [e] -> [(a, b, c, d, e)]
 zip5 (a:as) (b:bs) (c:cs) (d:ds) (e:es) = (a, b, c, d, e) : zip5 as bs cs ds es
 zip5 _ _ _ _ _ = []
 
--- Dequantise and inverse-transform one block row of one component into its
--- ring: blocks 0 .. pw/8-1 (a plane is exactly its blocks wide), whose
--- coefficients start at cOff and whose samples land at ring row gy0.
--- Top-level, with every array an argument: as a local loop over arrays
--- reached through the reconstruction state's tuples, each coefficient read
--- re-examined its array (18% slower IDCT, measured). Nine arguments on
--- purpose: past GHC's worker-argument limit nothing would be unboxed.
+------------------------------------------------------------------------------
+-- JPEG reconstruction kernels: the inverse DCT, chroma upsampling and colour
+-- conversion, in integers, arranged so the output is bit-identical to
+-- libjpeg-turbo's default decode (accurate integer IDCT, "fancy"
+-- upsampling, table colour conversion; 'docs/plans/bench/jpegcheck.sh' holds
+-- the decoder to that, and 'docs/plans/bench/jpeg_ref.py' is the same
+-- arithmetic as an executable specification). Each kernel is written from
+-- the published algorithm it cites; matching libjpeg means making the same
+-- arithmetic choices (rounding, precision, edge handling), which are stated
+-- at each kernel.
 --
--- Rows of coefficients that are all zero are skipped in both passes, and
--- that is exact, not an approximation: such a row's row-pass output is +0.0
--- throughout, so its terms in a column sum are all ±0.0, and adding ±0.0 to
--- an accumulator that starts at +0.0 can never change it (it is never -0.0:
--- only an exact cancellation reaches zero, and that rounds to +0.0). Most
--- blocks of a photo have one or two non-zero rows.
+-- Every kernel works on bare byte arrays: the entry points take their arrays
+-- by constructor pattern, so a worker receives only the 'MutableByteArray#'
+-- (the bounds are absent and dropped) and stays inside GHC's worker-argument
+-- limit with every 'Int' unboxed. The element accessors below ignore bounds,
+-- which 'unsafeRead'/'unsafeWrite' never consult anyway; every index is in
+-- range by construction, as each caller notes.
+
+{-# INLINE rdW8 #-}
+rdW8 :: forall s. MutableByteArray# s -> Int -> ST s Int
+rdW8 m i = do v <- unsafeRead (STUArray 0 0 0 m :: STUArray s Int Word8) i; pure (fromIntegral v)
+
+{-# INLINE wrW8 #-}
+wrW8 :: forall s. MutableByteArray# s -> Int -> Int -> ST s ()
+wrW8 m i v = unsafeWrite (STUArray 0 0 0 m :: STUArray s Int Word8) i (fromIntegral v)
+
+{-# INLINE rdI16 #-}
+rdI16 :: forall s. MutableByteArray# s -> Int -> ST s Int
+rdI16 m i = do v <- unsafeRead (STUArray 0 0 0 m :: STUArray s Int Int16) i; pure (fromIntegral v)
+
+{-# INLINE rdW64 #-}
+rdW64 :: forall s. MutableByteArray# s -> Int -> ST s Word64
+rdW64 m i = unsafeRead (STUArray 0 0 0 m :: STUArray s Int Word64) i
+
+{-# INLINE wrW64 #-}
+wrW64 :: forall s. MutableByteArray# s -> Int -> Word64 -> ST s ()
+wrW64 m i v = unsafeWrite (STUArray 0 0 0 m :: STUArray s Int Word64) i v
+
+{-# INLINE rdInt #-}
+rdInt :: forall s. MutableByteArray# s -> Int -> ST s Int
+rdInt m i = unsafeRead (STUArray 0 0 0 m :: STUArray s Int Int) i
+
+{-# INLINE wrInt #-}
+wrInt :: forall s. MutableByteArray# s -> Int -> Int -> ST s ()
+wrInt m i v = unsafeWrite (STUArray 0 0 0 m :: STUArray s Int Int) i v
+
+{-# INLINE tabAt #-}
+tabAt :: ByteArray# -> Int -> Int
+tabAt b i = unsafeAt (UArray 0 0 0 b :: UArray Int Int) i
+
+-- Saturate to a sample: the value itself when it is already 0..255.
+{-# INLINE sat8 #-}
+sat8 :: Int -> Int
+sat8 y | y .&. complement 255 == 0 = y
+       | y < 0 = 0
+       | otherwise = 255
+
+-- | The 8-point one-dimensional inverse DCT of Loeffler, Ligtenberg and
+-- Moschytz ("Practical fast 1-D DCT algorithms with 11 multiplications",
+-- ICASSP 1989), in fixed point, handing its eight outputs (in order) to the
+-- continuation. The even half (inputs 0, 2, 4, 6) is a butterfly of x0 and
+-- x4 plus one rotation by 6pi/16 of x2 and x6; the odd half (inputs 1, 3,
+-- 5, 7) is four butterflies sharing the 3pi/16 rotation; a final butterfly
+-- joins the halves. Each multiplier is its real value times 2^13, rounded to
+-- nearest (c_k = cos (k pi / 16)):
+--
+-- >  4433 = sqrt2 c6               6270 = sqrt2 (c2 - c6)
+-- > 15137 = sqrt2 (c2 + c6)        9633 = sqrt2 c3
+-- >  2446 = sqrt2 (c3 + c5 - c1 - c7)    16819 = sqrt2 (c1 + c3 - c5 + c7)
+-- > 25172 = sqrt2 (c1 + c3 + c5 - c7)    12299 = sqrt2 (c1 + c3 - c5 - c7)
+-- >  7373 = sqrt2 (c3 - c7)        20995 = sqrt2 (c1 + c3)
+-- > 16069 = sqrt2 (c3 + c5)         3196 = sqrt2 (c3 - c5)
+--
+-- The outputs carry 13 more fraction bits than the inputs, plus @bias@,
+-- which the caller sets to its rounding half (and any offset it wants
+-- applied before the shift): added once into the two even-part terms every
+-- output is built from, rather than into each of the eight outputs. Integer
+-- arithmetic is exact, so the order of the additions cannot matter; only the
+-- descale points, which are the callers', decide the result.
+{-# INLINE idct8 #-}
+idct8 :: Int -> Int -> Int -> Int -> Int -> Int -> Int -> Int -> Int
+      -> (Int -> Int -> Int -> Int -> Int -> Int -> Int -> Int -> r) -> r
+idct8 bias x0 x1 x2 x3 x4 x5 x6 x7 k =
+  let -- Even half.
+      !rot = (x2 + x6) * 4433
+      !e2 = rot - x6 * 15137
+      !e3 = rot + x2 * 6270
+      !e0 = ((x0 + x4) `unsafeShiftL` 13) + bias
+      !e1 = ((x0 - x4) `unsafeShiftL` 13) + bias
+      !a0 = e0 + e3
+      !a3 = e0 - e3
+      !a1 = e1 + e2
+      !a2 = e1 - e2
+      -- Odd half.
+      !s71 = x7 + x1
+      !s53 = x5 + x3
+      !s73 = x7 + x3
+      !s51 = x5 + x1
+      !rot3 = (s73 + s51) * 9633
+      !m71 = s71 * (-7373)
+      !m53 = s53 * (-20995)
+      !m73 = rot3 - s73 * 16069
+      !m51 = rot3 - s51 * 3196
+      !b0 = x7 * 2446 + m71 + m73
+      !b1 = x5 * 16819 + m53 + m51
+      !b2 = x3 * 25172 + m53 + m73
+      !b3 = x1 * 12299 + m71 + m51
+  in k (a0 + b3) (a1 + b2) (a2 + b1) (a3 + b0) (a3 - b0) (a2 - b1) (a1 - b2) (a0 - b3)
+
+-- The two-dimensional IDCT of T.81 A.3.3 is separable: 'idct8' down each
+-- column of the dequantised block, then along each row of the result. The
+-- column pass keeps two extra fraction bits (it descales by 13 - 2 = 11),
+-- the row pass descales by 13 + 2 + 3 = 18 (the 3 is the 2-D transform's
+-- factor 1/8), each descale rounds to nearest (half added, then an
+-- arithmetic shift), and the row pass applies the level shift of T.81 A.3.1
+-- (+128) and saturates to 0..255. A column (or row) whose inputs 1..7 are
+-- all zero has eight equal outputs, x0 << 2 for a column and
+-- (x0 + 16) >> 5 for a row: exactly what the full transform computes there,
+-- without the arithmetic.
+colBias, rowBias, rowDcBias :: Int
+colBias = 1 `unsafeShiftL` 10                                     -- half of 2^11
+rowBias = (1 `unsafeShiftL` 17) + (128 `unsafeShiftL` 18)         -- half of 2^18, plus the level shift
+rowDcBias = 16 + (128 `unsafeShiftL` 5)                           -- the same for (x0 + 16) >> 5
+
+-- Dequantise and transform one block's columns into the workspace (64
+-- Ints, row-major). @bo@ is the block's first coefficient (natural order,
+-- as the scan decoder stores them; the quantisation table is in natural
+-- order too).
+jIdctCols :: MutableByteArray# s -> ByteArray# -> MutableByteArray# s -> Int -> ST s ()
+jIdctCols c q ws !bo = go 0
+  where
+    go !x
+      | x > 7 = pure ()
+      | otherwise = do
+          let rd r = do v <- rdI16 c (bo + r*8 + x); pure (v * tabAt q (r*8 + x))
+              {-# INLINE rd #-}
+          x1 <- rd 1; x2 <- rd 2; x3 <- rd 3; x4 <- rd 4
+          x5 <- rd 5; x6 <- rd 6; x7 <- rd 7; x0 <- rd 0
+          if (x1 .|. x2 .|. x3 .|. x4 .|. x5 .|. x6 .|. x7) == 0
+            then do
+              let !d = x0 `unsafeShiftL` 2
+              wrInt ws x d; wrInt ws (8+x) d; wrInt ws (16+x) d; wrInt ws (24+x) d
+              wrInt ws (32+x) d; wrInt ws (40+x) d; wrInt ws (48+x) d; wrInt ws (56+x) d
+            else idct8 colBias x0 x1 x2 x3 x4 x5 x6 x7 $ \o0 o1 o2 o3 o4 o5 o6 o7 -> do
+              let wr r o = wrInt ws (r*8 + x) (o `unsafeShiftR` 11)
+                  {-# INLINE wr #-}
+              wr 0 o0; wr 1 o1; wr 2 o2; wr 3 o3; wr 4 o4; wr 5 o5; wr 6 o6; wr 7 o7
+          go (x + 1)
+
+-- Transform the workspace's rows into eight samples each, row r at plane
+-- offset po + r*pw.
+jIdctRows :: MutableByteArray# s -> MutableByteArray# s -> Int -> Int -> ST s ()
+jIdctRows ws pl !po !pw = go 0
+  where
+    go !r
+      | r > 7 = pure ()
+      | otherwise = do
+          let !o = r*8; !p = po + r*pw
+          x0 <- rdInt ws o;       x1 <- rdInt ws (o+1); x2 <- rdInt ws (o+2); x3 <- rdInt ws (o+3)
+          x4 <- rdInt ws (o+4);   x5 <- rdInt ws (o+5); x6 <- rdInt ws (o+6); x7 <- rdInt ws (o+7)
+          if (x1 .|. x2 .|. x3 .|. x4 .|. x5 .|. x6 .|. x7) == 0
+            then wrW64 pl (p `unsafeShiftR` 3) (spread8 (sat8 ((x0 + rowDcBias) `unsafeShiftR` 5)))
+            else idct8 rowBias x0 x1 x2 x3 x4 x5 x6 x7 $ \o0 o1 o2 o3 o4 o5 o6 o7 -> do
+              let wr i v = wrW8 pl (p + i) (sat8 (v `unsafeShiftR` 18))
+                  {-# INLINE wr #-}
+              wr 0 o0; wr 1 o1; wr 2 o2; wr 3 o3; wr 4 o4; wr 5 o5; wr 6 o6; wr 7 o7
+          go (r + 1)
+
+-- A byte in all eight lanes of a word (a row of eight equal samples).
+{-# INLINE spread8 #-}
+spread8 :: Int -> Word64
+spread8 v = fromIntegral v * 0x0101010101010101
+
+-- | Dequantise and inverse-transform one block row of one component into its
+-- ring: blocks 0 .. pw/8-1 (a plane is exactly its blocks wide), whose
+-- coefficients start at cOff and whose samples land at ring rows gy0 ..
+-- gy0+7. Every block lies inside the plane (planes are MCU-padded and a ring
+-- is a whole number of block rows high), so no write is checked, and every
+-- block's rows start at a multiple of 8 bytes (pw is), so a row can be
+-- written as one word.
+--
+-- Each block is classified from its 128 bytes read as sixteen words (a
+-- block's offset is a multiple of 64 coefficients, so they are aligned):
+-- when rows 1..7 are all zero every column is a constant column, so the
+-- workspace's eight rows are equal and the row transform is done once and
+-- copied; when only the DC remains the block is one value,
+-- (DC * q + 4) >> 3 plus the level shift, which is what both passes give
+-- for it. Both are exact restatements of the full transform, and between
+-- them they cover most blocks of most photographs.
 jIdctBlockRow :: STUArray s Int Int16 -> UArray Int Int -> STUArray s Int Word8
-              -> STUArray s Int Double -> STUArray s Int Double
-              -> Int -> Int -> Int -> Int -> ST s ()
-jIdctBlockRow !coef !qtbl !plane !blk !tmp !pw !ph !cOff !gy0 =
-  forLoop 0 (pw `quot` 8 - 1) $ \bx -> do
-    let boff = cOff + bx*64
-        -- Dequantise, collecting a bit per row that has a non-zero.
-        deq !k !mask
-          | k > 63 = pure mask
-          | otherwise = do
-              -- Unchecked: boff+k is inside the buffer (it holds this block
-              -- row, by 'CoefSrc') and every quantisation table is 0..63.
-              v <- fromIntegral <$> unsafeRead coef (boff+k)
-              unsafeWrite blk k (fromIntegral (v * (qtbl `unsafeAt` k)))
-              deq (k+1) (if v == 0 then mask
-                         else mask .|. (1 `shiftL` (k `shiftR` 3))
-                                   .|. (if k > 0 && k < 8 then 0x100 else 0))
-    mask <- deq 0 (0 :: Int)
-    if mask == 1
-      then do
-        -- DC only. Every row-pass output is then 0 + ct[0]*dc (the other
-        -- terms are ±0.0) and ct[k*8] is the same for every k, so all 64
-        -- samples are one value, computed by the same expressions.
-        dc <- readArray blk 0
-        let t = 0 + ctK 0 * dc
-            sm = 0 + ctK 0 * t
-            px = fromIntegral (clamp8 (roundD (0.25 * sm + 128)))
-        forLoop 0 7 $ \yy -> do
-          let gy = gy0 + yy
-          when (gy < ph) $ forLoop 0 7 $ \xx -> do
-            let gx = bx*8 + xx
-            when (gx < pw) $ unsafeWrite plane (gy*pw+gx) px
-      else do
-        jIdctRows blk tmp mask
-        jIdctCols tmp plane pw ph (bx*8) gy0
+              -> STUArray s Int Int -> Int -> Int -> Int -> ST s ()
+jIdctBlockRow (STUArray _ _ _ c) (UArray _ _ _ q) (STUArray _ _ _ pl) (STUArray _ _ _ ws) !pw !cOff !gy0 =
+  goB 0
+  where
+    !nb = pw `unsafeShiftR` 3
+    goB !bx
+      | bx >= nb = pure ()
+      | otherwise = do
+          jIdctBlock c q pl ws (cOff + bx*64) (gy0*pw + bx*8) pw
+          goB (bx + 1)
 
--- One component sample at output (x, y) from its precomputed tables (see
--- the upsampling note in 'decodeJpegImage'). Top-level and inlined, with
--- every input an argument: called per component per pixel, a closure here
--- would return a boxed Double each time.
-{-# INLINE jSample #-}
-jSample :: Int -> Int -> STUArray s Int Word8 -> Bool
-        -> UArray Int Int -> UArray Int Int -> UArray Int Double
-        -> UArray Int Int -> UArray Int Int -> UArray Int Double
-        -> Int -> Int -> ST s Double
-jSample !pw !_ph !plane !full !xa !xb !xd !ya !yb !yd !x !y
-  -- Unchecked reads: every index is clamped into the plane (pw >= 8, since
-  -- 'jpegFrame' holds sampling factors to 1..4) and the y tables hold rows
-  -- already reduced into the plane's ring.
-  | full = rdDU plane ((ya `unsafeAt` y) * pw + min (pw-1) x)
-  | otherwise = do
-      let !x0 = xa `unsafeAt` x; !x1 = xb `unsafeAt` x
-          !y0 = ya `unsafeAt` y; !y1 = yb `unsafeAt` y
-          !dx = xd `unsafeAt` x; !dy = yd `unsafeAt` y
-      !p00 <- rdDU plane (y0*pw+x0); !p10 <- rdDU plane (y0*pw+x1)
-      !p01 <- rdDU plane (y1*pw+x0); !p11 <- rdDU plane (y1*pw+x1)
-      let !top = p00 + (p10-p00)*dx; !bot = p01 + (p11-p01)*dx
-      pure (top + (bot-top)*dy)
-
--- The two IDCT passes, straight-line over each row/column so no per-sample
--- loop closure is left behind. Every sum adds its terms in the original
--- order starting from 0, so the result is bit-identical to the loop form.
--- Rows: tmp[v*8+xx] = sum_u ct[xx*8+u] * blk[v*8+u]. A row outside @mask@
--- is all zero, and its outputs are +0.0 exactly (0 plus terms of ±0.0), so
--- it is written as zeros without the arithmetic. The eight outputs of a row
--- are unrolled: as an inner loop, its closure (holding the eight inputs) was
--- allocated afresh for every row.
-jIdctRows :: STUArray s Int Double -> STUArray s Int Double -> Int -> ST s ()
-jIdctRows blk tmp mask = forLoop 0 7 $ \v -> do
-  let o = v*8
-  if not (testBit mask v)
-    then forLoop o (o+7) $ \i -> unsafeWrite tmp i 0
+jIdctBlock :: MutableByteArray# s -> ByteArray# -> MutableByteArray# s -> MutableByteArray# s
+           -> Int -> Int -> Int -> ST s ()
+jIdctBlock c q pl ws !bo !po !pw = do
+  let !wb = bo `unsafeShiftR` 2
+      rw i = rdW64 c (wb + i)
+      {-# INLINE rw #-}
+  w2 <- rw 2;   w3 <- rw 3;   w4 <- rw 4;   w5 <- rw 5;   w6 <- rw 6;   w7 <- rw 7
+  w8 <- rw 8;   w9 <- rw 9;   w10 <- rw 10; w11 <- rw 11; w12 <- rw 12; w13 <- rw 13
+  w14 <- rw 14; w15 <- rw 15
+  if (w2 .|. w3 .|. w4 .|. w5 .|. w6 .|. w7 .|. w8 .|. w9 .|. w10 .|. w11 .|. w12
+        .|. w13 .|. w14 .|. w15) /= 0
+    then jIdctCols c q ws bo >> jIdctRows ws pl po pw
     else do
-      b0 <- unsafeRead blk o;       b1 <- unsafeRead blk (o+1)
-      b2 <- unsafeRead blk (o+2);   b3 <- unsafeRead blk (o+3)
-      b4 <- unsafeRead blk (o+4);   b5 <- unsafeRead blk (o+5)
-      b6 <- unsafeRead blk (o+6);   b7 <- unsafeRead blk (o+7)
-      let out xx =
-            let c i = ctK (xx*8+i)
-            in unsafeWrite tmp (o+xx)
-                 (0 + c 0*b0 + c 1*b1 + c 2*b2 + c 3*b3 + c 4*b4 + c 5*b5 + c 6*b6 + c 7*b7)
-          {-# INLINE out #-}
-      out 0; out 1; out 2; out 3; out 4; out 5; out 6; out 7
+      -- Row 0 alone: its coefficients 4..7 are word 1, 1..3 read singly
+      -- (endian-neutral: no lane masking).
+      w1 <- rw 1
+      a1 <- rdI16 c (bo + 1); a2 <- rdI16 c (bo + 2); a3 <- rdI16 c (bo + 3)
+      dc <- rdI16 c bo
+      let !wi = po `unsafeShiftR` 3; !ws8 = pw `unsafeShiftR` 3
+          fillRows v = do
+            wrW64 pl (wi + ws8)   v; wrW64 pl (wi + 2*ws8) v; wrW64 pl (wi + 3*ws8) v
+            wrW64 pl (wi + 4*ws8) v; wrW64 pl (wi + 5*ws8) v; wrW64 pl (wi + 6*ws8) v
+            wrW64 pl (wi + 7*ws8) v
+          {-# INLINE fillRows #-}
+      if w1 == 0 && (a1 .|. a2 .|. a3) == 0
+        then do
+          let !v = spread8 (sat8 ((dc * tabAt q 0 + 4 + (128 `unsafeShiftL` 3)) `unsafeShiftR` 3))
+          wrW64 pl wi v
+          fillRows v
+        else do
+          -- Every column is constant at its row-0 input << 2; one row pass.
+          let col k = do v <- rdI16 c (bo + k); pure ((v * tabAt q k) `unsafeShiftL` 2)
+              {-# INLINE col #-}
+          x0 <- col 0; x1 <- col 1; x2 <- col 2; x3 <- col 3
+          x4 <- col 4; x5 <- col 5; x6 <- col 6; x7 <- col 7
+          idct8 rowBias x0 x1 x2 x3 x4 x5 x6 x7 $ \o0 o1 o2 o3 o4 o5 o6 o7 -> do
+            let wr i v = wrW8 pl (po + i) (sat8 (v `unsafeShiftR` 18))
+                {-# INLINE wr #-}
+            wr 0 o0; wr 1 o1; wr 2 o2; wr 3 o3; wr 4 o4; wr 5 o5; wr 6 o6; wr 7 o7
+          v <- rdW64 pl wi
+          fillRows v
 
--- Columns: out[yy][xx] = 0.25 * sum_v ct[yy*8+v] * tmp[v*8+xx], written into
--- the plane where it lies inside it; the eight outputs are unrolled for the
--- same reason as the rows. (Dropping the trailing zero rows' terms is exact
--- too, but four specialised copies measured slower: the call sites boxed.)
-jIdctCols :: STUArray s Int Double -> STUArray s Int Word8 -> Int -> Int
-          -> Int -> Int -> ST s ()
-jIdctCols tmp plane pw ph gx0 gy0 = forLoop 0 7 $ \xx -> do
-  let gx = gx0 + xx
-  when (gx < pw) $ do
-    t0 <- unsafeRead tmp xx;        t1 <- unsafeRead tmp (8+xx)
-    t2 <- unsafeRead tmp (16+xx);   t3 <- unsafeRead tmp (24+xx)
-    t4 <- unsafeRead tmp (32+xx);   t5 <- unsafeRead tmp (40+xx)
-    t6 <- unsafeRead tmp (48+xx);   t7 <- unsafeRead tmp (56+xx)
-    let out yy =
-          let gy = gy0 + yy
-              c v = ctK (yy*8+v)
-              sm = 0 + c 0*t0 + c 1*t1 + c 2*t2 + c 3*t3 + c 4*t4 + c 5*t5 + c 6*t6 + c 7*t7
-          in when (gy < ph) $
-               unsafeWrite plane (gy*pw+gx) (fromIntegral (clamp8 (roundD (0.25 * sm + 128))))
-        {-# INLINE out #-}
-    out 0; out 1; out 2; out 3; out 4; out 5; out 6; out 7
+-- | Chroma upsampling: the triangle (linear-interpolation) filter for
+-- chroma sited midway between luma samples, which is JFIF's (T.871) and
+-- T.81's default siting: an output sample a quarter of the way between two
+-- input samples weighs them 3/4 and 1/4, per axis, so 9, 3, 3, 1 sixteenths
+-- in two dimensions. Samples past an edge replicate the edge sample (the
+-- true downsampled width @dw@, never the MCU padding), and the result is
+-- rounded to 8 bits before colour conversion. The rounding offsets alternate
+-- between the two outputs of each input (1 and 2 of 4 in one dimension; 8
+-- and 7 of 16 in two) so the rounding error does not bias the picture. These
+-- are libjpeg's "fancy upsampling" choices. Used only where libjpeg uses
+-- them: 2x1 and 2x2 when the component is more than two samples wide, and
+-- 1x2; every other ratio replicates ('upBox').
+--
+-- 2x1: input row at po, dw samples, into 2*dw outputs.
+upH2V1 :: STUArray s Int Word8 -> Int -> Int -> STUArray s Int Word8 -> ST s ()
+upH2V1 (STUArray _ _ _ pl) !po !dw (STUArray _ _ _ out) = do
+  c0 <- rdW8 pl po
+  let go !i !l !c
+        | i >= dw - 1 = do
+            wrW8 out (2*i)     ((3*c + l + 1) `unsafeShiftR` 2)
+            wrW8 out (2*i + 1) c
+        | otherwise = do
+            n <- rdW8 pl (po + i + 1)
+            wrW8 out (2*i)     ((3*c + l + 1) `unsafeShiftR` 2)
+            wrW8 out (2*i + 1) ((3*c + n + 2) `unsafeShiftR` 2)
+            go (i + 1) c n
+  go 0 c0 c0
 
--- 'round' (to nearest, ties to even) for Double -> Int, inline: the library
--- version is an out-of-line call per sample, and the decoder rounds about
--- four times per pixel. Exact for any |x| < 2^52, where x - truncate x is
--- computed without error; JPEG samples are a few thousand at most.
-{-# INLINE roundD #-}
-roundD :: Double -> Int
-roundD x =
-  let n = truncate x :: Int
-      r = x - fromIntegral n
-  in if | r > 0.5   -> n + 1
-        | r < -0.5  -> n - 1
-        | r == 0.5  -> if even n then n else n + 1
-        | r == -0.5 -> if even n then n else n - 1
-        | otherwise -> n
+-- 2x2: the output row between input rows near (at no, weight 3/4) and far
+-- (at fo, 1/4): the vertical sums 3*near + far, then the same horizontal
+-- filter over them, in sixteenths.
+upH2V2 :: STUArray s Int Word8 -> Int -> Int -> Int -> STUArray s Int Word8 -> ST s ()
+upH2V2 (STUArray _ _ _ pl) !no !fo !dw (STUArray _ _ _ out) = do
+  let col i = do a <- rdW8 pl (no + i); b <- rdW8 pl (fo + i); pure (3*a + b)
+      {-# INLINE col #-}
+  t0 <- col 0
+  let go !i !l !t
+        | i >= dw - 1 = do
+            wrW8 out (2*i)     ((3*t + l + 8) `unsafeShiftR` 4)
+            wrW8 out (2*i + 1) ((4*t + 7) `unsafeShiftR` 4)
+        | otherwise = do
+            n <- col (i + 1)
+            wrW8 out (2*i)     ((3*t + l + 8) `unsafeShiftR` 4)
+            wrW8 out (2*i + 1) ((3*t + n + 7) `unsafeShiftR` 4)
+            go (i + 1) t n
+  go 0 t0 t0
+
+-- 1x2: n outputs, 3/4 near plus 1/4 far, rounding offset @bias@ (1 for the
+-- upper output row of a pair, whose far row is above; 2 for the lower).
+upH1V2 :: STUArray s Int Word8 -> Int -> Int -> Int -> Int -> STUArray s Int Word8 -> ST s ()
+upH1V2 (STUArray _ _ _ pl) !no !fo !n !bias (STUArray _ _ _ out) = go 0
+  where
+    go !x | x >= n = pure ()
+          | otherwise = do
+              a <- rdW8 pl (no + x); b <- rdW8 pl (fo + x)
+              wrW8 out x ((3*a + b + bias) `unsafeShiftR` 2)
+              go (x + 1)
+
+-- Replication (box) upsampling of one row: output x takes input
+-- (x * num) `quot` den, which for an integral ratio he = den/num is x / he.
+-- A fractional ratio (which libjpeg refuses) replicates by the same rule.
+upBox :: STUArray s Int Word8 -> Int -> Int -> Int -> Int -> STUArray s Int Word8 -> ST s ()
+upBox (STUArray _ _ _ pl) !po !num !den !n (STUArray _ _ _ out) = go 0
+  where
+    go !x | x >= n = pure ()
+          | otherwise = do
+              v <- rdW8 pl (po + (x * num) `quot` den)
+              wrW8 out x v
+              go (x + 1)
+
+-- | YCbCr to RGB (JFIF 1.02: R = Y + 1.402 Cr', G = Y - 0.34414 Cb' -
+-- 0.71414 Cr', B = Y + 1.772 Cb', with Cb' = Cb - 128 and Cr' = Cr - 128),
+-- by table: each product is the coefficient in 16-bit fixed point (rounded
+-- to nearest) times the chroma value. R and B round each term to an
+-- integer; G sums its two terms and one half and shifts once. Layout:
+-- [0..255] Cr -> R term, [256..511] Cb -> B term, [512..767] Cr -> G
+-- product, [768..1023] Cb -> G product plus the half.
+jYccTab :: UArray Int Int
+jYccTab = U.listArray (0, 1023) (map crR xs ++ map cbB xs ++ map crG xs ++ map cbG xs)
+  where
+    xs = [-128 .. 127] :: [Int]
+    fix16 :: Double -> Int
+    fix16 c = floor (c * 65536 + 0.5)
+    half = 1 `shiftL` 15
+    crR x = (fix16 1.402 * x + half) `shiftR` 16
+    cbB x = (fix16 1.772 * x + half) `shiftR` 16
+    crG x = negate (fix16 0.71414) * x
+    cbG x = negate (fix16 0.34414) * x + half
+
+-- Store pixel x of the output row at byte io (a multiple of 4) as one
+-- 32-bit word, bytes in memory order c0 c1 c2 c3 whatever the host's byte
+-- order. (Measured 10-15 ms faster than four byte stores on a 28-megapixel
+-- picture.)
+{-# INLINE wrPx #-}
+wrPx :: forall s. MutableByteArray# s -> Int -> Int -> Int -> Int -> Int -> Int -> ST s ()
+wrPx img io x c0 c1 c2 c3 =
+  unsafeWrite (STUArray 0 0 0 img :: STUArray s Int Word32) ((io `unsafeShiftR` 2) + x) (fromIntegral px)
+  where
+    px = case targetByteOrder of
+      LittleEndian -> c0 .|. (c1 `unsafeShiftL` 8) .|. (c2 `unsafeShiftL` 16) .|. (c3 `unsafeShiftL` 24)
+      BigEndian    -> (c0 `unsafeShiftL` 24) .|. (c1 `unsafeShiftL` 16) .|. (c2 `unsafeShiftL` 8) .|. c3
+
+-- One output row of RGBA (at byte io, w pixels) from component rows, each
+-- given as an array and the offset of the row's first sample in it.
+cvtYcc :: STUArray s Int Word8 -> Int -> Int -> STUArray s Int Word8 -> Int
+       -> STUArray s Int Word8 -> Int -> STUArray s Int Word8 -> Int -> UArray Int Int -> ST s ()
+cvtYcc (STUArray _ _ _ img) !io !w (STUArray _ _ _ s0) !o0 (STUArray _ _ _ s1) !o1
+       (STUArray _ _ _ s2) !o2 (UArray _ _ _ t) = go 0
+  where
+    go !x | x >= w = pure ()
+          | otherwise = do
+              y <- rdW8 s0 (o0 + x); cb <- rdW8 s1 (o1 + x); cr <- rdW8 s2 (o2 + x)
+              wrPx img io x (sat8 (y + tabAt t cr))
+                            (sat8 (y + ((tabAt t (768 + cb) + tabAt t (512 + cr)) `unsafeShiftR` 16)))
+                            (sat8 (y + tabAt t (256 + cb))) 255
+              go (x + 1)
+
+-- Three components that already are R, G and B (no colour transform).
+cvtRgb :: STUArray s Int Word8 -> Int -> Int -> STUArray s Int Word8 -> Int
+       -> STUArray s Int Word8 -> Int -> STUArray s Int Word8 -> Int -> ST s ()
+cvtRgb (STUArray _ _ _ img) !io !w (STUArray _ _ _ s0) !o0 (STUArray _ _ _ s1) !o1
+       (STUArray _ _ _ s2) !o2 = go 0
+  where
+    go !x | x >= w = pure ()
+          | otherwise = do
+              r <- rdW8 s0 (o0 + x); g <- rdW8 s1 (o1 + x); b <- rdW8 s2 (o2 + x)
+              wrPx img io x r g b 255
+              go (x + 1)
+
+-- One component: grey for display (v, v, v, 255), or a raw sample
+-- (v, 255, 255, 255).
+cvtGray :: Bool -> STUArray s Int Word8 -> Int -> Int -> STUArray s Int Word8 -> Int -> ST s ()
+cvtGray !raw (STUArray _ _ _ img) !io !w (STUArray _ _ _ s0) !o0 = go 0
+  where
+    go !x | x >= w = pure ()
+          | otherwise = do
+              g <- rdW8 s0 (o0 + x)
+              let !gb = if raw then 255 else g
+              wrPx img io x g gb gb 255
+              go (x + 1)
+
+-- Four components. @fl@: bit 0 applies the YCCK transform (the YCbCr one,
+-- then C, M, Y = 255 - R, G, B; K passes through), bit 1 converts to RGB
+-- for display, bit 2 says the file is Adobe-inverted (0 = full ink). For
+-- display the ink amounts go through the multiplicative R = (1 - C)(1 - K)
+-- (ImageMagick's; Pillow's identical rounding), otherwise the samples are
+-- stored as they are.
+cvtFour :: Int -> STUArray s Int Word8 -> Int -> Int -> STUArray s Int Word8 -> Int
+        -> STUArray s Int Word8 -> Int -> STUArray s Int Word8 -> Int
+        -> STUArray s Int Word8 -> Int -> UArray Int Int -> ST s ()
+cvtFour !fl img !io !w s0 !o0 s1 !o1 s2 !o2 s3 !o3 t =
+  -- One loop per flag combination, so the pixel loop tests none of them.
+  case fl .&. 7 of
+    0 -> cvtFourL False False False img io w s0 o0 s1 o1 s2 o2 s3 o3 t
+    1 -> cvtFourL True  False False img io w s0 o0 s1 o1 s2 o2 s3 o3 t
+    2 -> cvtFourL False True  False img io w s0 o0 s1 o1 s2 o2 s3 o3 t
+    3 -> cvtFourL True  True  False img io w s0 o0 s1 o1 s2 o2 s3 o3 t
+    4 -> cvtFourL False False True  img io w s0 o0 s1 o1 s2 o2 s3 o3 t
+    5 -> cvtFourL True  False True  img io w s0 o0 s1 o1 s2 o2 s3 o3 t
+    6 -> cvtFourL False True  True  img io w s0 o0 s1 o1 s2 o2 s3 o3 t
+    _ -> cvtFourL True  True  True  img io w s0 o0 s1 o1 s2 o2 s3 o3 t
+
+{-# INLINE cvtFourL #-}
+cvtFourL :: Bool -> Bool -> Bool -> STUArray s Int Word8 -> Int -> Int -> STUArray s Int Word8 -> Int
+         -> STUArray s Int Word8 -> Int -> STUArray s Int Word8 -> Int
+         -> STUArray s Int Word8 -> Int -> UArray Int Int -> ST s ()
+cvtFourL tr view inv (STUArray _ _ _ img) !io !w (STUArray _ _ _ s0) !o0 (STUArray _ _ _ s1) !o1
+         (STUArray _ _ _ s2) !o2 (STUArray _ _ _ s3) !o3 (UArray _ _ _ t) = go 0
+  where
+    go !x | x >= w = pure ()
+          | otherwise = do
+              v0 <- rdW8 s0 (o0 + x); v1 <- rdW8 s1 (o1 + x)
+              v2 <- rdW8 s2 (o2 + x); k0 <- rdW8 s3 (o3 + x)
+              let !c0 = if tr then 255 - sat8 (v0 + tabAt t v2) else v0
+                  !m0 = if tr then 255 - sat8 (v0 + ((tabAt t (768 + v1) + tabAt t (512 + v2)) `unsafeShiftR` 16)) else v1
+                  !y0 = if tr then 255 - sat8 (v0 + tabAt t (256 + v1)) else v2
+              if view
+                then do
+                  let ink v = if inv then 255 - v else v
+                      !nk = 255 - ink k0
+                      chan v = div255 ((255 - ink v) * nk)
+                  wrPx img io x (chan c0) (chan m0) (chan y0) 255
+                else wrPx img io x c0 m0 y0 k0
+              go (x + 1)
+
+-- A product of two bytes divided by 255, rounded to nearest: the same as
+-- @(p + 127) `quot` 255@ for every such product (checked on all 65 536),
+-- without the division.
+{-# INLINE div255 #-}
+div255 :: Int -> Int
+div255 p = let t = p + 128 in ((t `unsafeShiftR` 8) + t) `unsafeShiftR` 8
+
+-- | How one component reaches the output grid, decided once per frame.
+data JUp = JUp
+  { juMeth :: !Int   -- ^ 'jmFull', 'jmH2V1', 'jmH2V2', 'jmH1V2' or 'jmBox'.
+  , juDs   :: !Int   -- ^ Samples per block side in the component's plane (8: the full-size IDCT).
+  , juDw   :: !Int   -- ^ The component's true width in samples (not its MCU padding).
+  , juDh   :: !Int   -- ^ Its true height.
+  , juNumX :: !Int   -- ^ Box upsampling: output x reads column x * numX `quot` denX ...
+  , juDenX :: !Int
+  , juNumY :: !Int   -- ^ ... and output y reads row y * numY `quot` denY.
+  , juDenY :: !Int
+  }
+
+jmFull, jmH2V1, jmH2V2, jmH1V2, jmBox :: Int
+jmFull = 0; jmH2V1 = 1; jmH2V2 = 2; jmH1V2 = 3; jmBox = 4
+
+-- | The upsampling a component gets, for a w x h frame with maximum sampling
+-- factors hmax x vmax, at the full output scale. A component is expanded
+-- by he = hmax / H and ve = vmax / V (with ds-sample blocks, by
+-- 8 hmax / (H ds), which is where a reduced-size IDCT would enter); the
+-- triangle filter is used for 2x1 and 2x2 on a component more than two
+-- samples wide and for 1x2, replication for every other ratio, including
+-- the fractional ones a frame can declare.
+jUpFor :: Int -> Int -> Int -> Int -> JComp -> JUp
+jUpFor w h hmax vmax c =
+  let ds = 8
+      numX = jcH c * ds; denX = hmax * 8
+      numY = jcV c * ds; denY = vmax * 8
+      dw = (w * numX + denX - 1) `quot` denX
+      dh = (h * numY + denY - 1) `quot` denY
+      integral = denX `rem` numX == 0 && denY `rem` numY == 0
+      he = denX `quot` numX; ve = denY `quot` numY
+      meth | integral && he == 1 && ve == 1 = jmFull
+           | integral && he == 2 && ve == 1 && dw > 2 = jmH2V1
+           | integral && he == 2 && ve == 2 && dw > 2 = jmH2V2
+           | integral && he == 1 && ve == 2 = jmH1V2
+           | otherwise = jmBox
+  in JUp meth ds dw dh numX denX numY denY
+
+-- Whether a component reads the sample rows next to the one an output row
+-- maps to (so a band must reconstruct its neighbours' edge MCU rows too).
+juHalo :: JUp -> Bool
+juHalo u = juMeth u == jmH2V2 || juMeth u == jmH1V2
+
+-- The component row output row y maps to.
+{-# INLINE juRow #-}
+juRow :: JUp -> Int -> Int
+juRow u y
+  | m == jmFull || m == jmH2V1 = y
+  | m == jmBox = (y * juNumY u) `quot` juDenY u
+  | otherwise = y `unsafeShiftR` 1
+  where m = juMeth u
+
+-- The highest component row output row y reads.
+{-# INLINE juNeed #-}
+juNeed :: JUp -> Int -> Int
+juNeed u y
+  | juHalo u && odd y = min (juDh u - 1) (juRow u y + 1)
+  | otherwise = juRow u y
 
 newCoefs :: Int -> ST s (STUArray s Int Int16)
 newCoefs n = newArray (0, max 0 (n - 1)) 0
-
-{-# INLINE rdC #-}
-rdC :: STUArray s Int Int16 -> Int -> ST s Int
-rdC a i = fromIntegral <$> readArray a i
-
-{-# INLINE wrC #-}
-wrC :: STUArray s Int Int16 -> Int -> Int -> ST s ()
-wrC a i v = writeArray a i (fromIntegral v)
 
 clamp8 :: Int -> Int
 clamp8 v = max 0 (min 255 v)
@@ -2507,13 +2965,6 @@ forLoop lo hi act = go lo
   where go !i | i > hi = pure ()
               | otherwise = act i >> go (i + 1)
 {-# INLINE forLoop #-}
-
--- The unchecked, inlined form for the conversion loops, whose indices are
--- in range by construction: called out of line, each sample came back as a
--- boxed Double.
-{-# INLINE rdDU #-}
-rdDU :: STUArray s Int Word8 -> Int -> ST s Double
-rdDU a i = fromIntegral <$> unsafeRead a i
 
 -- Find and skip past the next restart marker (0xFF 0xD0..0xD7).
 findRST :: BS.ByteString -> Int -> Int

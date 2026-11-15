@@ -50,7 +50,7 @@ make clean
 - **Use `make`, not `cabal`, here.** This environment is offline with no Hackage
   index, so `cabal build` fails with "Could not read index". The Makefile drives
   `ghc --make` directly. `cabal build` / `cabal run` only work where a Hackage
-  index cache exists. GHC is 9.0.2.
+  index cache exists. GHC is 9.6.6 (`ghc --version`).
 - **Dependencies are limited to GHC boot libraries** (base, bytestring, text,
   containers, array, process, stm, directory, filepath, mtl, time; plus unix
   on the POSIX side only). Do not add a dependency unless it ships with GHC;
@@ -1086,11 +1086,12 @@ in `README.md`; the cross-cutting structure that matters when editing:
   same into a caller's buffer at an offset, which is how PNG inflates into the
   tail of its own output image and decodes in place; `inflateDyn`, which grows
   its buffer, for PDF content streams, which declare only their *compressed*
-  length; `Huff`/`buildHuff` are shared with JPEG's own canonical tables, and
-  the prefix-table decoder with VP8L). The result is an RGBA `Image`, and
+  length; `Huff`/`buildHuff` and the prefix-table decoder are shared with
+  VP8L). The result is an RGBA `Image`, and
   `renderImage` area-averages it down to a grid of half-block (`▀`, fg=top
   pixel / bg=bottom pixel, 24-bit colour) or ASCII-ramp `Cell`s.
-  **The decoders are hot loops held to byte-identical output**, and
+  **The decoders are hot loops held to byte-identical output** (JPEG's bar
+  is stricter, see below), and
   `docs/plans/completed/0032-image-decoders-round-2.md` records the GHC
   patterns that decide their speed (an `Int` returned from a non-inlined `ST`
   function is boxed; a local function capturing many variables is allocated
@@ -1101,25 +1102,79 @@ in `README.md`; the cross-cutting structure that matters when editing:
   `imgbench.sh build-threaded` builds the editor's runtime (`-threaded -N4`),
   and the bench reports wall-clock time, because CPU time stops meaning
   anything once a decoder runs in parallel.
+  **JPEG output is bit-exact with libjpeg-turbo** (2.1's default decode, as
+  Pillow ships it: the accurate integer IDCT, "fancy" triangle-filter chroma
+  upsampling, its table colour conversion and its three-component rule: JFIF
+  means YCbCr, else Adobe transform 0 means RGB, else ids `R`,`G`,`B` mean
+  RGB; four components with any non-zero transform are YCCK; the last APP14
+  wins; each component's quantisation table is latched by the first scan
+  that codes it, so a later DQT changes nothing; a scan selector names the
+  first component with its id not yet named), for every complete 8-bit
+  baseline or progressive Huffman file libjpeg
+  accepts; that, not "the previous build's hash", is the bar a change must
+  hold. Check it with `docs/plans/bench/jpegcheck.sh run BIN [--raw] FILE...`
+  (BIN an `imgbench.sh` build; it diffs every file against Pillow, display
+  RGB or, with `--raw`, the `decodeJPEGSamples` samples, and exits 1 on any
+  difference; `jpegcheck.sh corpus` generates the 141-file layout corpus,
+  `jpeg_ref.py` is the arithmetic as an executable specification). Outside
+  the bar: fractional sampling ratios (libjpeg refuses them; we replicate),
+  truncated or corrupt streams, non-Adobe four-component files (Pillow
+  inverts every CMYK file; we invert only under a marker libjpeg accepts).
+  12-bit files are refused, not decoded. Reaching it
+  fixed three old bugs: the first row and column of every subsampled picture
+  (the upsampler took 3/4 of the wrong neighbour), the right and bottom edges
+  interpolating into MCU padding, and RGB-coded files converted as YCbCr.
+  The decoder is written from the standards (T.81 Annex F/G, Loeffler et al.
+  1989 for the IDCT, JFIF 1.02 for colour; the kernels cite them), not from
+  libjpeg's source; `README.md` carries the IJG acknowledgement. Its entropy
+  decoder (`jScanRows`, every scan kind) keeps the reader state in loop
+  arguments, refills from 64-bit words, and decodes through a 10-bit
+  lookahead (`JFast`) that also carries the coefficient when code and
+  magnitude fit; it reproduces the old bit-serial reader exactly on corrupt
+  input too, which the fuzz outcome lists pin. There is no restart after a
+  scan's last unit (an interval dividing the unit count once sent the
+  search past the next scan's header, losing that scan).
+  **Hostile files are bounded before decoding** (`jpegScanWork`, from
+  `jpegFrame`): a scan header names at most four components, each once
+  (`jpegScanComps`, libjpeg's `get_sos` rule; 255 selectors over four
+  components sharing an id made 1020 blocks an MCU, and `jScanRows` does not
+  allocate, so a kill could not land in that one scan), a file may have at
+  most `maxJpegScans` (1000) scans, and the scans may make at most
+  `jpegVisitsPerBlock` (64) visits per frame block plus a million, counted
+  over every `FF DA` pair in the file (an upper bound on what the walk can
+  reach), so a refusal is instant. Real files use about ten scans and six
+  visits a block. `App.asyncThresholdFor` sends a JPEG to the background
+  loader at any size when its frame is over `jpegAsyncPixels` (4 MP) or it
+  has more than one scan (`Image.jpegCostHint`, a header walk over the first
+  `imageAsyncBytes`), as it does a JPEG XL: a 657-byte file can declare
+  6300x6300, and a decode killed there lands between scans.
+  `jpegScanComps` is `INLINE` for a reason that applies to anything new
+  called from `decodeJpegST`: an out-of-line call taking `bs` makes GHC's
+  boxity analysis keep the ByteString boxed in the decoder's worker, and the
+  entropy loops lost 10-15% to it; check the worker's arguments with
+  `-ddump-stg-final` after touching that function.
   **JPEG streams and runs in parallel, and both are invisible in its
-  output.** Entropy decoding is sequential and is 10–28% of the time, so the
-  calling thread entropy-decodes and up to four `parOrdered` workers do the
-  IDCT, upsampling and colour conversion in bands of 4–8 MCU rows
-  (`mkConv`/`runRange`, one reconstruction state per slot, `CoefSrc` naming
-  where a band's coefficients live). A band reads one MCU row of chroma
-  above and below itself as a halo and recomputes it, which is bit-identical
-  to what its neighbour computed. Parallelism needs `nw > 1`, at least 16 MCU
+  output.** Entropy decoding is sequential and is 20–40% of the
+  single-core time, so the calling thread entropy-decodes and up to four
+  `parOrdered` workers do the IDCT, upsampling and colour conversion in bands
+  of 4–8 MCU rows (`mkConv`/`runRange`, one reconstruction state per slot,
+  `CoefSrc` naming where a band's coefficients live). Only a component whose
+  upsampling filters vertically (`juHalo`: the 2x2 and 1x2 triangle filters,
+  which read one component row past each edge) is reconstructed for the MCU
+  row above and below a band, as a halo; recomputing it is bit-identical to
+  what the neighbour computed. Parallelism needs `nw > 1`, at least 16 MCU
   rows and 2^18 pixels; otherwise the sequential code runs unchanged.
   **A baseline file whose single scan is interleaved never holds the image's
   coefficients**: the scan is decoded MCU row by MCU row into small per-slot
   buffers (`look = nw + 2` slots of K+2 rows, the first two copied from the
   previous slot), which halved peak memory. `jpegStreamable` is what makes
   that legal, and it is conservative on purpose: the whole-coefficient path
-  dequantises with the tables as they stand *after* the walk and merges later
-  scans, so a DQT or a second SOS after the scan (or, with restart markers,
-  an `FF DA`/`FF DB` pair anywhere after the scan, since the restart search
-  can jump markers in a corrupt file) sends the file down the old path, as do
-  progressive files. A kill during a parallel decode must not leave a
+  merges later scans, so a second SOS reachable after the scan sends the file
+  down the old path, as do progressive files. With restart markers the
+  restart search can jump markers in a corrupt file, so there must also be
+  no `FF DA` pair after the first RST pair past the scan's data (none
+  follows it in a valid file). A later DQT is irrelevant on both paths,
+  since tables latch at a component's first scan. A kill during a parallel decode must not leave a
   poisoned thunk behind (a decoded image can sit unforced in a shared scene
   that a later raster job forces), so the JPEG sites use
   `parOrderedResumable`, which re-delivers an asynchronous exception with

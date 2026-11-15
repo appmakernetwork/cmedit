@@ -10,7 +10,7 @@ import Data.Bits (shiftR, (.&.), xor)
 import Data.Foldable (toList)
 import Data.IORef
 import Data.Word (Word8, Word64)
-import Data.Either (isLeft)
+import Data.Either (isLeft, isRight)
 import Data.List (foldl', intercalate, isInfixOf, isPrefixOf, isSuffixOf, nub, tails)
 import System.Directory (getTemporaryDirectory, removeFile, createDirectoryIfMissing, removeDirectoryRecursive, doesDirectoryExist, doesFileExist, getPermissions, setPermissions, setOwnerExecutable, createFileLink)
 import System.Environment (lookupEnv, setEnv)
@@ -85,14 +85,14 @@ import qualified Cmedit.Epub as Epub
 import qualified Cmedit.Xlsx as Xlsx
 import qualified Cmedit.Formula as Fm
 import qualified Cmedit.Odf as Odf
-import Cmedit.App (convertPath, abbreviateHome, detectLinters)
+import Cmedit.App (convertPath, abbreviateHome, detectLinters, asyncThresholdFor)
 import Cmedit.Rtf (RtfDoc(..))
 import Cmedit.Pdf (PdfDoc(..))
 import qualified Cmedit.Pdf as Pdf
 import qualified Cmedit.Rtf as Rtf
 import Cmedit.Csv
 import qualified Cmedit.Inflate as Inflate
-import Cmedit.Image (Image(..), ImgMode(..), decodeImage, decodeFrames, decodeGIFFrames, sniffImage, renderImage, viewFit, scaleRGBA)
+import Cmedit.Image (Image(..), ImgMode(..), JpegSamples(..), decodeImage, decodeJPEGSamples, jpegCostHint, decodeFrames, decodeGIFFrames, sniffImage, renderImage, viewFit, scaleRGBA)
 import Cmedit.Render (renderEditor, renderFrame, refreshHighlight, scrollPlan, Screen(..), ScrollHint(..), Theme(..), defaultTheme, lightTheme, themeFor, FileKind(..), fileKind, expandLineCells)
 import Cmedit.ConfigFile (ThemeName(..), defaultConfig)
 import Cmedit.Ansi (styleSgr, styleSgrWith)
@@ -101,7 +101,7 @@ import Cmedit.Gfx (base64B, sixelEncode, gfxFit, kittyPlace)
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Lazy as BSL
 import qualified Data.Map.Strict as M
-import Data.Char (isAlphaNum, isDigit, isSpace, toLower)
+import Data.Char (isAlphaNum, isDigit, isSpace, ord, toLower)
 import Cmedit.Syntax (Lang(..), Tok(..), TokRun(..), HlState(..), langForPath, initialState, lexLine,
                       lexLineRuns, expandTokRuns, refreshHlCache, refreshHlCacheFor,
                       hlStateBefore, hlCoverage, hlTokenRuns)
@@ -1261,13 +1261,14 @@ main = do
     Right im -> do
       checkEq "jpeg 4:2:0: dimensions" (imgW im, imgH im) (32, 24)
       -- Saturated blocks survive the round trip through YCbCr and chroma
-      -- upsampling; these are the exact values the decoder produced before the
-      -- IDCT was rewritten, so they pin the arithmetic as well as the plumbing.
-      checkEq "jpeg 4:2:0: red block"    (pixelAt im 0 0)   (253,0,1,255)
-      checkEq "jpeg 4:2:0: red block b"  (pixelAt im 4 4)   (252,1,0,255)
-      checkEq "jpeg 4:2:0: green block"  (pixelAt im 12 6)  (2,255,0,255)
-      checkEq "jpeg 4:2:0: gradient"     (pixelAt im 20 12) (158,121,121,255)
-      checkEq "jpeg 4:2:0: corner"       (pixelAt im 31 23) (0,0,0,255)
+      -- upsampling. These are libjpeg-turbo's values for this file (Pillow
+      -- 11.1's decode), which the decoder reproduces exactly (plan 0035), so
+      -- they pin the arithmetic as well as the plumbing.
+      checkEq "jpeg 4:2:0: red block"    (pixelAt im 0 0)   (254,0,0,255)
+      checkEq "jpeg 4:2:0: red block b"  (pixelAt im 4 4)   (251,2,0,255)
+      checkEq "jpeg 4:2:0: green block"  (pixelAt im 12 6)  (1,255,0,255)
+      checkEq "jpeg 4:2:0: gradient"     (pixelAt im 20 12) (157,121,121,255)
+      checkEq "jpeg 4:2:0: corner"       (pixelAt im 31 23) (1,0,0,255)
       checkEq "jpeg 4:2:0: checkerboard" (pixelAt im 28 9)  (255,255,255,255)
       -- Every pixel is opaque and in range (a decoder that walks off a plane
       -- tends to produce zeros or garbage alpha).
@@ -1275,25 +1276,123 @@ main = do
                        , let (_,_,_,a) = pixelAt im x y ]
       checkEq "jpeg 4:2:0: fully opaque" (all (== 255) alphas, length alphas) (True, 32*24)
   check "truncated JPEG -> error" (isLeft (decodeImage (BS.take 120 jpegColour420)))
-  -- Full-buffer fingerprints captured before the entropy INLINE refactor.
-  -- Progressive exercises DC/AC refinement; restart markers reset bit state
-  -- and predictors between MCUs. Fixtures include stuffed 0xFF00 bytes.
+  -- Marker surgery on the fixtures for the colour-space rule: jpegColour420
+  -- opens with its JFIF APP0 (bytes 2..19) and jpegRgb with its Adobe APP14
+  -- (bytes 2..17).
+  let adobe0 = BS.pack ([0xFF,0xEE,0,14] ++ map (fromIntegral . ord) "Adobe" ++ [0,100,0,0,0,0,0])
+      jfifPlusAdobe0 = BS.concat [BS.take 20 jpegColour420, adobe0, BS.drop 20 jpegColour420]
+      rgbNoAdobe = BS.append (BS.take 2 jpegRgb) (BS.drop 18 jpegRgb)
+      rgbUnderJfif = BS.concat [BS.take 2 jpegRgb, BS.take 18 (BS.drop 2 jpegColour420), BS.drop 18 jpegRgb]
+      setAt bs i v = BS.concat [BS.take i bs, BS.singleton v, BS.drop (i + 1) bs]
+      offsetOf m bs = BS.length (fst (BS.breakSubstring (BS.pack [0xFF, m]) bs))
+      -- Every SOF and SOS component id set to 1. libjpeg's get_sos gives
+      -- each selector the first component with its id not yet taken, so
+      -- this decodes exactly like the original.
+      dupIds420 =
+        let sof = offsetOf 0xC0 jpegColour420; sos = offsetOf 0xDA jpegColour420
+        in foldl' (\b i -> setAt b i 1) jpegColour420
+                  ([ sof + 10 + 3 * k | k <- [0 .. 2] ] ++ [ sos + 5 + 2 * k | k <- [0 .. 2] ])
+      -- jpegYcck420 opens with its Adobe APP14 (bytes 2..17, transform 2 at
+      -- byte 17). libjpeg reads any non-zero transform on four components
+      -- as YCCK, and the last APP14 it reads wins.
+      ycckT1 = setAt jpegYcck420 17 1
+      adobe0ThenYcck = BS.concat [BS.take 2 jpegYcck420, adobe0, BS.drop 2 jpegYcck420]
+      ycckThenAdobe0 = BS.concat [BS.take 18 jpegYcck420, adobe0, BS.drop 18 jpegYcck420]
+  check "jpeg fixtures: the markers the surgery assumes"
+    (BS.take 4 (BS.drop 2 jpegColour420) == BS.pack [0xFF,0xE0,0,16]
+     && BS.take 4 (BS.drop 2 jpegRgb) == BS.pack [0xFF,0xEE,0,14]
+     && BS.take 4 (BS.drop 2 jpegYcck420) == BS.pack [0xFF,0xEE,0,14]
+     && BS.index jpegYcck420 17 == 2
+     && BS.take 2 (BS.drop 18 jpegYcck420) == BS.pack [0xFF,0xDB])
+  -- Full-buffer fingerprints of libjpeg-turbo's decode of each fixture
+  -- (Pillow 11.1's RGB plus opaque alpha, checked byte for byte by
+  -- docs/plans/bench/jpegcheck.sh; plan 0035). Progressive exercises DC/AC
+  -- refinement; restart markers reset bit state and predictors between
+  -- MCUs. Fixtures include stuffed 0xFF00 bytes.
   forM_ [("gray", jpegGray8, 0x22fbd3b5b530fbcb)
-        ,("4:2:0", jpegColour420, 0xdda0dc786b1fd1e5)
-        ,("progressive", jpegProgressive, 0x81622e1736b5fdf4)
-        ,("restart", jpegRestart, 0x81622e1736b5fdf4)] $ \(label, bytes, expected) ->
+        ,("4:2:0", jpegColour420, 0xbc9c74907c3faa09)
+        ,("progressive", jpegProgressive, 0x813f6e121305bf7e)
+        ,("restart", jpegRestart, 0x813f6e121305bf7e)
+         -- A restart after every unit, so the interval divides every scan's
+         -- unit count: no RST follows a scan's last unit, and searching for
+         -- one used to swallow the next scan's header (and the scan).
+        ,("progressive, a restart every unit", jpegProgRst, 0x8ba7832a8895087a)
+        ,("component ids all 1", dupIds420, 0xbc9c74907c3faa09)
+        ,("YCCK under Adobe transform 1", ycckT1, 0xb856da68f65f9221)
+        ,("Adobe 0 then Adobe 2: the last wins", adobe0ThenYcck, 0xb856da68f65f9221)
+        ,("Adobe 2 then Adobe 0: the last wins", ycckThenAdobe0, 0xf809163ac3a8d976)
+        ,("4:2:2", jpegH2V1, 0xd0cc6edb9ec93909)
+        ,("4:4:0", jpegH1V2, 0xd08670197e29c05b)
+        ,("3x2 replicated", jpegBox3x2, 0xaf16f4d23eff6871)
+        ,("RGB-coded (Adobe 0)", jpegRgb, 0x58ee189b1e8b00f0)
+        ,("YCCK 4:2:0 with K at 2x2", jpegYcck420, 0xb856da68f65f9221)
+         -- The three-component rule (libjpeg's): JFIF means YCbCr even with
+         -- an Adobe transform-0 segment beside it; component ids R, G, B
+         -- mean RGB when there is neither marker, and YCbCr under JFIF.
+        ,("JFIF beside Adobe 0", jfifPlusAdobe0, 0xbc9c74907c3faa09)
+        ,("ids R G B, no marker", rgbNoAdobe, 0x58ee189b1e8b00f0)
+        ,("ids R G B under JFIF", rgbUnderJfif, 0x19604d057a238ab0)] $ \(label, bytes, expected) ->
     case decodeImage bytes of
       Left e -> check ("jpeg " ++ label ++ ": " ++ e) False
       Right im -> do
         let fingerprint = foldl' (\h b -> (h `xor` fromIntegral b) * 1099511628211)
                                  (14695981039346656037 :: Word64) (U.elems (imgPix im))
         checkEq ("jpeg " ++ label ++ ": all RGBA bytes") fingerprint expected
+  -- The PDF path (decodeJPEGSamples, no /ColorTransform): three components
+  -- with ids R, G, B and no Adobe marker are RGB, as pdf.js and libjpeg
+  -- read them, so the samples are the display RGB.
+  checkEq "jpeg samples: ids R G B with no marker are not transformed"
+    (fmap (U.elems . jsData) (decodeJPEGSamples Nothing rgbNoAdobe))
+    (fmap (U.elems . imgPix) (decodeImage rgbNoAdobe))
+  -- 12-bit samples are refused, not decoded as 8-bit garbage.
+  check "jpeg: 12-bit precision is refused"
+    (either ("precision" `isInfixOf`) (const False)
+            (decodeImage (setAt jpegColour420 (offsetOf 0xC0 jpegColour420 + 4) 12)))
+  -- A scan header names at most four components, each once: 255 selectors
+  -- of one id over four components sharing it decode as four (they made
+  -- 1020 blocks an MCU, an uncancellable stall on a 657-byte file).
+  checkEq "jpeg: a scan with 255 selectors codes four components"
+    (fmap (U.elems . imgPix) (decodeImage (sharedIdJpeg 255)))
+    (fmap (U.elems . imgPix) (decodeImage (sharedIdJpeg 4)))
+  check "jpeg: the shared-id file decodes" (isRight (decodeImage (sharedIdJpeg 4)))
+  -- The scan limits refuse a file before decoding any of it: more than
+  -- 1000 scans, or scans that would visit the frame's blocks more than 64
+  -- times over (100 empty scans of an 8000x4000 frame; decoding it took
+  -- tens of seconds before).
+  check "jpeg: more than 1000 scans is refused"
+    (either ("scans" `isInfixOf`) (const False) (decodeImage (manyScanJpeg 16 16 1000)))
+  check "jpeg: 1000 scans of a small picture decode" (isRight (decodeImage (manyScanJpeg 16 16 999)))
+  check "jpeg: scans past the work limit are refused"
+    (either ("work limit" `isInfixOf`) (const False) (decodeImage (manyScanJpeg 8000 4000 100)))
+  -- What the loader reads to decide whether a JPEG decodes in the
+  -- background (App.asyncThresholdFor): the frame's pixels and the scans.
+  checkEq "jpeg cost hint: one baseline scan" (jpegCostHint jpegColour420) (Just (32 * 24, 1))
+  check "jpeg cost hint: progressive has several scans"
+    (maybe False ((> 1) . snd) (jpegCostHint jpegProgressive))
+  checkEq "jpeg cost hint: the header of a big picture" (fmap fst (jpegCostHint (manyScanJpeg 6300 6300 1)))
+    (Just (6300 * 6300))
+  do
+    tmp <- getTemporaryDirectory
+    let small = tmp </> "cmedit-spec-small.jpg"
+        big = tmp </> "cmedit-spec-big.jpg"
+        prog = tmp </> "cmedit-spec-prog.jpg"
+    BS.writeFile small jpegColour420
+    BS.writeFile big (manyScanJpeg 6300 6300 1)
+    BS.writeFile prog jpegProgressive
+    tSmall <- asyncThresholdFor small
+    tBig <- asyncThresholdFor big
+    tProg <- asyncThresholdFor prog
+    mapM_ removeFile [small, big, prog]
+    checkEq "async: a small baseline JPEG crosses at the image threshold" tSmall (64 * 1024)
+    checkEq "async: a tiny file declaring 40 MP decodes in the background" tBig (-1)
+    checkEq "async: a multi-scan JPEG decodes in the background" tProg (-1)
   -- A baseline JPEG whose one scan is the whole story is decoded streaming
   -- (Image.jpegStreamable: never all of its coefficients at once); anything
   -- after the scan that could change the picture must send it down the
-  -- whole-image path instead. Pin both halves: a quantisation table or a
-  -- second scan after the scan is honoured, and what follows EOI is
-  -- ignored.
+  -- whole-image path instead. Pin both halves: a second scan after the scan
+  -- is honoured, and what follows EOI is ignored. A quantisation table
+  -- after the scan changes nothing on either path: libjpeg latches each
+  -- component's table at the first scan that codes it, and so do we.
   do
     let rgba = either (const Nothing) (Just . U.elems . imgPix) . decodeImage
         eoi = BS.pack [0xFF, 0xD9]
@@ -1311,17 +1410,26 @@ main = do
         base420 = rgba jpegColour420
         baseRst = rgba jpegRestart
     check "jpeg fixtures end in EOI" (all (BS.isSuffixOf eoi) [jpegColour420, jpegRestart])
-    check "jpeg: a DQT after the scan is honoured"
-      (isJust base420 && rgba (beforeEoi jpegColour420 dqt) /= base420)
+    checkEq "jpeg: a DQT after the scan is ignored (tables latch at the first scan)"
+      (rgba (beforeEoi jpegColour420 dqt)) base420
+    check "jpeg 4:2:0: decodes" (isJust base420)
+    -- Between progressive scans too: the first scan codes every component.
+    let prog2 = BS.length (fst (BS.breakSubstring (BS.pack [0xFF, 0xDA])
+                                 (BS.drop 2 (snd (BS.breakSubstring (BS.pack [0xFF, 0xDA]) jpegProgressive)))))
+                + 2 + BS.length (fst (BS.breakSubstring (BS.pack [0xFF, 0xDA]) jpegProgressive))
+    checkEq "jpeg: a DQT between progressive scans is ignored"
+      (rgba (BS.concat [BS.take prog2 jpegProgressive, dqt, BS.drop prog2 jpegProgressive]))
+      (rgba jpegProgressive)
     check "jpeg: a second scan is honoured"
       (isJust base420 && rgba (beforeEoi jpegColour420 (rescan jpegColour420)) /= base420)
-    -- Here the restart interval divides the MCU count, so the decoder's
-    -- restart search after the last MCU runs to the end of the file and the
-    -- walk never reaches the table: the whole-image path's answer, as
-    -- found. It is why a restart file with a DQT anywhere after the scan
-    -- is not streamed: where the walk resumes is not predictable.
-    checkEq "jpeg restart: the final restart search skips a trailing DQT"
+    -- Here the restart interval divides the MCU count. There is no restart
+    -- search after the last MCU (there used to be, and it ran to the end of
+    -- the file, which is how this pin first passed); the walk now reaches
+    -- the table, which the latch ignores.
+    checkEq "jpeg restart: a trailing DQT is ignored"
       (rgba (beforeEoi jpegRestart dqt)) baseRst
+    check "jpeg restart: a second scan is honoured"
+      (isJust baseRst && rgba (beforeEoi jpegRestart (rescan jpegRestart)) /= baseRst)
     check "jpeg restart: decodes" (isJust baseRst)
     checkEq "jpeg: segments after EOI are ignored"
       (rgba (BS.concat [jpegColour420, dqt, rescan jpegColour420])) base420
@@ -9523,8 +9631,8 @@ csvParseRef delim = Seq.fromList . map rowFromList . rows . T.unpack
 -- Two real JPEGs, 32x24, produced by an independent encoder: a baseline
 -- grayscale one and a 4:2:0 colour one. The decoder had NO test coverage at
 -- all before the performance work of plan 0018 — which meant a decoder rewrite
--- had nothing to check itself against. Expected pixels below were captured
--- from the decoder as it stood before that work.
+-- had nothing to check itself against. Expected pixels are libjpeg-turbo's
+-- (since plan 0035 the decoder matches it exactly).
 jpegGray8 :: BS.ByteString
 jpegGray8 = BS.pack $
   [ 255,216,255,224,0,16,74,70,73,70,0,1,1,0,0,1
@@ -9919,6 +10027,279 @@ jpegRestart = BS.pack
   , 31,244,235,229,127,103,255,0,203,135,246,119,252,82,197,21
   , 242,217,29,89,85,246,156,222,95,169,225,229,21,167,87,13
   , 30,119,177,255,217
+  ]
+
+-- Plan 0035's fixtures: one per sampling layout and colour rule the decoder
+-- tells apart, each a 20x14 crop of jpegColour420's picture (so no layout's
+-- MCU divides it), quality 50, written by Pillow 11.1 or ImageMagick 7 and
+-- regenerated by docs/plans/bench/jpeg_fixtures.py, which also prints the
+-- fingerprints the test expects (libjpeg-turbo's decode, via Pillow). 4:2:2
+-- (triangle 2x1), 4:4:0 (triangle 1x2), 3x2 (replication), RGB-coded (Adobe
+-- transform 0, ids R G B), and YCCK with C and K at 2x2 (Adobe transform 2,
+-- inverted).
+
+jpegH2V1 :: BS.ByteString
+jpegH2V1 = BS.pack
+  [ 255,216,255,224,0,16,74,70,73,70,0,1,1,0,0,1
+  , 0,1,0,0,255,219,0,67,0,16,11,12,14,12,10,16
+  , 14,13,14,18,17,16,19,24,40,26,24,22,22,24,49,35
+  , 37,29,40,58,51,61,60,57,51,56,55,64,72,92,78,64
+  , 68,87,69,55,56,80,109,81,87,95,98,103,104,103,62,77
+  , 113,121,112,100,120,92,101,103,99,255,219,0,67,1,17,18
+  , 18,24,21,24,47,26,26,47,99,66,56,66,99,99,99,99
+  , 99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99
+  , 99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99
+  , 99,99,99,99,99,99,99,99,99,99,99,99,99,99,255,192
+  , 0,17,8,0,14,0,20,3,1,33,0,2,17,1,3,17
+  , 1,255,196,0,31,0,0,1,5,1,1,1,1,1,1,0
+  , 0,0,0,0,0,0,0,1,2,3,4,5,6,7,8,9
+  , 10,11,255,196,0,181,16,0,2,1,3,3,2,4,3,5
+  , 5,4,4,0,0,1,125,1,2,3,0,4,17,5,18,33
+  , 49,65,6,19,81,97,7,34,113,20,50,129,145,161,8,35
+  , 66,177,193,21,82,209,240,36,51,98,114,130,9,10,22,23
+  , 24,25,26,37,38,39,40,41,42,52,53,54,55,56,57,58
+  , 67,68,69,70,71,72,73,74,83,84,85,86,87,88,89,90
+  , 99,100,101,102,103,104,105,106,115,116,117,118,119,120,121,122
+  , 131,132,133,134,135,136,137,138,146,147,148,149,150,151,152,153
+  , 154,162,163,164,165,166,167,168,169,170,178,179,180,181,182,183
+  , 184,185,186,194,195,196,197,198,199,200,201,202,210,211,212,213
+  , 214,215,216,217,218,225,226,227,228,229,230,231,232,233,234,241
+  , 242,243,244,245,246,247,248,249,250,255,196,0,31,1,0,3
+  , 1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,1
+  , 2,3,4,5,6,7,8,9,10,11,255,196,0,181,17,0
+  , 2,1,2,4,4,3,4,7,5,4,4,0,1,2,119,0
+  , 1,2,3,17,4,5,33,49,6,18,65,81,7,97,113,19
+  , 34,50,129,8,20,66,145,161,177,193,9,35,51,82,240,21
+  , 98,114,209,10,22,36,52,225,37,241,23,24,25,26,38,39
+  , 40,41,42,53,54,55,56,57,58,67,68,69,70,71,72,73
+  , 74,83,84,85,86,87,88,89,90,99,100,101,102,103,104,105
+  , 106,115,116,117,118,119,120,121,122,130,131,132,133,134,135,136
+  , 137,138,146,147,148,149,150,151,152,153,154,162,163,164,165,166
+  , 167,168,169,170,178,179,180,181,182,183,184,185,186,194,195,196
+  , 197,198,199,200,201,202,210,211,212,213,214,215,216,217,218,226
+  , 227,228,229,230,231,232,233,234,242,243,244,245,246,247,248,249
+  , 250,255,218,0,12,3,1,0,2,17,3,17,0,63,0,102
+  , 147,255,0,30,173,254,249,254,66,146,250,31,50,225,78,63
+  , 135,31,169,175,43,8,237,137,108,229,155,182,115,81,249,177
+  , 98,179,220,153,251,47,155,239,246,127,51,245,251,60,159,250
+  , 16,250,119,37,122,205,220,244,42,59,201,176,210,127,227,213
+  , 191,223,63,200,85,223,44,59,100,215,139,65,219,16,207,47
+  , 16,237,155,212,245,100,163,68,154,248,121,177,67,108,234,62
+  , 92,202,99,206,127,224,80,185,239,235,248,122,149,235,197,221
+  , 30,131,122,159,255,217
+  ]
+
+jpegH1V2 :: BS.ByteString
+jpegH1V2 = BS.pack
+  [ 255,216,255,224,0,16,74,70,73,70,0,1,1,0,0,1
+  , 0,1,0,0,255,219,0,67,0,16,11,12,14,12,10,16
+  , 14,13,14,18,17,16,19,24,40,26,24,22,22,24,49,35
+  , 37,29,40,58,51,61,60,57,51,56,55,64,72,92,78,64
+  , 68,87,69,55,56,80,109,81,87,95,98,103,104,103,62,77
+  , 113,121,112,100,120,92,101,103,99,255,219,0,67,1,17,18
+  , 18,24,21,24,47,26,26,47,99,66,56,66,99,99,99,99
+  , 99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99
+  , 99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99
+  , 99,99,99,99,99,99,99,99,99,99,99,99,99,99,255,192
+  , 0,17,8,0,14,0,20,3,1,18,0,2,17,1,3,17
+  , 1,255,196,0,24,0,0,2,3,0,0,0,0,0,0,0
+  , 0,0,0,0,0,0,0,4,1,2,5,255,196,0,42,16
+  , 0,0,3,4,8,7,1,0,0,0,0,0,0,0,0,0
+  , 1,2,3,0,4,17,19,5,20,52,65,81,114,161,177,18
+  , 34,66,97,113,129,130,178,255,196,0,23,1,0,3,1,0
+  , 0,0,0,0,0,0,0,0,0,0,0,0,3,4,5,6
+  , 255,196,0,33,17,0,1,3,2,7,1,0,0,0,0,0
+  , 0,0,0,0,0,0,1,3,18,2,4,5,6,17,33,50
+  , 52,97,113,255,218,0,12,3,1,0,2,17,3,17,0,63
+  , 0,165,19,101,54,113,216,24,162,108,166,206,59,3,103,238
+  , 57,32,182,105,237,211,240,135,228,102,60,20,97,211,13,69
+  , 158,150,7,52,69,169,88,57,22,148,14,16,236,27,84,244
+  , 73,39,62,34,70,171,55,189,94,102,181,117,63,65,226,241
+  , 210,10,17,103,224,154,146,46,199,40,114,197,81,78,49,250
+  , 68,227,126,62,177,117,43,150,229,87,43,146,234,127,255,217
+  ]
+
+jpegBox3x2 :: BS.ByteString
+jpegBox3x2 = BS.pack
+  [ 255,216,255,224,0,16,74,70,73,70,0,1,1,0,0,1
+  , 0,1,0,0,255,219,0,67,0,16,11,12,14,12,10,16
+  , 14,13,14,18,17,16,19,24,40,26,24,22,22,24,49,35
+  , 37,29,40,58,51,61,60,57,51,56,55,64,72,92,78,64
+  , 68,87,69,55,56,80,109,81,87,95,98,103,104,103,62,77
+  , 113,121,112,100,120,92,101,103,99,255,219,0,67,1,17,18
+  , 18,24,21,24,47,26,26,47,99,66,56,66,99,99,99,99
+  , 99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99
+  , 99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99
+  , 99,99,99,99,99,99,99,99,99,99,99,99,99,99,255,192
+  , 0,17,8,0,14,0,20,3,1,50,0,2,17,1,3,17
+  , 1,255,196,0,24,0,0,2,3,0,0,0,0,0,0,0
+  , 0,0,0,0,0,0,0,1,2,3,4,255,196,0,42,16
+  , 0,0,3,4,8,7,1,0,0,0,0,0,0,0,0,0
+  , 1,2,3,0,4,17,19,5,20,52,65,81,114,161,177,18
+  , 34,66,97,113,129,130,178,255,196,0,21,1,1,1,0,0
+  , 0,0,0,0,0,0,0,0,0,0,0,0,3,5,255,196
+  , 0,28,17,0,1,4,3,1,0,0,0,0,0,0,0,0
+  , 0,0,0,1,0,2,4,17,3,97,98,177,255,218,0,12
+  , 3,1,0,2,17,3,17,0,63,0,133,19,101,54,113,216
+  , 25,63,35,49,224,163,14,152,106,44,210,115,226,36,106,179
+  , 123,213,230,107,87,83,244,30,47,18,137,178,155,56,236,13
+  , 182,88,28,209,22,180,40,69,159,130,106,72,187,28,161,203
+  , 21,69,56,199,233,19,141,248,250,198,124,39,81,120,218,28
+  , 47,169,50,7,71,210,191,255,217
+  ]
+
+jpegRgb :: BS.ByteString
+jpegRgb = BS.pack
+  [ 255,216,255,238,0,14,65,100,111,98,101,0,100,0,0,0
+  , 0,0,255,219,0,67,0,16,11,12,14,12,10,16,14,13
+  , 14,18,17,16,19,24,40,26,24,22,22,24,49,35,37,29
+  , 40,58,51,61,60,57,51,56,55,64,72,92,78,64,68,87
+  , 69,55,56,80,109,81,87,95,98,103,104,103,62,77,113,121
+  , 112,100,120,92,101,103,99,255,192,0,17,8,0,14,0,20
+  , 3,82,17,0,71,17,0,66,17,0,255,196,0,31,0,0
+  , 1,5,1,1,1,1,1,1,0,0,0,0,0,0,0,0
+  , 1,2,3,4,5,6,7,8,9,10,11,255,196,0,181,16
+  , 0,2,1,3,3,2,4,3,5,5,4,4,0,0,1,125
+  , 1,2,3,0,4,17,5,18,33,49,65,6,19,81,97,7
+  , 34,113,20,50,129,145,161,8,35,66,177,193,21,82,209,240
+  , 36,51,98,114,130,9,10,22,23,24,25,26,37,38,39,40
+  , 41,42,52,53,54,55,56,57,58,67,68,69,70,71,72,73
+  , 74,83,84,85,86,87,88,89,90,99,100,101,102,103,104,105
+  , 106,115,116,117,118,119,120,121,122,131,132,133,134,135,136,137
+  , 138,146,147,148,149,150,151,152,153,154,162,163,164,165,166,167
+  , 168,169,170,178,179,180,181,182,183,184,185,186,194,195,196,197
+  , 198,199,200,201,202,210,211,212,213,214,215,216,217,218,225,226
+  , 227,228,229,230,231,232,233,234,241,242,243,244,245,246,247,248
+  , 249,250,255,218,0,12,3,82,0,71,0,66,0,0,63,0
+  , 206,248,145,255,0,33,184,191,235,159,248,86,135,195,79,249
+  , 0,205,255,0,93,207,242,21,192,127,0,250,154,111,132,191
+  , 227,213,191,222,170,222,53,181,243,181,88,219,25,253,208,31
+  , 169,174,159,195,103,22,77,245,173,219,155,111,58,93,223,102
+  , 243,120,198,239,179,249,159,175,145,39,243,31,78,231,54,202
+  , 195,247,31,241,235,230,243,215,236,254,103,235,246,121,63,244
+  , 33,244,238,118,22,223,205,27,190,205,230,255,0,181,246,127
+  , 51,245,251,60,159,250,16,250,119,56,159,18,63,228,55,23
+  , 253,115,255,0,10,219,248,105,255,0,32,25,191,235,185,254
+  , 66,184,15,224,31,83,77,240,143,252,122,191,251,213,127,95
+  , 128,75,120,172,127,187,93,71,134,255,0,228,30,255,0,239
+  , 87,76,218,60,218,134,37,138,27,103,0,109,204,166,60,255
+  , 0,227,208,185,239,235,248,122,231,13,10,91,193,230,69,13
+  , 180,138,62,92,202,99,206,127,224,80,185,239,235,248,122,244
+  , 22,218,60,218,140,94,116,80,91,56,7,110,101,49,231,63
+  , 240,40,92,247,245,252,61,127,255,217
+  ]
+
+-- progrst.jpg from docs/plans/bench/jpeg_fixtures.py: 20x14 4:2:0 q50,
+-- progressive, a restart interval of one unit.
+jpegProgRst :: BS.ByteString
+jpegProgRst = BS.pack
+  [ 255,216,255,224,0,16,74,70,73,70,0,1,1,0,0,1
+  , 0,1,0,0,255,219,0,67,0,16,11,12,14,12,10,16
+  , 14,13,14,18,17,16,19,24,40,26,24,22,22,24,49,35
+  , 37,29,40,58,51,61,60,57,51,56,55,64,72,92,78,64
+  , 68,87,69,55,56,80,109,81,87,95,98,103,104,103,62,77
+  , 113,121,112,100,120,92,101,103,99,255,219,0,67,1,17,18
+  , 18,24,21,24,47,26,26,47,99,66,56,66,99,99,99,99
+  , 99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99
+  , 99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99
+  , 99,99,99,99,99,99,99,99,99,99,99,99,99,99,255,194
+  , 0,17,8,0,14,0,20,3,1,34,0,2,17,1,3,17
+  , 1,255,196,0,23,0,1,1,1,1,0,0,0,0,0,0
+  , 0,0,0,0,0,0,0,2,3,4,255,196,0,23,1,0
+  , 3,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+  , 2,3,4,255,221,0,4,0,1,255,218,0,12,3,1,0
+  , 2,16,3,16,0,0,1,147,124,113,255,208,151,72,111,255
+  , 196,0,26,16,0,1,5,1,0,0,0,0,0,0,0,0
+  , 0,0,0,0,2,0,1,3,17,50,19,255,218,0,8,1
+  , 1,0,1,5,2,139,63,255,208,54,178,255,209,96,95,255
+  , 210,139,63,255,211,165,255,212,226,230,191,255,196,0,24,17
+  , 0,3,1,1,0,0,0,0,0,0,0,0,0,0,0,0
+  , 0,1,2,4,17,255,218,0,8,1,3,1,1,63,1,167
+  , 205,148,127,255,208,108,255,196,0,23,17,0,3,1,0,0
+  , 0,0,0,0,0,0,0,0,0,0,0,0,3,17,1,255
+  , 218,0,8,1,2,1,1,63,1,94,198,31,255,208,167,255
+  , 196,0,28,16,0,2,1,5,1,0,0,0,0,0,0,0
+  , 0,0,0,0,0,17,1,2,50,129,130,194,209,255,218,0
+  , 8,1,1,0,6,63,2,63,255,208,63,255,209,181,234,249
+  , 147,255,210,63,255,211,63,255,212,113,20,229,120,127,255,196
+  , 0,28,16,0,2,2,2,3,0,0,0,0,0,0,0,0
+  , 0,0,0,0,1,49,113,17,240,33,65,241,255,218,0,8
+  , 1,1,0,1,63,33,158,207,255,208,198,81,255,209,200,182
+  , 52,236,255,210,158,207,255,211,228,207,255,212,158,74,61,28
+  , 255,218,0,12,3,1,0,2,0,3,0,0,0,16,171,255
+  , 208,243,255,196,0,23,17,0,3,1,0,0,0,0,0,0
+  , 0,0,0,0,0,0,0,0,1,17,97,255,218,0,8,1
+  , 3,1,1,63,16,180,214,127,255,208,163,167,255,196,0,23
+  , 17,0,3,1,0,0,0,0,0,0,0,0,0,0,0,0
+  , 0,0,1,17,33,255,218,0,8,1,2,1,1,63,16,176
+  , 207,255,208,85,167,255,196,0,31,16,0,1,2,6,3,0
+  , 0,0,0,0,0,0,0,0,0,0,1,0,17,65,81,129
+  , 161,177,193,33,49,113,255,218,0,8,1,1,0,1,63,16
+  , 184,224,47,255,208,112,52,151,43,255,209,230,106,236,208,242
+  , 39,255,210,184,224,47,255,211,99,197,127,255,212,2,54,221
+  , 141,207,83,25,210,127,255,217
+  ]
+
+-- A 64x48 baseline frame of four 1x1 components that all have id 1, and one
+-- scan whose header lists @ns@ selectors, every one naming id 1 (DC and AC
+-- tables 0; one-symbol tables, so any data decodes).
+sharedIdJpeg :: Int -> BS.ByteString
+sharedIdJpeg ns = BS.pack (concat [[0xFF, 0xD8], dqt, sof, dht 0x00, dht 0x10, sos, dat, [0xFF, 0xD9]])
+  where
+    byte = fromIntegral :: Int -> Word8
+    seg m body = [0xFF, m, byte ((length body + 2) `div` 256), byte ((length body + 2) `mod` 256)] ++ body
+    dqt = seg 0xDB (0 : replicate 64 4)
+    sof = seg 0xC0 ([8, 0, 48, 0, 64, 4] ++ concat (replicate 4 [1, 0x11, 0]))
+    dht tc = seg 0xC4 ([tc, 1] ++ replicate 15 0 ++ [if tc == 0 then 2 else 0x01])
+    sos = seg 0xDA ([byte ns] ++ concat (replicate ns [1, 0x00]) ++ [0, 63, 0])
+    dat = take 600 (cycle [0x5A, 0x3C, 0x96, 0x0F, 0xC3])
+
+-- A progressive grey frame of @w@ x @h@ with @k@ AC scans after its DC scan
+-- (@k + 1@ scans) and no entropy data (the scan limits decide before any of it is read).
+manyScanJpeg :: Int -> Int -> Int -> BS.ByteString
+manyScanJpeg w h k = BS.pack (concat ([[0xFF, 0xD8], dqt, sof, dht 0x00, dht 0x10, scan 0 0]
+                                      ++ replicate k (scan 1 63) ++ [[0xFF, 0xD9]]))
+  where
+    byte = fromIntegral :: Int -> Word8
+    seg m body = [0xFF, m, byte ((length body + 2) `div` 256), byte ((length body + 2) `mod` 256)] ++ body
+    dqt = seg 0xDB (0 : replicate 64 1)
+    sof = seg 0xC2 [8, byte (h `div` 256), byte (h `mod` 256), byte (w `div` 256), byte (w `mod` 256), 1, 1, 0x11, 0]
+    dht tc = seg 0xC4 ([tc, 1] ++ replicate 15 0 ++ [0])
+    scan ss se = seg 0xDA [1, 1, 0x00, ss, se, 0]
+
+jpegYcck420 :: BS.ByteString
+jpegYcck420 = BS.pack
+  [ 255,216,255,238,0,14,65,100,111,98,101,0,100,0,0,0
+  , 0,2,255,219,0,67,0,16,11,12,14,12,10,16,14,13
+  , 14,18,17,16,19,24,40,26,24,22,22,24,49,35,37,29
+  , 40,58,51,61,60,57,51,56,55,64,72,92,78,64,68,87
+  , 69,55,56,80,109,81,87,95,98,103,104,103,62,77,113,121
+  , 112,100,120,92,101,103,99,255,219,0,67,1,17,18,18,24
+  , 21,24,47,26,26,47,99,66,56,66,99,99,99,99,99,99
+  , 99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99
+  , 99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99
+  , 99,99,99,99,99,99,99,99,99,99,99,99,255,192,0,20
+  , 8,0,14,0,20,4,1,34,0,2,17,1,3,17,1,4
+  , 34,0,255,196,0,24,0,1,1,1,1,1,0,0,0,0
+  , 0,0,0,0,0,0,0,5,0,6,2,4,255,196,0,46
+  , 16,0,0,3,6,2,8,7,1,0,0,0,0,0,0,0
+  , 0,1,2,3,0,4,5,17,18,19,81,114,20,52,53,65
+  , 97,129,161,177,33,49,66,113,162,178,193,209,255,196,0,22
+  , 1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0
+  , 0,5,4,6,255,196,0,31,17,0,1,3,3,5,0,0
+  , 0,0,0,0,0,0,0,0,0,2,0,1,3,4,5,18
+  , 19,49,97,113,177,255,218,0,14,4,1,0,2,17,3,17
+  , 4,0,0,63,0,230,39,180,15,144,191,172,66,139,88,126
+  , 56,206,85,16,189,39,253,101,226,123,64,249,11,250,217,184
+  , 208,137,94,72,98,143,165,152,170,12,233,216,122,85,69,30
+  , 165,154,49,225,189,91,119,125,101,231,49,126,160,193,71,11
+  , 40,205,88,164,94,226,206,187,235,47,57,139,245,6,38,54
+  , 157,79,165,62,250,36,200,131,208,24,68,111,129,56,93,167
+  , 165,210,118,231,132,198,184,197,83,119,68,72,162,171,20,68
+  , 211,145,43,151,151,5,11,219,155,76,99,64,45,186,204,152
+  , 226,78,40,135,151,107,202,85,163,93,240,149,90,61,206,182
+  , 20,238,30,219,198,111,73,160,235,68,36,170,72,187,28,0
+  , 41,154,162,156,254,72,156,119,227,203,25,191,255,217
   ]
 
 -- PNG fixtures encoded with Python zlib; mixed filters, split IDAT chunks,

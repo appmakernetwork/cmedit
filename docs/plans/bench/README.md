@@ -83,6 +83,34 @@ it found two pre-existing hangs (a DEFLATE stream truncated at a block
 boundary; a GIF LZW dictionary with a cycle), both now fixed and pinned by
 Spec tests.
 
+## The JPEG conformance check (0035)
+
+The JPEG decoder is held to libjpeg-turbo's default decode, byte for byte,
+with Pillow (which ships it) as the oracle. `jpeg_gen.py PHOTO OUTDIR` writes
+the 141-file corpus (every sampling layout libjpeg accepts including 3x/4x,
+mixed and luma-subsampled, 1x1 to 33x1 sizes, q5..q100, progressive, restart,
+progressive with restarts whose interval divides a scan's unit count,
+optimised tables, RGB via Adobe transform 0, CMYK and YCCK). `jpegcheck.sh run
+BIN [--raw] FILE...` dumps an `ImageDecode.hs` build's output for each file and
+prints `jpeg_cmp.py`'s line (max and mean absolute difference, share of
+differing samples); every line must say `max 0`. `--raw` compares
+`decodeJPEGSamples` (`IMAGE_RAW=1`, what a PDF's DCTDecode gets) instead of the
+display RGB, so CMYK and YCCK are checked on their samples rather than through
+a CMYK-to-RGB conversion. `jpeg_ref.py FILE [SCALE]` is the executable
+specification the decoder follows (accurate integer IDCT, triangle-filter
+upsampling, table colour conversion, libjpeg's colour-space rule, and the
+reduced-size IDCTs for 1/2, 1/4, 1/8), checked against Pillow on its own.
+`jpeg_fixtures.py C420.JPG OUTDIR` regenerates the small per-layout fixtures
+`test/Spec.hs` embeds (4:2:2, 4:4:0, 3x2, RGB-coded, YCCK) from the bytes of
+its `jpegColour420`, and prints the libjpeg-turbo fingerprints Spec expects,
+so Spec itself never needs Pillow.
+
+```sh
+python3 -I docs/plans/bench/jpeg_gen.py /path/photo.jpg /tmp/jpegcorpus
+docs/plans/bench/imgbench.sh build src /tmp/ib-new
+docs/plans/bench/jpegcheck.sh run /tmp/ib-new /tmp/jpegcorpus/*.jpg
+```
+
 ## The font-reader oracles (0034 B)
 
 `fontcheck.sh [DIR...]` builds `FontCheck.hs` at `-O2` and walks every font

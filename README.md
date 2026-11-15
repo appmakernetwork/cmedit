@@ -609,6 +609,13 @@ version 3** (GPL-3.0-only). You may use, study, share and modify it under those
 terms; distributed derivative works must remain under the GPL. It comes with no
 warranty. See the [`LICENSE`](LICENSE) file for the full text.
 
+## Acknowledgements
+
+The JPEG decoder is written from the published standards (ITU-T T.81, JFIF
+1.02, and the Loeffler–Ligtenberg–Moschytz IDCT) and reproduces
+libjpeg-turbo's output exactly. This software is based in part on the work of
+the Independent JPEG Group.
+
 ## Contributing
 
 Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md). Merging a
