@@ -335,7 +335,7 @@ colourSpec check = do
       rgbOf e xs = either (const (-1, -1, -1)) (`toRGB` xs) e
       near3 tol (a, b, c) (x, y, z) = nearD tol a x && nearD tol b y && nearD tol c z
       nm = OName . bs
-  check "colour: CMYK is poppler's sixteen-corner blend"
+  check "colour: CMYK is the measured sixteen-corner blend"
     (near3 1e-9 (toRGB CSCMYK [0, 0, 0, 0]) (1, 1, 1) && near3 1e-9 (toRGB CSCMYK [0, 0, 0, 1]) (0.1373, 0.1216, 0.1255)
      && near3 1e-9 (toRGB CSCMYK [1, 0, 0, 0]) (0, 0.6784, 0.9373) && near3 1e-9 (toRGB CSCMYK [1, 1, 1, 1]) (0, 0, 0)
      && near3 1e-9 (toRGB CSCMYK [0.5, 0, 0, 0]) (0.5, 0.8392, 0.96865)
@@ -446,6 +446,12 @@ ccittSpec check = do
   forM_ [(False, False), (False, True), (True, False), (True, True)] $ \(a, e) ->
     check ("ccitt: MH runs over 2560, align=" ++ show a ++ " eol=" ++ show e)
       (crData (dec (prm a e) (mhEncode e a rows)) == expect && crRows (dec (prm a e) (mhEncode e a rows)) == 5)
+  -- Trailing zero padding, however long, ends the image: with alignment on
+  -- and no EOLs each padding byte used to start one more (damaged) white row.
+  forM_ [(a, e, z) | (a, e) <- [(True, False), (False, False), (True, True)], z <- [1, 2, 5, 64]] $ \(a, e, z) ->
+    let r = dec (prm a e) (mhEncode e a rows <> BS.replicate z 0)
+    in check ("ccitt: " ++ show z ++ " bytes of trailing zeros, align=" ++ show a ++ " eol=" ++ show e)
+         (crData r == expect && crRows r == 5 && crDamaged r == 0)
   where
     packRun width runs =
       let px = concat (zipWith replicate runs (cycle [False, True]))
@@ -462,7 +468,7 @@ jpegCmyk = hexBS "ffd8ffee000e41646f626500640000000000ffdb0043000201010101010201
 jpegYcck = hexBS "ffd8ffee000e41646f626500640000000002ffdb0043000201010101010201010102020202020403020202020504040304060506060605060606070908060709070606080b08090a0a0a0a0a06080b0c0b0a0c090a0a0affdb004301020202020202050303050a0706070a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0affc00014080010001004011100021101031101041100ffc4001700000301000000000000000000000000000708090affc40014100100000000000000000000000000000000ffc4001701010101010000000000000000000000000906080affc40014110100000000000000000000000000000000ffda000e040100021103110400003f004cd93cae2fe1905c39630bd2ecfa104140bf8835e311efffd9"
 
 -- The quadrants' ink, and their expected RGB in the image view (ImageMagick's
--- multiplicative conversion) and in a PDF (poppler's, 'cmykToRGB').
+-- multiplicative conversion) and in a PDF (pdftoppm's rendering, 'cmykToRGB').
 quadrantInk :: [[Double]]
 quadrantInk = [[200, 30, 0, 0], [0, 180, 60, 20], [10, 10, 200, 0], [0, 0, 0, 220]]
 

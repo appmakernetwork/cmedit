@@ -3,11 +3,14 @@
 -- transforms, dequantisation matrices, coefficient orders and the
 -- restoration filters. The orchestration lives in "Cmedit.Jxl".
 --
--- Conventions follow jxl-oxide (and so libjxl): a varblock's coefficients
--- sit in the frame's float planes at the varblock's own pixel footprint, x
--- being horizontal frequency; the 1-D transforms are the scaled pair
--- @X_k = (1/N) Σ x_n cos(..) · (√2 for k > 0)@ and its exact inverse, so a
--- DC coefficient equal to the LF value reproduces a flat block.
+-- Conventions: a varblock's coefficients sit in the frame's float planes at
+-- the varblock's own pixel footprint, x being horizontal frequency; the 1-D
+-- transforms are the specification's scaled pair (Annex I),
+-- @X_k = (1/N) Σ x_n cos((2n+1)kπ/2N) · (√2 for k > 0)@ and its exact
+-- inverse, so a DC coefficient equal to the LF value reproduces a flat
+-- block. libjxl and jxl-oxide lay their coefficients out the same way,
+-- which is what makes their intermediate planes comparable with ours when a
+-- difference has to be tracked down; the output is held to libjxl's.
 module Cmedit.JxlVarDct
   ( FPlane
     -- * Transform types
@@ -75,7 +78,35 @@ matrixW = listArray (0, 16) [8,8,8,8,16,32,16,32,32,8,8,64,64,128,128,256,256]
 matrixH = listArray (0, 16) [8,8,8,8,16,32,8,8,16,8,8,64,32,128,64,256,128]
 
 ------------------------------------------------------------------------------
--- 1-D transforms (radix-2, after Perera & Liu as libjxl and jxl-oxide do)
+-- 1-D transforms
+--
+-- Both directions use the classical radix-2 recursion on the cosine
+-- transform (B. G. Lee, "A new algorithm to compute the discrete cosine
+-- transform", IEEE Trans. ASSP 32, 1984; in the self-recursive form of
+-- S. M. Perera and J. Liu, "Lowest complexity self-recursive radix-2 DCT
+-- II/III algorithms", SIAM J. Matrix Anal. Appl. 39, 2018), which the other
+-- JPEG XL decoders use too. It follows from the definition in three lines.
+-- Write the inverse as @x_n = Σ_k c_k cos((2n+1)kπ/2N)@ with @c_0 = X_0@
+-- and @c_k = √2 X_k@, and split the sum by the parity of k:
+--
+--  * the even terms are @Σ_j c_2j cos((2n+1)jπ/N)@: the same transform at
+--    half the size, of the even coefficients; call it @E_n@;
+--  * the odd terms @O_n@, multiplied by @2 cos((2n+1)π/2N)@ and expanded with
+--    @2 cos a cos b = cos(a+b) + cos(a−b)@, become
+--    @Σ_j (c_(2j+1) + c_(2j−1)) cos((2n+1)jπ/N)@: again the half-size
+--    transform, of each odd coefficient plus the odd one before it (the
+--    first alone, which in the scaled convention is @√2 X_1@);
+--  * and since @E@ is even and @O@ odd about the middle of the block,
+--    @x_n = E_n + O_n@ and @x_(N−1−n) = E_n − O_n@.
+--
+-- So one transform of size N costs two of size N/2, N/2 − 1 additions, and
+-- N/2 multiplications by the secants @1 / (2 cos((2n+1)π/2N))@ ('secTab').
+-- The forward transform is the same steps transposed and run backwards.
+-- The small sizes are written out, and sizes 16 and 32 expanded by a
+-- generator, but every kernel performs exactly this recursion's additions
+-- and multiplications in its order: the results are bit-identical to the
+-- general case below, which the decoder's lossless-exact and
+-- one-code-value bars against libjxl depend on.
 
 -- [n/2 + k] = 1 / (2 cos((2k + 1) pi / 2n)), for n = 4 .. 256.
 secTab :: UArray Int Float
@@ -86,6 +117,11 @@ secTab = listArray (0, 255)
 
 sqrt2 :: Float
 sqrt2 = 1.4142135623730951
+
+-- The secants of the four-point step: 1 / (2 cos(π/8)) and 1 / (2 cos(3π/8)).
+sec4a, sec4b :: Float
+sec4a = 0.541196100146197
+sec4b = 1.3065629648763766
 
 -- | LLF / small-transform scratch (at most 32x32), two disjoint 256-value
 -- recursive work regions, and sixteen gathered columns of at most 256 values.
@@ -110,43 +146,49 @@ idct1 a off n t toff
       x0 <- rd a off; x1 <- rd a (off + 1)
       wr a off (x0 + x1); wr a (off + 1) (x0 - x1)
   | n == 4 = do
-      i0 <- rd a off; i1 <- rd a (off + 1); i2 <- rd a (off + 2); i3 <- rd a (off + 3)
-      let tmp0 = i1 * sqrt2
-          tmp1 = i1 + i3
-          o0 = (tmp0 + tmp1) * 0.5411961
-          o1 = (tmp0 - tmp1) * 1.306563
-          s02 = i0 + i2
-          d02 = i0 - i2
-      wr a off (s02 + o0); wr a (off + 1) (d02 + o1)
-      wr a (off + 2) (d02 - o1); wr a (off + 3) (s02 - o0)
+      x0 <- rd a off; x1 <- rd a (off + 1); x2 <- rd a (off + 2); x3 <- rd a (off + 3)
+      let -- E: the two-point transform of the even coefficients
+          e0 = x0 + x2
+          e1 = x0 - x2
+          -- O: the two-point transform of (√2 x1, x1 + x3), over 2 cos
+          lead = x1 * sqrt2
+          pair = x1 + x3
+          o0 = (lead + pair) * sec4a
+          o1 = (lead - pair) * sec4b
+      wr a off (e0 + o0); wr a (off + 1) (e1 + o1)
+      wr a (off + 2) (e1 - o1); wr a (off + 3) (e0 - o0)
   | n == 8 = do
-      i0 <- rd a off; i1 <- rd a (off + 1); i2 <- rd a (off + 2); i3 <- rd a (off + 3)
-      i4 <- rd a (off + 4); i5 <- rd a (off + 5); i6 <- rd a (off + 6); i7 <- rd a (off + 7)
-      let -- even half: inverse DCT-4 of (i0, i2, i4, i6)
-          et0 = i2 * sqrt2
-          et1 = i2 + i6
-          eo0 = (et0 + et1) * 0.5411961
-          eo1 = (et0 - et1) * 1.306563
-          es02 = i0 + i4
-          ed02 = i0 - i4
-          e0 = es02 + eo0; e1 = ed02 + eo1; e2 = ed02 - eo1; e3 = es02 - eo0
-          -- odd half: inverse DCT-4 of (i1 √2, i3 + i1, i5 + i3, i7 + i5)
-          q0 = i1 * sqrt2; q1 = i3 + i1; q2 = i5 + i3; q3 = i7 + i5
-          ot0 = q1 * sqrt2
-          ot1 = q1 + q3
-          oo0 = (ot0 + ot1) * 0.5411961
-          oo1 = (ot0 - ot1) * 1.306563
-          os02 = q0 + q2
-          od02 = q0 - q2
-          r0 = (os02 + oo0) * 0.5097955791041592
-          r1 = (od02 + oo1) * 0.6013448869350453
-          r2 = (od02 - oo1) * 0.8999762231364156
-          r3 = (os02 - oo0) * 2.5629154477415055
-      wr a off (e0 + r0); wr a (off + 7) (e0 - r0)
-      wr a (off + 1) (e1 + r1); wr a (off + 6) (e1 - r1)
-      wr a (off + 2) (e2 + r2); wr a (off + 5) (e2 - r2)
-      wr a (off + 3) (e3 + r3); wr a (off + 4) (e3 - r3)
-  -- Expanded radix-2 graphs retain the existing Float operation order
+      x0 <- rd a off; x1 <- rd a (off + 1); x2 <- rd a (off + 2); x3 <- rd a (off + 3)
+      x4 <- rd a (off + 4); x5 <- rd a (off + 5); x6 <- rd a (off + 6); x7 <- rd a (off + 7)
+      let -- E: the four-point transform of (x0, x2, x4, x6), itself one step
+          -- of the recursion
+          eLead = x2 * sqrt2
+          ePair = x2 + x6
+          eo0 = (eLead + ePair) * sec4a
+          eo1 = (eLead - ePair) * sec4b
+          ee0 = x0 + x4
+          ee1 = x0 - x4
+          e0 = ee0 + eo0; e1 = ee1 + eo1; e2 = ee1 - eo1; e3 = ee0 - eo0
+          -- O: the four-point transform of each odd coefficient plus the one
+          -- before it, (√2 x1, x3 + x1, x5 + x3, x7 + x5) ...
+          y0 = x1 * sqrt2; y1 = x3 + x1; y2 = x5 + x3; y3 = x7 + x5
+          oLead = y1 * sqrt2
+          oPair = y1 + y3
+          oo0 = (oLead + oPair) * sec4a
+          oo1 = (oLead - oPair) * sec4b
+          oe0 = y0 + y2
+          oe1 = y0 - y2
+          -- ... over 2 cos((2n+1)π/16)
+          o0 = (oe0 + oo0) * 0.5097955791041592
+          o1 = (oe1 + oo1) * 0.6013448869350453
+          o2 = (oe1 - oo1) * 0.8999762231364156
+          o3 = (oe0 - oo0) * 2.5629154477415055
+      wr a off (e0 + o0); wr a (off + 7) (e0 - o0)
+      wr a (off + 1) (e1 + o1); wr a (off + 6) (e1 - o1)
+      wr a (off + 2) (e2 + o2); wr a (off + 5) (e2 - o2)
+      wr a (off + 3) (e3 + o3); wr a (off + 4) (e3 - o3)
+  -- The recursion expanded for these two sizes (by a generator, from the
+  -- general case below): the same Float operations in the same order,
   -- while avoiding recursive scratch-array traffic at these two sizes.
   | n == 16 = do
       i0 <- rd a (off + 0)
@@ -167,8 +209,8 @@ idct1 a off n t toff
       i15 <- rd a (off + 15)
       let v0 = i4 * sqrt2
           v1 = i4 + i12
-          v2 = (v0 + v1) * 0.5411961
-          v3 = (v0 - v1) * 1.306563
+          v2 = (v0 + v1) * sec4a
+          v3 = (v0 - v1) * sec4b
           v4 = i0 + i8
           v5 = i0 - i8
           v6 = v4 + v2
@@ -181,8 +223,8 @@ idct1 a off n t toff
           v13 = i14 + i10
           v14 = v11 * sqrt2
           v15 = v11 + v13
-          v16 = (v14 + v15) * 0.5411961
-          v17 = (v14 - v15) * 1.306563
+          v16 = (v14 + v15) * sec4a
+          v17 = (v14 - v15) * sec4b
           v18 = v10 + v12
           v19 = v10 - v12
           v20 = v18 + v16
@@ -211,8 +253,8 @@ idct1 a off n t toff
           v43 = i15 + i13
           v44 = v38 * sqrt2
           v45 = v38 + v42
-          v46 = (v44 + v45) * 0.5411961
-          v47 = (v44 - v45) * 1.306563
+          v46 = (v44 + v45) * sec4a
+          v47 = (v44 - v45) * sec4b
           v48 = v36 + v40
           v49 = v36 - v40
           v50 = v48 + v46
@@ -225,8 +267,8 @@ idct1 a off n t toff
           v57 = v43 + v41
           v58 = v55 * sqrt2
           v59 = v55 + v57
-          v60 = (v58 + v59) * 0.5411961
-          v61 = (v58 - v59) * 1.306563
+          v60 = (v58 + v59) * sec4a
+          v61 = (v58 - v59) * sec4b
           v62 = v54 + v56
           v63 = v54 - v56
           v64 = v62 + v60
@@ -320,8 +362,8 @@ idct1 a off n t toff
       i31 <- rd a (off + 31)
       let v0 = i8 * sqrt2
           v1 = i8 + i24
-          v2 = (v0 + v1) * 0.5411961
-          v3 = (v0 - v1) * 1.306563
+          v2 = (v0 + v1) * sec4a
+          v3 = (v0 - v1) * sec4b
           v4 = i0 + i16
           v5 = i0 - i16
           v6 = v4 + v2
@@ -334,8 +376,8 @@ idct1 a off n t toff
           v13 = i28 + i20
           v14 = v11 * sqrt2
           v15 = v11 + v13
-          v16 = (v14 + v15) * 0.5411961
-          v17 = (v14 - v15) * 1.306563
+          v16 = (v14 + v15) * sec4a
+          v17 = (v14 - v15) * sec4b
           v18 = v10 + v12
           v19 = v10 - v12
           v20 = v18 + v16
@@ -364,8 +406,8 @@ idct1 a off n t toff
           v43 = i30 + i26
           v44 = v38 * sqrt2
           v45 = v38 + v42
-          v46 = (v44 + v45) * 0.5411961
-          v47 = (v44 - v45) * 1.306563
+          v46 = (v44 + v45) * sec4a
+          v47 = (v44 - v45) * sec4b
           v48 = v36 + v40
           v49 = v36 - v40
           v50 = v48 + v46
@@ -378,8 +420,8 @@ idct1 a off n t toff
           v57 = v43 + v41
           v58 = v55 * sqrt2
           v59 = v55 + v57
-          v60 = (v58 + v59) * 0.5411961
-          v61 = (v58 - v59) * 1.306563
+          v60 = (v58 + v59) * sec4a
+          v61 = (v58 - v59) * sec4b
           v62 = v54 + v56
           v63 = v54 - v56
           v64 = v62 + v60
@@ -440,8 +482,8 @@ idct1 a off n t toff
           v119 = i31 + i29
           v120 = v108 * sqrt2
           v121 = v108 + v116
-          v122 = (v120 + v121) * 0.5411961
-          v123 = (v120 - v121) * 1.306563
+          v122 = (v120 + v121) * sec4a
+          v123 = (v120 - v121) * sec4b
           v124 = v104 + v112
           v125 = v104 - v112
           v126 = v124 + v122
@@ -454,8 +496,8 @@ idct1 a off n t toff
           v133 = v118 + v114
           v134 = v131 * sqrt2
           v135 = v131 + v133
-          v136 = (v134 + v135) * 0.5411961
-          v137 = (v134 - v135) * 1.306563
+          v136 = (v134 + v135) * sec4a
+          v137 = (v134 - v135) * sec4b
           v138 = v130 + v132
           v139 = v130 - v132
           v140 = v138 + v136
@@ -484,8 +526,8 @@ idct1 a off n t toff
           v163 = v119 + v117
           v164 = v158 * sqrt2
           v165 = v158 + v162
-          v166 = (v164 + v165) * 0.5411961
-          v167 = (v164 - v165) * 1.306563
+          v166 = (v164 + v165) * sec4a
+          v167 = (v164 - v165) * sec4b
           v168 = v156 + v160
           v169 = v156 - v160
           v170 = v168 + v166
@@ -498,8 +540,8 @@ idct1 a off n t toff
           v177 = v163 + v161
           v178 = v175 * sqrt2
           v179 = v175 + v177
-          v180 = (v178 + v179) * 0.5411961
-          v181 = (v178 - v179) * 1.306563
+          v180 = (v178 + v179) * sec4a
+          v181 = (v178 - v179) * sec4b
           v182 = v174 + v176
           v183 = v174 - v176
           v184 = v182 + v180
@@ -624,9 +666,12 @@ idct1 a off n t toff
       wr a (off + 31) v271
   | otherwise = do
       let h = n `shiftR` 1
+      -- even coefficients to t[0, h), odd ones to t[h, n)
       forLoop 0 (h - 1) $ \i -> do
         rd a (off + 2 * i) >>= wr t (toff + i)
         rd a (off + 2 * i + 1) >>= wr t (toff + h + i)
+      -- each odd coefficient plus the one before it (from the top down, so
+      -- every sum reads an unmodified neighbour), the first times √2
       let acc j | j < 1 = pure ()
                 | otherwise = do
                     p <- rd t (toff + h + j - 1)
@@ -636,6 +681,7 @@ idct1 a off n t toff
       acc (h - 1)
       v0 <- rd t (toff + h)
       wr t (toff + h) (v0 * sqrt2)
+      -- E and 2 cos · O, then the butterfly
       idct1 t toff h a off
       idct1 t (toff + h) h a (off + h)
       forLoop 0 (h - 1) $ \i -> do
@@ -697,8 +743,8 @@ idct16x4 a off = do
   i3 <- rd a (off + 3)
   let v0 = i2 * sqrt2
       v1 = i2 * sqrt2
-      v2 = (v1 + i2) * 0.5411961
-      v3 = (v1 - i2) * 1.306563
+      v2 = (v1 + i2) * sec4a
+      v3 = (v1 - i2) * sec4b
       v4 = v0 + v2
       v5 = v0 + v3
       v6 = v0 - v3
@@ -718,16 +764,16 @@ idct16x4 a off = do
       v20 = i1 * sqrt2
       v21 = i3 + i1
       v22 = i3 * sqrt2
-      v23 = (v22 + i3) * 0.5411961
-      v24 = (v22 - i3) * 1.306563
+      v23 = (v22 + i3) * sec4a
+      v24 = (v22 - i3) * sec4b
       v25 = v20 + v23
       v26 = v20 + v24
       v27 = v20 - v24
       v28 = v20 - v23
       v29 = v21 * sqrt2
       v30 = v21 * sqrt2
-      v31 = (v30 + v21) * 0.5411961
-      v32 = (v30 - v21) * 1.306563
+      v31 = (v30 + v21) * sec4a
+      v32 = (v30 - v21) * sec4b
       v33 = v29 + v31
       v34 = v29 + v32
       v35 = v29 - v32
@@ -794,8 +840,8 @@ idct32x4 a off = do
   let v0 = i2 * sqrt2
       v1 = i2 * sqrt2
       v2 = i2 * sqrt2
-      v3 = (v2 + i2) * 0.5411961
-      v4 = (v2 - i2) * 1.306563
+      v3 = (v2 + i2) * sec4a
+      v4 = (v2 - i2) * sec4b
       v5 = v1 + v3
       v6 = v1 + v4
       v7 = v1 - v4
@@ -840,8 +886,8 @@ idct32x4 a off = do
       v46 = i3 + i1
       v47 = i3 * sqrt2
       v48 = i3 * sqrt2
-      v49 = (v48 + i3) * 0.5411961
-      v50 = (v48 - i3) * 1.306563
+      v49 = (v48 + i3) * sec4a
+      v50 = (v48 - i3) * sec4b
       v51 = v47 + v49
       v52 = v47 + v50
       v53 = v47 - v50
@@ -861,8 +907,8 @@ idct32x4 a off = do
       v67 = v46 * sqrt2
       v68 = v46 * sqrt2
       v69 = v46 * sqrt2
-      v70 = (v69 + v46) * 0.5411961
-      v71 = (v69 - v46) * 1.306563
+      v70 = (v69 + v46) * sec4a
+      v71 = (v69 - v46) * sec4b
       v72 = v68 + v70
       v73 = v68 + v71
       v74 = v68 - v71
@@ -996,8 +1042,8 @@ idct32x8 a off = do
   i7 <- rd a (off + 7)
   let v0 = i4 * sqrt2
       v1 = i4 * sqrt2
-      v2 = (v1 + i4) * 0.5411961
-      v3 = (v1 - i4) * 1.306563
+      v2 = (v1 + i4) * sec4a
+      v3 = (v1 - i4) * sec4b
       v4 = v0 + v2
       v5 = v0 + v3
       v6 = v0 - v3
@@ -1017,16 +1063,16 @@ idct32x8 a off = do
       v20 = i2 * sqrt2
       v21 = i6 + i2
       v22 = i6 * sqrt2
-      v23 = (v22 + i6) * 0.5411961
-      v24 = (v22 - i6) * 1.306563
+      v23 = (v22 + i6) * sec4a
+      v24 = (v22 - i6) * sec4b
       v25 = v20 + v23
       v26 = v20 + v24
       v27 = v20 - v24
       v28 = v20 - v23
       v29 = v21 * sqrt2
       v30 = v21 * sqrt2
-      v31 = (v30 + v21) * 0.5411961
-      v32 = (v30 - v21) * 1.306563
+      v31 = (v30 + v21) * sec4a
+      v32 = (v30 - v21) * sec4b
       v33 = v29 + v31
       v34 = v29 + v32
       v35 = v29 - v32
@@ -1072,16 +1118,16 @@ idct32x8 a off = do
       v75 = i5 + i3
       v76 = i7 + i5
       v77 = i7 * sqrt2
-      v78 = (v77 + i7) * 0.5411961
-      v79 = (v77 - i7) * 1.306563
+      v78 = (v77 + i7) * sec4a
+      v79 = (v77 - i7) * sec4b
       v80 = v73 + v78
       v81 = v73 + v79
       v82 = v73 - v79
       v83 = v73 - v78
       v84 = v75 * sqrt2
       v85 = v75 * sqrt2
-      v86 = (v85 + v75) * 0.5411961
-      v87 = (v85 - v75) * 1.306563
+      v86 = (v85 + v75) * sec4a
+      v87 = (v85 - v75) * sec4b
       v88 = v84 + v86
       v89 = v84 + v87
       v90 = v84 - v87
@@ -1101,16 +1147,16 @@ idct32x8 a off = do
       v104 = v74 * sqrt2
       v105 = v76 + v74
       v106 = v76 * sqrt2
-      v107 = (v106 + v76) * 0.5411961
-      v108 = (v106 - v76) * 1.306563
+      v107 = (v106 + v76) * sec4a
+      v108 = (v106 - v76) * sec4b
       v109 = v104 + v107
       v110 = v104 + v108
       v111 = v104 - v108
       v112 = v104 - v107
       v113 = v105 * sqrt2
       v114 = v105 * sqrt2
-      v115 = (v114 + v105) * 0.5411961
-      v116 = (v114 - v105) * 1.306563
+      v115 = (v114 + v105) * sec4a
+      v116 = (v114 - v105) * sec4b
       v117 = v113 + v115
       v118 = v113 + v116
       v119 = v113 - v116
@@ -1245,8 +1291,8 @@ idct64x8 a off = do
   let v0 = i4 * sqrt2
       v1 = i4 * sqrt2
       v2 = i4 * sqrt2
-      v3 = (v2 + i4) * 0.5411961
-      v4 = (v2 - i4) * 1.306563
+      v3 = (v2 + i4) * sec4a
+      v4 = (v2 - i4) * sec4b
       v5 = v1 + v3
       v6 = v1 + v4
       v7 = v1 - v4
@@ -1291,8 +1337,8 @@ idct64x8 a off = do
       v46 = i6 + i2
       v47 = i6 * sqrt2
       v48 = i6 * sqrt2
-      v49 = (v48 + i6) * 0.5411961
-      v50 = (v48 - i6) * 1.306563
+      v49 = (v48 + i6) * sec4a
+      v50 = (v48 - i6) * sec4b
       v51 = v47 + v49
       v52 = v47 + v50
       v53 = v47 - v50
@@ -1312,8 +1358,8 @@ idct64x8 a off = do
       v67 = v46 * sqrt2
       v68 = v46 * sqrt2
       v69 = v46 * sqrt2
-      v70 = (v69 + v46) * 0.5411961
-      v71 = (v69 - v46) * 1.306563
+      v70 = (v69 + v46) * sec4a
+      v71 = (v69 - v46) * sec4b
       v72 = v68 + v70
       v73 = v68 + v71
       v74 = v68 - v71
@@ -1408,8 +1454,8 @@ idct64x8 a off = do
       v163 = i7 + i5
       v164 = i7 * sqrt2
       v165 = i7 * sqrt2
-      v166 = (v165 + i7) * 0.5411961
-      v167 = (v165 - i7) * 1.306563
+      v166 = (v165 + i7) * sec4a
+      v167 = (v165 - i7) * sec4b
       v168 = v164 + v166
       v169 = v164 + v167
       v170 = v164 - v167
@@ -1429,8 +1475,8 @@ idct64x8 a off = do
       v184 = v162 * sqrt2
       v185 = v162 * sqrt2
       v186 = v162 * sqrt2
-      v187 = (v186 + v162) * 0.5411961
-      v188 = (v186 - v162) * 1.306563
+      v187 = (v186 + v162) * sec4a
+      v188 = (v186 - v162) * sec4b
       v189 = v185 + v187
       v190 = v185 + v188
       v191 = v185 - v188
@@ -1475,8 +1521,8 @@ idct64x8 a off = do
       v230 = v163 + v161
       v231 = v163 * sqrt2
       v232 = v163 * sqrt2
-      v233 = (v232 + v163) * 0.5411961
-      v234 = (v232 - v163) * 1.306563
+      v233 = (v232 + v163) * sec4a
+      v234 = (v232 - v163) * sec4b
       v235 = v231 + v233
       v236 = v231 + v234
       v237 = v231 - v234
@@ -1496,8 +1542,8 @@ idct64x8 a off = do
       v251 = v230 * sqrt2
       v252 = v230 * sqrt2
       v253 = v230 * sqrt2
-      v254 = (v253 + v230) * 0.5411961
-      v255 = (v253 - v230) * 1.306563
+      v254 = (v253 + v230) * sec4a
+      v255 = (v253 - v230) * sec4b
       v256 = v252 + v254
       v257 = v252 + v255
       v258 = v252 - v255
@@ -1767,8 +1813,8 @@ idct64x16 a off = do
   i15 <- rd a (off + 15)
   let v0 = i8 * sqrt2
       v1 = i8 * sqrt2
-      v2 = (v1 + i8) * 0.5411961
-      v3 = (v1 - i8) * 1.306563
+      v2 = (v1 + i8) * sec4a
+      v3 = (v1 - i8) * sec4b
       v4 = v0 + v2
       v5 = v0 + v3
       v6 = v0 - v3
@@ -1788,16 +1834,16 @@ idct64x16 a off = do
       v20 = i4 * sqrt2
       v21 = i12 + i4
       v22 = i12 * sqrt2
-      v23 = (v22 + i12) * 0.5411961
-      v24 = (v22 - i12) * 1.306563
+      v23 = (v22 + i12) * sec4a
+      v24 = (v22 - i12) * sec4b
       v25 = v20 + v23
       v26 = v20 + v24
       v27 = v20 - v24
       v28 = v20 - v23
       v29 = v21 * sqrt2
       v30 = v21 * sqrt2
-      v31 = (v30 + v21) * 0.5411961
-      v32 = (v30 - v21) * 1.306563
+      v31 = (v30 + v21) * sec4a
+      v32 = (v30 - v21) * sec4b
       v33 = v29 + v31
       v34 = v29 + v32
       v35 = v29 - v32
@@ -1843,16 +1889,16 @@ idct64x16 a off = do
       v75 = i10 + i6
       v76 = i14 + i10
       v77 = i14 * sqrt2
-      v78 = (v77 + i14) * 0.5411961
-      v79 = (v77 - i14) * 1.306563
+      v78 = (v77 + i14) * sec4a
+      v79 = (v77 - i14) * sec4b
       v80 = v73 + v78
       v81 = v73 + v79
       v82 = v73 - v79
       v83 = v73 - v78
       v84 = v75 * sqrt2
       v85 = v75 * sqrt2
-      v86 = (v85 + v75) * 0.5411961
-      v87 = (v85 - v75) * 1.306563
+      v86 = (v85 + v75) * sec4a
+      v87 = (v85 - v75) * sec4b
       v88 = v84 + v86
       v89 = v84 + v87
       v90 = v84 - v87
@@ -1872,16 +1918,16 @@ idct64x16 a off = do
       v104 = v74 * sqrt2
       v105 = v76 + v74
       v106 = v76 * sqrt2
-      v107 = (v106 + v76) * 0.5411961
-      v108 = (v106 - v76) * 1.306563
+      v107 = (v106 + v76) * sec4a
+      v108 = (v106 - v76) * sec4b
       v109 = v104 + v107
       v110 = v104 + v108
       v111 = v104 - v108
       v112 = v104 - v107
       v113 = v105 * sqrt2
       v114 = v105 * sqrt2
-      v115 = (v114 + v105) * 0.5411961
-      v116 = (v114 - v105) * 1.306563
+      v115 = (v114 + v105) * sec4a
+      v116 = (v114 - v105) * sec4b
       v117 = v113 + v115
       v118 = v113 + v116
       v119 = v113 - v116
@@ -1979,16 +2025,16 @@ idct64x16 a off = do
       v211 = i13 + i11
       v212 = i15 + i13
       v213 = i15 * sqrt2
-      v214 = (v213 + i15) * 0.5411961
-      v215 = (v213 - i15) * 1.306563
+      v214 = (v213 + i15) * sec4a
+      v215 = (v213 - i15) * sec4b
       v216 = v205 + v214
       v217 = v205 + v215
       v218 = v205 - v215
       v219 = v205 - v214
       v220 = v209 * sqrt2
       v221 = v209 * sqrt2
-      v222 = (v221 + v209) * 0.5411961
-      v223 = (v221 - v209) * 1.306563
+      v222 = (v221 + v209) * sec4a
+      v223 = (v221 - v209) * sec4b
       v224 = v220 + v222
       v225 = v220 + v223
       v226 = v220 - v223
@@ -2008,16 +2054,16 @@ idct64x16 a off = do
       v240 = v207 * sqrt2
       v241 = v211 + v207
       v242 = v211 * sqrt2
-      v243 = (v242 + v211) * 0.5411961
-      v244 = (v242 - v211) * 1.306563
+      v243 = (v242 + v211) * sec4a
+      v244 = (v242 - v211) * sec4b
       v245 = v240 + v243
       v246 = v240 + v244
       v247 = v240 - v244
       v248 = v240 - v243
       v249 = v241 * sqrt2
       v250 = v241 * sqrt2
-      v251 = (v250 + v241) * 0.5411961
-      v252 = (v250 - v241) * 1.306563
+      v251 = (v250 + v241) * sec4a
+      v252 = (v250 - v241) * sec4b
       v253 = v249 + v251
       v254 = v249 + v252
       v255 = v249 - v252
@@ -2063,16 +2109,16 @@ idct64x16 a off = do
       v295 = v210 + v208
       v296 = v212 + v210
       v297 = v212 * sqrt2
-      v298 = (v297 + v212) * 0.5411961
-      v299 = (v297 - v212) * 1.306563
+      v298 = (v297 + v212) * sec4a
+      v299 = (v297 - v212) * sec4b
       v300 = v293 + v298
       v301 = v293 + v299
       v302 = v293 - v299
       v303 = v293 - v298
       v304 = v295 * sqrt2
       v305 = v295 * sqrt2
-      v306 = (v305 + v295) * 0.5411961
-      v307 = (v305 - v295) * 1.306563
+      v306 = (v305 + v295) * sec4a
+      v307 = (v305 - v295) * sec4b
       v308 = v304 + v306
       v309 = v304 + v307
       v310 = v304 - v307
@@ -2092,16 +2138,16 @@ idct64x16 a off = do
       v324 = v294 * sqrt2
       v325 = v296 + v294
       v326 = v296 * sqrt2
-      v327 = (v326 + v296) * 0.5411961
-      v328 = (v326 - v296) * 1.306563
+      v327 = (v326 + v296) * sec4a
+      v328 = (v326 - v296) * sec4b
       v329 = v324 + v327
       v330 = v324 + v328
       v331 = v324 - v328
       v332 = v324 - v327
       v333 = v325 * sqrt2
       v334 = v325 * sqrt2
-      v335 = (v334 + v325) * 0.5411961
-      v336 = (v334 - v325) * 1.306563
+      v335 = (v334 + v325) * sec4a
+      v336 = (v334 - v325) * sec4b
       v337 = v333 + v335
       v338 = v333 + v336
       v339 = v333 - v336
@@ -2351,23 +2397,17 @@ idct64x16 a off = do
   wr a (off + 62) v519
   wr a (off + 63) v520
 
--- Forward 1-D transform (only the LLF coefficients of large blocks need it).
+-- Forward 1-D transform (only the LLF coefficients of large blocks need it):
+-- the inverse's steps transposed, in reverse order. Mirror sums go to the
+-- even half and mirror differences, over 2 cos, to the odd half; each half
+-- is transformed; and every odd output is its value plus the next one's,
+-- the first having been scaled by √2.
 fdct1 :: FPlane s -> Int -> Int -> FPlane s -> Int -> ST s ()
 fdct1 a off n t toff
   | n <= 1 = pure ()
   | n == 2 = do
       x0 <- rd a off; x1 <- rd a (off + 1)
       wr a off ((x0 + x1) / 2); wr a (off + 1) ((x0 - x1) / 2)
-  | n == 4 = do
-      i0 <- rd a off; i1 <- rd a (off + 1); i2 <- rd a (off + 2); i3 <- rd a (off + 3)
-      let s03 = i0 + i3
-          s12 = i1 + i2
-          t0 = (i0 - i3) * 0.5411961
-          t1 = (i1 - i2) * 1.306563
-          o0 = (t0 + t1) / 4
-          o1 = (t0 - t1) / 4
-      wr a off ((s03 + s12) / 4); wr a (off + 1) (o0 * sqrt2 + o1)
-      wr a (off + 2) ((s03 - s12) / 4); wr a (off + 3) o1
   | otherwise = do
       let h = n `shiftR` 1
       forLoop 0 (h - 1) $ \i -> do

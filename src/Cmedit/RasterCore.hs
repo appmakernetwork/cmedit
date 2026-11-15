@@ -6,9 +6,13 @@
 -- __Coverage is exact-area signed accumulation, kept sparse.__ A path is
 -- flattened (device space, 'flatTol') into line edges clipped to the fill
 -- box. Each edge deposits, row by row, the exact signed area it sweeps into
--- an accumulation buffer (the font-rs / stb_truetype formulation: one cell
--- receives the partial trapezoid, the next the remainder, and a running sum
--- along the row reproduces the area to the left of every edge). A prefix sum
+-- an accumulation buffer: what a cell receives is the change, from the
+-- pixel before it, in the area lying to the right of the edge, so a running
+-- sum along the row reproduces that area at every pixel ('accLine' has the
+-- derivation). The technique is the signed-area accumulation buffer that
+-- Raph Levien described for font-rs ("Inside the fastest font renderer in
+-- the world", 2016) and that stb_truetype's second rasteriser also uses;
+-- the arithmetic here is worked out from the geometry. A prefix sum
 -- along a row then gives, at each pixel, the integral of the winding number
 -- over that pixel, from which non-zero takes @min 1 |a|@ and even-odd folds
 -- @|a|@ modulo 2. Both rules are therefore exact wherever at most one edge
@@ -830,11 +834,33 @@ addPolygon env !bx !by !w !h pts = case pts of
 -- One edge (top to bottom, ya < yb, band-relative rows [0, nrows)) into the
 -- accumulation buffer, recording which edge last deposited into each cell.
 --
--- Every x is clamped to [0, w] (w = stride - 2) as it is stepped, not just
+-- Take the slab of the edge inside one pixel row: height @dy@, the edge
+-- running from @xl@ to @xr@ (left to right, whichever end is the top). A
+-- pixel's coverage by the half-plane to the right of the edge is @dy@ times
+-- the mean, over the pixel's width, of the fraction of the slab's height at
+-- which the edge is already to the left: 0 before @xl@, 1 after @xr@,
+-- linear between. Its integral from the left,
+--
+-- > L(u) = 0                        u <= xl
+-- >      = (u - xl)^2 / 2(xr - xl)  xl <= u <= xr
+-- >      = u - (xl + xr) / 2        u >= xr
+--
+-- gives pixel @i@ the coverage @dy (L(i+1) - L(i))@, and the buffer holds
+-- differences of coverage, so cell @i@ receives
+-- @dy (L(i+1) - 2 L(i) + L(i-1))@: nothing left of the edge's first pixel,
+-- nothing right of the pixel after its last (where L is linear), and
+-- @dy@ in total. 'slabLeft' is L, measured from the first pixel's left side
+-- so that large coordinates cost no precision. When the edge stays within
+-- one pixel, as nearly every edge of a glyph does, the two cells are simply
+-- @dy (1 - m)@ and @dy m@ for its mean position @m@ in the pixel. The edge's
+-- x at each row boundary comes from its line equation, not from a running
+-- sum, so a long edge accumulates no error.
+--
+-- Every x is clamped to [0, w] (w = stride - 2) as it is evaluated, not just
 -- at the ends: an edge that ends exactly on the box's left side (which the
--- left-edge collapse produces for anything crossing it) can step to -1e-16,
--- and floor of that is cell -1, one write before the row (on band row 0,
--- before the buffer).
+-- left-edge collapse produces for anything crossing it) can come out at
+-- -1e-16, and floor of that is cell -1, one write before the row (on band
+-- row 0, before the buffer).
 -- The buffers one fill accumulates into, bundled so 'accLine' stays under
 -- GHC's worker-argument limit (past ten arguments its Doubles are boxed:
 -- measured, a 70% slowdown on a page of text).
@@ -862,56 +888,59 @@ accLine (AccB acc rmin rmax owner flags rowC edges con stride) !nrows !top !e = 
   sg <- rdA con (3 * e + 2)
   let !ya = ya0 - top
       !yb = yb0 - top
-  let !ys = if ya > 0 then ya else 0
-      !nr = fromIntegral nrows
-      !ye = if yb < nr then yb else nr
+      !yFirst = if ya > 0 then ya else 0
+      !yLimit = fromIntegral nrows :: Double
+      !yLast = if yb < yLimit then yb else yLimit
       !wd = fromIntegral (stride - 2) :: Double
-  when (ys < ye) $ do
-    let !dxdy = (xb - xa) / (yb - ya)
-        !xs = clampW wd (xa + (ys - ya) * dxdy)
-        !rs = floor ys :: Int
-        !re = ceiling ye :: Int
-        go !r !x
-          | r >= re = return ()
+  when (yFirst < yLast) $ do
+    let !slope = (xb - xa) / (yb - ya)
+        xAt y = clampW wd (xa + (y - ya) * slope)
+        !rowEnd = ceiling yLast :: Int
+        -- one pixel row of the edge: from (xTop, yTop) down to the row's
+        -- lower boundary or the edge's end
+        slab !r !xTop !yTop
+          | r >= rowEnd = return ()
           | otherwise = do
-              let !rt = fromIntegral r
-                  !dy = (if rt + 1 < ye then rt + 1 else ye) - (if rt > ys then rt else ys)
-                  !xn = clampW wd (x + dxdy * dy)
-                  !d = dy * dir
-                  !xl = if x < xn then x else xn
-                  !xr = if x < xn then xn else x
-                  !x0f = fromIntegral (floor xl :: Int) :: Double
-                  !x0i = floor xl :: Int
-                  !x1i = ceiling xr :: Int
-                  !ls = r * stride
-              if x1i <= x0i + 1
+              let !below = fromIntegral (r + 1) :: Double
+                  !yBot = if below < yLast then below else yLast
+                  !xBot = xAt yBot
+                  !area = (yBot - yTop) * dir
+                  !xl = if xTop < xBot then xTop else xBot
+                  !xr = if xTop < xBot then xBot else xTop
+                  !c0 = floor xl :: Int
+                  !origin = fromIntegral c0 :: Double
+                  !ul = xl - origin
+                  !ur = xr - origin
+                  !mean = 0.5 * (ul + ur)
+                  !cells = ceiling ur :: Int          -- pixels the edge crosses
+                  !i0 = r * stride + c0
+              if cells <= 1
                 then do
-                  let !xmf = 0.5 * (x + xn) - x0f
-                  dep acc owner flags edges e cs ce dir r (ls + x0i) (d - d * xmf)
-                  dep acc owner flags edges e cs ce dir r (ls + x0i + 1) (d * xmf)
-                  touchRow rmin rmax rowC flags cs sg r x0i (x0i + 1) xl xr
+                  dep acc owner flags edges e cs ce dir r i0 (area * (1 - mean))
+                  when (cells == 1) $ dep acc owner flags edges e cs ce dir r (i0 + 1) (area * mean)
                 else do
-                  let !s = 1 / (xr - xl)
-                      !x0fr = xl - x0f
-                      !a0 = 0.5 * s * (1 - x0fr) * (1 - x0fr)
-                      !x1fr = xr - fromIntegral x1i + 1
-                      !am = 0.5 * s * x1fr * x1fr
-                  dep acc owner flags edges e cs ce dir r (ls + x0i) (d * a0)
-                  if x1i == x0i + 2
-                    then dep acc owner flags edges e cs ce dir r (ls + x0i + 1) (d * (1 - a0 - am))
-                    else do
-                      let !a1 = s * (1.5 - x0fr)
-                          !ds = d * s
-                      dep acc owner flags edges e cs ce dir r (ls + x0i + 1) (d * (a1 - a0))
-                      let mid !xi | xi >= x1i - 1 = return ()
-                                  | otherwise = dep acc owner flags edges e cs ce dir r (ls + xi) ds >> mid (xi + 1)
-                      mid (x0i + 2)
-                      let !a2 = a1 + fromIntegral (x1i - x0i - 3) * s
-                      dep acc owner flags edges e cs ce dir r (ls + x1i - 1) (d * (1 - a2 - am))
-                  dep acc owner flags edges e cs ce dir r (ls + x1i) (d * am)
-                  touchRow rmin rmax rowC flags cs sg r x0i x1i xl xr
-              go (r + 1) xn
-    go rs xs
+                  let !half = 0.5 / (ur - ul)
+                      -- lPrev = L(j - 1), lHere = L(j)
+                      across !j !lPrev !lHere
+                        | j > cells = return ()
+                        | otherwise = do
+                            let !lNext = slabLeft ul ur mean half (fromIntegral (j + 1))
+                            dep acc owner flags edges e cs ce dir r (i0 + j) (area * (lNext - 2 * lHere + lPrev))
+                            across (j + 1) lHere lNext
+                  across 0 0 0
+              touchRow rmin rmax rowC flags cs sg r c0 (c0 + (if cells > 1 then cells else 1)) xl xr
+              slab (r + 1) xBot yBot
+    slab (floor yFirst) (xAt yFirst) yFirst
+
+-- L of 'accLine': the area left of @u@ under the edge's crossing fraction,
+-- per unit of slab height, with the edge spanning [ul, ur] and
+-- @half = 1 / 2(ur - ul)@ (not used when the span is empty).
+slabLeft :: Double -> Double -> Double -> Double -> Double -> Double
+slabLeft ul ur mean half u
+  | u <= ul = 0
+  | u >= ur = u - mean
+  | otherwise = let t = u - ul in t * t * half
+{-# INLINE slabLeft #-}
 
 clampW :: Double -> Double -> Double
 clampW wd v = if v > 0 then (if v < wd then v else wd) else 0

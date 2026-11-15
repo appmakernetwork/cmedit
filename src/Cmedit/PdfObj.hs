@@ -1532,8 +1532,15 @@ pageRotation f d =
 --
 -- A font program is indexed by glyph /name/ (Type 1 and CFF charstrings, a
 -- TrueType @post@ table), so a renderer needs the standard encodings as names,
--- where the text view needs them as characters. The tables are PDF 32000
--- Annex D, generated from Ghostscript's copies; @"."@ marks an unused code.
+-- where the text view needs them as characters. The tables are ISO 32000-1
+-- Annex D, which is Appendix D of Adobe's PDF Reference (sixth edition, PDF
+-- 1.7; Adobe publishes it freely): D.1 for the three Latin encodings, D.3 for
+-- MacExpertEncoding, D.4 and D.5 for the two symbolic fonts, with the
+-- appendix's footnotes applied (WinAnsi's unused codes above octal 40 are
+-- the bullet, its 240 and 255 a second space and hyphen; MacRoman's 312 a
+-- second space). Every code of every table is checked against the text of
+-- that appendix by @docs\/plans\/bench\/pdf_encodings_check.py@, which is
+-- how they are to be regenerated or extended. @"."@ marks an unused code.
 
 encodingTable :: [String] -> IM.IntMap BS.ByteString
 encodingTable rows =
@@ -1796,8 +1803,12 @@ zapfDingbatsEncodingNames = encodingTable
   , ". a201 a183 a184 a197 a185 a194 a198"
   , "a186 a195 a187 a188 a189 a190 a191 ." ]
 
--- | Glyph name to Unicode for every name the standard encodings use (taken
--- from the Adobe Glyph List; the ZapfDingbats @aN@ names are not in it).
+-- | Glyph name to Unicode for every name the standard encodings use. The
+-- values are the Adobe Glyph List's (@glyphlist.txt@, Copyright 2002-2019
+-- Adobe, BSD 3-clause; see the acknowledgements in @README.md@): the list
+-- is the normative name-to-Unicode mapping PDF itself refers to (ISO 32000-1
+-- §9.10.2), so there is no other source for it. The same checker verifies
+-- them. The ZapfDingbats @aN@ names are not in that list.
 standardGlyphUnicode :: [(BS.ByteString, Int)]
 standardGlyphUnicode =
   [ ("A", 0x0041), ("AE", 0x00c6), ("AEsmall", 0xf7e6), ("Aacute", 0x00c1)

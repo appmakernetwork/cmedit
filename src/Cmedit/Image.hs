@@ -3639,9 +3639,19 @@ vlPlaneDist w code
 -- intra modes, and the DCT token partitions. Reconstruction is intra
 -- prediction + dequantise + 4x4 IDCT (plus a WHT for the luma DC plane),
 -- followed by the in-loop deblocking filter and 4:2:0 chroma upsampling.
+--
+-- Everything up to the reconstructed planes is written from the RFC, which
+-- is the format's specification and fixes its results exactly; mode numbers
+-- and table layouts are the RFC's. The tables at the end of this module
+-- ('vpCoeffProbs', 'vpCoeffUpdate', 'vpBModeProbs', 'vpDcQ', 'vpAcQ') are
+-- the format's constants, reproduced from its sections 13.4, 13.5, 11.5 and
+-- 14.1 (code components (c) 2010, 2011 Google Inc., BSD licence: see the
+-- acknowledgements in @README.md@). Decoded output is compared with
+-- libwebp's and is identical to it.
 
+-- RFC 6386 section 13.3: the probability band of each scan position.
 vpBands :: UArray Int Int
-vpBands = U.listArray (0,16) [0,1,2,3,6,4,5,6,6,6,6,6,6,6,6,7,0]
+vpBands = U.listArray (0,15) [0,1,2,3,6,4,5,6,6,6,6,6,6,6,6,7]
 
 vpZigzag :: UArray Int Int
 vpZigzag = U.listArray (0,15) [0,1,4,8,5,2,3,6,9,12,13,10,7,11,14,15]
@@ -3656,12 +3666,17 @@ vpCatProbs = U.listArray (0, 22)
   , 254,254,243,230,196,177,153,140,133,130,129 ]
 vpCatStart = U.listArray (0, 4) [0, 3, 7, 12, 23]
 
--- Boolean arithmetic decoder (RFC 6386 section 7), in libwebp's formulation:
--- the same arithmetic as the RFC's bit-at-a-time loop, but with up to 56 bits
--- prefetched and each renormalisation done as one computed shift. State lives
--- in an unboxed array: 0 byte position, 1 value window, 2 bits in the window
--- below the active byte (negative = refill due), 3 range minus one. Reads
--- past the end of the partition yield zero bytes, as the format prescribes.
+-- Boolean arithmetic decoder: RFC 6386 section 7.3's, with its @value@
+-- widened from two bytes to a 64-bit window. The RFC keeps the byte being
+-- compared with the split on top of @value@ and shifts new bits in from
+-- below, one doubling of the range at a time; here the window is kept the
+-- same way round (the compared byte is its top byte), the doublings a
+-- decision needs are counted and done as one shift, and input is taken
+-- seven bytes at a time whenever fewer than eight valid bits remain. The
+-- split, the comparison and the two outcomes are the RFC's own. State lives
+-- in an unboxed array: 0 byte position, 1 the window, 2 how many of its top
+-- bits are valid, 3 the range (128..255). Reads past the end of the
+-- partition yield zero bytes, as the format prescribes.
 data VPBool s = VPBool !BS.ByteString !Int !(STUArray s Int Int)
                        -- buffer, end, state
 
@@ -3670,53 +3685,49 @@ vpNewBool bs off len = do
   let end = min (BS.length bs) (max off (off + len))
   st <- newArray (0, 3) 0
   unsafeWrite st 0 off
-  unsafeWrite st 2 (-8)
-  unsafeWrite st 3 254
-  vpLoad bs end st
+  unsafeWrite st 3 255
   pure (VPBool bs end st)
 
--- Refill: seven bytes at once when they are there, else one (or a zero).
--- The window holds fewer than 8 bits whenever this runs, so 56 more fit.
-vpLoad :: BS.ByteString -> Int -> STUArray s Int Int -> ST s ()
-vpLoad bs end st = do
+-- Top the window up with the next seven bytes. It holds fewer than eight
+-- valid bits whenever this runs, and the bits below them are zero, so the
+-- new bytes are or-ed in directly beneath.
+vpRefill :: BS.ByteString -> Int -> STUArray s Int Int -> ST s ()
+vpRefill bs end st = do
   pos   <- unsafeRead st 0
-  value <- unsafeRead st 1
-  bits  <- unsafeRead st 2
-  if pos >= 0 && pos + 7 <= end
-    then do
-      let b i = fromIntegral (BSU.unsafeIndex bs (pos + i)) :: Int
-          v = (b 0 `shiftL` 48) .|. (b 1 `shiftL` 40) .|. (b 2 `shiftL` 32)
-              .|. (b 3 `shiftL` 24) .|. (b 4 `shiftL` 16) .|. (b 5 `shiftL` 8) .|. b 6
-      unsafeWrite st 1 ((value `shiftL` 56) .|. v)
-      unsafeWrite st 2 (bits + 56)
-      unsafeWrite st 0 (pos + 7)
-    else do
-      let byte = if pos >= 0 && pos < end then at bs pos else 0
-      unsafeWrite st 1 ((value `shiftL` 8) .|. byte)
-      unsafeWrite st 2 (bits + 8)
-      unsafeWrite st 0 (pos + 1)
+  win   <- unsafeRead st 1
+  valid <- unsafeRead st 2
+  let byte i | i >= 0 && i < end = fromIntegral (BSU.unsafeIndex bs i) :: Int
+             | otherwise = 0
+      fast i = fromIntegral (BSU.unsafeIndex bs (pos + i)) :: Int
+      seven | pos >= 0 && pos + 7 <= end =
+                (fast 0 `shiftL` 48) .|. (fast 1 `shiftL` 40) .|. (fast 2 `shiftL` 32)
+                .|. (fast 3 `shiftL` 24) .|. (fast 4 `shiftL` 16) .|. (fast 5 `shiftL` 8) .|. fast 6
+            | otherwise = foldl (\acc i -> (acc `shiftL` 8) .|. byte (pos + i)) 0 [0 .. 6]
+  unsafeWrite st 1 (win .|. (seven `shiftL` (8 - valid)))
+  unsafeWrite st 2 (valid + 56)
+  unsafeWrite st 0 (pos + 7)
 
--- One exit, with the bit and the new range/value picked as pure values:
+-- One exit, with the bit and the new range/window picked as pure values:
 -- two monadic exits let case-of-case copy each call site's continuation into
 -- both, and this is inlined at every token, which multiplied the frame
 -- decoder's code size many times over.
 {-# INLINE vpGetBool #-}
 vpGetBool :: VPBool s -> Int -> ST s Int
 vpGetBool (VPBool bs end st) prob = do
-  bits0 <- unsafeRead st 2
-  when (bits0 < 0) $ vpLoad bs end st
-  value <- unsafeRead st 1
-  bits  <- unsafeRead st 2
+  valid0 <- unsafeRead st 2
+  when (valid0 < 8) $ vpRefill bs end st
+  win   <- unsafeRead st 1
+  valid <- unsafeRead st 2
   rng   <- unsafeRead st 3
-  let split = (rng * prob) `shiftR` 8
-      big   = (split + 1) `shiftL` bits
-      bit   = if value >= big then 1 else 0   -- (value >> bits) > split
-      r     = if bit == 1 then rng - split else split + 1
+  let split = 1 + (((rng - 1) * prob) `shiftR` 8)
+      big   = split `shiftL` 56                -- the split against the window's top byte
+      bit   = if (fromIntegral win :: Word) >= fromIntegral big then 1 else 0
+      r     = if bit == 1 then rng - split else split
       -- Doublings that bring range r (1..255) back to at least 128.
       sh    = countLeadingZeros r - (finiteBitSize r - 8)
-  unsafeWrite st 1 (value - big * bit)
-  unsafeWrite st 2 (bits - sh)
-  unsafeWrite st 3 ((r `shiftL` sh) - 1)
+  unsafeWrite st 1 ((win - big * bit) `shiftL` sh)
+  unsafeWrite st 2 (valid - sh)
+  unsafeWrite st 3 (r `shiftL` sh)
   pure bit
 
 vpFlag :: VPBool s -> ST s Int
@@ -4046,10 +4057,10 @@ vpDecodeFrame bs part0 w h = do
 rdI :: STUArray s Int Int -> Int -> ST s Int
 rdI = readArray
 
--- Key-frame 4x4 sub-mode, context-coded against the above/left sub-modes.
--- Mode numbering follows the tree-leaf order 0..9 = DC TM VE HE RD VR LD VL
--- HD HU (libwebp's), because 'vpBModeProbs' is indexed by it — this differs
--- from RFC 6386's enum, which swaps LD in front of RD/VR.
+-- Key-frame 4x4 sub-mode, context-coded against the above/left sub-modes
+-- (RFC 6386 section 11.2: @bmode_tree@ walked with @kf_bmode_prob[A][L]@).
+-- Modes are numbered as the RFC's @intra_bmode@ enum, 0..9 = DC TM VE HE LD
+-- RD VR VL HD HU, which is also how 'vpBModeProbs' is indexed.
 vpReadBMode :: VPBool s -> Int -> ST s Int
 vpReadBMode bd base = do
   let pr i = vpGetBool bd (vpBModeProbs ! (base + i))
@@ -4063,9 +4074,9 @@ vpReadBMode bd base = do
         if b3 == 0
           then do b4 <- pr 4
                   if b4 == 0 then pure 3
-                  else do b5 <- pr 5; pure (if b5 == 0 then 4 else 5)
+                  else do b5 <- pr 5; pure (if b5 == 0 then 5 else 6)
           else do b6 <- pr 6
-                  if b6 == 0 then pure 6
+                  if b6 == 0 then pure 4
                   else do b7 <- pr 7
                           if b7 == 0 then pure 7
                           else do b8 <- pr 8; pure (if b8 == 0 then 8 else 9)
@@ -4143,7 +4154,7 @@ vpLargeValue bd probs p = do
           v <- extra lo 0
           pure (v + 3 + (8 `shiftL` cat))
 
--- The exact integer 4x4 inverse DCT (RFC 6386 section 14.3), added onto the
+-- The exact integer 4x4 inverse DCT (RFC 6386 section 14.4), added onto the
 -- prediction already in the plane. Columns go through a 16-entry scratch
 -- buffer; rows are written straight into the plane.
 vpIdctAdd :: STUArray s Int Int -> STUArray s Int Word8 -> Int -> Int -> Int
@@ -4328,14 +4339,14 @@ vpBPix edge mode row c = case mode of
           pure (clamp8 (l + a - p))
   2 -> a3 (4+c) (5+c) (6+c)                                             -- B_VE
   3 -> if row == 3 then a3 1 0 0 else a3 (4-row) (3-row) (2-row)        -- B_HE
-  4 -> let d = c - row in a3 (d+3) (d+4) (d+5)                          -- B_RD
-  5 -> case row of                                                      -- B_VR
+  4 -> let k = row + c                                                  -- B_LD
+       in if k < 6 then a3 (5+k) (6+k) (7+k) else a3 11 12 12
+  5 -> let d = c - row in a3 (d+3) (d+4) (d+5)                          -- B_RD
+  6 -> case row of                                                      -- B_VR
          0 -> a2 (4+c) (5+c)
          1 -> a3 (3+c) (4+c) (5+c)
          2 -> if c == 0 then a3 2 3 4 else a2 (3+c) (4+c)
          _ -> if c == 0 then a3 1 2 3 else a3 (2+c) (3+c) (4+c)
-  6 -> let k = row + c                                                  -- B_LD
-       in if k < 6 then a3 (5+k) (6+k) (7+k) else a3 11 12 12
   7 -> case row of                                                      -- B_VL
          0 -> a2 (5+c) (6+c)
          1 -> a3 (5+c) (6+c) (7+c)
@@ -4469,7 +4480,7 @@ vpSimpleEdge :: STUArray s Int Word8 -> Int -> Int -> Int -> ST s ()
 vpSimpleEdge pl o step lim = do
   p1 <- rdP8 pl (o-2*step); p0 <- rdP8 pl (o-step)
   q0 <- rdP8 pl o;          q1 <- rdP8 pl (o+step)
-  when (4*abs (p0-q0) + abs (p1-q1) <= 2*lim + 1) $ vpAdjust2 pl o step p1 p0 q0 q1
+  when (2*abs (p0-q0) + (abs (p1-q1) `shiftR` 1) <= lim) $ vpAdjust2 pl o step p1 p0 q0 q1
 
 -- Normal filter for one edge position: macroblock edges use the wide 6-tap
 -- smoothing, interior edges the 4-tap one; high edge variance falls back to
@@ -4481,7 +4492,7 @@ vpEdge mbEdge pl o step lim ilim hevT = do
   q0 <- rdP8 pl o;          q1 <- rdP8 pl (o+step)
   -- The cheap edge-difference test rejects most positions before the outer
   -- taps are read.
-  when (4*abs (p0-q0) + abs (p1-q1) <= 2*lim + 1) $ do
+  when (2*abs (p0-q0) + (abs (p1-q1) `shiftR` 1) <= lim) $ do
     p3 <- rdP8 pl (o-4*step); p2 <- rdP8 pl (o-3*step)
     q2 <- rdP8 pl (o+2*step); q3 <- rdP8 pl (o+3*step)
     let ok = abs (p3-p2) <= ilim && abs (p2-p1) <= ilim && abs (p1-p0) <= ilim
@@ -4512,10 +4523,35 @@ vpEdge mbEdge pl o step lim ilim hevT = do
             unsafeWrite pl o          (fromIntegral (clamp8 (q0 - a1)))
             unsafeWrite pl (o+step)   (fromIntegral (clamp8 (q1 - a3)))
 
--- YUV 4:2:0 planes to RGBA: "fancy" bilinear chroma upsampling and the
--- BT.601 studio-range conversion, in libwebp's fixed-point arithmetic. The
+-- YUV 4:2:0 planes to RGBA. Neither RFC 6386 nor the WebP container
+-- specification fixes the arithmetic of this step (the container says only
+-- that the colour is ITU-R BT.601), so the bar is libwebp's output, which
+-- this matches bit for bit: chroma is upsampled bilinearly, each output
+-- sample weighing its four nearest chroma samples 9:3:3:1, and the
+-- conversion is BT.601's studio-range matrix in fixed point ('vpYuv'). The
 -- two chroma rows and the clamped column pair are resolved once per row and
--- per pixel respectively; the samples feeding each output pixel are unchanged.
+-- per pixel respectively.
+--
+-- The matrix: luma is scaled by 255/219 and chroma by 255/224 (the studio
+-- ranges 16..235 and 16..240), with BT.601's luma weights Kr = 0.299 and
+-- Kb = 0.114. Coefficients carry 14 fractional bits; a sample times a
+-- coefficient is reduced by 8 bits, leaving 6, and each channel's constant
+-- gathers the 16 and 128 offsets and the rounding half at that precision.
+-- Returned as (y, v to r, u to g, v to g, u to b, r constant, g constant,
+-- b constant) = (19077, 26149, 6419, 13320, 33050, -14234, 8708, -17685).
+vpYuv :: (Int, Int, Int, Int, Int, Int, Int, Int)
+vpYuv = (q fy, q frv, q fgu, q fgv, q fbu, c (negate (16 * fy + 128 * frv)),
+         c (128 * fgu + 128 * fgv - 16 * fy), c (negate (16 * fy + 128 * fbu)))
+  where
+    kr = 0.299; kb = 0.114; kg = 1 - kr - kb :: Double
+    luma = 255 / 219; chroma = 255 / 224 :: Double
+    fy = luma
+    frv = 2 * (1 - kr) * chroma
+    fbu = 2 * (1 - kb) * chroma
+    fgu = 2 * (1 - kb) * kb / kg * chroma
+    fgv = 2 * (1 - kr) * kr / kg * chroma
+    q x = round (x * 16384) :: Int               -- 14 fractional bits
+    c x = truncate (x * 64 + 32) :: Int          -- 6 fractional bits, plus the rounding half
 vpToImage :: Int -> Int -> Int -> Int -> UArray Int Word8 -> UArray Int Word8
           -> UArray Int Word8 -> Maybe (UArray Int Word8) -> Image
 vpToImage w h yW cW yP uP vP malpha =
@@ -4523,6 +4559,7 @@ vpToImage w h yW cW yP uP vP malpha =
     a <- newBytes (w*h*4)
     let chW = (w + 1) `shiftR` 1; chH = (h + 1) `shiftR` 1
         c8 pl i = fromIntegral (pl `unsafeAt` i) :: Int
+        !(!kY, !kRV, !kGU, !kGV, !kBU, !cR, !cG, !cB) = vpYuv
     forLoop 0 (h-1) $ \y -> do
       let cy = y `shiftR` 1
           dy = if odd y then 1 else -1
@@ -4542,11 +4579,11 @@ vpToImage w h yW cW yP uP vP malpha =
             vv = up vP
             mh val co = (val * co) `shiftR` 8
             clip v = if v < 0 then 0 else if v >= 16384 then 255 else v `shiftR` 6
-            yy = mh yv 19077
+            yy = mh yv kY
             o = (oRow + x) * 4
-        unsafeWrite a o       (fromIntegral (clip (yy + mh vv 26149 - 14234)))
-        unsafeWrite a (o + 1) (fromIntegral (clip (yy - mh uv 6419 - mh vv 13320 + 8708)))
-        unsafeWrite a (o + 2) (fromIntegral (clip (yy + mh uv 33050 - 17685)))
+        unsafeWrite a o       (fromIntegral (clip (yy + mh vv kRV + cR)))
+        unsafeWrite a (o + 1) (fromIntegral (clip (yy - mh uv kGU - mh vv kGV + cG)))
+        unsafeWrite a (o + 2) (fromIntegral (clip (yy + mh uv kBU + cB)))
         unsafeWrite a (o + 3) (case malpha of
                                  Nothing -> 255
                                  Just ap -> ap `unsafeAt` (oRow + x))
@@ -4937,16 +4974,17 @@ vpCoeffUpdate = U.listArray (0,1055)
   , 254,255,255,255,255,255,255,255,255,255,255
   , 255,255,255,255,255,255,255,255,255,255,255 ]
 
--- Key-frame B-mode probabilities, [above][left][9] flattened.
+-- Key-frame B-mode probabilities (RFC 6386 section 11.5, @kf_bmode_prob@):
+-- [above][left][9] flattened, modes in the RFC's enum order.
 vpBModeProbs :: UArray Int Int
 vpBModeProbs = U.listArray (0,899)
   [ 231,120,48,89,115,113,120,152,112
   , 152,179,64,126,170,118,46,70,95
   , 175,69,143,80,85,82,72,155,103
   , 56,58,10,171,218,189,17,13,152
+  , 144,71,10,38,171,213,144,34,26
   , 114,26,17,163,44,195,21,10,173
   , 121,24,80,195,26,62,44,64,85
-  , 144,71,10,38,171,213,144,34,26
   , 170,46,55,19,136,160,33,206,71
   , 63,20,8,114,114,208,12,9,226
   , 81,40,11,96,182,84,29,16,36
@@ -4954,9 +4992,9 @@ vpBModeProbs = U.listArray (0,899)
   , 72,187,100,130,157,111,32,75,80
   , 66,102,167,99,74,62,40,234,128
   , 41,53,9,178,241,141,26,8,107
+  , 104,79,12,27,217,255,87,17,7
   , 74,43,26,146,73,166,49,23,157
   , 65,38,105,160,51,52,31,115,128
-  , 104,79,12,27,217,255,87,17,7
   , 87,68,71,44,114,51,15,186,23
   , 47,41,14,110,182,183,21,17,194
   , 66,45,25,102,197,189,23,18,22
@@ -4964,9 +5002,9 @@ vpBModeProbs = U.listArray (0,899)
   , 43,97,183,117,85,38,35,179,61
   , 39,53,200,87,26,21,43,232,171
   , 56,34,51,104,114,102,29,93,77
+  , 107,54,32,26,51,1,81,43,31
   , 39,28,85,171,58,165,90,98,64
   , 34,22,116,206,23,34,43,166,73
-  , 107,54,32,26,51,1,81,43,31
   , 68,25,106,22,64,171,36,225,114
   , 34,19,21,102,132,188,16,76,124
   , 62,18,78,95,85,57,50,48,51
@@ -4974,19 +5012,29 @@ vpBModeProbs = U.listArray (0,899)
   , 60,148,31,172,219,228,21,18,111
   , 112,113,77,85,179,255,38,120,114
   , 40,42,1,196,245,209,10,25,109
+  , 100,80,8,43,154,1,51,26,71
   , 88,43,29,140,166,213,37,43,154
   , 61,63,30,155,67,45,68,1,209
-  , 100,80,8,43,154,1,51,26,71
   , 142,78,78,16,255,128,34,197,171
   , 41,40,5,102,211,183,4,1,221
   , 51,50,17,168,209,192,23,25,82
+  , 125,98,42,88,104,85,117,175,82
+  , 95,84,53,89,128,100,113,101,45
+  , 75,79,123,47,51,128,81,171,1
+  , 57,17,5,71,102,57,53,41,49
+  , 115,21,2,10,102,255,166,23,6
+  , 38,33,13,121,57,73,26,1,85
+  , 41,10,67,138,77,110,90,47,114
+  , 101,29,16,10,85,128,101,196,26
+  , 57,18,10,102,102,213,34,20,43
+  , 117,20,15,36,163,128,68,1,26
   , 138,31,36,171,27,166,38,44,229
   , 67,87,58,169,82,115,26,59,179
   , 63,59,90,180,59,166,93,73,154
   , 40,40,21,116,143,209,34,39,175
+  , 57,46,22,24,128,1,54,17,37
   , 47,15,16,183,34,223,49,45,183
   , 46,17,33,183,6,98,15,32,183
-  , 57,46,22,24,128,1,54,17,37
   , 65,32,73,115,28,128,23,128,205
   , 40,3,9,115,51,192,18,6,223
   , 87,37,9,115,59,77,64,21,47
@@ -4994,29 +5042,19 @@ vpBModeProbs = U.listArray (0,899)
   , 64,90,70,205,40,41,23,26,57
   , 54,57,112,184,5,41,38,166,213
   , 30,34,26,133,152,116,10,32,134
+  , 75,32,12,51,192,255,160,43,51
   , 39,19,53,221,26,114,32,73,255
   , 31,9,65,234,2,15,1,118,73
-  , 75,32,12,51,192,255,160,43,51
   , 88,31,35,67,102,85,55,186,85
   , 56,21,23,111,59,205,45,37,192
   , 55,38,70,124,73,102,1,34,98
-  , 125,98,42,88,104,85,117,175,82
-  , 95,84,53,89,128,100,113,101,45
-  , 75,79,123,47,51,128,81,171,1
-  , 57,17,5,71,102,57,53,41,49
-  , 38,33,13,121,57,73,26,1,85
-  , 41,10,67,138,77,110,90,47,114
-  , 115,21,2,10,102,255,166,23,6
-  , 101,29,16,10,85,128,101,196,26
-  , 57,18,10,102,102,213,34,20,43
-  , 117,20,15,36,163,128,68,1,26
   , 102,61,71,37,34,53,31,243,192
   , 69,60,71,38,73,119,28,222,37
   , 68,45,128,34,1,47,11,245,171
   , 62,17,19,70,146,85,55,62,70
+  , 75,15,9,9,64,255,184,119,16
   , 37,43,37,154,100,163,85,160,1
   , 63,9,92,136,28,64,32,201,85
-  , 75,15,9,9,64,255,184,119,16
   , 86,6,28,5,64,255,25,248,1
   , 56,8,17,132,137,255,55,116,128
   , 58,15,20,82,135,57,26,121,40
@@ -5024,9 +5062,9 @@ vpBModeProbs = U.listArray (0,899)
   , 51,103,44,131,131,123,31,6,158
   , 86,40,64,135,148,224,45,183,128
   , 22,26,17,131,240,154,14,1,209
+  , 83,12,13,54,192,255,68,47,28
   , 45,16,21,91,64,222,7,1,197
   , 56,21,39,155,60,138,23,102,213
-  , 83,12,13,54,192,255,68,47,28
   , 85,26,85,85,128,128,32,146,171
   , 18,11,7,63,144,171,4,4,246
   , 35,27,10,146,174,171,12,26,128
@@ -5034,9 +5072,9 @@ vpBModeProbs = U.listArray (0,899)
   , 85,126,47,87,176,51,41,20,32
   , 101,75,128,139,118,146,116,128,85
   , 56,41,15,176,236,85,37,9,62
+  , 146,36,19,30,171,255,97,27,20
   , 71,30,17,119,118,255,17,18,138
   , 101,38,60,138,55,70,43,26,142
-  , 146,36,19,30,171,255,97,27,20
   , 138,45,61,62,219,1,81,188,64
   , 32,41,20,117,151,142,20,21,163
   , 112,19,12,61,195,128,48,4,24 ]

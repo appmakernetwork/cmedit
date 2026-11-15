@@ -536,7 +536,9 @@ charToNames = M.fromListWith (flip (++)) [ (c, [n]) | (n, c) <- aglPairs ]
 -- Windows-1252 and Mac Roman extras, Greek (Symbol's names), and the common
 -- punctuation, math and arrow names. For a name that is in neither this
 -- table nor the @uni@ form, the caller still has the font's own name lookup.
--- Where two names share a character the preferred one comes first.
+-- Where two names share a character the preferred one comes first. (The
+-- list is Adobe's @glyphlist.txt@, Copyright 2002-2019 Adobe, BSD 3-clause;
+-- see the acknowledgements in @README.md@.)
 aglPairs :: [(String, Char)]
 aglPairs =
   [ ("space", ' '), ("exclam", '!'), ("quotedbl", '"'), ("numbersign", '#')

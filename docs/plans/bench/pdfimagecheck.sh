@@ -8,8 +8,9 @@
 # What is compared: each image's colour after /Decode and its colour space
 # (pdfimages -png converts to grey or RGB the same way), each soft mask on its
 # own, each stencil's coverage. CMYK (raw, JPEG, and anything ending in
-# DeviceCMYK) is compared directly too: the reader uses poppler's own
-# profile-less CMYK->RGB, so those rows are held to the same bar. Files are
+# DeviceCMYK) is compared directly too: the reader's profile-less CMYK->RGB
+# is measured from pdftoppm's output (cmyk_measure.py), so those rows are
+# held to the same bar. Files are
 # only read; nothing is copied anywhere.
 set -e
 here=$(cd "$(dirname "$0")" && pwd)

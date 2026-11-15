@@ -2037,8 +2037,12 @@ noiseRows fh visible invisible lut (corrX, corrB) img ya yb = do
         unsafeWrite py i (yv + nx + ny)
         unsafeWrite pb i (bv + corrB' * (nx + ny))
 
--- Eight-lane xorshift128+ as libjxl seeds it: the sixteen words at @sb@
--- of @st@ (lane i's halves at @sb + i@ and @sb + 8 + i@).
+-- The noise generator the specification prescribes (ISO/IEC 18181-1,
+-- noise synthesis): eight independent xorshift128+ generators (Vigna's,
+-- with shifts 23, 18 and 5), each half of whose state is seeded by running
+-- SplitMix64 on from the group's seed. libjxl's output is the reference it
+-- is held to. The sixteen words are at @sb@ of @st@ (lane i's halves at
+-- @sb + i@ and @sb + 8 + i@).
 seedXorShift :: STUArray s Int Word64 -> Int -> Word64 -> Word64 -> ST s ()
 seedXorShift st sb seed0 seed1 = do
   let mix z0 = let z1 = (z0 `xor` (z0 `shiftR` 30)) * 0xBF58476D1CE4E5B9

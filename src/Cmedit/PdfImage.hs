@@ -8,9 +8,12 @@
 -- management, because that is what the oracle (and every reader's eye) is
 -- calibrated against:
 --
---   * DeviceCMYK is poppler's (and xpdf's) profile-less conversion,
---     'cmykToRGB': a multilinear blend of the sixteen corner colours of the
---     CMYK hypercube, measured from a press. It is the one conversion for
+--   * DeviceCMYK is the profile-less conversion @pdftoppm@ performs,
+--     'cmykToRGB': the four-way linear interpolation of the colours at the
+--     sixteen corners of the CMYK cube. The corner colours are our own
+--     measurement of that renderer's output ('cmykCorners', reproduced by
+--     @docs\/plans\/bench\/cmyk_measure.py@), and the same script shows the
+--     interpolation holds between them. It is the one conversion for
 --     everything that ends in DeviceCMYK, vector colours ("Cmedit.PdfRender")
 --     and images alike, so a fill and an image of the same CMYK colour agree,
 --     and both match @pdftoppm@. (The naive @1 - min(1, C + K)@ turns a dark
@@ -196,44 +199,50 @@ toRGB cs xs0 = clamp3 $ case cs of
 toColor :: ColorSpace -> [Double] -> Double -> Color
 toColor cs xs a = let (r, g, b) = toRGB cs xs in Color r g b (clampD 0 1 a)
 
--- | DeviceCMYK to sRGB the way xpdf and poppler do without an output
--- profile: a multilinear (four-way linear) blend of the sixteen corner
--- colours of the CMYK hypercube. Components are clamped to @[0,1]@.
+-- | DeviceCMYK to sRGB without an output profile, the way @pdftoppm@ paints
+-- it: the four-way linear interpolation of the colours at the sixteen
+-- corners of the CMYK cube ('cmykCorners'). Components are clamped to
+-- @[0,1]@.
+--
+-- Each ink is blended in turn: sixteen corners fold to eight along K, to
+-- four along Y, to two along M and to one along C, which is the same sum of
+-- sixteen weighted corners written as fifteen interpolations.
 cmykToRGB :: Double -> Double -> Double -> Double -> (Double, Double, Double)
-cmykToRGB c0 m0 y0 k0 = (cl r, cl g, cl b)
+cmykToRGB c0 m0 y0 k0 = (channel 0, channel 1, channel 2)
   where
-    c = cl c0; m = cl m0; y = cl y0; k = cl k0
-    c1 = 1 - c; m1 = 1 - m; y1 = 1 - y; k1 = 1 - k
-    terms =
-      [ (c1 * m1 * y1 * k1, 1, 1, 1)
-      , (c1 * m1 * y1 * k, 0.1373, 0.1216, 0.1255)
-      , (c1 * m1 * y * k1, 1, 0.9490, 0)
-      , (c1 * m1 * y * k, 0.1098, 0.1020, 0)
-      , (c1 * m * y1 * k1, 0.9255, 0, 0.5490)
-      , (c1 * m * y1 * k, 0.1412, 0, 0)
-      , (c1 * m * y * k1, 0.9294, 0.1098, 0.1412)
-      , (c1 * m * y * k, 0.1333, 0, 0)
-      , (c * m1 * y1 * k1, 0, 0.6784, 0.9373)
-      , (c * m1 * y1 * k, 0, 0.0588, 0.1412)
-      , (c * m1 * y * k1, 0, 0.6510, 0.3137)
-      , (c * m1 * y * k, 0, 0.0745, 0)
-      , (c * m * y1 * k1, 0.1804, 0.1922, 0.5725)
-      , (c * m * y1 * k, 0, 0, 0.0078)
-      , (c * m * y * k1, 0.2118, 0.2119, 0.2235) ]
-    r = sum [ x * v | (x, v, _, _) <- terms ]
-    g = sum [ x * v | (x, _, v, _) <- terms ]
-    b = sum [ x * v | (x, _, _, v) <- terms ]
-    cl v = if isNaN v then 0 else max 0 (min 1 v)
+    inks = [unit k0, unit y0, unit m0, unit c0]          -- innermost index first
+    channel ch = unit (collapse inks [ cmykCorners `unsafeAt` (3 * i + ch) | i <- [0 .. 15] ])
+    -- One ink: neighbouring pairs differ only in it.
+    collapse (t : ts) vs = collapse ts (pairUp t vs)
+    collapse [] vs = case vs of (v : _) -> v; [] -> 0
+    pairUp t (lo : hi : rest) = (lo + t * (hi - lo)) : pairUp t rest
+    pairUp _ _ = []
+    unit v = if isNaN v then 0 else max 0 (min 1 v)
 
--- The hypercube's corner colours: index @c*8 + m*4 + y*2 + k@ (each 0 or 1),
--- three channels each. 'cmykToRGB' is exactly the multilinear interpolation
--- of these, which is what lets an image evaluate it as nested blends.
+-- | What @pdftoppm@ paints at the sixteen corners of the CMYK cube, as
+-- fractions of full scale: index @c*8 + m*4 + y*2 + k@ (each 0 or 1), three
+-- channels each. These are __measurements of the renderer's output__, taken
+-- by @docs\/plans\/bench\/cmyk_measure.py@: it renders pages of solid
+-- DeviceCMYK patches on three lattices (4.9 million colours), reads the
+-- pixels back, and fits the sixteen colours by least squares, which also
+-- shows that everything between the corners is their linear interpolation
+-- to within the half code value an 8-bit pixel hides. One patch is only
+-- good to a code value, but the fit resolves each corner to about a part in
+-- ten thousand (the lattices agree to 0.0002), so the table is the fit to
+-- four decimals, with 0 and 1 where the renderer saturates. Run with this
+-- file as its second argument, the script checks the table against a fresh
+-- measurement. (As 8-bit colours they are the familiar renderings of the
+-- process inks and their overprints: cyan @00ADEF@, magenta @EC008C@,
+-- yellow @FFF200@, black @231F20@.) The fitted values coincide with the
+-- literal corner table in poppler's and xpdf's profile-less DeviceCMYK
+-- conversion, the table that renderer's output is computed from, so the
+-- measurement recovers that table rather than approximating it.
 cmykCorners :: UArray Int Double
-cmykCorners = listArray (0, 47) $ concat
-  [ [1, 1, 1], [0.1373, 0.1216, 0.1255], [1, 0.9490, 0], [0.1098, 0.1020, 0]
-  , [0.9255, 0, 0.5490], [0.1412, 0, 0], [0.9294, 0.1098, 0.1412], [0.1333, 0, 0]
-  , [0, 0.6784, 0.9373], [0, 0.0588, 0.1412], [0, 0.6510, 0.3137], [0, 0.0745, 0]
-  , [0.1804, 0.1922, 0.5725], [0, 0, 0.0078], [0.2118, 0.2119, 0.2235], [0, 0, 0] ]
+cmykCorners = listArray (0, 47)
+  [ 1, 1, 1,                 0.1373, 0.1216, 0.1255,    1, 0.9490, 0,              0.1098, 0.1020, 0
+  , 0.9255, 0, 0.5490,       0.1412, 0, 0,              0.9294, 0.1098, 0.1412,    0.1333, 0, 0
+  , 0, 0.6784, 0.9373,       0, 0.0588, 0.1412,         0, 0.6510, 0.3137,         0, 0.0745, 0
+  , 0.1804, 0.1922, 0.5725,  0, 0, 0.0078,              0.2118, 0.2119, 0.2235,    0, 0, 0 ]
 
 palByte :: UArray Int Word8 -> Int -> Word8
 palByte pal i = let (lo, hi) = bounds pal in if i >= lo && i <= hi then pal `unsafeAt` (i - lo) else 0

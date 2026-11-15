@@ -82,7 +82,7 @@ data ShadeBody
   deriving (Show)
 
 -- | A colour operand as the renderer paints it: "Cmedit.PdfImage"'s
--- 'toColor', whose DeviceCMYK conversion is poppler's sixteen-corner blend
+-- 'toColor', whose DeviceCMYK conversion is the measured sixteen-corner blend
 -- ('cmykToRGB', also re-exported from here). It lives there and only there,
 -- so a vector fill and an image of the same CMYK colour agree.
 paintColor :: ColorSpace -> [Double] -> Double -> Color

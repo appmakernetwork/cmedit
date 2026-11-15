@@ -451,7 +451,9 @@ readDist br _logA tableSize = do
       jguard (shift <= 13) "JPEG XL: bad ANS histogram"
       alpha <- liftJ ((+ 3) <$> readU8 br)
       jguard (alpha <= tableSize) "JPEG XL: bad ANS histogram"
-      -- log counts, with run-length "same" markers (libjxl's ReadHistogram)
+      -- §C.2.5's general form: a log count per symbol through its small
+      -- prefix code, with run-length "same as before" markers; the largest
+      -- is left out and takes whatever remains of the 4096
       let readLogs !i acc
             | i >= alpha = pure (reverse acc)
             | otherwise = do

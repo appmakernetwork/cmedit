@@ -611,10 +611,74 @@ warranty. See the [`LICENSE`](LICENSE) file for the full text.
 
 ## Acknowledgements
 
-The JPEG decoder is written from the published standards (ITU-T T.81, JFIF
-1.02, and the Loeffler–Ligtenberg–Moschytz IDCT) and reproduces
-libjpeg-turbo's output exactly. This software is based in part on the work of
-the Independent JPEG Group.
+CMeDit's decoders and renderers are written from published specifications
+and papers, and are held to reference implementations by comparing *output*
+(`docs/plans/bench/` has the harnesses), not by following their source. The
+sources each one is written from:
+
+- **JPEG.** ITU-T T.81, JFIF 1.02, and the Loeffler–Ligtenberg–Moschytz
+  IDCT; it reproduces libjpeg-turbo's output exactly. This software is based
+  in part on the work of the Independent JPEG Group.
+- **WebP (lossy).** RFC 6386, *VP8 Data Format and Decoding Guide*: the
+  bitstream, the boolean decoder, the prediction modes, the inverse
+  transforms, the loop filter, and its tables of default probabilities and
+  quantiser steps, which are the format's constants and are reproduced from
+  the RFC. The RFC's code components are © 2010, 2011 Google Inc. under the
+  BSD licence below. Colour conversion is ITU-R BT.601; output matches
+  libwebp's bit for bit.
+- **JPEG XL.** ISO/IEC 18181-1. The cosine transforms use the radix-2
+  recursion of B. G. Lee (IEEE Trans. ASSP 32, 1984) in the self-recursive
+  form of S. M. Perera and J. Liu (SIAM J. Matrix Anal. Appl. 39, 2018); the
+  noise generator is S. Vigna's xorshift128+ seeded with SplitMix64, as the
+  standard prescribes. Output is held to libjxl's.
+- **CCITT fax (PDF).** ITU-T T.4 and T.6, and the `CCITTFaxDecode`
+  parameters of ISO 32000-1.
+- **PDF.** ISO 32000-1 and Adobe's *PDF Reference*, sixth edition, whose
+  Appendix D is the source of the standard encoding tables. Glyph names are
+  mapped to Unicode with values from the **Adobe Glyph List**
+  (`glyphlist.txt`, © 2002–2019 Adobe, BSD licence below): it is the
+  normative mapping the PDF standard itself refers to, so `Cmedit.PdfObj` and
+  `Cmedit.FontCore` carry the subset of it they need. DeviceCMYK is converted
+  with corner colours measured from pdftoppm's rendering
+  (`docs/plans/bench/cmyk_measure.py`); pages are compared with poppler's.
+- **Vector rasteriser.** Coverage is the signed-area accumulation buffer
+  described by Raph Levien for font-rs (*Inside the fastest font renderer in
+  the world*, 2016); compositing follows W3C *Compositing and Blending
+  Level 1*. Output is compared with resvg's.
+
+The two BSD-licensed sources named above carry this licence, with "Google"
+and "Adobe" respectively as the copyright holder's name:
+
+```
+Copyright (c) 2010, 2011, Google Inc.  All rights reserved.
+Copyright 2002-2019 Adobe (http://www.adobe.com/).
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+  * Redistributions of source code must retain the above copyright notice,
+    this list of conditions and the following disclaimer.
+
+  * Redistributions in binary form must reproduce the above copyright notice,
+    this list of conditions and the following disclaimer in the documentation
+    and/or other materials provided with the distribution.
+
+  * Neither the name of Google (for RFC 6386) or Adobe (for the Adobe Glyph
+    List) nor the names of its contributors may be used to endorse or promote
+    products derived from this software without specific prior written
+    permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
 
 ## Contributing
 
