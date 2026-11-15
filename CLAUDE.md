@@ -1097,7 +1097,34 @@ in `README.md`; the cross-cutting structure that matters when editing:
   per call unless it is a join point; two monadic exits duplicate an inlined
   continuation) plus every rejected experiment. Change one with
   `docs/plans/bench/imgbench.sh` (compare the hash column against the old
-  build) and `docs/plans/bench/ImageFuzz.hs` (diff corrupt-input outcomes).
+  build) and `docs/plans/bench/ImageFuzz.hs` (diff corrupt-input outcomes);
+  `imgbench.sh build-threaded` builds the editor's runtime (`-threaded -N4`),
+  and the bench reports wall-clock time, because CPU time stops meaning
+  anything once a decoder runs in parallel.
+  **JPEG streams and runs in parallel, and both are invisible in its
+  output.** Entropy decoding is sequential and is 10–28% of the time, so the
+  calling thread entropy-decodes and up to four `parOrdered` workers do the
+  IDCT, upsampling and colour conversion in bands of 4–8 MCU rows
+  (`mkConv`/`runRange`, one reconstruction state per slot, `CoefSrc` naming
+  where a band's coefficients live). A band reads one MCU row of chroma
+  above and below itself as a halo and recomputes it, which is bit-identical
+  to what its neighbour computed. Parallelism needs `nw > 1`, at least 16 MCU
+  rows and 2^18 pixels; otherwise the sequential code runs unchanged.
+  **A baseline file whose single scan is interleaved never holds the image's
+  coefficients**: the scan is decoded MCU row by MCU row into small per-slot
+  buffers (`look = nw + 2` slots of K+2 rows, the first two copied from the
+  previous slot), which halved peak memory. `jpegStreamable` is what makes
+  that legal, and it is conservative on purpose: the whole-coefficient path
+  dequantises with the tables as they stand *after* the walk and merges later
+  scans, so a DQT or a second SOS after the scan (or, with restart markers,
+  an `FF DA`/`FF DB` pair anywhere after the scan, since the restart search
+  can jump markers in a corrupt file) sends the file down the old path, as do
+  progressive files. A kill during a parallel decode must not leave a
+  poisoned thunk behind (a decoded image can sit unforced in a shared scene
+  that a later raster job forces), so the JPEG sites use
+  `parOrderedResumable`, which re-delivers an asynchronous exception with
+  `throwTo` to itself, freezing the thunk; a resumed decode restarts
+  sequentially from the beginning, since the entropy reader has moved on.
   Detection is by **magic bytes** in `App.openPath` (not extension): it sniffs
   the file, decodes images via `imageLoaded`/`imageLoadedNew`/`addImageDocument`,
   and surfaces a `setError` for anything it recognises but cannot decode (rather
@@ -1251,14 +1278,17 @@ in `README.md`; the cross-cutting structure that matters when editing:
   background thread that can be killed, so the call forks under `mask` and
   kills-and-joins every worker under `uninterruptibleMask` on any
   exception; no worker may outlive the call. A new parallel site uses
-  `parOrdered`, never a bare `forkIO`, caps itself at four workers, and must
+  `parOrdered` (or `parOrderedResumable`, when the thunk being forced can be
+  forced again after a kill, as a JPEG in a shared scene can), never a bare
+  `forkIO`, caps itself at four workers, and must
   pass the kill test (interrupt real decodes at many points, compare the live
   thread set) as well as the hash corpus at 1 and 4 threads. Current sites:
   render row bands, restoration (gaborish + EPF) in 128-row bands of
   512-pixel tiles with 8-pixel halos (`filterBands`, only for large noisy
   frames), noise row bands that regenerate their halos from the RNG rather
   than reading a neighbour's output, and lossless pass groups
-  (`passGroupsPar`). Two traps from that work: a job's result must be built
+  (`passGroupsPar`), plus the JPEG decoder's reconstruction bands (see the
+  image-view bullet). Two traps from that work: a job's result must be built
   *inside* the job, not memoised in a pass-long array (that retained every
   group's output, +305 MiB on a 4096² lossless image), and peak RSS here
   follows the GC schedule, not the allocation total (reusing EPF scratch

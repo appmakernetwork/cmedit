@@ -16,10 +16,11 @@
 -- Base only, no FFI, portable (the Windows build typechecks it).
 module Cmedit.JxlPar
   ( parOrdered
+  , parOrderedResumable
   , parWorkers
   ) where
 
-import Control.Concurrent (forkIOWithUnmask, killThread, getNumCapabilities)
+import Control.Concurrent (forkIOWithUnmask, killThread, getNumCapabilities, myThreadId, throwTo)
 import Control.Concurrent.MVar
 import Control.Concurrent.QSem
 import Control.Exception
@@ -52,12 +53,48 @@ parWorkers = getNumCapabilities
 -- claimed it, and a worker that dies for any reason while holding a
 -- claim writes the exception into that slot first.
 --
+-- The re-throw is synchronous, so the thunks under evaluation on the
+-- calling thread are poisoned rather than frozen; a caller that can be
+-- forced again after a kill uses 'parOrderedResumable' instead.
+--
 -- With one worker (or one job) the call is the plain sequential loop,
 -- so a single-capability program runs exactly the code it did before.
-parOrdered :: forall a. Int -> Int -> Int -> (Int -> IO a) -> (Int -> a -> IO Bool) -> IO ()
-parOrdered nworkers look n job consume
-  | n <= 0 = pure ()
-  | nworkers <= 1 || n == 1 = sequential 0
+parOrdered :: Int -> Int -> Int -> (Int -> IO a) -> (Int -> a -> IO Bool) -> IO ()
+parOrdered nworkers look n job consume = () <$ parCore False nworkers look n job consume
+
+-- | 'parOrdered' for a caller that runs inside a pure computation whose
+-- thunk may be forced again after the forcing thread is killed. It returns
+-- 'True' when the stage ran (to the end, or until @consume@ stopped it),
+-- and 'False' when it was interrupted by an asynchronous exception and the
+-- thunk has since been forced again: the stage's work is then incomplete
+-- and whatever it was writing is in an unknown state, so the caller must
+-- discard it and redo the computation another way (sequentially).
+--
+-- Why it exists: 'parOrdered' tears down and then re-throws an
+-- asynchronous exception with 'throwIO', which is a /synchronous/ raise
+-- from the handler. GHC freezes the thunks under evaluation on a thread
+-- only when an exception arrives asynchronously; a synchronous raise
+-- updates every one of them to "raise ThreadKilled", so a decode killed
+-- in the consumer was poisoned for good and every later force of that
+-- thunk (by another job that wants the same picture) failed at once.
+-- Here, after the workers are joined, the exception is re-delivered with
+-- 'throwTo' to the calling thread itself, which the RTS raises
+-- asynchronously even while masked: the thunks are frozen, the thread
+-- dies with the original exception, and a later force resumes the frozen
+-- stack just after the 'throwTo', where this returns 'False'. The workers
+-- are gone by then and cannot be resumed, which is why the caller must
+-- start over. The resumed stack still holds 'mask''s exit frame, so the
+-- resuming thread leaves this call unmasked whatever its own masking state
+-- was; the editor's jobs force pictures unmasked, so that is harmless.
+-- Synchronous exceptions (a job's own error) propagate with 'throwIO' as
+-- in 'parOrdered'.
+parOrderedResumable :: Int -> Int -> Int -> (Int -> IO a) -> (Int -> a -> IO Bool) -> IO Bool
+parOrderedResumable = parCore True
+
+parCore :: forall a. Bool -> Int -> Int -> Int -> (Int -> IO a) -> (Int -> a -> IO Bool) -> IO Bool
+parCore resumable nworkers look n job consume
+  | n <= 0 = pure True
+  | nworkers <= 1 || n == 1 = True <$ sequential 0
   | otherwise = mask $ \restore -> do
       slots <- replicateM n newEmptyMVar
       let slotOf = listArray (0, n - 1) slots :: Array Int (MVar (Either SomeException a))
@@ -97,8 +134,16 @@ parOrdered nworkers look n job consume
                 go <- consume i v
                 signalQSem gate
                 when go (consumer (i + 1))
-      restore (consumer 0) `onException` stopAll
+      r <- try (restore (consumer 0)) :: IO (Either SomeException ())
       stopAll
+      case r of
+        Right () -> pure True
+        Left e
+          | resumable && isAsync e -> do
+              me <- myThreadId
+              throwTo me e
+              pure False
+          | otherwise -> throwIO e
   where
     sequential !i
       | i >= n = pure ()

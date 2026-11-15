@@ -16,9 +16,10 @@ import System.Directory (getTemporaryDirectory, removeFile, createDirectoryIfMis
 import System.Environment (lookupEnv, setEnv)
 import System.FilePath ((</>))
 import Control.Exception (SomeException, evaluate, try, throwIO, ErrorCall(..), AsyncException(..), finally)
-import Control.Concurrent (forkIO, killThread, threadDelay, newEmptyMVar, putMVar, takeMVar, readMVar, tryPutMVar, MVar, ThreadId)
+import Control.Concurrent (forkIO, killThread, threadDelay, newEmptyMVar, putMVar, takeMVar, readMVar, tryPutMVar, MVar, ThreadId, getNumCapabilities, setNumCapabilities, forkFinally)
 import GHC.Conc.Sync (listThreads, threadStatus, ThreadStatus(..))
-import Cmedit.JxlPar (parOrdered)
+import Cmedit.JxlPar (parOrdered, parOrderedResumable)
+import Control.Monad.ST.Unsafe (unsafeIOToST)
 import RasterSpec (rasterSpec)
 import FontSpec (fontSpec)
 import PdfImageSpec (pdfImageSpec)
@@ -1287,6 +1288,112 @@ main = do
         let fingerprint = foldl' (\h b -> (h `xor` fromIntegral b) * 1099511628211)
                                  (14695981039346656037 :: Word64) (U.elems (imgPix im))
         checkEq ("jpeg " ++ label ++ ": all RGBA bytes") fingerprint expected
+  -- A baseline JPEG whose one scan is the whole story is decoded streaming
+  -- (Image.jpegStreamable: never all of its coefficients at once); anything
+  -- after the scan that could change the picture must send it down the
+  -- whole-image path instead. Pin both halves: a quantisation table or a
+  -- second scan after the scan is honoured, and what follows EOI is
+  -- ignored.
+  do
+    let rgba = either (const Nothing) (Just . U.elems . imgPix) . decodeImage
+        eoi = BS.pack [0xFF, 0xD9]
+        -- Insert before the final EOI (both fixtures end with one).
+        beforeEoi bs extra = BS.concat [BS.take (BS.length bs - 2) bs, extra, eoi]
+        dqt = BS.pack ([0xFF, 0xDB, 0x00, 0x43, 0x00] ++ replicate 64 2)
+        -- The fixture's own scan again, at successive-approximation Al = 1
+        -- (its DC and AC rewritten doubled).
+        rescan bs =
+          let sos = BS.length (fst (BS.breakSubstring (BS.pack [0xFF, 0xDA]) bs))
+              len = fromIntegral (BS.index bs (sos+2)) * 256 + fromIntegral (BS.index bs (sos+3))
+              ahal = sos + 2 + len - 1
+              scan = BS.take (BS.length bs - 2 - sos) (BS.drop sos bs)
+          in BS.concat [BS.take (ahal - sos) scan, BS.singleton 0x01, BS.drop (ahal - sos + 1) scan]
+        base420 = rgba jpegColour420
+        baseRst = rgba jpegRestart
+    check "jpeg fixtures end in EOI" (all (BS.isSuffixOf eoi) [jpegColour420, jpegRestart])
+    check "jpeg: a DQT after the scan is honoured"
+      (isJust base420 && rgba (beforeEoi jpegColour420 dqt) /= base420)
+    check "jpeg: a second scan is honoured"
+      (isJust base420 && rgba (beforeEoi jpegColour420 (rescan jpegColour420)) /= base420)
+    -- Here the restart interval divides the MCU count, so the decoder's
+    -- restart search after the last MCU runs to the end of the file and the
+    -- walk never reaches the table: the whole-image path's answer, as
+    -- found. It is why a restart file with a DQT anywhere after the scan
+    -- is not streamed: where the walk resumes is not predictable.
+    checkEq "jpeg restart: the final restart search skips a trailing DQT"
+      (rgba (beforeEoi jpegRestart dqt)) baseRst
+    check "jpeg restart: decodes" (isJust baseRst)
+    checkEq "jpeg: segments after EOI are ignored"
+      (rgba (BS.concat [jpegColour420, dqt, rescan jpegColour420])) base420
+  -- Banded parallel reconstruction (Image.decodeJpegST on
+  -- JxlPar.parOrderedResumable) must be invisible: the same bytes at four
+  -- capabilities as at one, on both the streamed (one interleaved scan) and
+  -- the whole-image (one scan per component) paths. The test binary is
+  -- -threaded but starts on one capability, so raise it here and put it
+  -- back afterwards. Then: a decode killed part-way must leave its thunk
+  -- resumable, not poisoned. The kill points are timing-dependent (whether
+  -- one lands in the parallel stage varies run to run), but the assertion
+  -- holds wherever it lands, so the check cannot flake, only vary in what
+  -- it covers.
+  do
+    caps0 <- getNumCapabilities
+    let fnvOf im = foldl' (\h b -> (h `xor` fromIntegral b) * 1099511628211)
+                          (14695981039346656037 :: Word64) (U.elems (imgPix im))
+        -- Forced to the hash, so each decode runs at the capability count
+        -- in force where it is evaluated, not wherever checkEq gets to it.
+        decodeHash bs = either (const Nothing) (\im -> let h = fnvOf im in h `seq` Just (imgW im, imgH im, h))
+                               (decodeImage bs)
+        streamed = synthJpeg True
+        whole = synthJpeg False
+    (do
+      setNumCapabilities 1
+      seqS <- evaluate (decodeHash (BS.copy streamed))
+      setNumCapabilities 4
+      t0 <- getMonotonicTime
+      parS <- evaluate (decodeHash (BS.copy streamed))
+      t1 <- getMonotonicTime
+      parW <- evaluate (decodeHash (BS.copy whole))
+      check "jpeg synthetic: decodes at 512x512" (fmap (\(w', h', _) -> (w', h')) seqS == Just (512, 512))
+      checkEq "jpeg parallel bands (streamed): same bytes at 4 capabilities as at 1" parS seqS
+      checkEq "jpeg parallel bands (whole-image): same bytes as the streamed decode" parW seqS
+      let durUs = max 1000 (round ((t1 - t0) * 1e6)) :: Int
+      forM_ [("streamed", streamed), ("whole-image", whole)] $ \(label, bytes) ->
+        forM_ [3, 6 :: Int] $ \tenths -> do
+          let thunk = decodeHash (BS.copy bytes)
+          d1 <- newEmptyMVar
+          t <- forkFinally (evaluate thunk) (\_ -> putMVar d1 ())
+          threadDelay (durUs * tenths `div` 10)
+          killThread t
+          takeMVar d1
+          d2 <- newEmptyMVar
+          _ <- forkFinally (evaluate thunk) (putMVar d2 . either (\e -> Left (show (e :: SomeException))) Right)
+          again <- takeMVar d2
+          checkEq ("jpeg " ++ label ++ ": a decode killed at " ++ show tenths ++ "/10 resumes when forced again")
+            again (Right seqS))
+      `finally` setNumCapabilities caps0
+  -- parOrderedResumable itself, deterministically: a kill delivered while
+  -- the calling thread is inside consume freezes the enclosing thunk, and
+  -- forcing it again resumes after the stage, which reports False.
+  do
+    entered <- newEmptyMVar
+    gate <- newEmptyMVar :: IO (MVar ())
+    let stage = ST.runST (unsafeIOToST (do
+          ok <- parOrderedResumable 4 4 8 pure
+                  (\i _ -> when (i == 2) (void (tryPutMVar entered ()) >> readMVar gate) >> pure True)
+          pure (if ok then "completed" else "resumed after a kill")))
+    d1 <- newEmptyMVar
+    t <- forkFinally (evaluate stage) (putMVar d1 . either (\e -> show (e :: SomeException)) id)
+    takeMVar entered
+    killThread t
+    first <- takeMVar d1
+    checkEq "parOrderedResumable: the killed forcer dies of ThreadKilled" first (show ThreadKilled)
+    putMVar gate ()
+    d2 <- newEmptyMVar
+    _ <- forkFinally (evaluate stage) (putMVar d2 . either (\e -> show (e :: SomeException)) id)
+    again <- takeMVar d2
+    checkEq "parOrderedResumable: the same thunk resumes instead of re-raising" again "resumed after a kill"
+    ok <- parOrderedResumable 4 4 8 pure (\_ _ -> pure True)
+    check "parOrderedResumable: an uninterrupted stage reports True" ok
 
 
   -- Paged read-only view of huge files (plan 0012) ---------------------------
@@ -10096,3 +10203,60 @@ mkJxlLossy = BS.pack
   , 162,77,118,190,110,81,1,48,168,195,167,223,231,123,222,93,221,207
   , 66,58,96,10,40,128,212,181,37,93,81,173,51
   ]
+
+-- | A deterministic 512x512 4:2:0 baseline JPEG, big enough for the
+-- decoder's banded parallel reconstruction (at least 2^18 pixels and 16 MCU
+-- rows). @interleaved@ writes one interleaved scan (decoded streaming);
+-- otherwise one scan per component, which sends it down the whole-image
+-- coefficient path. Both code exactly the same coefficients, so both must
+-- decode to the same picture. Every Huffman code has one length per table
+-- (4 bits for DC, 8 for AC), so the code of a symbol is its index.
+synthJpeg :: Bool -> BS.ByteString
+synthJpeg interleaved = BS.pack (concat ([[0xFF, 0xD8], dqt, sof, dht] ++ scans ++ [[0xFF, 0xD9]]))
+  where
+    size = 512 :: Int
+    comps = [(1, 2, 2), (2, 1, 1), (3, 1, 1)] :: [(Int, Int, Int)]
+    byte = fromIntegral :: Int -> Word8
+    seg m body = [0xFF, m, byte ((length body + 2) `div` 256), byte ((length body + 2) `mod` 256)] ++ body
+    dqt = seg 0xDB (0 : replicate 64 8)
+    sof = seg 0xC0 ([8, 2, 0, 2, 0, 3] ++ concat [ [byte i, byte (hh * 16 + vv), 0] | (i, hh, vv) <- comps ])
+    acSyms = 0x00 : 0xF0 : [ r * 16 + s | r <- [0 .. 15], s <- [1 .. 10] ] :: [Int]
+    counts len n = [ if l == len then n else 0 | l <- [1 .. 16 :: Int] ]
+    dht = seg 0xC4 ([0x00] ++ counts 4 12 ++ map byte [0 .. 11] ++ [0x10] ++ counts 8 162 ++ map byte acSyms)
+    acCode sym = (8, length (takeWhile (/= sym) acSyms))
+    magnitude v = length (takeWhile (> 0) (iterate (`div` 2) (abs v)))
+    extra v s = if v >= 0 then v else v + 2 ^ s - 1
+    dcOf ci bx by = (bx * 7 + by * 13 + ci * 29) `mod` 61 - 30
+    acOf ci bx by = filter ((/= 0) . snd)
+      [(1, (bx * 3 + by * 5 + ci) `mod` 9 - 4), (2, (bx + by * 2 + ci) `mod` 7 - 3), (9, (bx * by + ci) `mod` 5 - 2)]
+    block ci (bx, by) prev =
+      let dc = dcOf ci bx by
+          d = dc - prev
+          sd = magnitude d
+          acs = acOf ci bx by
+          runs = zip (0 : map fst acs) acs
+          acBits = concat [ [acCode ((k - k0 - 1) * 16 + magnitude v), (magnitude v, extra v (magnitude v))]
+                          | (k0, (k, v)) <- runs ]
+          eob = if null acs || fst (last acs) < 63 then [acCode 0] else []
+      in ([(4, sd), (sd, extra d sd)] ++ acBits ++ eob, dc)
+    -- Blocks in coding order, tagged with their component index.
+    mcuW = size `div` 16
+    interleavedOrder = [ (ci, (mx * hh + u, my * vv + v))
+                       | my <- [0 .. mcuW - 1], mx <- [0 .. mcuW - 1]
+                       , (ci, (_, hh, vv)) <- zip [0 ..] comps, v <- [0 .. vv - 1], u <- [0 .. hh - 1] ]
+    compOrder ci hh = [ (ci, (bx, by)) | by <- [0 .. mcuW * hh - 1], bx <- [0 .. mcuW * hh - 1] ]
+    encode order = go order (replicate 3 0)
+      where go [] _ = []
+            go ((ci, b) : rest) preds =
+              let (bits, dc) = block ci b (preds !! ci)
+              in bits ++ go rest [ if j == ci then dc else p | (j, p) <- zip [0 ..] preds ]
+    sos ids = seg 0xDA ([byte (length ids)] ++ concat [ [byte i, 0x00] | i <- ids ] ++ [0, 63, 0])
+    scans
+      | interleaved = [sos [1, 2, 3], pack (encode interleavedOrder)]
+      | otherwise = concat [ [sos [i], pack (encode (compOrder ci hh))] | (ci, (i, hh, _)) <- zip [0 ..] comps ]
+    pack codes =
+      let bits = concat [ [ (v `div` (2 ^ (n - 1 - j))) `mod` 2 | j <- [0 .. n - 1] ] | (n, v) <- codes ]
+          padded = bits ++ replicate ((8 - length bits `mod` 8) `mod` 8) 1
+          bytes [] = []
+          bytes xs = let (a, b) = splitAt 8 xs in foldl' (\acc x -> acc * 2 + x) 0 a : bytes b
+      in concatMap (\x -> if x == 255 then [0xFF, 0x00] else [byte x]) (bytes padded)

@@ -2,13 +2,16 @@
 # Build ImageDecode.hs against a source tree and time each file in fresh
 # processes (one file per process, so the peak is per-file).
 #   docs/plans/bench/imgbench.sh build SRC_DIR OUT_BIN
+#   docs/plans/bench/imgbench.sh build-threaded SRC_DIR OUT_BIN [N]
+#     (the editor's runtime: -threaded with N capabilities, default 4)
 #   docs/plans/bench/imgbench.sh run OUT_BIN RUNS FILE...
 # `run` prints, per file: median ms, min ms, allocated MB, peak MB, hash.
 set -e
 case "$1" in
-build)
-  src=$2; out=$3
-  ghc --make docs/plans/bench/ImageDecode.hs -i"$src" -O2 -rtsopts -with-rtsopts=-T \
+build|build-threaded)
+  src=$2; out=$3; rts=-T; thr=
+  if [ "$1" = build-threaded ]; then thr=-threaded; rts="-T -N${4:-4}"; fi
+  ghc --make docs/plans/bench/ImageDecode.hs -i"$src" -O2 $thr -rtsopts "-with-rtsopts=$rts" \
     -outputdir "$out.d" -o "$out" -package base -package bytestring -package array \
     -package containers -package text -package filepath \
     -XLambdaCase -XOverloadedStrings -XBangPatterns -XTupleSections \
