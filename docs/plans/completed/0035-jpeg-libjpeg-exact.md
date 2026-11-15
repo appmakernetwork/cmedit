@@ -2,8 +2,9 @@
 
 **Theme:** decode correctness and latency for `Cmedit.Image`'s JPEG decoder
 (baseline and progressive Huffman, every sampling layout, gray/YCbCr/RGB/CMYK/YCCK)
-**Status:** ✅ **RESOLVED 2026-11-15** (phase 1; the scaled decode of phase 2 is
-designed below and not started)
+**Status:** ✅ **RESOLVED 2026-11-15** (phase 1, and phase 2a: the scaled
+decoder, D1, and the viewer's use of it, D2–D4; phase 2b, PDF page images,
+is not started)
 
 ## Outcome
 
@@ -346,20 +347,184 @@ selector changes, 1 with an Adobe transform of 49 (now YCCK); ImageFuzz 26,
 all mutants of the two DQT-after-the-scan files (the latch). Kill and resume tests pass (now also on the DoS files and a
 progressive+restart file). `make test` 4665 passed (21 new).
 
-## Phase 2 (designed, not started): scaled decode for the viewer
+## Phase 2, D1 (done): the scaled decoder
 
-A placement never exceeds `maxGfxPixels` (1.2 MP), yet a 28 MP photo is
-decoded whole. `decodeJPEGScaled den` (1/2, 1/4, 1/8 by reduced IDCTs, which
-libjpeg-turbo does without upsampling) would open big420 at 1/4 (1.78 MP),
-~8 MB of pixels instead of 114, and refine to full resolution in a background
-job only when a zoom crop needs it (`idFull`/`idDen` in `ImageDoc`, one
-`pictureSample` helper for the three samplers). `jUpFor` is where it enters:
-`ds` is the only constant to vary, and fancy upsampling must turn off at 1/8.
-`jpeg_ref.py` already specifies the scaled kernels and is exact against
-`Image.draft`.
+`decodeJPEGScaled den` (den 1, 2, 4, 8) decodes at ceil(W/den) x ceil(H/den),
+**bit-exact with libjpeg-turbo's scaled decode**; `decodeJPEGScaled 1` is
+`decodeJPEG`, byte for byte. `jpegDims` reads the full-size frame dimensions
+from the headers. Nothing outside the reconstruction changed: entropy
+decoding, the coefficient buffers, `mkConv`/`runRange`/`CoefSrc`,
+`jpegStreamable` and both parallel paths run as before at every scale.
+
+- **Kernels.** `jIdctBlock4`/`jIdctBlock2` and a one-sample loop beside
+  `jIdctBlock`, dispatched once per block row on the component's `ds`. Each
+  reduced transform is the 8-point LL&M IDCT followed by a box sum over g
+  outputs (g = 8/N), folded into one N x 8 matrix per axis (DCT-domain
+  downsampling, Merhav and Bhaskaran 1997); every weight is
+  `round(2^13 sqrt2 sum cos((2m+1)k pi/16))` over the group, which
+  reproduces each constant in `jpeg_ref.py` (checked numerically), and the
+  descales are idct8's plus log2 g per pass. Frequency 4 drops out at N = 4,
+  2, 4 and 6 at N = 2, everything but the DC at N = 1. The same exact
+  zero-column, zero-row and DC-only shortcuts as at full size.
+- **Geometry.** `jUpFor` takes the scale: ds starts at 8/den and doubles while
+  both expansions to the output are even (so 4:2:0 at 1/2 is luma 4x4 plus
+  chroma 8x8 and no upsampling), the triangle filter is off at 1/8, and the
+  method is re-derived from the scaled ratio. Everything output-shaped in
+  `decodeJpegST` (row buffers, conversion widths, band rows) uses ow/oh.
+- **Size limits apply to the output.** `jpegFrameScaled`: the output must pass
+  `checkDims` (its errors name the file's size); for den > 1 the source may
+  be up to 4 x `maxPixels` and 2 x `maxDim` a side when it decodes streaming,
+  but keeps the full-size pixel limit otherwise, because the whole-image path
+  holds every coefficient and decodes each scan in one call a kill cannot
+  interrupt. **`decodeImage` picks the scale** (`decodeJPEGFit`): full size when
+  it fits, else the first of 1/2, 1/4, 1/8 that does, from the header alone,
+  so a 54 MP photo opens at 1/2 instead of being refused. `decodeJPEG` stays
+  full size, and the PDF path (`decodeJPEGSamples`) is untouched.
+- **No bands at 1/8**: a block is one read there, so the entropy decoder is
+  the whole cost (big420: 84 ms either way, 18 MB more peak with bands).
+
+| gate | result |
+|---|---|
+| vs Pillow at 1/2, 1/4, 1/8 (`jpegcheck.sh --scale`; draft, draft at the floored size, or the same decoder config set directly for sides under N) | **max 0** on all 254 files (photos, 132 layouts, edge2) x 3 scales, 1-core and -N4 builds |
+| scale 1 | max 0 display and raw; hashes identical to HEAD `ec8265b` on 302 files, display and raw |
+| -N1 vs -N4 vs non-threaded | identical at every scale (302 files), and on scaled fuzz output |
+| fuzz (SFuzz + ImageFuzz mutators, 2216 mutants at 1/2 and at 1/8, each also at 1/1) | 0 exceptions, 0 timeouts; Left/Right and every Left message identical to scale 1 |
+| kill test at 1/2, 1/4, 1/8 (10 files incl. a 54 MP photo, a 156 MP frame, the DoS files) | OK: no thread survives, 0.2 MB live after; worst kill latency unchanged from scale 1 (z_dos_one_scan 0.5 s either way) |
+| `make test` | 4723 passed (58 new: 12 fixtures x 3 scales, scale-1 identity, `jpegDims`, the size rules); zero warnings; `windows-check` clean |
+
+Wall time (median of 9, ms; peak MB in parentheses):
+
+| file | 1 core 1/1 | 1/2 | 1/4 | 1/8 | -N4 1/1 | 1/2 | 1/4 | 1/8 | Pillow 1/1, 1/2, 1/4, 1/8 (RGB) |
+|---|---|---|---|---|---|---|---|---|---|
+| big420 | 344 (125) | 172 (40) | 116 (18) | 90 (11) | 132 (163) | 99 (75) | 87 (52) | 86 (26) | 88, 59, 48, 37 |
+| wallpaper | 381 (85) | 245 (35) | 195 (23) | 166 (17) | 169 (121) | 166 (63) | 167 (53) | 171 (32) | 145, 124, 115, 86 |
+| progressive | 277 (101) | 198 (63) | 173 (50) | 160 (50) | 203 (117) | 171 (78) | 165 (65) | 162 (66) | 113, 101, 95, 91 |
+| photo444 | 201 (61) | 122 (24) | 87 (10) | 64 (10) | 75 (94) | 73 (53) | 71 (47) | 65 (26) | 62, 45, 39, 29 |
+
+At four cores every scaled decode sits on the entropy decoder's floor
+(75 ms on big420, 154 on wallpaper, ~160 for progressive's scan walk), so
+D1's gain there is memory, and the time win is on one core. At 1/1 the
+decoder is within 1% of HEAD except progressive at one core (+2%,
+allocation identical, unchanged by removing the block-size dispatch:
+layout, not a code path).
+
+## Phase 2, D2–D4 (done): scaled decode for the viewer
+
+A placement never exceeds `maxGfxPixels` (1.2 MP), yet a 28 MP photo was
+decoded whole, and then sampled whole on the UI thread for every cell grid
+and every placement. Now the image view opens a large JPEG at a reduced scale
+and refines it in a background job only when a zoom needs the pixels.
+
+**D2, the model.** `ImageDoc` gained `idFull` (the file's size), `idDen` (the
+decode is the file at 1/den), `idEpoch` (from `tickVecClock`; `mkImageDoc`
+takes it, so no installer can forget one), `idDenStuck` and `idRefines`.
+`imageDims` returns `idFull`, so `idCrop`, `viewFit`, `wheelZoom`,
+`cellRectToCrop`, `imageFitCap` and `gfxFit` are untouched and stay in
+full-resolution coordinates. `EditorState.pictureSample idoc crop` is the one
+translation: each crop edge maps to the nearest decoded pixel boundary *by
+the scale* (decoded pixel i covers source `[i·den, (i+1)·den)`; an edge at the
+picture's own maps to the decode's, whose last pixel is partial), with at
+least one pixel each way. (It first mapped proportionally to the two sizes,
+which drifts by up to a pixel towards the far edge; review fix.) Its callers are `renderPicture`, which fits in
+full coordinates and samples the decode with `renderImagePlaced` (used by
+`refreshImage` and `Render.drawImage`), and `App.placeGfx`. A kitty payload
+is never larger than the decoded crop, because the terminal scales it into
+the cell box. Sixel draws 1:1, so it keeps the fitted size and is upsampled.
+Loaders hand over a `Decoded` (frames, full size, den, mtime), and
+`OutImage` carries it. The status bar prints `idFull`.
+
+**D3, the opening scale.** `jpegOpenDen full` is the largest den whose output
+still has at least `maxGfxPixels` pixels, and never finer than
+`Image.jpegFitScale` (the limits) allows: big420 opens at 1/4 (1500×1189),
+wallpaper at 1/2, anything under 4.8 MP whole. It depends on the file alone,
+because cell-size and capability replies arrive after the first frame. The
+two other paths need less. The half-block picture is two sub-pixels per
+cell, about 60 000 pixels on a 300×100 terminal. Sixel is fitted by the same
+`gfxFit` under the same cap as kitty. So one rule covers all three. A stream
+(a pipe) cannot be re-read, so it decodes at `jpegFitScale` as before, and is
+marked `idStream` so that nothing ever asks to re-read it. The opening scale is
+*recorded* (`idBaseDen`, from `dcDen`): parking first recomputed it as
+`jpegOpenDen`, which sent a piped photo opened at 1/1 to 1/4 on its first tab
+switch, after which its refinement re-read a drained pipe (stuck) or a FIFO
+(blocked for good). Other formats are untouched.
+
+**D4, the refinement.** `imageNeedDen` is the largest den whose decode still
+holds, in the crop, the pixels the view shows, within 1/16 so that a cell
+rounding never costs a decode. On a pixel terminal that is the payload
+`gfxFit` wants, *whether or not a menu covers it*, because opening a menu must
+not cancel a decode. Elsewhere it is the half-block box. `imageRefineWant`
+names `ImgWant (path, epoch, den, full, mtime)` when that is finer than `idDen`,
+the picture is not stuck, and it is under `maxImageRefines` (2) for this
+visit. `App.imageUpkeep` runs beside `vectorUpkeep` at the top of every
+`renderNow`. It starts `JImgDecode` unless that want is in flight
+(`drvImgDecode`, written once the job has started and cleared only by its
+own result), and cancels it when nothing is wanted. The job runs under
+`guardJob` and `trySync`. It re-reads the file (the view holds no bytes),
+refuses a file whose mtime is not the one the picture opened with (checked
+before and after the read; a same-size rewrite would otherwise install the new
+file's pixels into the old picture) or whose frame is another size, decodes,
+and forces the pixels.
+`imageRedecoded` installs only for the same path and epoch, a finer den, the
+same full size, and pixels of exactly that scale's size. It replaces
+`idImage` *and* `idFrames`, so the coarse decode is released. A failure or a
+size mismatch sets `idDenStuck` with a status note and is not retried. A
+later, coarser result is ignored. `GfxKey` gained `gkDen`, so the finer
+decode re-places, and the coarse placement stays up until then. While the
+view shows fewer pixels than it could, the status zone says `(1/4 scale)`,
+and it says nothing at the fit.
+
+Three decisions beyond the design:
+* **A document going inactive parks its refinement.** `parkDoc`, used at
+  every zipper push (`pushActive`, `nextFile`/`prevFile`, `switchToFile`, and
+  `rebuildZipper` for journal recovery and session snapshots), box-
+  reduces a refined picture back to its opening scale (`Image.reduceImage`,
+  a word-at-a-time k×k mean) and resets the count. It is strict in the result,
+  so the 114 MB goes at the switch, not whenever something next reads the
+  document. The crop is kept, so returning re-asks for the finer decode, and
+  the coarse picture shows meanwhile. That is why the cap is per *visit*:
+  per-document would leave a photo permanently coarse after its second
+  return. Cost: 76 ms once, when leaving a refined 28 MP picture.
+  Not done: keeping the refined decode, because ten zoomed photos would be
+  over a gigabyte. Also not done: keeping the coarse decode beside the fine
+  one, because the brief asked for it to be released.
+* **Pictures record their file's mtime** (`dcMtime` → `edDiskMtime`). They
+  used to record none, so the freshness poll never marked a changed image
+  and Revert was unreachable for one. Now ◆ and the "changed on disk" notice
+  appear, and Revert reloads under a new epoch, which is the path this step
+  has to be safe against.
+* **The samplers were rewritten** (output identical): `scaleRGBA` walks
+  each box once for all four channels into an `unsafeCreate` buffer, and
+  `renderImagePlaced`'s box sum is strict with unchecked reads. Without
+  this the 1/4 decode still left 290 ms between the capability reply and
+  the first placement: 100 ms of cell grid and 190 ms of payload, for a
+  1.8 MP source. After: 15 ms and 19 ms. At 1/1 the same work went from 2.4 s
+  and 1.6 s to 145 ms and 86 ms.
+
+Measured by `docs/plans/bench/pty_jpegview.py` (fake kitty, 120×40 cells of
+8×16 px; HEAD `ec8265b` built separately):
+
+| big420, 6000×4753 | HEAD | now |
+|---|---|---|
+| spawn → first kitty placement | 4099, 4399 ms | 170–173 ms |
+| spawn → half-block picture (no replies) | 2456–2718 ms | 165–167 ms |
+| VmRSS once idle (an empty editor: 46 MB) | 188 MB | 76–79 MB |
+
+The live heap after opening is about 12 MB, 7.1 MB of it the 1/4 decode
+(`-hT`). The rest of the resident set is memory the RTS keeps from the
+decode's transient peak. The refinement lands 160 ms after a wheel burst
+(1/1, four capabilities). Its placement equals a full Pillow decode of the
+crop, area-averaged as `scaleRGBA` does, with a maximum difference of 0. The
+crop is predicted by replaying `wheelZoom`, and the prediction is checked
+against the payload size it implies. RSS is 197 MB while refined. A Revert
+issued while the refinement runs places nothing of the old file: across runs,
+the job was either cancelled or its result was dropped by epoch, and the new
+file then refines to its own pixels with a difference of 0. `pty_pdf.py` and
+`pty_svg.py` pass, and Spec went from 4723 to 4778 tests.
 
 ## Files
 
-`src/Cmedit/Image.hs` (the decoder), `test/Spec.hs` (fixtures, fingerprints,
+`src/Cmedit/Image.hs` (the decoder; `reduceImage`, the samplers),
+`src/Cmedit/{EditorState,EditorDoc,EditorEdit,Render,App}.hs` (D2–D4),
+`docs/plans/bench/pty_jpegview.py`, `test/Spec.hs` (fixtures, fingerprints,
 colour rules), `docs/plans/bench/{ImageDecode.hs,jpegcheck.sh,jpeg_gen.py,jpeg_cmp.py,jpeg_ref.py,jpeg_fixtures.py,README.md}`,
 `CLAUDE.md` (the Image view bullet), `README.md` (acknowledgement).

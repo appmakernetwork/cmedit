@@ -36,6 +36,19 @@ module Cmedit.Editor
   , imageLoaded
   , imageLoadedNew
   , addImageDocument
+  , Decoded(..)
+  , fullDecode
+  , pictureSample
+  , renderPicture
+  , jpegOpenDen
+  , imageNeedDen
+  , ImgWant(..)
+  , imageRefineWant
+  , imageRedecoded
+  , imageScaleNote
+  , maxImageRefines
+  , parkImage
+  , parkDoc
     -- * Paged view (files too large to load)
   , PagerDoc(..)
   , pagerLoaded

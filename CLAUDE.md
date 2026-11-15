@@ -1180,6 +1180,57 @@ in `README.md`; the cross-cutting structure that matters when editing:
   `parOrderedResumable`, which re-delivers an asynchronous exception with
   `throwTo` to itself, freezing the thunk; a resumed decode restarts
   sequentially from the beginning, since the entropy reader has moved on.
+  `decodeJPEGScaled den` decodes at 1/2, 1/4 and 1/8, bit-exact with
+  libjpeg-turbo's scaled decode (reduced IDCTs, chroma enlarged in the IDCT,
+  no fancy upsampling at 1/8). `decodeImage` opens a JPEG past the size
+  limits at the first scale that fits. The source frame is bounded separately:
+  4 × maxPixels when streaming, maxPixels otherwise.
+  **The image view opens a large JPEG reduced and refines it on demand**
+  (plan 0035 D2–D4). `classifyBytes` (via `decodeForView`) decodes at
+  `jpegOpenDen`: the coarsest scale whose output still has `maxGfxPixels`, and
+  never finer than the limits allow. It depends on the file alone, since the
+  capability replies come after the first frame. big420 opens at 1/4 in
+  170 ms instead of 4 s. The half-block view needs far less and sixel the same
+  cap, so one rule covers all three. A stream cannot be re-read and decodes at
+  `jpegFitScale`, and is marked `idStream`, so `imageRefineWant` never names
+  one. The `ImageDoc` carries `idFull`/`idDen`/`idEpoch`, plus `idBaseDen`
+  (the scale it *opened* at, recorded from `dcDen`, never recomputed)
+  (`mkImageDoc` takes the epoch; a Revert or re-open draws a new one), and
+  **every geometry stays in full-resolution coordinates**: `imageDims` is
+  `idFull`, so `idCrop`, `viewFit`, `wheelZoom`, `cellRectToCrop`,
+  `imageFitCap` and `gfxFit` are unchanged.
+  `pictureSample` is the one translation into the decoded pixels, and
+  everything that samples a bitmap goes through it: `renderPicture` (for
+  `refreshImage` and `drawImage`) and `placeGfx`. Never sample `idImage`
+  with a crop directly. It maps an edge *by the scale* (decoded pixel i
+  covers source `[i·den, (i+1)·den)`), not proportionally to the two sizes,
+  which drift apart by the partial last pixel.
+  A zoom that needs more pixels than the decode holds (`imageNeedDen`: the
+  `gfxFit` payload on a pixel terminal, even under a menu, otherwise the
+  half-block box; within 1/16) yields `imageRefineWant`. `App.imageUpkeep`
+  (beside `vectorUpkeep`) runs a `JImgDecode` job for it, which re-reads the
+  file, refuses one whose mtime is not the one the picture opened with
+  (`iwMtime`, checked before and after the read: a same-size rewrite is
+  otherwise invisible) or whose frame is another size, and decodes. Only a result for the
+  same path, epoch and full size, at a finer scale, is installed
+  (`imageRedecoded`), and it replaces `idFrames` too, so the coarse pixels go.
+  A failure marks the picture `idDenStuck` with a note and is never retried.
+  The scale never coarsens, and a picture is refined at most
+  `maxImageRefines` (2) times per visit. Leaving the document parks it
+  (`parkDoc` at every zipper push, and `rebuildZipper` wherever a zipper is
+  rebuilt from `allOpenDocs`: journal recovery, session snapshots),
+  box-reducing the refined picture back to `idBaseDen` (`reduceImage`), so an
+  inactive photo never holds 114 MB. Parking to a *recomputed* opening scale
+  degraded a piped photo for good: it opened at 1/1, parked at 1/4, and the
+  refinement then re-read a pipe.
+  `gkDen` in `GfxKey` re-places when the decode changes, and the coarse
+  placement stays up until then. The status zone says `(1/4 scale)` only
+  while the view shows fewer pixels than it could. Pictures also record their
+  mtime (`dcMtime`), so a changed one gets ◆ and Revert like a text file.
+  `docs/plans/bench/pty_jpegview.py` checks open time, RSS, a pixel-exact 1/1
+  refinement, Revert mid-job, the dumb floor and a piped photo across a tab
+  switch. JPEG XObjects in PDFs are
+  still decoded at full size (phase 2b).
   Detection is by **magic bytes** in `App.openPath` (not extension): it sniffs
   the file, decodes images via `imageLoaded`/`imageLoadedNew`/`addImageDocument`,
   and surfaces a `setError` for anything it recognises but cannot decode (rather

@@ -45,7 +45,8 @@ import qualified Cmedit.Csv as Csv
 import Cmedit.About (aboutCanvasH, aboutCanvasMinW, aboutTotalFrames)
 import Cmedit.HelpCard (helpCanvasMinW, helpDialogText)
 import Cmedit.Clipboard (CopyOutcome(..))
-import Cmedit.Image (Image(..), ImgMode(..), renderImage, viewFit)
+import Cmedit.Image (Image(..), ImgMode(..), renderImage, renderImagePlaced, viewFit, jpegFitScale)
+import Cmedit.Gfx (gfxFit, maxGfxPixels)
 import Cmedit.VecView (VecDoc(..), SceneSize(..), emptyVecDoc, vecDims, placeholderImage)
 import Cmedit.Scene (Scene)
 import Cmedit.Pager (PagerDoc(..), pagerStatus)
@@ -157,17 +158,25 @@ data Document = Document
 -- and a cache of the last rendered cell grid (keyed by size + mode) so we only
 -- re-scale on resize or a mode toggle. This is a wholly separate view mode to
 -- both plain-text and CSV — nothing here flows through the line buffer.
+--
+-- A JPEG may be decoded at a reduced scale ('idDen'): the decoded pixels
+-- are then smaller than the picture in the file, but every piece of view
+-- geometry ('idCrop', 'imageDims', 'viewFit', the wheel zoom, the drag crop,
+-- 'imageFitCap', the overlay's 'Cmedit.Gfx.gfxFit') stays in the file's
+-- full-resolution coordinates ('idFull'), and only the samplers translate,
+-- through 'pictureSample'. A zoom that needs more source pixels than the
+-- decode has asks the driver for a finer one ('imageRefineWant').
 data ImageDoc = ImageDoc
   { idImage :: !Image                         -- ^ The frame currently displayed ('idFrames' !! 'idFrame').
   , idMode  :: !ImgMode
-  , idCrop  :: !(Maybe (Int, Int, Int, Int))  -- ^ Zoomed view rect in source px (x,y,w,h); Nothing = whole image.
+  , idCrop  :: !(Maybe (Int, Int, Int, Int))  -- ^ Zoomed view rect in full-resolution source px (x,y,w,h); Nothing = whole image.
   , idDrag  :: !(Maybe (Int, Int, Int, Int))  -- ^ In-progress drag rect in text-area cells (aRow,aCol,curRow,curCol).
   , idFrames :: ![(Image, Int)]               -- ^ All frames with their delays (ms); a singleton for a static image.
   , idFrame  :: !Int                          -- ^ Index of the displayed frame in 'idFrames'.
     -- The cache key carries the cell pixel geometry ('cellPxKey') as well as
     -- size/mode/crop/frame: a font-size change alters the fitted shape even
     -- when the cell grid dimensions stay the same, and an animation step must
-    -- re-scale the new frame.
+    -- re-scale the new frame. (A refined decode empties the cache outright.)
   , idCache :: !(Maybe (Int, Int, ImgMode, (Int, Int, Int, Int), (Int, Int), Int, Array (Int, Int) Cell))
   , idVec   :: !(Maybe VecDoc)
     -- ^ A vector picture (an SVG) instead of a decoded bitmap: 'idImage' and
@@ -177,21 +186,73 @@ data ImageDoc = ImageDoc
     -- "Cmedit.VecView"). Unlike a bitmap the document under it is a live,
     -- editable text buffer, so the "image means no buffer" checks ask
     -- 'bufferlessImage' instead of 'isJust'.
+  , idFull  :: !(Int, Int)
+    -- ^ The picture's size in the file. Equal to the decoded size except
+    -- for a JPEG decoded at 1/'idDen'.
+  , idDen   :: !Int
+    -- ^ The decoded pixels are the file's at 1/den (1, 2, 4 or 8; only a JPEG
+    -- is ever above 1). Moves only towards 1 while the document is showing
+    -- ('imageRedecoded' never coarsens), and back to the opening scale when
+    -- it goes inactive ('parkImage').
+  , idBaseDen :: !Int
+    -- ^ The scale it was opened at ('dcDen'), which is what parking returns
+    -- to. Recorded, not recomputed: a stream opens finer than 'jpegOpenDen'
+    -- would pick (it cannot be re-read), and recomputing would coarsen it
+    -- for good on the first tab switch.
+  , idStream :: !Bool
+    -- ^ Read from a pipe or a device ('dcStream'): there is nothing to
+    -- re-read, so no refinement is ever wanted ('imageRefineWant').
+  , idEpoch :: !Int
+    -- ^ This picture model's identity, from the session clock
+    -- ('tickVecClock'): fresh on every open, re-open and Revert, so a
+    -- re-decode begun for an earlier model can never install into this one.
+  , idDenStuck :: !Bool
+    -- ^ A re-decode failed (or found the file changed under it): stay at the
+    -- current scale, with a status note, rather than asking again.
+  , idRefines :: !Int
+    -- ^ Re-decodes installed since the document last became active (at most
+    -- 'maxImageRefines').
   } deriving (Show)
 
--- | Build the image-view model for a decoded frame sequence (never empty; the
--- first frame becomes the displayed one).
-mkImageDoc :: [(Image, Int)] -> ImageDoc
-mkImageDoc frames@((img, _) : _) = ImageDoc
-  { idImage = img, idMode = HalfBlock, idCrop = Nothing, idDrag = Nothing
-  , idFrames = frames, idFrame = 0, idCache = Nothing, idVec = Nothing
+-- | A decoded bitmap as the loader hands it to the image view: its frames,
+-- the picture's full size in the file, and the scale it was decoded at.
+data Decoded = Decoded
+  { dcFrames :: ![(Image, Int)]   -- ^ Frames + delays (ms); a singleton for a still. Never empty.
+  , dcFull   :: !(Int, Int)       -- ^ The picture's size in the file.
+  , dcDen    :: !Int              -- ^ Decoded at 1/den (only a JPEG is ever above 1).
+  , dcMtime  :: !(Maybe DiskTime) -- ^ The file's mtime when it was read: the
+                                  --   baseline that lets the freshness poll mark a
+                                  --   changed picture and offer Revert, like a text file's.
+  , dcStream :: !Bool             -- ^ Read from a pipe or a device, which cannot be read twice.
   }
-mkImageDoc [] = error "mkImageDoc: empty frame list"  -- decoders never produce this
+
+-- | A decode at full size (every format but a large JPEG): the file's size
+-- is the first frame's.
+fullDecode :: [(Image, Int)] -> Decoded
+fullDecode frames = Decoded frames dims 1 Nothing False
+  where dims = case frames of
+                 ((i, _) : _) -> (imgW i, imgH i)
+                 []           -> (0, 0)
+
+-- | Build the image-view model for a decoded frame sequence (never empty; the
+-- first frame becomes the displayed one), under a fresh epoch from
+-- 'tickVecClock'. Taking the epoch here is what stops an installer from
+-- forgetting one.
+mkImageDoc :: Int -> Decoded -> ImageDoc
+mkImageDoc epoch dc = case dcFrames dc of
+  frames@((img, _) : _) -> ImageDoc
+    { idImage = img, idMode = HalfBlock, idCrop = Nothing, idDrag = Nothing
+    , idFrames = frames, idFrame = 0, idCache = Nothing, idVec = Nothing
+    , idFull = dcFull dc, idDen = max 1 (dcDen dc), idBaseDen = max 1 (dcDen dc)
+    , idStream = dcStream dc, idEpoch = epoch
+    , idDenStuck = False, idRefines = 0
+    }
+  [] -> error "mkImageDoc: empty frame list"  -- decoders never produce this
 
 -- | A picture view of a vector document, waiting for its first parse, with
 -- a fresh epoch (see 'Cmedit.VecView.vdEpoch').
 mkVectorDoc :: Int -> ImageDoc
-mkVectorDoc epoch = (mkImageDoc [(placeholderImage, 0)]) { idVec = Just (emptyVecDoc epoch) }
+mkVectorDoc epoch = (mkImageDoc epoch (fullDecode [(placeholderImage, 0)])) { idVec = Just (emptyVecDoc epoch) }
 
 -- | Draw the next value of the session clock that stamps vector-picture
 -- epochs and recency.
@@ -203,7 +264,142 @@ tickVecClock ed = (edVecClock ed, ed { edVecClock = edVecClock ed + 1 })
 imageDims :: ImageDoc -> (Int, Int)
 imageDims idoc = case idVec idoc of
   Just vd -> vecDims (vdSize vd)
-  Nothing -> (imgW (idImage idoc), imgH (idImage idoc))
+  Nothing -> idFull idoc
+
+-- | The current view rectangle in full-resolution source pixels (the whole
+-- image when unzoomed).
+imageCrop :: ImageDoc -> (Int, Int, Int, Int)
+imageCrop idoc = case idCrop idoc of
+  Just r  -> r
+  Nothing -> let (w, h) = imageDims idoc in (0, 0, w, h)
+
+-- | What to sample for a full-resolution crop: the decoded image and the
+-- same rectangle in /its/ pixels. The only translation between the view's
+-- geometry and a reduced JPEG decode, shared by every sampler (the cell
+-- picture, 'Cmedit.Render.drawImage', the driver's pixel placement). At
+-- 1/den, decoded pixel @i@ covers source pixels @[i·den, (i+1)·den)@, so
+-- each edge maps by the scale to the nearest decoded pixel boundary, not
+-- proportionally to the sizes (those differ by the partial last pixel, and
+-- proportional mapping drifts by up to a pixel towards the far edge). An
+-- edge at or past the picture's own maps to the decode's: the last decoded
+-- pixel is partial (libjpeg's scaled output covers the whole picture), but
+-- it is the picture's edge. The result keeps at least one pixel each way.
+pictureSample :: ImageDoc -> (Int, Int, Int, Int) -> (Image, (Int, Int, Int, Int))
+pictureSample idoc crop@(x, y, w, h)
+  | (dw, dh) == (fw, fh) = (img, crop)
+  | otherwise =
+      let x0 = clampTo (dw - 1) (edge x fw dw)
+          y0 = clampTo (dh - 1) (edge y fh dh)
+          x1 = clampTo dw (edge (x + w) fw dw)
+          y1 = clampTo dh (edge (y + h) fh dh)
+      in (img, (x0, y0, max 1 (x1 - x0), max 1 (y1 - y0)))
+  where
+    img = idImage idoc
+    dw = imgW img; dh = imgH img
+    (fw0, fh0) = idFull idoc
+    fw = max 1 fw0; fh = max 1 fh0
+    den = max 1 (idDen idoc)
+    edge v full dec
+      | v >= full = dec
+      | otherwise = min dec ((2 * v + den) `quot` (2 * den))
+    clampTo hi v = max 0 (min hi v)
+
+-- | The cell picture of a bitmap: fitted in full-resolution coordinates
+-- (so the native-size cap and the centring are the file's, whatever scale
+-- it was decoded at), sampled from the decoded pixels ('pictureSample').
+renderPicture :: Editor -> ImageDoc -> Int -> Int -> Array (Int, Int) Cell
+renderPicture ed idoc cols rows =
+  let crop@(_, _, cw, ch) = imageCrop idoc
+      placed = viewFit (cellAspect ed) (imageFitCap ed idoc) cols rows (max 1 cw) (max 1 ch)
+      (img, dcrop) = pictureSample idoc crop
+  in renderImagePlaced (idMode idoc) cols rows placed dcrop img
+
+------------------------------------------------------------------------------
+-- Reduced-scale JPEG decoding: the opening scale and the refinement.
+
+-- | The scale a JPEG of this full size opens at: the coarsest whose output
+-- still has at least 'maxGfxPixels' pixels, the most a pixel placement ever
+-- sends (so the whole-picture view, on any terminal, needs nothing finer),
+-- and never finer than the size limits allow ('jpegFitScale'). A function of
+-- the file alone, deliberately: the terminal's capability and cell-size
+-- replies arrive after the first frame and must not change what was decoded.
+-- The half-block picture needs far less (two sub-pixels per cell: a
+-- 300x100 terminal is 60 000 pixels), and sixel the same as kitty (both are
+-- fitted by 'gfxFit' under the same cap), so one rule covers all three.
+jpegOpenDen :: (Int, Int) -> Int
+jpegOpenDen full@(w, h) = max (jpegFitScale full) coarse
+  where
+    coarse = last (1 : [ d | d <- [2, 4, 8], scaledDim w d * scaledDim h d >= maxGfxPixels ])
+    scaledDim n d = (n + d - 1) `quot` d
+
+-- | Re-decodes a document may install per visit (it goes back to its opening
+-- scale when it goes inactive, and the count with it).
+maxImageRefines :: Int
+maxImageRefines = 2
+
+-- | The coarsest scale the current view of a bitmap can be drawn from
+-- without enlarging it: the largest denominator whose decode still has, in
+-- the displayed crop, the pixels the view shows (within 1/16, so a cell
+-- rounding is never worth a decode). On a terminal that draws pixels the
+-- view's size is the placement payload 'gfxFit' wants, whether or not a
+-- menu or dialog covers it this frame (closing a menu must not restart a
+-- decode); elsewhere it is the half-block picture's sub-pixel box.
+imageNeedDen :: Editor -> ImageDoc -> Int
+imageNeedDen ed idoc =
+  let lo = computeLayout ed
+      cols = loTextWidth lo; rows = loTextHeight lo
+      (_, _, cw, ch) = imageCrop idoc
+      (wantW, wantH)
+        | edGfxCaps ed =
+            let px = cellPxKey ed
+                cellPx = if px == (0, 0) then (8, 16) else px
+                allowUp = isJust (idCrop idoc) || px == (0, 0)
+                (_, _, _, _, pw, ph) = gfxFit cellPx (loTextTop lo, loTextLeft lo, cols, rows) (cw, ch) allowUp
+            in (pw, ph)
+        | otherwise =
+            let (ow, oh, _, _) = viewFit (cellAspect ed) (imageFitCap ed idoc) cols rows (max 1 cw) (max 1 ch)
+            in (ow, oh)
+      enough d = cw * 16 >= wantW * d * 15 && ch * 16 >= wantH * d * 15
+      minD = jpegFitScale (idFull idoc)
+  in case filter enough (filter (>= minD) [1, 2, 4, 8]) of
+       [] -> minD
+       ds -> last ds
+
+-- | A finer decode the active image view wants: the file, the picture model
+-- it is for, the scale, and the full size the file must still have.
+data ImgWant = ImgWant
+  { iwPath  :: !FilePath
+  , iwEpoch :: !Int
+  , iwDen   :: !Int
+  , iwFull  :: !(Int, Int)
+  , iwMtime :: !(Maybe DiskTime)
+    -- ^ The file's mtime when the picture was opened ('edDiskMtime'): the
+    -- job refuses a file that has changed since, even at the same size.
+  } deriving (Eq, Show)
+
+-- | The re-decode the active bitmap needs, if any: only a reduced JPEG
+-- ('idDen' > 1) that is showing, was read from a file that can be read again
+-- (never a stream, 'idStream'), is not stuck, is under its refinement cap,
+-- and whose view needs a finer scale than it has. Never a coarser one. The
+-- driver ('App.imageUpkeep') starts the job when this names something not
+-- already in flight and cancels it when this stops naming it.
+imageRefineWant :: Editor -> Maybe ImgWant
+imageRefineWant ed = case (edImage ed, edPath ed) of
+  (Just idoc, Just path)
+    | isNothing (idVec idoc), idDen idoc > 1, not (idStream idoc), not (idDenStuck idoc)
+    , idRefines idoc < maxImageRefines, isNothing (edLoading ed)
+    , let need = imageNeedDen ed idoc, need < idDen idoc
+    -> Just (ImgWant path (idEpoch idoc) need (idFull idoc) (edDiskMtime ed))
+  _ -> Nothing
+
+-- | The status bar's note on a reduced picture, while the view is showing
+-- fewer pixels than it could (a re-decode is on its way, or could not be
+-- made): @"(1/4 scale)"@. Empty otherwise, which is almost always.
+imageScaleNote :: Editor -> ImageDoc -> String
+imageScaleNote ed idoc
+  | isNothing (idVec idoc), idDen idoc > 1, imageNeedDen ed idoc < idDen idoc =
+      "  (1/" ++ show (idDen idoc) ++ " scale)"
+  | otherwise = ""
 
 -- | An image view with no buffer under it (a decoded bitmap). A vector
 -- picture is the opposite: its buffer is the document.

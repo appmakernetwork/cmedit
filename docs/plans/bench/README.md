@@ -96,19 +96,26 @@ prints `jpeg_cmp.py`'s line (max and mean absolute difference, share of
 differing samples); every line must say `max 0`. `--raw` compares
 `decodeJPEGSamples` (`IMAGE_RAW=1`, what a PDF's DCTDecode gets) instead of the
 display RGB, so CMYK and YCCK are checked on their samples rather than through
-a CMYK-to-RGB conversion. `jpeg_ref.py FILE [SCALE]` is the executable
+a CMYK-to-RGB conversion. `--scale N` (2, 4, 8) checks `decodeJPEGScaled`
+(`IMAGE_SCALE=N`) against Pillow's decode at 1/N: `Image.draft` where it can
+reach that scale (it rounds the scale down for odd sizes, so the floored size
+is tried too), else the same decoder configuration set directly; the line's
+last word says which. `jpeg_ref.py FILE [SCALE]` is the executable
 specification the decoder follows (accurate integer IDCT, triangle-filter
 upsampling, table colour conversion, libjpeg's colour-space rule, and the
 reduced-size IDCTs for 1/2, 1/4, 1/8), checked against Pillow on its own.
 `jpeg_fixtures.py C420.JPG OUTDIR` regenerates the small per-layout fixtures
-`test/Spec.hs` embeds (4:2:2, 4:4:0, 3x2, RGB-coded, YCCK) from the bytes of
-its `jpegColour420`, and prints the libjpeg-turbo fingerprints Spec expects,
-so Spec itself never needs Pillow.
+`test/Spec.hs` embeds (4:2:2, 4:4:0, 3x2, RGB-coded, YCCK, YCbCr 4:4:4) from
+the bytes of its `jpegColour420`, and prints the libjpeg-turbo fingerprints
+Spec expects, full size and at 1/2, 1/4, 1/8 (also for any further files
+named after OUTDIR, such as Spec's other fixtures written out), so Spec itself
+never needs Pillow.
 
 ```sh
 python3 -I docs/plans/bench/jpeg_gen.py /path/photo.jpg /tmp/jpegcorpus
 docs/plans/bench/imgbench.sh build src /tmp/ib-new
 docs/plans/bench/jpegcheck.sh run /tmp/ib-new /tmp/jpegcorpus/*.jpg
+for d in 2 4 8; do docs/plans/bench/jpegcheck.sh run /tmp/ib-new --scale $d /tmp/jpegcorpus/*.jpg; done
 ```
 
 ## The font-reader oracles (0034 B)
@@ -192,6 +199,25 @@ drift apart.
 
 ```sh
 python3 docs/plans/bench/pty_session.py    # ~5 s, exit 1 if a scenario fails
+```
+
+`pty_jpegview.py` checks reduced-scale JPEG viewing (plan 0035 D2–D4). It
+imports `pty_journal.py` and `pty_svg.py`, and needs Pillow and numpy. It
+opens `big420.jpg` (`JPEG_PHOTO=` to override) on a fake kitty terminal and
+reports spawn-to-first-placement time and idle `VmRSS`/`VmHWM`. It zooms
+until a full decode is needed and compares that placement's pixels with
+Pillow's full decode of the crop, area-averaged like `scaleRGBA`; the
+difference must be 0. It replaces the file and Reverts while the refinement
+runs, then checks the dumb-terminal floor, and finally feeds the photo
+through a pipe (`/dev/fd/N`, as `cmedit <(cat big.jpg)` does), switches tabs
+away and back, zooms, and expects full-resolution pixels with no re-read, no
+scale note and no hang. `CMEDIT_BIN=` runs another build,
+for a before/after (`open` and `dumb` are the scenarios that make sense
+there).
+
+```sh
+python3 docs/plans/bench/pty_jpegview.py              # ~25 s, exit = failures
+CMEDIT_BIN=/old/cmedit python3 docs/plans/bench/pty_jpegview.py open dumb
 ```
 
 Five scenarios, each in its own throwaway `HOME`, so the developer's own

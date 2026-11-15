@@ -749,8 +749,9 @@ statusRightInfo ed = flatten segs
             anim = if nf > 1
                      then "frame " ++ show (idFrame idoc + 1) ++ "/" ++ show nf ++ "  "
                      else ""
-        in [ plain (anim ++ imgFmt img ++ "  " ++ show (imgW img) ++ "\xd7" ++ show (imgH img)
-                    ++ "   IMAGE/" ++ m ++ " ") ]
+            (fw, fh) = idFull idoc
+        in [ plain (anim ++ imgFmt img ++ "  " ++ show fw ++ "\xd7" ++ show fh
+                    ++ imageScaleNote ed idoc ++ "   IMAGE/" ++ m ++ " ") ]
       Nothing -> case edCsv ed of
         Just v ->
           let (r0, c0, r1, c1) = Csv.selRect v

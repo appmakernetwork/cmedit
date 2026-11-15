@@ -70,7 +70,7 @@ import Cmedit.Definition (DefReq(..))
 import qualified Cmedit.Definition as D
 import Cmedit.Editor
 import Cmedit.Gfx
-import Cmedit.Image (Image, imgW, imgH, sniffImage, decodeFrames, scaleRGBA, jpegCostHint)
+import Cmedit.Image (Image, imgW, imgH, sniffImage, decodeFrames, decodeJPEGScaled, jpegDims, jpegFitScale, scaleRGBA, jpegCostHint)
 import Cmedit.Jobs (JobTable, newJobTable, startJobIn, cancelJobIn)
 import Cmedit.FontProvider (FontProvider, newFontProvider, startFontDiscovery, providerFiles, facesForQueries, fontFor)
 import qualified Cmedit.PdfRender as PR
@@ -212,10 +212,11 @@ runTui cfg cfgWarns files readOnly statsOnExit restoreFlag = do
     jobsRef <- newJobTable
     stats <- newDrvStats
     vecDrv <- newVecDrv
+    imgDecRef <- newIORef Nothing
     let drv = Drv loadQ searchQ searchGen defGen dirMtimes focused recentsRef sessionRef quickGen
                   capsRef pointerRef themeRef gfxRef lintGen lintFpRef lintAvRef lintRunRef
                   lintLastRef journalDir journalsRef journalFpRef journalWarnRef
-                  journalLastRef journalRunRef journalGate stats jobsRef vecDrv
+                  journalLastRef journalRunRef journalGate stats jobsRef vecDrv imgDecRef
     src       <- mkHandleSource stdin
     clickRef  <- newIORef (ClickState 0 (-1) (-1) 0)
     mainTid   <- myThreadId
@@ -928,6 +929,9 @@ data Drv = Drv
       --   dropped, but the work itself carried on — a retyped search term left
       --   the old walk reading files nobody would look at.
   , drvVec       :: !VecDrv            -- ^ Vector-picture jobs, fonts and overlay rasters.
+  , drvImgDecode :: !(IORef (Maybe ImgWant))
+      -- ^ The finer JPEG decode in flight ('imageUpkeep'): not re-requested
+      --   while it runs, cleared only by the result for the same request.
   }
 
 -- | Cheap session counters. Bumped with 'modifyIORef'' at a handful of sites
@@ -964,6 +968,7 @@ data JobKind = JSearch | JDefs | JQuickOpen | JLoad | JReplace | JJournal
              | JPdfPage    -- ^ The PDF page view's current page → scene.
              | JPdfPrefetch -- ^ A neighbouring page → scene, while the view is idle.
              | JVecGfxPrefetch -- ^ The next page's overlay raster, while the view is idle.
+             | JImgDecode  -- ^ A finer decode of a reduced JPEG, for a zoom that needs it.
   deriving (Eq, Ord, Show)
 
 -- | The driver's half of the vector-picture view (plan 0034). Everything here
@@ -1030,6 +1035,7 @@ data GfxKey = GfxKey
   , gkPx   :: !(Int, Int)               -- ^ Cell pixel size in effect.
   , gkKind :: !GfxKind
   , gkScene :: !Int                     -- ^ A vector picture's scene id (0 for a bitmap): a re-parse re-places.
+  , gkDen   :: !Int                     -- ^ The bitmap's decode scale ('idDen'): a refined decode re-places.
   , gkFrame :: !Int                     -- ^ Displayed animation frame. Static under
                                         --   real kitty (the terminal loops natively);
                                         --   the editor's tick steps it elsewhere —
@@ -1112,6 +1118,8 @@ data SearchMsg
       -- ^ A PDF page's scene: the request, its scene id, drawn before fonts
       --   were known, the scene and its notes.
       -- ^ An overlay raster finished, as the RGBA payload to place.
+  | SMImgDecoded !ImgWant !(Either String Image)
+      -- ^ A finer JPEG decode finished (or why there is none).
   | SMJournal    ![(FilePath, Int)] !Int
       -- ^ A write-behind pass finished: the journals that now hold their
       --   document's content as of the given edit counter, and how many writes
@@ -1443,6 +1451,9 @@ eventLoop editorRef prevRef titleRef q drv _src = do
           case res of
             Just (_, notes@(_ : _)) | showing -> modifyIORef' editorRef (setStatus (T.intercalate "; " (map T.pack notes)))
             _ -> pure ()
+      SMImgDecoded w res -> do
+        atomicModifyIORef' (drvImgDecode drv) (\cur -> (if cur == Just w then Nothing else cur, ()))
+        modifyIORef' editorRef (imageRedecoded w res)
       SMPageParsed w sid fontless res -> do
         let v = drvVec drv
         atomicModifyIORef' (vdrPage v) (\cur -> (if cur == Just w then Nothing else cur, ()))
@@ -1479,6 +1490,7 @@ eventLoop editorRef prevRef titleRef q drv _src = do
       SMVecCells {}   -> True
       SMVecGfx {}     -> True
       SMPageParsed {} -> True
+      SMImgDecoded {} -> True
       SMFontsReady    -> True
       _               -> False
 
@@ -2321,6 +2333,47 @@ vectorUpkeep drv editorRef = do
     modifyIORef' editorRef (\e -> e { edVecGfxReady = ready })
   pdfPageUpkeep drv editorRef caps ready
 
+-- | The bitmap image view's half of the upkeep: a finer decode of a reduced
+-- JPEG when the view needs one ('imageRefineWant'), unless that request is
+-- already in flight; a request no longer wanted (the document went
+-- inactive, closed or was reverted, or the zoom came back) is cancelled.
+-- While it runs, the coarse picture (and its placement) stays on screen.
+imageUpkeep :: Drv -> IORef Editor -> IO ()
+imageUpkeep drv editorRef = do
+  ed <- readIORef editorRef
+  pend <- readIORef (drvImgDecode drv)
+  case imageRefineWant ed of
+    Just w -> when (pend /= Just w) (startImgDecode drv w)
+    Nothing -> when (isJust pend) $ do
+      writeIORef (drvImgDecode drv) Nothing
+      cancelJob drv JImgDecode
+
+-- | Re-read a JPEG and decode it at the finer scale a zoom asked for, off
+-- the event-loop thread, the pixels forced here. The view holds no bytes,
+-- hence the re-read, and the re-read is also the check that the file still
+-- holds the picture it was opened from: a file whose mtime is not the one
+-- the picture was opened with (checked before the read and again after it,
+-- so a write in between is caught too) or whose frame size differs is
+-- refused, and the model then stays at its scale ('imageRedecoded'). The
+-- in-flight marker is written only once the job has started.
+startImgDecode :: Drv -> ImgWant -> IO ()
+startImgDecode drv w = do
+  let post res = atomically (writeTQueue (drvSearchQ drv) (SMImgDecoded w res))
+      changed = Left "the file has changed since it was opened"
+  startJob drv JImgDecode $ guardJob (post . Left) $ do
+    r <- trySync $ do
+      mt0 <- fileMtime (iwPath w)
+      if mt0 /= iwMtime w then pure changed else do
+        bs <- BS.readFile (iwPath w)
+        mt1 <- fileMtime (iwPath w)
+        if mt1 /= iwMtime w || jpegDims bs /= Just (iwFull w)
+          then pure changed
+          else case decodeJPEGScaled (iwDen w) bs of
+            Left e -> pure (Left e)
+            Right img -> Right <$> evaluate img   -- strict fields: the pixels are built here
+    post (either (Left . takeWhile (/= '\n') . show) id r)
+  writeIORef (drvImgDecode drv) (Just w)
+
 -- | The PDF page view's half of 'vectorUpkeep': the current page's scene,
 -- then, once everything for it is settled, the neighbours' (prefetch) and
 -- the next page's overlay raster, so PgDn lands on a picture already made.
@@ -2714,7 +2767,7 @@ runToolCapture exe args dir mstdin = handle onErr $
 -- The result of reading and classifying a file, before it touches the editor.
 data LoadOutcome
   = OutText  !FilePath !LoadResult
-  | OutImage !FilePath ![(Image, Int)]   -- ^ Frames + delays (ms); singleton for a still.
+  | OutImage !FilePath !Decoded          -- ^ Frames + delays (ms), a singleton for a still; a large JPEG reduced ('jpegOpenDen').
   | OutPaged !PagerDoc                   -- ^ Too large for a buffer: the read-only paged view.
   | OutPdf   !FilePath !PdfDoc           -- ^ A PDF, already extracted into its reading view.
   | OutDoc   !FilePath !RtfDoc           -- ^ A DOCX or EPUB, already mapped onto the formatted reading view.
@@ -2786,8 +2839,10 @@ classifyFileWith pagedOK path = do
 -- say (a stream has nothing to save back to).
 classifyBytes :: Bool -> FilePath -> BS.ByteString -> IO LoadOutcome
 classifyBytes forceRO path bs = case sniffImage bs of
-  Just _  -> pure (either (\err -> OutError (takeFileName path ++ ": " ++ err))
-                          (OutImage path) (decodeFrames bs))
+  Just fmt -> do
+    mt <- fileMtime path
+    pure (either (\err -> OutError (takeFileName path ++ ": " ++ err))
+                 (\dc -> OutImage path dc { dcMtime = mt, dcStream = forceRO }) (decodeForView (not forceRO) fmt bs))
   Nothing
     -- Sniffed before the binary refusal, exactly like an image: a
     -- PDF is binary by nature, so that refusal would otherwise be
@@ -2812,6 +2867,21 @@ classifyBytes forceRO path bs = case sniffImage bs of
         ro <- if forceRO then pure True else not <$> canWrite path
         mt <- fileMtime path
         pure (OutText path (loadFromBytes ro mt bs))
+
+-- | Decode an image for the image view. A JPEG opens at the reduced scale
+-- 'jpegOpenDen' picks from its frame header alone (the coarsest that still
+-- covers any placement), so a 28 MP photo costs a quarter of its decode and
+-- a sixteenth of its memory; a zoom that needs more asks for a finer decode
+-- later ('imageUpkeep'), which re-reads the file. A stream (@rereadable@
+-- False: a pipe, a device) cannot be read twice, so it decodes as finely as
+-- the size limits allow, as it did before reduced decoding existed. Every
+-- other format decodes at full size.
+decodeForView :: Bool -> String -> BS.ByteString -> Either String Decoded
+decodeForView rereadable "JPEG" bs
+  | Just full <- jpegDims bs =
+      let den = if rereadable then jpegOpenDen full else jpegFitScale full
+      in (\img -> Decoded [(img, 0)] full den Nothing (not rereadable)) <$> decodeJPEGScaled den bs
+decodeForView _ _ bs = fullDecode <$> decodeFrames bs
 
 -- | Whether a path that exists is a regular file, as opposed to a pipe or a
 -- device. Portable by construction: 'hFileSize' refuses anything that is not
@@ -3627,7 +3697,7 @@ xlsxOutcome path get = do
 
 -- Apply a load outcome to the editor via the matching pure installer.
 applyOutcome :: (FilePath -> LoadResult -> Editor -> Editor)
-             -> (FilePath -> [(Image, Int)] -> Editor -> Editor)
+             -> (FilePath -> Decoded -> Editor -> Editor)
              -> LoadOutcome -> Editor -> Editor
 applyOutcome installText installImage o ed = case o of
   OutText p lr  -> installText p lr ed
@@ -3644,7 +3714,7 @@ applyOutcome installText installImage o ed = case o of
 -- Open a path synchronously (used at startup and for Revert). The interactive
 -- Open path (EffOpen) loads large files on a background thread instead.
 openPath :: (FilePath -> LoadResult -> Editor -> Editor)
-         -> (FilePath -> [(Image, Int)] -> Editor -> Editor)
+         -> (FilePath -> Decoded -> Editor -> Editor)
          -> FilePath -> Editor -> IO Editor
 openPath installText installImage path ed =
   flip (applyOutcome installText installImage) ed
@@ -4035,6 +4105,7 @@ renderNow :: Drv -> IORef Editor -> IORef (Maybe Screen) -> IORef String -> IO (
 renderNow drv editorRef prevRef titleRef = do
   tStart <- getMonotonicTime
   vectorUpkeep drv editorRef
+  imageUpkeep drv editorRef
   ed0 <- readIORef editorRef
   prev <- readIORef prevRef
   caps <- readIORef (drvCaps drv)
@@ -4149,6 +4220,7 @@ wantGfx caps ed = do
               , gkPx   = cellPxKey ed
               , gkKind = kind
               , gkScene = maybe 0 vdSceneId (idVec idoc)
+              , gkDen = idDen idoc
               , gkFrame = idFrame idoc
               }
 
@@ -4200,16 +4272,27 @@ vecPlacement drv caps ed mprev key = do
 placeGfx :: Editor -> GfxKey -> Maybe Int -> Builder
 placeGfx ed key prevFrame = fromMaybe mempty $ do
   idoc <- edImage ed
-  let img = idImage idoc
-      (cx, cy, cw, ch) = gkCrop key
+  let (_, _, cw, ch) = gkCrop key
+      -- The fit is the full-resolution crop's; the pixels come from the
+      -- decode, which for a reduced JPEG is smaller ('pictureSample').
+      (img, dcrop@(_, _, dcw, dch)) = pictureSample idoc (gkCrop key)
       cellPx = case gkPx key of (0, 0) -> (8, 16); p -> p  -- unknown: assume 2:1
       (top, left, tw, th) = gkGeom key
       -- Fill (upscale) only when zoomed into a crop, or when the real cell
       -- pixel size is unknown so "native" is meaningless; otherwise a small
       -- image stays at 1:1 and centred. Matches 'imageFitCap' for the cell view.
       allowUpscale = isJust (idCrop idoc) || gkPx key == (0, 0)
-      (row, col, cols, rows, pxW, pxH) = gfxFit cellPx (top, left, tw, th) (cw, ch) allowUpscale
-      rgba = scaleRGBA img (cx, cy, cw, ch) pxW pxH
+      (row, col, cols, rows, pxW0, pxH0) = gfxFit cellPx (top, left, tw, th) (cw, ch) allowUpscale
+      -- Kitty scales the payload into the cell box, so a payload is never
+      -- larger than the decoded crop (an upscale would only cost bytes);
+      -- sixel draws 1:1, so it keeps the fitted size and is upsampled.
+      shrink = minimum [ 1.0, fromIntegral dcw / fromIntegral (max 1 pxW0)
+                       , fromIntegral dch / fromIntegral (max 1 pxH0) ] :: Double
+      (pxW, pxH)
+        | gkKind key == GfxKitty, shrink < 1 =
+            (max 1 (min dcw (round (fromIntegral pxW0 * shrink))), max 1 (min dch (round (fromIntegral pxH0 * shrink))))
+        | otherwise = (pxW0, pxH0)
+      rgba = scaleRGBA img dcrop pxW pxH
       frames = idFrames idoc
       nFrames = length frames
       kittyAnim = gkKind key == GfxKitty && nFrames > 1 && isNothing (idCrop idoc)

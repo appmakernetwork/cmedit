@@ -10,6 +10,9 @@
 -- IMAGE_RAW=1 decodes a JPEG through 'decodeJPEGSamples' (what a PDF's
 -- DCTDecode gets: four bytes per pixel, the samples as stored after the
 -- colour transform), hashing and dumping those instead (jpegcheck.sh --raw).
+-- IMAGE_SCALE=N (2, 4 or 8) decodes a JPEG at 1/N through 'decodeJPEGScaled'
+-- (jpegcheck.sh --scale N); 1 is the same as unset for a JPEG within the
+-- size limits ('decodeImage' picks a reduced scale only past them).
 module Main where
 
 import Control.Exception (evaluate)
@@ -34,6 +37,7 @@ main = do
   dumpDir <- lookupEnv "IMAGE_RGBA_DIR"
   frames <- maybe False (== "1") <$> lookupEnv "FRAMES"
   raw <- maybe False (== "1") <$> lookupEnv "IMAGE_RAW"
+  scale <- maybe 1 read <$> lookupEnv "IMAGE_SCALE"
   forM_ paths $ \path -> do
     bs <- BS.readFile path
     evaluate (BS.length bs)
@@ -45,6 +49,8 @@ main = do
       then either fail (\js -> (: []) <$> evaluate (jsData js)) (decodeJPEGSamples Nothing bs)
       else if frames
       then either fail (\fs -> mapM (evaluate . imgPix . fst) fs) (decodeFrames bs)
+      else if scale /= 1
+      then either fail (\im -> (: []) <$> evaluate (imgPix im)) (decodeJPEGScaled scale bs)
       else either fail (\im -> (: []) <$> evaluate (imgPix im)) (decodeImage bs)
     wend <- getMonotonicTimeNSec
     end <- getCPUTime

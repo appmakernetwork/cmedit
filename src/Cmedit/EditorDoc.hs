@@ -44,7 +44,7 @@ import qualified Cmedit.Csv as Csv
 import Cmedit.About (aboutCanvasH, aboutCanvasMinW, aboutTotalFrames)
 import Cmedit.Manual (manualPath, manualText)
 import Cmedit.Clipboard (CopyOutcome(..))
-import Cmedit.Image (Image(..), ImgMode(..), renderImage, renderImagePlaced, viewFit)
+import Cmedit.Image (Image(..), ImgMode(..), renderImage, renderImagePlaced, viewFit, reduceImage)
 import Cmedit.Geom (Rect(..), rectW, rectH)
 import Cmedit.Scene (Scene(..))
 import Cmedit.Svg (sniffSvgText)
@@ -334,7 +334,7 @@ pdfLoadedNew path pd ed = case switchToOpen path ed of
     | otherwise               -> ed'
   Nothing
     | isPristine ed -> pdfLoaded path pd ed
-    | otherwise     -> pdfLoaded path pd ed { edBefore = edBefore ed ++ [captureDoc ed] }
+    | otherwise     -> pdfLoaded path pd (pushActive ed)
 
 -- | Append a PDF to the open-files list (startup, 2nd+ file).
 addPdfDocument :: FilePath -> PdfDoc -> Editor -> Editor
@@ -393,7 +393,7 @@ containerDocLoadedNew path rd ed = case switchToOpen path ed of
     | otherwise               -> ed'
   Nothing
     | isPristine ed -> containerDocLoaded path rd ed
-    | otherwise     -> containerDocLoaded path rd ed { edBefore = edBefore ed ++ [captureDoc ed] }
+    | otherwise     -> containerDocLoaded path rd (pushActive ed)
 
 -- | Append one to the open-files list (startup, 2nd+ file).
 addContainerDoc :: FilePath -> RtfDoc -> Editor -> Editor
@@ -419,7 +419,7 @@ workbookLoadedNew path wb ed = case switchToOpen path ed of
     | otherwise               -> ed'
   Nothing
     | isPristine ed -> workbookLoaded path wb ed
-    | otherwise     -> workbookLoaded path wb ed { edBefore = edBefore ed ++ [captureDoc ed] }
+    | otherwise     -> workbookLoaded path wb (pushActive ed)
 
 addWorkbookDocument :: FilePath -> Workbook -> Editor -> Editor
 addWorkbookDocument path wb ed =
@@ -545,7 +545,7 @@ setLoadedNew path lr ed = case switchToOpen path ed of
   Just ed' -> ed'
   Nothing
     | isPristine ed -> setLoaded path lr ed
-    | otherwise     -> setLoaded path lr ed { edBefore = edBefore ed ++ [captureDoc ed] }
+    | otherwise     -> setLoaded path lr (pushActive ed)
 
 -- | Reload the active document from disk in place (the Revert command),
 -- discarding unsaved edits. Behaves like a fresh load but keeps the cursor where
@@ -651,19 +651,19 @@ docFromLoad seqNow path lr = Document
 
 -- | Install a decoded image (its full frame sequence) as the active read-only
 -- image document.
-imageLoaded :: FilePath -> [(Image, Int)] -> Editor -> Editor
-imageLoaded path frames ed = touchRecent path $ refreshImage $ ensureVisible ed
+imageLoaded :: FilePath -> Decoded -> Editor -> Editor
+imageLoaded path dc ed0 = touchRecent path $ refreshImage $ ensureVisible ed
   { edBuffer = emptyBuffer, edSavedBuffer = emptyBuffer
   , edCursor = origin, edSelAnchor = Nothing, edDesiredCol = 0
   , edTop = 0, edLeft = 0
   , edPath = Just path, edModified = False
-  , edDiskMtime = Nothing, edDiskChanged = False
+  , edDiskMtime = dcMtime dc, edDiskChanged = False
   , edLineEnding = LF, edSavedEol = LF, edEncoding = Utf8, edSavedEnc = Utf8
   , edFinalNewline = True
   , edReadOnly = True
   , edUndo = Seq.empty, edRedo = Seq.empty, edLastEdit = EKNone
   , edStatus = T.pack ("Viewing image  " ++ imgFmt img ++ " "
-                ++ show (imgW img) ++ "x" ++ show (imgH img)
+                ++ show fullW ++ "x" ++ show fullH
                 ++ (if nframes > 1 then ", " ++ show nframes ++ " frames" else "")
                 ++ "  —  press 'a' for ASCII/colour")
     -- Opened from the file-explorer panel: keep the selection focus there
@@ -673,22 +673,25 @@ imageLoaded path frames ed = touchRecent path $ refreshImage $ ensureVisible ed
   , edDialog = Nothing, edSearchMode = False
   , edDefPick = Nothing, edQuickOpen = Nothing, edComplete = Nothing
   , edCsv = Nothing, edCsvStash = Nothing
-  , edImage = Just (mkImageDoc frames), edSvgStash = Nothing, edPdfView = Nothing
+  , edImage = Just (mkImageDoc epoch dc), edSvgStash = Nothing, edPdfView = Nothing
   }
-  where img = case frames of ((i, _) : _) -> i
+  where (epoch, ed) = tickVecClock ed0
+        frames = dcFrames dc
+        img = case frames of ((i, _) : _) -> i
                              []           -> error "imageLoaded: empty frame list"
         nframes = length frames
+        (fullW, fullH) = dcFull dc
 
 -- | Open a decoded image as a new document (reusing a pristine empty buffer if
 -- present), mirroring 'setLoadedNew' for text.
-imageLoadedNew :: FilePath -> [(Image, Int)] -> Editor -> Editor
+imageLoadedNew :: FilePath -> Decoded -> Editor -> Editor
 imageLoadedNew path frames ed = case switchToOpen path ed of
   Just ed'
     | edFocus ed == FExplorer -> ed' { edFocus = FExplorer }  -- see 'imageLoaded'
     | otherwise               -> ed'
   Nothing
     | isPristine ed -> imageLoaded path frames ed
-    | otherwise     -> imageLoaded path frames ed { edBefore = edBefore ed ++ [captureDoc ed] }
+    | otherwise     -> imageLoaded path frames (pushActive ed)
 
 -- | Install a paged (too-large-to-load) file as the active document. The index
 -- pass has already run; the first window arrives via 'EffPagerFill'.
@@ -726,7 +729,7 @@ pagerLoadedNew pg ed = case switchToOpen (pgPath pg) ed of
     | otherwise               -> ed'
   Nothing
     | isPristine ed -> pagerLoaded pg ed
-    | otherwise     -> pagerLoaded pg ed { edBefore = edBefore ed ++ [captureDoc ed] }
+    | otherwise     -> pagerLoaded pg (pushActive ed)
 
 -- | Append a paged document to the open-files list (startup, 2nd+ file).
 addPagerDocument :: PagerDoc -> Editor -> Editor
@@ -748,21 +751,22 @@ pagerFillRequest ed = do
   pure (pgPath pg, from, n)
 
 -- | Append an image document to the open-files list (startup, 2nd+ file).
-addImageDocument :: FilePath -> [(Image, Int)] -> Editor -> Editor
-addImageDocument path frames ed =
-  touchRecent path ed { edAfter = edAfter ed ++ [imageDocSnapshot path frames] }
+addImageDocument :: FilePath -> Decoded -> Editor -> Editor
+addImageDocument path dc ed0 =
+  touchRecent path ed { edAfter = edAfter ed ++ [imageDocSnapshot path epoch dc] }
+  where (epoch, ed) = tickVecClock ed0
 
-imageDocSnapshot :: FilePath -> [(Image, Int)] -> Document
-imageDocSnapshot path frames = Document
+imageDocSnapshot :: FilePath -> Int -> Decoded -> Document
+imageDocSnapshot path epoch dc = Document
   { docBuffer = emptyBuffer, docSavedBuffer = emptyBuffer, docCursor = origin
   , docSelAnchor = Nothing, docDesiredCol = 0, docTop = 0, docLeft = 0
   , docPath = Just path, docModified = False
-  , docDiskMtime = Nothing, docDiskChanged = False
+  , docDiskMtime = dcMtime dc, docDiskChanged = False
   , docLineEnding = LF, docSavedEol = LF, docEncoding = Utf8, docSavedEnc = Utf8
   , docFinalNewline = True, docReadOnly = True
   , docUndo = Seq.empty, docRedo = Seq.empty, docLastEdit = EKNone, docOverwrite = False
   , docDiscard = False, docCsv = Nothing, docCsvStash = Nothing
-  , docImage = Just (mkImageDoc frames), docSvgStash = Nothing, docPdfView = Nothing
+  , docImage = Just (mkImageDoc epoch dc), docSvgStash = Nothing, docPdfView = Nothing
   , docPager = Nothing, docRtf = Nothing, docSheets = Nothing, docPdf = Nothing
   , docHlCache = Nothing
   , docDiags = []
@@ -812,8 +816,83 @@ refreshImage ed = case activePicture ed of
     in if stale && cols > 0 && rows > 0
          then modPicture (const idoc
                      { idCache = Just (cols, rows, idMode idoc, crop, pxk, idFrame idoc
-                                      , renderImage (cellAspect ed) (imageFitCap ed idoc) (idMode idoc) cols rows crop (idImage idoc)) }) ed
+                                      , renderPicture ed idoc cols rows) }) ed
          else ed
+
+-- | Install a finer decode of the active JPEG (the driver's 'JImgDecode'
+-- result for @w@). Installs only into the very picture model that asked
+-- (same path and epoch: a Revert or a re-open in between makes a new one),
+-- only a scale finer than the one showing (never coarser), and only pixels
+-- of exactly the size that scale of the asked-for full size has. A failure,
+-- or a file whose picture is no longer that size, marks the document stuck
+-- at its current scale with a note, so it is not asked for again. A result
+-- for a document no longer showing is dropped; it asks again when it is.
+imageRedecoded :: ImgWant -> Either String Image -> Editor -> Editor
+imageRedecoded w res ed = case edImage ed of
+  Just idoc | isNothing (idVec idoc), edPath ed == Just (iwPath w), idEpoch idoc == iwEpoch w ->
+    let stuck why = (modImage (\d -> d { idDenStuck = True }) ed)
+                      { edStatus = T.pack ("Showing this picture at 1/" ++ show (idDen idoc)
+                                           ++ " scale: " ++ why) }
+        (fw, fh) = iwFull w
+        sized = ((fw + iwDen w - 1) `quot` iwDen w, (fh + iwDen w - 1) `quot` iwDen w)
+    in case res of
+         _ | iwDen w >= idDen idoc -> ed
+         Left err -> stuck err
+         Right img
+           | iwFull w /= idFull idoc || (imgW img, imgH img) /= sized ->
+               stuck "the file has changed since it was opened"
+           | otherwise ->
+               let delay = case idFrames idoc of ((_, dl) : _) -> dl; [] -> 0
+               in refreshImage (modImage (\d -> d { idImage = img, idFrames = [(img, delay)], idFrame = 0
+                                                    , idDen = iwDen w, idCache = Nothing
+                                                    , idRefines = idRefines d + 1 }) ed)
+  _ -> ed
+
+-- | A picture going inactive gives back a refined decode: it returns to its
+-- opening scale ('idBaseDen'), reduced from the pixels it has (a box
+-- filter; see 'Cmedit.Image.reduceImage'), so an open document that is not
+-- showing never holds more than its opening decode, and its refinement
+-- count starts again. Showing it again re-asks for the finer scale if the
+-- view (whose crop is kept) still needs it. Anything else is unchanged.
+parkImage :: ImageDoc -> ImageDoc
+parkImage idoc
+  | isNothing (idVec idoc), base > idDen idoc, [(img, dl)] <- idFrames idoc =
+      let !img' = reduceImage (base `quot` idDen idoc) img
+      in idoc { idImage = img', idFrames = [(img', dl)], idFrame = 0, idDen = base
+              , idCache = Nothing, idRefines = 0 }
+  | otherwise = idoc
+  where base = idBaseDen idoc
+
+-- | Move the active document into the zipper, after the others (it is about
+-- to be replaced by a newly opened or new document), parked ('parkDoc').
+pushActive :: Editor -> Editor
+pushActive ed = let !d = parkDoc ed in ed { edBefore = edBefore ed ++ [d] }
+
+-- | 'captureDoc' for a document going into the zipper (it stops being the
+-- active one), with its picture parked ('parkImage'). Strict in the parked
+-- picture, so the refined pixels are released when the switch happens, not
+-- whenever something next looks at the document.
+parkDoc :: Editor -> Document
+parkDoc = parkDocument . captureDoc
+
+-- | 'parkImage' on a document's picture, strictly (see 'parkDoc'). A no-op
+-- on one already parked, so it is safe on anything taken from the zipper.
+parkDocument :: Document -> Document
+parkDocument d = case docImage d of
+  Just im -> let !im' = parkImage im in d { docImage = Just im' }
+  Nothing -> d
+
+-- | Lay out a rebuilt zipper around the document at index @k@, which becomes
+-- the active one: every other document is parked ('parkDocument'), forced
+-- now, so a refined picture that ends up inactive gives its pixels back
+-- here rather than whenever something next looks at it.
+rebuildZipper :: Int -> [Document] -> Editor -> Editor
+rebuildZipper k docs ed =
+  let !bef = parkAll (take k docs)
+      !aft = parkAll (drop (k + 1) docs)
+  in restoreDoc (docs !! k) ed { edBefore = bef, edAfter = aft }
+  where
+    parkAll ds = let ps = map parkDocument ds in foldr seq () ps `seq` ps
 
 -- | Advance the animation one frame (driver tick; a no-op unless the editor
 -- is the one stepping the animation right now — see
@@ -834,12 +913,6 @@ tickImage ed = case (imageTickUs ed, edImage ed) of
 -- the image view to the true aspect ratio.
 setCellPx :: (Int, Int) -> Editor -> Editor
 setCellPx wh ed = refreshImage ed { edCellPx = Just wh }
-
--- | The current view rectangle in source pixels (the whole image when unzoomed).
-imageCrop :: ImageDoc -> (Int, Int, Int, Int)
-imageCrop idoc = case idCrop idoc of
-  Just r  -> r
-  Nothing -> let (w, h) = imageDims idoc in (0, 0, w, h)
 
 -- Update the active image doc (no-op if there isn't one).
 modImage :: (ImageDoc -> ImageDoc) -> Editor -> Editor
@@ -1521,19 +1594,19 @@ pdfZoomCentre zin ed =
 nextFile :: Editor -> Editor
 nextFile ed
   | fileCount ed <= 1 = ed { edStatus = "No other open files" }
-  | otherwise = case edAfter ed of
-      (d : ds) -> switchTo d ed { edBefore = edBefore ed ++ [captureDoc ed], edAfter = ds }
+  | otherwise = let !parked = parkDoc ed in case edAfter ed of
+      (d : ds) -> switchTo d ed { edBefore = edBefore ed ++ [parked], edAfter = ds }
       [] -> case edBefore ed of      -- wrap to the first file
-        (d : ds) -> switchTo d ed { edBefore = [], edAfter = ds ++ [captureDoc ed] }
+        (d : ds) -> switchTo d ed { edBefore = [], edAfter = ds ++ [parked] }
         []       -> ed
 
 prevFile :: Editor -> Editor
 prevFile ed
   | fileCount ed <= 1 = ed { edStatus = "No other open files" }
-  | otherwise = case reverse (edBefore ed) of
-      (d : rb) -> switchTo d ed { edBefore = reverse rb, edAfter = captureDoc ed : edAfter ed }
+  | otherwise = let !parked = parkDoc ed in case reverse (edBefore ed) of
+      (d : rb) -> switchTo d ed { edBefore = reverse rb, edAfter = parked : edAfter ed }
       [] -> case reverse (edAfter ed) of   -- wrap to the last file
-        (d : ra) -> switchTo d ed { edBefore = captureDoc ed : reverse ra, edAfter = [] }
+        (d : ra) -> switchTo d ed { edBefore = parked : reverse ra, edAfter = [] }
         []       -> ed
 
 switchTo :: Document -> Editor -> Editor
@@ -1553,7 +1626,8 @@ switchToFile k ed
   | k < 0 || k >= fileCount ed = ed
   | k == length (edBefore ed)  = ed            -- already active
   | otherwise =
-      let allDocs = edBefore ed ++ [captureDoc ed] ++ edAfter ed
+      let !parked = parkDoc ed
+          allDocs = edBefore ed ++ [parked] ++ edAfter ed
           target  = allDocs !! k
       in (restoreDoc target ed { edBefore = take k allDocs, edAfter = drop (k + 1) allDocs })
            { edStatus = T.pack ("File " ++ fileLabel target) }
@@ -1969,7 +2043,7 @@ clearQuitState ed = ed
 newFileFlow :: Editor -> Editor
 newFileFlow ed
   | isPristine ed = doNew ed
-  | otherwise     = doNew (ed { edBefore = edBefore ed ++ [captureDoc ed] })
+  | otherwise     = doNew (pushActive ed)
 
 -- The one place (besides 'newEditor') an untitled buffer is born, so the one
 -- place a fresh document id must be handed out: an untitled journal is named
@@ -2007,7 +2081,7 @@ openManual ed0 = case findOpenIndex manualPath ed of
   Just k  -> (switchToFile k ed) { edStatus = manualStatus }
   Nothing ->
     let ed1 | isPristine ed = ed
-            | otherwise     = ed { edBefore = edBefore ed ++ [captureDoc ed] }
+            | otherwise     = (pushActive ed)
         buf = fromText manualText
     in ensureVisible ed1
          { edBuffer = buf, edSavedBuffer = buf
@@ -2477,8 +2551,7 @@ describeRecover it =
 recoverJournals :: Editor -> Editor
 recoverJournals ed0
   | null items = closeDialog ed0 { edRecover = [] }
-  | otherwise  = (restoreDoc (docs !! k) ed1 { edBefore = take k docs
-                                             , edAfter  = drop (k + 1) docs })
+  | otherwise  = (rebuildZipper k docs ed1)
                    { edStatus = T.pack ("Recovered " ++ show n ++ " unsaved file"
                                         ++ plural n ++ " \x2014 nothing has been "
                                         ++ "written to disk") }
@@ -2617,8 +2690,7 @@ describeChanged cf =
 installSessionSnapshots :: Editor -> Editor
 installSessionSnapshots ed0
   | n == 0    = ed0 { edSessionChanged = [] }
-  | otherwise = (restoreDoc (docs !! here) ed1 { edBefore = take here docs
-                                               , edAfter  = drop (here + 1) docs })
+  | otherwise = (rebuildZipper here docs ed1)
                   { edStatus = T.pack ("Restored " ++ show n ++ " file" ++ plural n
                                        ++ " as the session left them \x2014 unsaved, "
                                        ++ "nothing has been written to disk") }

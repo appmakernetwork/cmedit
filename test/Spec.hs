@@ -92,7 +92,7 @@ import qualified Cmedit.Pdf as Pdf
 import qualified Cmedit.Rtf as Rtf
 import Cmedit.Csv
 import qualified Cmedit.Inflate as Inflate
-import Cmedit.Image (Image(..), ImgMode(..), JpegSamples(..), decodeImage, decodeJPEGSamples, jpegCostHint, decodeFrames, decodeGIFFrames, sniffImage, renderImage, viewFit, scaleRGBA)
+import Cmedit.Image (Image(..), ImgMode(..), JpegSamples(..), decodeImage, decodeJPEG, decodeJPEGScaled, jpegDims, decodeJPEGSamples, jpegCostHint, decodeFrames, decodeGIFFrames, sniffImage, renderImage, renderImagePlaced, viewFit, scaleRGBA, reduceImage, jpegFitScale)
 import Cmedit.Render (renderEditor, renderFrame, refreshHighlight, scrollPlan, Screen(..), ScrollHint(..), Theme(..), defaultTheme, lightTheme, themeFor, FileKind(..), fileKind, expandLineCells)
 import Cmedit.ConfigFile (ThemeName(..), defaultConfig)
 import Cmedit.Ansi (styleSgr, styleSgrWith)
@@ -1124,29 +1124,29 @@ main = do
       -- in the panel (no keystroke editing in the read-only image view);
       -- opened any other way it takes the editor focus like a normal document.
       check "image opened from the panel keeps panel focus"
-            (edFocus (imageLoadedNew "/w/pic.bmp" [(im, 0)] edExp) == FExplorer)
+            (edFocus (imageLoadedNew "/w/pic.bmp" (fullDecode [(im, 0)]) edExp) == FExplorer)
       check "image opened elsewhere focuses the view"
-            (edFocus (imageLoadedNew "/w/pic.bmp" [(im, 0)] ed0) == FEdit)
+            (edFocus (imageLoadedNew "/w/pic.bmp" (fullDecode [(im, 0)]) ed0) == FEdit)
       -- The half-block cell picture is drawn only when no pixel placement will
       -- cover it; with graphics caps present the renderer blanks the area so the
       -- blocky fallback / checkerboard can't bleed through the overlay.
-      let edImgE = setGfxCaps True False False (imageLoaded "/w/pic.bmp" [(im, 0)] ed0)   -- caps + editor
+      let edImgE = setGfxCaps True False False (imageLoaded "/w/pic.bmp" (fullDecode [(im, 0)]) ed0)   -- caps + editor
       check "gfx overlay off without caps"
-            (not (imageOverlayActive (imageLoaded "/w/pic.bmp" [(im, 0)] ed0)))
+            (not (imageOverlayActive (imageLoaded "/w/pic.bmp" (fullDecode [(im, 0)]) ed0)))
       check "gfx overlay on with caps (image focused)"
             (imageOverlayActive edImgE)
       check "gfx overlay on with caps (panel focused)"
-            (imageOverlayActive (setGfxCaps True False False (imageLoaded "/w/pic.bmp" [(im, 0)] edExp)))
+            (imageOverlayActive (setGfxCaps True False False (imageLoaded "/w/pic.bmp" (fullDecode [(im, 0)]) edExp)))
       check "gfx overlay off when the search view obscures the image"
             (not (imageOverlayActive (edImgE { edSearchMode = True })))
       -- Animation scheduling: who steps the frames depends on the terminal.
       let anim2 = [(im, 500), (im, 100)]
-          edAnim = imageLoaded "/w/anim.gif" anim2 ed0          -- no gfx caps
+          edAnim = imageLoaded "/w/anim.gif" (fullDecode anim2) ed0          -- no gfx caps
           edAnimK = setGfxCaps True True False edAnim           -- real kitty (native animation)
           edAnimS = setGfxCaps False False True edAnim          -- sixel
           edAnimG = setGfxCaps True False False edAnim          -- static kitty protocol (Ghostty/WezTerm)
       check "still image never ticks"
-            (imageTickUs (imageLoaded "/w/pic.bmp" [(im, 0)] ed0) == Nothing)
+            (imageTickUs (imageLoaded "/w/pic.bmp" (fullDecode [(im, 0)]) ed0) == Nothing)
       check "cell fallback ticks at the frame delay"
             (imageTickUs edAnim == Just 500000)
       check "cell fallback clamps tiny delays to 50ms"
@@ -1188,7 +1188,7 @@ main = do
   case decodeImage bmp of
     Right im -> do
       checkEq "image view hides the terminal cursor"
-              (scrCursor (renderEditor (imageLoaded "pic.bmp" [(im, 0)] ed0))) Nothing
+              (scrCursor (renderEditor (imageLoaded "pic.bmp" (fullDecode [(im, 0)]) ed0))) Nothing
       check "text view still places the cursor"
             (isJust' (scrCursor (renderEditor (setLoaded "t.txt" (mkLR "hi") ed0))))
     Left _ -> check "image cursor decode" False
@@ -1338,6 +1338,61 @@ main = do
         let fingerprint = foldl' (\h b -> (h `xor` fromIntegral b) * 1099511628211)
                                  (14695981039346656037 :: Word64) (U.elems (imgPix im))
         checkEq ("jpeg " ++ label ++ ": all RGBA bytes") fingerprint expected
+  -- Reduced-size decodes (plan 0035 phase 2): each fixture at 1/2, 1/4 and
+  -- 1/8, against libjpeg-turbo's decode at that scale (Pillow 11.1's, at
+  -- decoder scale 1/N as Image.draft sets it; jpeg_fixtures.py prints these,
+  -- and jpegcheck.sh --scale holds the corpus to the same). The size is
+  -- ceil (W/N) x ceil (H/N). At 1/2 a 4:2:0 file's chroma is reconstructed
+  -- at full size by the IDCT and not upsampled at all; at 1/8 the triangle
+  -- filter is off; the 4:2:2 and 4:4:0 fixtures keep it at 1/2 and 1/4.
+  forM_ [("gray", jpegGray8, [(16, 12, 0xa43c65e795946c75), (8, 6, 0xb20ee005bfb1c401), (4, 3, 0x60dfa394aab49633)])
+        ,("4:2:0", jpegColour420, [(16, 12, 0xdb7e5c563f56f019), (8, 6, 0x1e4529d702a0bcc9), (4, 3, 0x8043309ea364b658)])
+        ,("4:4:4", jpegYcc444, [(10, 7, 0xceb302e4441f4802), (5, 4, 0x32fc9cf3f9ff6224), (3, 2, 0xcfc672a76abe6494)])
+        ,("progressive", jpegProgressive, [(16, 12, 0x50ddf2fbbc9748aa), (8, 6, 0x70aadf8ac817f531), (4, 3, 0x29bce4b4be374501)])
+        ,("restart", jpegRestart, [(16, 12, 0x50ddf2fbbc9748aa), (8, 6, 0x70aadf8ac817f531), (4, 3, 0x29bce4b4be374501)])
+        ,("progressive, a restart every unit", jpegProgRst, [(10, 7, 0xc598ff1c614397f1), (5, 4, 0x53675f090dc18223), (3, 2, 0xc21745cd4d40b28f)])
+        ,("4:2:2", jpegH2V1, [(10, 7, 0xd5b167bbb9385722), (5, 4, 0xe5af40bdec7962da), (3, 2, 0xa81d99ee3464546f)])
+        ,("4:4:0", jpegH1V2, [(10, 7, 0x8f34b48e384f16f1), (5, 4, 0x21c5920ccbbcb364), (3, 2, 0xb4872c5154160305)])
+        ,("3x2 replicated", jpegBox3x2, [(10, 7, 0x166f0b6d8a3241c4), (5, 4, 0x39b11ea49fd26b72), (3, 2, 0xda01445700cb4835)])
+        ,("RGB-coded (Adobe 0)", jpegRgb, [(10, 7, 0x35dddae2c29efd96), (5, 4, 0x9c0c5bdb0652f650), (3, 2, 0x06bcba1b88969f2d)])
+        ,("YCCK 4:2:0 with K at 2x2", jpegYcck420, [(10, 7, 0x607de7b91fd6d63b), (5, 4, 0x4ffeda887d003a07), (3, 2, 0x4e0f09595bf3763d)])
+        ,("CMYK as stored (Adobe 0 last)", ycckThenAdobe0, [(10, 7, 0x615358af81212618), (5, 4, 0xb28336f1256c5d82), (3, 2, 0x1724cfd14288ccbb)])
+        ] $ \(label, bytes, expected) -> do
+    forM_ (zip [2, 4, 8 :: Int] expected) $ \(d, (ew, eh, fp)) ->
+      case decodeJPEGScaled d bytes of
+        Left e -> check ("jpeg 1/" ++ show d ++ " " ++ label ++ ": " ++ e) False
+        Right im -> do
+          let fingerprint = foldl' (\h b -> (h `xor` fromIntegral b) * 1099511628211)
+                                   (14695981039346656037 :: Word64) (U.elems (imgPix im))
+          checkEq ("jpeg 1/" ++ show d ++ " " ++ label ++ ": size and all RGBA bytes")
+                  (imgW im, imgH im, fingerprint) (ew, eh, fp)
+    -- Scale 1 is the full-size decode, byte for byte.
+    checkEq ("jpeg 1/1 " ++ label ++ ": the full-size decode")
+            (fmap (U.elems . imgPix) (decodeJPEGScaled 1 bytes)) (fmap (U.elems . imgPix) (decodeJPEG bytes))
+  check "jpeg: a scale other than 1, 2, 4 or 8 is refused" (all (\d -> isLeft (decodeJPEGScaled d jpegColour420)) [0, 3, 16])
+  checkEq "jpeg dims: the full-size frame" (jpegDims jpegColour420) (Just (32, 24))
+  checkEq "jpeg dims: a big frame, from the header alone" (jpegDims (manyScanJpeg 6300 6300 1)) (Just (6300, 6300))
+  checkEq "jpeg dims: not a JPEG" (jpegDims (BS.pack [0x89, 0x50, 0x4E, 0x47])) Nothing
+  -- The size limits apply to the picture decoded: decodeImage opens a JPEG
+  -- past them at the first scale that fits, rather than refusing it. A
+  -- frame decoded streaming may be up to four times the full-size pixel
+  -- limit; any other keeps the full-size limit at every scale (its
+  -- coefficients are held whole), so the progressive one is refused.
+  case decodeImage (blankBaselineJpeg 6400 6400) of
+    Left e -> check ("jpeg 41 MP baseline: " ++ e) False
+    Right im -> do
+      checkEq "jpeg 41 MP baseline: opens at 1/2" (imgW im, imgH im) (3200, 3200)
+      checkEq "jpeg 41 MP baseline: mid-grey corners" (pixelAt im 0 0, pixelAt im 3199 3199)
+              ((128, 128, 128, 255), (128, 128, 128, 255))
+  check "jpeg 41 MP baseline: refused at full size"
+    (either ("size limit" `isInfixOf`) (const False) (decodeJPEG (blankBaselineJpeg 6400 6400)))
+  checkEq "jpeg 24000-wide baseline: opens at 1/2 (a side past the limit)"
+    (fmap (\im -> (imgW im, imgH im)) (decodeImage (blankBaselineJpeg 24000 64))) (Right (12000, 32))
+  check "jpeg 169 MP baseline: refused (past four times the limit)"
+    (either ("size limit" `isInfixOf`) (const False) (decodeImage (blankBaselineJpeg 13000 13000)))
+  check "jpeg 41 MP progressive: refused at every scale"
+    (either ("size limit" `isInfixOf`) (const False) (decodeImage (manyScanJpeg 6400 6400 1))
+     && all (\d -> isLeft (decodeJPEGScaled d (manyScanJpeg 6400 6400 1))) [2, 4, 8])
   -- The PDF path (decodeJPEGSamples, no /ColorTransform): three components
   -- with ids R, G, B and no Adobe marker are RGB, as pdf.js and libjpeg
   -- read them, so the samples are the display RGB.
@@ -3785,7 +3840,7 @@ main = do
     -- Views with no text refuse rather than writing an empty file, which is
     -- what Save As did before this existed.
     let edImg = imageLoaded "/tmp/x.png"
-                  [(Image 1 1 "PNG" (listArray (0, 3) [0, 0, 0, 255]), 0)] ed0
+                  (fullDecode [(Image 1 1 "PNG" (listArray (0, 3) [0, 0, 0, 255]), 0)]) ed0
     checkEq "an image has nothing to export" (exportSuggestion edImg) Nothing
     check "and says so rather than offering a dialog"
       (case saveAsRefusal edImg of Just m -> "no text" `isInfixOf` m; Nothing -> False)
@@ -6331,7 +6386,7 @@ main = do
     -- A zoom rectangle dragged in the margin beside a small picture must
     -- leave a crop that is on the image.
     let tiny = Image 30 20 "PNG" (listArray (0, 30 * 20 * 4 - 1) (repeat 0))
-        edTiny = imageLoaded "/tiny.png" [(tiny, 0)] (newEditor (24, 80) defaultConfig)
+        edTiny = imageLoaded "/tiny.png" (fullDecode [(tiny, 0)]) (newEditor (24, 80) defaultConfig)
         edTinyZ = foldl (\e k -> fst (update k e)) edTiny
                     [ mouseAt 18 75 True False, mouseAt 21 78 True True, mouseAt 21 78 False False ]
     check "a zoom drag in the letterbox margin stays on the image"
@@ -6469,7 +6524,7 @@ main = do
   case decodeImage (mkBMP 2 2 [(255,0,0),(0,255,0),(0,0,255),(255,255,0)]) of
     Left _   -> check "image fixture decodes for find-menu test" False
     Right im -> do
-      let edImg = imageLoaded "/pic.png" [(im, 0)] ed0
+      let edImg = imageLoaded "/pic.png" (fullDecode [(im, 0)]) ed0
           findActs = [ a | MEItem _ _ a <- entriesFor edImg 2 ]   -- Find menu is index 2
       check "image view hides in-file Find/Replace/GoTo"
             (all (`notElem` findActs) [MAFind, MAFindNext, MAFindPrev, MAReplace, MAGoToLine])
@@ -6492,7 +6547,7 @@ main = do
   -- the pointer.
   do
     let bigImg = Image 800 600 "PNG" (listArray (0, 800 * 600 * 4 - 1) (repeat 0))
-        edBig = imageLoaded "/big.png" [(bigImg, 0)] ed0
+        edBig = imageLoaded "/big.png" (fullDecode [(bigImg, 0)]) ed0
         loB = computeLayout edBig
         srcAt e r c = case edImage e of
           Nothing -> (0, 0)
@@ -6546,13 +6601,201 @@ main = do
     -- notch jumps to fill, and wheeling back out must return to the fit
     -- instead of re-deriving the fill scale from the whole-image crop forever.
     let smallImg = Image 40 30 "PNG" (listArray (0, 40 * 30 * 4 - 1) (repeat 0))
-        edSmall = imageLoaded "/small.png" [(smallImg, 0)] (setCellPx (10, 20) ed0)
+        edSmall = imageLoaded "/small.png" (fullDecode [(smallImg, 0)]) (setCellPx (10, 20) ed0)
         edSmallIn = zoomAt MBWheelUp r0 c0 edSmall
     check "a native-size image zooms in to fill" ((idCrop =<< edImage edSmallIn) == Just (0, 0, 40, 30))
     check "and wheels back out to the native fit"
       ((idCrop =<< edImage (zoomAt MBWheelDown r0 c0 edSmallIn)) == Nothing)
     check "the wheel outside the text area does nothing"
       ((idCrop =<< edImage (fst (update (KMouse (MouseEvent MBWheelUp 0 0 True False noMods 1)) edBig))) == Nothing)
+
+  -- Reduced-scale JPEG viewing (plan 0035 D2-D4): the view's geometry is the
+  -- file's full resolution, the pixels are a 1/den decode, and a zoom that
+  -- needs more asks for a finer one, which installs only into the model
+  -- that asked, never coarsens, and is capped.
+  do
+    -- D3: the opening scale is the coarsest that still covers a placement,
+    -- and never finer than the size limits allow.
+    checkEq "opening scale: a 28 MP photo opens at 1/4" (jpegOpenDen (6000, 4753)) 4
+    checkEq "opening scale: a 4096 square opens at 1/2" (jpegOpenDen (4096, 4096)) 2
+    checkEq "opening scale: a picture under 4.8 MP opens whole" (jpegOpenDen (2000, 1500)) 1
+    checkEq "opening scale: exactly maxGfxPixels at 1/2 opens at 1/2" (jpegOpenDen (2400, 2000)) 2
+    checkEq "opening scale: a 144 MP frame opens at 1/8" (jpegOpenDen (12000, 12000)) 8
+    checkEq "opening scale: the size limits win (24000 wide)" (jpegOpenDen (24000, 64)) 2
+    checkEq "the finest scale the limits allow" (map jpegFitScale [(6000, 4753), (12000, 12000), (24000, 64)]) [1, 2, 2]
+    -- reduceImage: a k x k box mean, the last box clipped.
+    let px4 = Image 3 2 "T" (listArray (0, 23) [ 10,20,30,40, 30,40,50,60, 7,7,7,7
+                                                , 50,60,70,80, 70,80,90,100, 9,9,9,9 ])
+        red = reduceImage 2 px4
+    checkEq "reduceImage sizes round up" (imgW red, imgH red) (2, 1)
+    checkEq "reduceImage averages each box (clipped at the edge)" (U.elems (imgPix red)) [40,50,60,70, 8,8,8,8]
+    checkEq "reduceImage 1 is the identity" (U.elems (imgPix (reduceImage 1 px4))) (U.elems (imgPix px4))
+    -- pictureSample: full-resolution crops into decoded pixels.
+    let blank w h = Image w h "JPEG" (STA.runSTUArray (STA.newArray (0, w * h * 4 - 1) 0))
+        full = (4800, 4000)
+        dec4 = blank 1200 1000
+        dc4 = Decoded [(dec4, 0)] full 4 Nothing False
+        idoc4 = mkImageDoc 7 dc4
+        sampleOf d c = snd (pictureSample d c)
+    checkEq "a reduced picture's dims are the file's" (imageDims idoc4) full
+    checkEq "the whole picture samples the whole decode" (sampleOf idoc4 (0, 0, 4800, 4000)) (0, 0, 1200, 1000)
+    checkEq "a crop maps proportionally" (sampleOf idoc4 (1000, 800, 400, 300)) (250, 200, 100, 75)
+    checkEq "a one-pixel crop at the far corner stays inside" (sampleOf idoc4 (4799, 3999, 1, 1)) (1199, 999, 1, 1)
+    checkEq "a tiny crop keeps a pixel each way" (sampleOf idoc4 (100, 100, 1, 1)) (25, 25, 1, 1)
+    let odd = mkImageDoc 0 (Decoded [(blank 1500 1189, 0)] (6000, 4753) 4 Nothing False)
+    checkEq "an odd size's whole crop is the whole (partial-pixel) decode" (sampleOf odd (0, 0, 6000, 4753)) (0, 0, 1500, 1189)
+    -- Edges map by the scale (decoded pixel i covers source [i*den, (i+1)*den)),
+    -- not proportionally to the sizes, which drifts towards the far edge.
+    let at den (fw, fh) = mkImageDoc 0 (Decoded [(blank ((fw + den - 1) `quot` den) ((fh + den - 1) `quot` den), 0)]
+                                                (fw, fh) den Nothing False)
+        odd2 = at 2 (1001, 999); odd4 = at 4 (4001, 3001); odd8 = at 8 (6001, 4753)
+    checkEq "1/2: edges round to the nearest decoded boundary" (sampleOf odd2 (998, 996, 2, 2)) (499, 498, 1, 1)
+    checkEq "1/2: the whole odd picture is the whole decode" (sampleOf odd2 (0, 0, 1001, 999)) (0, 0, 501, 500)
+    checkEq "1/2: a crop to the far edge ends at the decode's" (sampleOf odd2 (1000, 997, 1, 2)) (500, 499, 1, 1)
+    checkEq "1/4: near the far edge, by the scale" (sampleOf odd4 (3996, 0, 4, 4)) (999, 0, 1, 1)
+    checkEq "1/4: a half-pixel edge rounds up" (sampleOf odd4 (2002, 1498, 1000, 1000)) (501, 375, 250, 250)
+    checkEq "1/4: the whole odd picture is the whole decode" (sampleOf odd4 (0, 0, 4001, 3001)) (0, 0, 1001, 751)
+    checkEq "1/8: near the far edge, by the scale" (sampleOf odd8 (5995, 4740, 5, 13)) (749, 593, 1, 2)
+    checkEq "1/8: just short of the far edge" (sampleOf odd8 (0, 0, 6000, 4752)) (0, 0, 750, 594)
+    checkEq "1/8: the whole odd picture is the whole decode" (sampleOf odd8 (0, 0, 6001, 4753)) (0, 0, 751, 595)
+    let idocFull = mkImageDoc 0 (fullDecode [(blank 40 30, 0)])
+    checkEq "a full-size decode samples its crop unchanged" (sampleOf idocFull (3, 4, 10, 9)) (3, 4, 10, 9)
+    checkEq "a full-size decode is at scale 1" (idDen idocFull, idFull idocFull) (1, (40, 30))
+    -- The installed model: epochs, the cell picture, the refinement want.
+    let edK = setCellPx (8, 16) (setGfxCaps True False False ed0)
+        edJ = imageLoaded "/w/big.jpg" dc4 edK
+        edJ' = imageLoaded "/w/big.jpg" dc4 edJ   -- a Revert installs a new model
+        epochOf e = maybe (-1) idEpoch (edImage e)
+        loJ = computeLayout edJ
+    check "every install draws a fresh epoch" (epochOf edJ /= epochOf edJ' && epochOf edJ >= 0)
+    check "the cell picture is cached at the text area's size"
+      (case edImage edJ >>= idCache of
+         Just (c, r, _, _, _, _, g) -> c == loTextWidth loJ && r == loTextHeight loJ && snd (bounds g) == (r - 1, c - 1)
+         Nothing -> False)
+    check "the cell picture is the decode fitted in full-resolution geometry"
+      (case edImage edJ of
+         Just d -> let cols = loTextWidth loJ; rows = loTextHeight loJ
+                       placed = viewFit (cellAspect edJ) (imageFitCap edJ d) cols rows 4800 4000
+                   in A.elems (renderPicture edJ d cols rows)
+                        == A.elems (renderImagePlaced (idMode d) cols rows placed (0, 0, 1200, 1000) dec4)
+         Nothing -> False)
+    check "the status bar names the file's size" ("4800\xd7\&4000" `isInfixOf` fst (statusRightInfo edJ))
+    checkEq "at the fit no finer decode is wanted" (imageRefineWant edJ) Nothing
+    check "and the status bar says nothing about the scale" (not ("scale)" `isInfixOf` fst (statusRightInfo edJ)))
+    let wheel e = fst (update (KMouse (MouseEvent MBWheelUp (loTextLeft loJ + loTextWidth loJ `div` 2)
+                                                 (loTextTop loJ + loTextHeight loJ `div` 2) True False noMods 1)) e)
+        zooms = iterate wheel edJ
+        firstWant = [ (n, w, e) | (n, e) <- zip [0 :: Int ..] (take 40 zooms), Just w <- [imageRefineWant e] ]
+    case firstWant of
+      [] -> check "zooming in eventually wants a finer decode" False
+      ((n, w, edZ) : _) -> do
+        check "zooming in eventually wants a finer decode" (n > 0)
+        check "the want names the path, the model's epoch and the full size"
+          (iwPath w == "/w/big.jpg" && iwEpoch w == epochOf edZ && iwFull w == full)
+        check "the want is finer than what is showing, at the scale the view needs"
+          (iwDen w < 4 && Just (iwDen w) == fmap (imageNeedDen edZ) (edImage edZ))
+        check "the status bar notes the reduced scale while it is pending" ("(1/4 scale)" `isInfixOf` fst (statusRightInfo edZ))
+        check "a menu over the picture does not withdraw the want"
+          (imageRefineWant (fst (update (KAltChar 'f') edZ)) == Just w)
+        let dec2 = blank 2400 2000
+            w2 = w { iwDen = 2 }
+            edR = imageRedecoded w2 (Right dec2) edZ
+            imR = edImage edR
+        check "a finer decode installs" (fmap idDen imR == Just 2 && fmap (imgW . idImage) imR == Just 2400)
+        check "and replaces every frame (the coarse pixels are released)"
+          (fmap (map (imgW . fst) . idFrames) imR == Just [2400])
+        check "the view keeps its crop" (fmap idCrop imR == fmap idCrop (edImage edZ))
+        checkEq "and counts one refinement" (fmap idRefines imR) (Just 1)
+        checkEq "the crop now samples the finer decode"
+          (fmap (\d -> snd (pictureSample d (0, 0, 4800, 4000))) imR) (Just (0, 0, 2400, 2000))
+        -- stale results
+        checkEq "a result for an earlier epoch (a Revert) is dropped"
+          (fmap idDen (edImage (imageRedecoded w2 { iwEpoch = iwEpoch w2 - 1 } (Right dec2) edZ))) (Just 4)
+        checkEq "a result for another path is dropped"
+          (fmap idDen (edImage (imageRedecoded w2 { iwPath = "/w/other.jpg" } (Right dec2) edZ))) (Just 4)
+        let edStuckD = imageRedecoded w2 (Right (blank 2400 1999)) edZ
+        check "pixels of the wrong size mark the picture stuck"
+          (fmap idDen (edImage edStuckD) == Just 4 && fmap idDenStuck (edImage edStuckD) == Just True
+           && "changed" `T.isInfixOf` edStatus edStuckD)
+        check "a stuck picture asks for nothing more" (imageRefineWant edStuckD == Nothing)
+        check "but still says it is reduced" ("(1/4 scale)" `isInfixOf` fst (statusRightInfo edStuckD))
+        let edStuckF = imageRedecoded w2 { iwFull = (4800, 4001) } (Right dec2) edZ
+        check "a different full size (the file changed) marks it stuck"
+          (fmap idDenStuck (edImage edStuckF) == Just True && fmap idDen (edImage edStuckF) == Just 4)
+        let edFail = imageRedecoded w2 (Left "corrupt") edZ
+        check "a failed decode marks it stuck with the reason"
+          (fmap idDenStuck (edImage edFail) == Just True && "corrupt" `T.isInfixOf` edStatus edFail)
+        -- never coarsens
+        let edR1 = imageRedecoded w { iwDen = 1 } (Right (blank 4800 4000)) edZ
+        checkEq "a full-size decode installs" (fmap idDen (edImage edR1)) (Just 1)
+        checkEq "a coarser result arriving later is ignored"
+          (fmap idDen (edImage (imageRedecoded w2 (Right dec2) edR1))) (Just 1)
+        checkEq "and a picture at full size wants nothing" (imageRefineWant (iterate wheel edR1 !! 3)) Nothing
+        -- the cap
+        let capped = edZ { edImage = fmap (\d -> d { idRefines = maxImageRefines }) (edImage edZ) }
+        checkEq "at most two refinements per visit" (imageRefineWant capped) Nothing
+        let twice = imageRedecoded w { iwDen = 1 } (Right (blank 4800 4000)) edR
+        checkEq "the second refinement counts two" (fmap idRefines (edImage twice)) (Just 2)
+        -- going inactive parks the refined decode back at the opening scale
+        -- (a smaller picture here: the test suite runs unoptimised)
+        let fullP = (2400, 2000)
+            edP = imageLoaded "/w/p2.jpg" (Decoded [(blank 1200 1000, 0)] fullP 2 Nothing False) edK
+            edPZ = iterate wheel edP !! 12
+            edPR = imageRedecoded (ImgWant "/w/p2.jpg" (epochOf edP) 1 fullP Nothing) (Right (blank 2400 2000)) edPZ
+            parked = fmap parkImage (edImage edPR)
+        checkEq "the small picture opens at 1/2" (fmap idDen (edImage edP)) (Just 2)
+        checkEq "and refines to full size" (fmap idDen (edImage edPR)) (Just 1)
+        check "parking returns to the opening scale"
+          (fmap idDen parked == Just 2 && fmap (\d -> (imgW (idImage d), imgH (idImage d))) parked == Just (1200, 1000))
+        check "and keeps one frame of it, the count reset, the crop kept"
+          (fmap (length . idFrames) parked == Just 1 && fmap idRefines parked == Just 0
+           && fmap idCrop parked == fmap idCrop (edImage edPR) && isJust (idCrop =<< parked))
+        let withTxt = setLoadedNew "/w/notes.txt" (mkLR2 "hi") edPR
+        check "opening another file parks the picture in the zipper"
+          (case [ im | d <- edBefore withTxt, Just im <- [docImage d] ] of
+             [im] -> idDen im == 2 && imgW (idImage im) == 1200
+             _ -> False)
+        let back = switchToFile 0 withTxt
+        check "and showing it again asks for the finer decode again"
+          (fmap iwDen (imageRefineWant back) == Just 1 && fmap idDen (edImage back) == Just 2)
+        check "an unreduced picture parks unchanged"
+          (fmap (idDen . parkImage) (edImage (imageLoaded "/w/p.png" (fullDecode [(blank 40 30, 0)]) edK)) == Just 1)
+        -- Recovery rebuilds the zipper; a refined picture it moves out of
+        -- the active slot is parked like any other.
+        let recJ = Journal (Just "/w/r.txt") Nothing LF Utf8 True False (Pos 0 0) (T.pack "x")
+            edRecP = recoverJournals (openRecoverDialog
+                       [RecoverItem (J.journalFileName (Just "/w/r.txt") (0 :: Int)) RecoverClean recJ] edPR)
+        check "recovering a journal parks the refined picture it makes inactive"
+          (edPath edRecP == Just "/w/r.txt"
+           && [ (idDen im, imgW (idImage im)) | d <- edBefore edRecP ++ edAfter edRecP, Just im <- [docImage d] ]
+                == [(2, 1200)])
+    -- A picture opened at full size (a stream: it cannot be re-read, so it
+    -- decodes as finely as the limits allow) parks at the scale it opened
+    -- at, not at the one a file of its size would have opened at.
+    let streamed = mkImageDoc 0 (Decoded [(blank 6000 4753, 0)] (6000, 4753) 1 Nothing True)
+        parkedS = parkImage streamed
+    checkEq "a 6000x4753 picture decoded at 1/1 survives parking unchanged"
+      (idDen parkedS, idBaseDen parkedS, imgW (idImage parkedS), imgH (idImage parkedS)) (1, 1, 6000, 4753)
+    -- The want carries the mtime the picture was opened with, so the job can
+    -- refuse a file rewritten at the same size.
+    let edMt = imageLoaded "/w/mt.jpg" dc4 { dcMtime = Just (mt 100) } edK
+    checkEq "a refinement want names the opening mtime"
+      (take 1 [ iwMtime w | e <- take 40 (iterate wheel edMt), Just w <- [imageRefineWant e] ]) [Just (mt 100)]
+    -- The same picture read from a stream, at any scale, never asks to
+    -- re-read what cannot be read twice.
+    let edS = imageLoaded "/dev/fd/63" dc4 { dcStream = True } edK
+    checkEq "a picture from a stream never wants a finer decode, however zoomed"
+      [ w | e <- take 40 (iterate wheel edS), Just w <- [imageRefineWant e] ] []
+    -- A picture records its file's mtime, so a change on disk is noticed and
+    -- Revert (which installs a new model, a new epoch) is offered.
+    let edM = imageLoaded "/w/m.jpg" dc4 { dcMtime = Just (mt 100) } edK
+        edM' = noteDiskMtimes [("/w/m.jpg", Just (mt 200))] edM
+    check "a picture changed on disk is marked and can be reverted"
+      (edDiskChanged edM' && not (edDiskChanged edM) && MARevert `elem` [ a | MEItem _ _ a <- entriesFor edM' 0 ])
+    -- Other formats are untouched: a full-size bitmap never asks.
+    let edPng = imageLoaded "/w/big.png" (fullDecode [(blank 1200 1000, 0)]) edK
+    checkEq "a full-size bitmap never wants a re-decode, however zoomed"
+      (imageRefineWant (iterate (\e -> fst (update (KMouse (MouseEvent MBWheelUp 30 10 True False noMods 1)) e)) edPng !! 12)) Nothing
 
   -- Input parsing: Ctrl+Shift+F/H arrive as CSI u under the Kitty protocol.
   kcsF <- parseBytes (csiU 102 6)   -- 'f' with shift(1)+ctrl(4) -> mods param 6
@@ -8191,7 +8434,7 @@ main = do
     let edCsvDoc = (setLoaded "/w/t.csv" (mkLR "a,b\n1,2") ed0) { edLintAvail = availAll }
     check "csv doc -> no lint" (lintRequest False edCsvDoc == Nothing)
     let img1 = Image 1 1 "test" (listArray (0, 3) [0, 0, 0, 255])
-        edImg = edPy { edImage = Just (mkImageDoc [(img1, 0)]) }
+        edImg = edPy { edImage = Just (mkImageDoc 0 (fullDecode [(img1, 0)])) }
     check "image doc -> no lint" (lintRequest False edImg == Nothing)
     check "untitled -> no lint"
       (lintRequest False (ed0 { edLintAvail = availAll, edBuffer = fromText (T.pack "x=1\n") }) == Nothing)
@@ -8691,7 +8934,7 @@ main = do
 
     -- Views with no buffer under them, and things that are not files.
     let pix1 = Image 1 1 "png" (listArray (0, 3) [0, 0, 0, 255])
-        edImg = imageLoaded "/w/p.png" [(pix1, 0)] edJ0
+        edImg = imageLoaded "/w/p.png" (fullDecode [(pix1, 0)]) edJ0
     check "an image document is never journalled"
       (null (journalRequests (edImg { edModified = True })))
     check "the manual is never journalled"
@@ -10266,6 +10509,73 @@ manyScanJpeg w h k = BS.pack (concat ([[0xFF, 0xD8], dqt, sof, dht 0x00, dht 0x1
     sof = seg 0xC2 [8, byte (h `div` 256), byte (h `mod` 256), byte (w `div` 256), byte (w `mod` 256), 1, 1, 0x11, 0]
     dht tc = seg 0xC4 ([tc, 1] ++ replicate 15 0 ++ [0])
     scan ss se = seg 0xDA [1, 1, 0x00, ss, se, 0]
+
+-- ycc444.jpg from docs/plans/bench/jpeg_fixtures.py: 20x14 YCbCr 4:4:4 q50.
+jpegYcc444 :: BS.ByteString
+jpegYcc444 = BS.pack
+  [ 255,216,255,224,0,16,74,70,73,70,0,1,1,0,0,1
+  , 0,1,0,0,255,219,0,67,0,16,11,12,14,12,10,16
+  , 14,13,14,18,17,16,19,24,40,26,24,22,22,24,49,35
+  , 37,29,40,58,51,61,60,57,51,56,55,64,72,92,78,64
+  , 68,87,69,55,56,80,109,81,87,95,98,103,104,103,62,77
+  , 113,121,112,100,120,92,101,103,99,255,219,0,67,1,17,18
+  , 18,24,21,24,47,26,26,47,99,66,56,66,99,99,99,99
+  , 99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99
+  , 99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99
+  , 99,99,99,99,99,99,99,99,99,99,99,99,99,99,255,192
+  , 0,17,8,0,14,0,20,3,1,17,0,2,17,1,3,17
+  , 1,255,196,0,31,0,0,1,5,1,1,1,1,1,1,0
+  , 0,0,0,0,0,0,0,1,2,3,4,5,6,7,8,9
+  , 10,11,255,196,0,181,16,0,2,1,3,3,2,4,3,5
+  , 5,4,4,0,0,1,125,1,2,3,0,4,17,5,18,33
+  , 49,65,6,19,81,97,7,34,113,20,50,129,145,161,8,35
+  , 66,177,193,21,82,209,240,36,51,98,114,130,9,10,22,23
+  , 24,25,26,37,38,39,40,41,42,52,53,54,55,56,57,58
+  , 67,68,69,70,71,72,73,74,83,84,85,86,87,88,89,90
+  , 99,100,101,102,103,104,105,106,115,116,117,118,119,120,121,122
+  , 131,132,133,134,135,136,137,138,146,147,148,149,150,151,152,153
+  , 154,162,163,164,165,166,167,168,169,170,178,179,180,181,182,183
+  , 184,185,186,194,195,196,197,198,199,200,201,202,210,211,212,213
+  , 214,215,216,217,218,225,226,227,228,229,230,231,232,233,234,241
+  , 242,243,244,245,246,247,248,249,250,255,196,0,31,1,0,3
+  , 1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,1
+  , 2,3,4,5,6,7,8,9,10,11,255,196,0,181,17,0
+  , 2,1,2,4,4,3,4,7,5,4,4,0,1,2,119,0
+  , 1,2,3,17,4,5,33,49,6,18,65,81,7,97,113,19
+  , 34,50,129,8,20,66,145,161,177,193,9,35,51,82,240,21
+  , 98,114,209,10,22,36,52,225,37,241,23,24,25,26,38,39
+  , 40,41,42,53,54,55,56,57,58,67,68,69,70,71,72,73
+  , 74,83,84,85,86,87,88,89,90,99,100,101,102,103,104,105
+  , 106,115,116,117,118,119,120,121,122,130,131,132,133,134,135,136
+  , 137,138,146,147,148,149,150,151,152,153,154,162,163,164,165,166
+  , 167,168,169,170,178,179,180,181,182,183,184,185,186,194,195,196
+  , 197,198,199,200,201,202,210,211,212,213,214,215,216,217,218,226
+  , 227,228,229,230,231,232,233,234,242,243,244,245,246,247,248,249
+  , 250,255,218,0,12,3,1,0,2,17,3,17,0,63,0,102
+  , 147,255,0,30,173,254,249,254,66,190,127,17,241,35,155,138
+  , 127,222,227,232,37,244,62,101,194,156,127,14,63,83,94,182
+  , 93,43,82,98,201,103,106,77,121,139,21,158,228,207,217,124
+  , 223,127,179,249,159,175,217,228,255,0,208,135,211,185,236,114
+  , 185,233,214,149,229,112,210,127,227,213,191,223,63,200,87,206
+  , 226,62,36,121,188,83,254,247,31,66,239,150,29,178,107,187
+  , 4,237,77,156,185,92,173,77,146,141,18,107,225,230,197,13
+  , 179,168,249,115,41,143,57,255,0,129,66,231,191,175,225,235
+  , 223,7,116,122,205,220,255,217
+  ]
+
+-- A baseline one-component w x h frame whose scan has no data: every
+-- coefficient decodes as zero (the reader reads zeros past the EOI), so the
+-- picture is uniform mid-grey, and the single interleaved-equivalent scan
+-- decodes streaming. Cheap to decode at any size.
+blankBaselineJpeg :: Int -> Int -> BS.ByteString
+blankBaselineJpeg w h = BS.pack (concat [[0xFF, 0xD8], dqt, sof, dht 0x00, dht 0x10, sos, [0xFF, 0xD9]])
+  where
+    byte = fromIntegral :: Int -> Word8
+    seg m body = [0xFF, m, byte ((length body + 2) `div` 256), byte ((length body + 2) `mod` 256)] ++ body
+    dqt = seg 0xDB (0 : replicate 64 1)
+    sof = seg 0xC0 [8, byte (h `div` 256), byte (h `mod` 256), byte (w `div` 256), byte (w `mod` 256), 1, 1, 0x11, 0]
+    dht tc = seg 0xC4 ([tc, 1] ++ replicate 15 0 ++ [0])
+    sos = seg 0xDA [1, 1, 0x00, 0, 63, 0]
 
 jpegYcck420 :: BS.ByteString
 jpegYcck420 = BS.pack

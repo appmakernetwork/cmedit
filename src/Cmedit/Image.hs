@@ -26,6 +26,9 @@ module Cmedit.Image
   , ImgMode(..)
   , decodeImage
   , decodeJPEG
+  , decodeJPEGScaled
+  , jpegDims
+  , jpegFitScale
   , JpegSamples(..)
   , decodeJPEGSamples
   , jpegCostHint
@@ -37,6 +40,7 @@ module Cmedit.Image
   , renderImagePlaced
   , viewFit
   , scaleRGBA
+  , reduceImage
   ) where
 
 import Control.Monad (when, unless, forM, forM_, foldM)
@@ -49,7 +53,8 @@ import qualified Data.Array as A
 import Data.Array.ST (STArray, STUArray, newArray, readArray, writeArray, runSTUArray)
 import Data.Array.MArray (freeze, thaw)
 import Data.Array.Base (STUArray(..), UArray(..), unsafeRead, unsafeWrite, unsafeAt, unsafeNewArray_)
-import GHC.Exts (Int(I#), Int#, Word(W#), Word#, ByteArray#, MutableByteArray#, shrinkMutableByteArray#, copyMutableByteArray#, setByteArray#, (*#))
+import GHC.Exts (Int(I#), Int#, Word(W#), Word#, ByteArray#, MutableByteArray#, shrinkMutableByteArray#, copyMutableByteArray#, setByteArray#, (*#), indexWord32Array#)
+import GHC.Word (Word32(W32#))
 import GHC.ST (ST(..))
 import Data.Array.Unsafe (castSTUArray, unsafeFreeze)
 import Data.Array.Unboxed (UArray, (!), bounds)
@@ -62,6 +67,8 @@ import Data.Word (Word8, Word16, Word32, Word64)
 import Data.Int (Int16)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
+import qualified Data.ByteString.Internal as BI
+import Foreign.Storable (pokeByteOff)
 import GHC.ByteOrder (ByteOrder(..), targetByteOrder)
 
 import Cmedit.Inflate (Huff(..), buildHuff, inflateInto, InflateHuff(..), buildInflateHuffN, decodeSymSlow)
@@ -176,7 +183,7 @@ fourCC = BS.pack . map (fromIntegral . ord)
 decodeImage :: BS.ByteString -> Either String Image
 decodeImage bs = case sniffImage bs of
   Just "PNG"  -> decodePNG bs
-  Just "JPEG" -> decodeJPEG bs
+  Just "JPEG" -> decodeJPEGFit bs
   Just "GIF"  -> decodeGIF bs
   Just "BMP"  -> decodeBMP bs
   Just "PNM"  -> decodePNM bs
@@ -1227,13 +1234,25 @@ data JFrame = JFrame { jfW :: !Int, jfH :: !Int, jfComps :: ![JComp] }
 -- Four-component (CMYK and YCCK) files are converted with the multiplicative
 -- formula @R = (1 - C)(1 - K)@, ImageMagick's (no ICC profile is
 -- interpreted; a PDF's CMYK images go through "Cmedit.PdfImage" and
--- poppler's conversion instead), after undoing the
+-- its conversion measured from pdftoppm's output instead), after undoing the
 -- Adobe convention when the file carries an Adobe APP14 marker: Photoshop
 -- writes CMYK /inverted/ (0 = full ink), and every reader that honours the
 -- marker (libjpeg's users, GIMP, pdf.js) un-inverts it.
 decodeJPEG :: BS.ByteString -> Either String Image
-decodeJPEG bs = do
-  (w, h, comps) <- jpegFrame bs
+decodeJPEG = decodeJPEGScaled 1
+
+-- | Decode a JPEG to RGBA at 1/@den@ of its size, for @den@ 1, 2, 4 or 8:
+-- @ceil (W/den)@ by @ceil (H/den)@ pixels, exactly the picture libjpeg-turbo
+-- decodes at that scale (its default decode, scale 1/den: see the
+-- reduced-size kernels). @den@ 1 is 'decodeJPEG'. The reduction happens in
+-- the inverse DCT, so a smaller picture costs less to reconstruct (the
+-- entropy decoding is the same at every scale) and never exists at full
+-- size. The size limits apply to the /output/; the source frame is bounded
+-- separately (see 'jpegFrameScaled').
+decodeJPEGScaled :: Int -> BS.ByteString -> Either String Image
+decodeJPEGScaled den bs = do
+  when' (den `notElem` [1, 2, 4, 8]) "unsupported JPEG scale"
+  (w, h, comps) <- jpegFrameScaled den bs
   let (jfif, adobe) = jpegColourMarkers bs
       rgbCoded = not jfif && maybe (map jcId comps == [82, 71, 66]) (== 0) adobe
       -- libjpeg reads any non-zero Adobe transform on four components as
@@ -1241,7 +1260,38 @@ decodeJPEG bs = do
       mode | length comps == 4 = JView4 (maybe False (/= 0) adobe) (isJust adobe)
            | length comps == 3 && rgbCoded = JViewRgb
            | otherwise         = JView
-  Right (decodeJpegImage mode bs w h comps)
+  Right (decodeJpegImage den mode bs w h comps)
+
+-- | 'decodeImage''s JPEG decode: full size when the picture is within the
+-- size limits, otherwise the first of 1/2, 1/4 and 1/8 that is, so a photo
+-- too large to show whole opens at a resolution it can be shown at instead
+-- of being refused. The scale is chosen from the frame header alone.
+-- (A caller that needs the full-size pixels, or a particular scale, calls
+-- 'decodeJPEG' or 'decodeJPEGScaled'; 'jpegDims' gives the full size.)
+decodeJPEGFit :: BS.ByteString -> Either String Image
+decodeJPEGFit bs = decodeJPEGScaled (maybe 1 jpegFitScale (jpegDims bs)) bs
+
+-- | The finest scale denominator (1, 2, 4 or 8) at which a JPEG of this
+-- full size passes the size limits: 1 for any picture that can be shown
+-- whole, 1 also when no scale fits (the decode then says why). The image
+-- view never decodes finer than this ("Cmedit.EditorState"'s refinement).
+jpegFitScale :: (Int, Int) -> Int
+jpegFitScale (w, h) =
+  head ([ d | d <- [1, 2, 4, 8], fits (scaledDim w d) (scaledDim h d) ] ++ [1])
+  where fits a b = either (const False) (const True) (checkDims a b)
+
+-- | A JPEG's full-size frame dimensions, from a walk over its headers to
+-- the frame header (nothing is decoded); 'Nothing' when there is none.
+jpegDims :: BS.ByteString -> Maybe (Int, Int)
+jpegDims bs
+  | BS.length bs < 2 || at bs 0 /= 0xFF || at bs 1 /= 0xD8 = Nothing
+  | otherwise = case findFrame bs 2 of
+      Right fr -> Just (jfW fr, jfH fr)
+      Left _   -> Nothing
+
+-- A dimension at 1/den: rounded up, as libjpeg sizes its scaled output.
+scaledDim :: Int -> Int -> Int
+scaledDim n den = (n + den - 1) `quot` den
 
 -- | A JPEG's decoded component samples, before any colour conversion beyond
 -- the JPEG-level transform: what a PDF @DCTDecode@ filter produces.
@@ -1269,24 +1319,53 @@ decodeJPEGSamples override bs = do
       transform = case adobe of
         Just t  -> t /= 0
         Nothing -> fromMaybe (n == 3 && map jcId comps /= [82, 71, 66]) override
-      img = decodeJpegImage (JRaw (transform && n >= 3)) bs w h comps
+      img = decodeJpegImage 1 (JRaw (transform && n >= 3)) bs w h comps
   Right (JpegSamples w h n adobe (imgPix img))
 
 -- The checked frame header: dimensions and components.
 jpegFrame :: BS.ByteString -> Either String (Int, Int, [JComp])
-jpegFrame bs = do
+jpegFrame = jpegFrameScaled 1
+
+-- The frame header checked for a decode at 1/den: the size limits apply to
+-- the picture decoded ('checkDims' on the output), and for den > 1 the
+-- source frame has bounds of its own, because the decoder still visits
+-- every one of its blocks. A file decoded streaming (a single scan that is
+-- the whole picture, 'jpegStreamable') holds a few MCU rows of
+-- coefficients at a time, entropy-decoded one MCU row per call, so its
+-- frame may be up to 'maxJpegSourcePixels' (four times the full-size limit:
+-- as large as fits at half size); any other is decoded through whole-image
+-- coefficient buffers, two bytes a sample, with each scan decoded in one
+-- call that a kill cannot interrupt, so it keeps the full-size pixel limit
+-- exactly, and neither its memory nor the time a cancelled decode takes to
+-- stop grows with the scale. Either way a side may be at most
+-- 'maxJpegSourceDim'.
+jpegFrameScaled :: Int -> BS.ByteString -> Either String (Int, Int, [JComp])
+jpegFrameScaled den bs = do
   when' (BS.length bs < 2 || at bs 0 /= 0xFF || at bs 1 /= 0xD8) "not a JPEG file"
   fr <- findFrame bs 2
   let w = jfW fr; h = jfH fr; comps = jfComps fr
-  checkDims w h
+  -- When the output is past a limit the source is too (it is at least as
+  -- large), so the source's own check reports it, in the file's terms.
+  either (const (checkDims w h)) Right (checkDims (scaledDim w den) (scaledDim h den))
   -- Sampling factors are 1..4 and a quantisation table id 0..3; anything
   -- else divides by zero or indexes outside the tables and the planes.
   when' (any (\c -> jcH c < 1 || jcH c > 4 || jcV c < 1 || jcV c > 4 || jcTq c > 3) comps)
         "bad JPEG frame header"
   when' (null comps) "JPEG missing frame header"
   when' (not (length comps `elem` [1,3,4])) "unsupported JPEG component count"
+  when (den > 1) $ do
+    when' (w > maxJpegSourceDim || h > maxJpegSourceDim)
+          ("image too large (" ++ show w ++ "x" ++ show h ++ ")")
+    when' (w * h > (if jpegStreamable bs comps then maxJpegSourcePixels else maxPixels))
+          "image exceeds the size limit"
   jpegScanWork bs w h comps
   Right (w, h, comps)
+
+-- The largest JPEG frame decoded at a reduced scale, in pixels and per
+-- side (see 'jpegFrameScaled').
+maxJpegSourcePixels, maxJpegSourceDim :: Int
+maxJpegSourcePixels = 4 * maxPixels
+maxJpegSourceDim = 2 * maxDim
 
 -- | The most scans a JPEG may have. A progressive file has about ten
 -- (libjpeg's default script has ten), so this refuses only files built to
@@ -1867,13 +1946,13 @@ data CoefSrc s = CoefSrc
   , csFetch  :: Int -> ST s ()
   }
 
-decodeJpegImage :: JOut -> BS.ByteString -> Int -> Int -> [JComp] -> Image
-decodeJpegImage mode bs w h comps =
+decodeJpegImage :: Int -> JOut -> BS.ByteString -> Int -> Int -> [JComp] -> Image
+decodeJpegImage den mode bs w h comps =
   -- Not 'buildImage': on the whole-image path the RGBA buffer is allocated
   -- only after the scans, so it is never live alongside the entropy
   -- decoder's garbage; on the streaming path there are no whole-image
   -- coefficient buffers at all (see 'jpegStreamable').
-  Image w h "JPEG" (runSTUArray (decodeJpegST True mode bs w h comps))
+  Image (scaledDim w den) (scaledDim h den) "JPEG" (runSTUArray (decodeJpegST True den mode bs w h comps))
 
 -- The decoder proper. Its own function so that @s@ is in scope for the
 -- local signatures below: without them @mkConv@ is let-generalised over
@@ -1888,14 +1967,25 @@ decodeJpegImage mode bs w h comps =
 -- workers do not survive that, and the entropy reader has moved on past
 -- what the abandoned bands consumed, so the only sound recovery is to
 -- discard everything and decode again from the start, sequentially.
-decodeJpegST :: forall s. Bool -> JOut -> BS.ByteString -> Int -> Int -> [JComp]
+--
+-- @den@ (1, 2, 4 or 8) is the scale: the picture is @ow@ x @oh@, w and h
+-- divided by den and rounded up. Entropy decoding and the coefficient
+-- buffers are the same at every scale; what changes is each component's
+-- block size in its plane ('juDs', from 8 down to 8 / den, chosen by
+-- 'jUpFor'), and so the IDCT kernel, the plane geometry and the upsampling.
+decodeJpegST :: forall s. Bool -> Int -> JOut -> BS.ByteString -> Int -> Int -> [JComp]
              -> ST s (STUArray s Int Word8)
-decodeJpegST allowPar mode bs w h comps = do
+decodeJpegST allowPar den mode bs w h comps = do
     let hmax = maximum (map jcH comps)
         vmax = maximum (map jcV comps)
         mcuW = 8*hmax; mcuH = 8*vmax
         mpr  = (w + mcuW - 1) `div` mcuW       -- MCUs per row / col
         mpc  = (h + mcuH - 1) `div` mcuH
+        -- The output: its size, the smallest block size any component can
+        -- have at this scale, and the output rows one MCU row makes.
+        ow = scaledDim w den; oh = scaledDim h den
+        mind = 8 `quot` den
+        oMcuH = mind * vmax
         ncomp = length comps
         -- per component: (blocksPerRow, blocksPerCol) on the MCU-padded grid,
         -- and (blocksWide, blocksHigh) for its true (non-interleaved) extent.
@@ -1911,8 +2001,8 @@ decodeJpegST allowPar mode bs w h comps = do
         -- a plane holds a ring of three MCU rows' worth of sample rows, and
         -- plane row r lives at ring row r `mod` rows ('prep' in @mkConv@
         -- reduces every row it reads). The planes, rings and IDCT geometry
-        -- are written in terms of the component's block size 'juDs' (8, the
-        -- only IDCT so far), so a reduced-size IDCT needs only kernels.
+        -- are written in terms of the component's block size 'juDs' (8 at
+        -- full size; less in a reduced-size decode).
         planeRows c u = min (snd (planeDims c u)) (3 * juDs u * jcV c)
     -- Mutable decode tables (DQT/DHT may appear or change between scans).
     quantT <- newArray (0,3) (U.listArray (0,63) (replicate 64 1))
@@ -2051,7 +2141,7 @@ decodeJpegST allowPar mode bs w h comps = do
                   else writeArray st iPos next >> loop                     -- APPn / COM / SOF (already parsed)
     -- How each component reaches the output grid (see 'jUpFor'), and which
     -- row kernel turns the component rows into output bytes.
-    let ups = map (jUpFor w h hmax vmax) comps
+    let ups = map (jUpFor mind w h hmax vmax) comps
         kernel = case mode of
           JView | ncomp == 1 -> kGray
                 | otherwise  -> kYcc
@@ -2069,7 +2159,7 @@ decodeJpegST allowPar mode bs w h comps = do
     -- the halo below). Only a component whose upsampling reads neighbouring
     -- rows ('juHalo') is ever read outside [mLo, mHi), so only those are
     -- reconstructed outside it. The whole picture is
-    -- @runRange src 0 mpc 0 h@.
+    -- @runRange src 0 mpc 0 oh@.
     let mkConv :: STUArray s Int Word8 -> [UArray Int Int]
                -> ST s (CoefSrc s -> Int -> Int -> Int -> Int -> ST s ())
         mkConv img qtbls = do
@@ -2081,7 +2171,7 @@ decodeJpegST allowPar mode bs w h comps = do
           -- A subsampled component's current output-resolution row (a
           -- full-resolution one is read straight from its ring). Rounded to
           -- 8 bits here, before colour conversion, as libjpeg does.
-          bufs <- mapM (\u -> newArray (0, max w (2 * juDw u) + 7) 0 :: ST s (STUArray s Int Word8)) ups
+          bufs <- mapM (\u -> newArray (0, max ow (2 * juDw u) + 7) 0 :: ST s (STUArray s Int Word8)) ups
           -- The component row each buffer holds, so a box-upsampled row
           -- shared by several output rows is expanded once.
           tags   <- newArray (0, 3) (-1) :: ST s (STUArray s Int Int)
@@ -2101,7 +2191,7 @@ decodeJpegST allowPar mode bs w h comps = do
                   let !by0 = m * jcV c; !by1 = (m+1) * jcV c - 1
                       !brow0 = base * jcV c
                   forLoop by0 by1 $ \by ->
-                    jIdctBlockRow coef qtbl plane ws pw ((by - brow0)*bpr*64) ((by * juDs u) `rem` rr)
+                    jIdctBlockRow coef qtbl plane ws pw (juDs u) ((by - brow0)*bpr*64) ((by * juDs u) `rem` rr)
               -- Per component (the last repeated to fill four slots): its
               -- geometry, ring, row buffer and the array its rows are read
               -- from by the row kernel.
@@ -2122,11 +2212,11 @@ decodeJpegST allowPar mode bs w h comps = do
                 if | meth == jmFull -> pure (ring cy)
                    | meth == jmH2V1 -> upH2V1 pl (ring cy) (juDw u) buf >> pure 0
                    | meth == jmH2V2 -> upH2V2 pl (ring cy) (ring far) (juDw u) buf >> pure 0
-                   | meth == jmH1V2 -> upH1V2 pl (ring cy) (ring far) w (if odd y then 2 else 1) buf >> pure 0
+                   | meth == jmH1V2 -> upH1V2 pl (ring cy) (ring far) ow (if odd y then 2 else 1) buf >> pure 0
                    | otherwise -> do
                        t <- unsafeRead tags k
                        when (t /= cy) $ do
-                         upBox pl (ring cy) (juNumX u) (juDenX u) w buf
+                         upBox pl (ring cy) (juNumX u) (juDenX u) ow buf
                          unsafeWrite tags k cy
                        pure 0
               -- With m MCU rows reconstructed, a component's ring holds its
@@ -2153,25 +2243,25 @@ decodeJpegST allowPar mode bs w h comps = do
                         sync y
                 forLoop y0 (y1-1) $ \y -> do
                   sync y
-                  let !io = y*w*4
+                  let !io = y*ow*4
                   o0 <- prep s0 y
                   case kernel of
-                    k | k == kGray -> cvtGray False img io w (srcOf s0) o0
-                      | k == kRaw1 -> cvtGray True img io w (srcOf s0) o0
+                    k | k == kGray -> cvtGray False img io ow (srcOf s0) o0
+                      | k == kRaw1 -> cvtGray True img io ow (srcOf s0) o0
                       | otherwise -> do
                           o1 <- prep s1 y
                           o2 <- prep s2 y
-                          if | k == kYcc -> cvtYcc img io w (srcOf s0) o0 (srcOf s1) o1 (srcOf s2) o2 jYccTab
-                             | k == kRgb -> cvtRgb img io w (srcOf s0) o0 (srcOf s1) o1 (srcOf s2) o2
+                          if | k == kYcc -> cvtYcc img io ow (srcOf s0) o0 (srcOf s1) o1 (srcOf s2) o2 jYccTab
+                             | k == kRgb -> cvtRgb img io ow (srcOf s0) o0 (srcOf s1) o1 (srcOf s2) o2
                              | otherwise -> do
                                  o3 <- prep s3 y
-                                 cvtFour (k - kFour 0) img io w (srcOf s0) o0 (srcOf s1) o1
+                                 cvtFour (k - kFour 0) img io ow (srcOf s0) o0 (srcOf s1) o1
                                          (srcOf s2) o2 (srcOf s3) o3 jYccTab
           pure runRange
     -- The output image, unfilled: the fill is dead work, since every
     -- conversion branch writes all four bytes of every pixel (w, h >= 1 and
     -- the component count is 1, 3 or 4, by 'jpegFrame').
-    let newImg = unsafeNewArray_ (0, max 0 (w * h * 4 - 1)) :: ST s (STUArray s Int Word8)
+    let newImg = unsafeNewArray_ (0, max 0 (ow * oh * 4 - 1)) :: ST s (STUArray s Int Word8)
         -- Each component's table as latched by its first scan; one no scan
         -- codes has only zero coefficients, so any table gives the same.
         quantNow = forM (zip [0 ..] comps) $ \(ci, c) ->
@@ -2185,12 +2275,16 @@ decodeJpegST allowPar mode bs w h comps = do
     -- it and the one below, the same computation the neighbouring band
     -- does, so every sample is bit-identical to the sequential pass.
     -- One capability, or a picture too small to be worth it, runs the
-    -- sequential code exactly as it was.
+    -- sequential code exactly as it was. So does a decode at 1/8: a block
+    -- is then one sample, a single read, and the entropy decoder (on the
+    -- calling thread either way) is the whole cost, so bands would add
+    -- only their buffers (measured on a 28-megapixel photo at four
+    -- capabilities: the same time, and 18 MB more peak memory).
     nwAll <- unsafeIOToST parWorkers
     let nw = min 4 nwAll
-        parallel = allowPar && nw > 1 && mpc >= 16 && w * h >= 262144
+        parallel = allowPar && nw > 1 && den < 8 && mpc >= 16 && ow * oh >= 262144
         -- What an interrupted-and-resumed parallel stage falls back to.
-        restart = decodeJpegST False mode bs w h comps
+        restart = decodeJpegST False den mode bs w h comps
         -- Bands of 4..8 MCU rows, at least two per worker. Measured at 4
         -- workers, 8 rows were as fast as 16 (the halo rows cost a few per
         -- cent of a 4:2:0 picture's IDCT) and held 17 MB less coefficient
@@ -2199,8 +2293,8 @@ decodeJpegST allowPar mode bs w h comps = do
         nb = (mpc + kB - 1) `div` kB
         bandLo j = j * kB
         bandHi j = min mpc ((j + 1) * kB)
-        bandY0 j = j * kB * mcuH
-        bandY1 j = min h ((j + 1) * kB * mcuH)
+        bandY0 j = j * kB * oMcuH
+        bandY1 j = min oh ((j + 1) * kB * oMcuH)
         -- Everything the reconstruction states share, evaluated here on the
         -- calling thread rather than by whichever worker reaches it first.
         forceShared qtbls = do
@@ -2281,14 +2375,14 @@ decodeJpegST allowPar mode bs w h comps = do
                 run <- mkConv img qtbls
                 run (CoefSrc bufs 0 True (\m -> mapM_ zeroCoefs bufs
                                                >> rows bufs m (m * unit) (m * unit + unit - 1)))
-                    0 mpc 0 h
+                    0 mpc 0 oh
                 pure True
           Nothing -> do
             -- No scan (unreachable when 'jpegStreamable' holds, which found
             -- one): every coefficient is zero, as on the whole-image path.
             bufs <- mapM newCoefs rowLens
             run <- mkConv img qtbls
-            run (CoefSrc bufs 0 True noFetch) 0 mpc 0 h
+            run (CoefSrc bufs 0 True noFetch) 0 mpc 0 oh
             pure True
         if completed then pure img else restart
       else do
@@ -2323,7 +2417,7 @@ decodeJpegST allowPar mode bs w h comps = do
               (\_ _ -> pure True)
           else do
             run <- mkConv img qtbls
-            run src 0 mpc 0 h
+            run src 0 mpc 0 oh
             pure True
         if completed then pure img else restart
 
@@ -2627,12 +2721,13 @@ spread8 :: Int -> Word64
 spread8 v = fromIntegral v * 0x0101010101010101
 
 -- | Dequantise and inverse-transform one block row of one component into its
--- ring: blocks 0 .. pw/8-1 (a plane is exactly its blocks wide), whose
--- coefficients start at cOff and whose samples land at ring rows gy0 ..
--- gy0+7. Every block lies inside the plane (planes are MCU-padded and a ring
--- is a whole number of block rows high), so no write is checked, and every
--- block's rows start at a multiple of 8 bytes (pw is), so a row can be
--- written as one word.
+-- ring, at ds samples a block side (8 at full size; 4, 2 or 1 in a
+-- reduced-size decode): blocks 0 .. pw/ds-1 (a plane is exactly its blocks
+-- wide), whose coefficients start at cOff and whose samples land at ring
+-- rows gy0 .. gy0+ds-1. Every block lies inside the plane (planes are
+-- MCU-padded and a ring is a whole number of block rows high), so no write
+-- is checked, and every block's rows start at a multiple of ds bytes (pw
+-- is), so an 8-sample row can be written as one word.
 --
 -- Each block is classified from its 128 bytes read as sixteen words (a
 -- block's offset is a multiple of 64 coefficients, so they are aligned):
@@ -2643,16 +2738,40 @@ spread8 v = fromIntegral v * 0x0101010101010101
 -- for it. Both are exact restatements of the full transform, and between
 -- them they cover most blocks of most photographs.
 jIdctBlockRow :: STUArray s Int Int16 -> UArray Int Int -> STUArray s Int Word8
-              -> STUArray s Int Int -> Int -> Int -> Int -> ST s ()
-jIdctBlockRow (STUArray _ _ _ c) (UArray _ _ _ q) (STUArray _ _ _ pl) (STUArray _ _ _ ws) !pw !cOff !gy0 =
-  goB 0
+              -> STUArray s Int Int -> Int -> Int -> Int -> Int -> ST s ()
+jIdctBlockRow (STUArray _ _ _ c) (UArray _ _ _ q) (STUArray _ _ _ pl) (STUArray _ _ _ ws) !pw !ds !cOff !gy0 =
+  -- One loop per block size, so the block loop tests none of them.
+  case ds of
+    8 -> goB8 0
+    4 -> goB4 0
+    2 -> goB2 0
+    _ -> goB1 0
   where
-    !nb = pw `unsafeShiftR` 3
-    goB !bx
+    !nb = pw `quot` ds
+    !row0 = gy0 * pw
+    goB8 !bx
       | bx >= nb = pure ()
       | otherwise = do
-          jIdctBlock c q pl ws (cOff + bx*64) (gy0*pw + bx*8) pw
-          goB (bx + 1)
+          jIdctBlock c q pl ws (cOff + bx*64) (row0 + bx*8) pw
+          goB8 (bx + 1)
+    goB4 !bx
+      | bx >= nb = pure ()
+      | otherwise = do
+          jIdctBlock4 c q pl ws (cOff + bx*64) (row0 + bx*4) pw
+          goB4 (bx + 1)
+    goB2 !bx
+      | bx >= nb = pure ()
+      | otherwise = do
+          jIdctBlock2 c q pl ws (cOff + bx*64) (row0 + bx*2) pw
+          goB2 (bx + 1)
+    -- One sample a block: only the DC term survives (see 'kern2'), so the
+    -- block is the DC value, (DC * q + 4) >> 3 plus the level shift.
+    goB1 !bx
+      | bx >= nb = pure ()
+      | otherwise = do
+          dc <- rdI16 c (cOff + bx*64)
+          wrW8 pl (row0 + bx) (sat8 ((dc * tabAt q 0 + 4 + (128 `unsafeShiftL` 3)) `unsafeShiftR` 3))
+          goB1 (bx + 1)
 
 jIdctBlock :: MutableByteArray# s -> ByteArray# -> MutableByteArray# s -> MutableByteArray# s
            -> Int -> Int -> Int -> ST s ()
@@ -2695,6 +2814,188 @@ jIdctBlock c q pl ws !bo !po !pw = do
             wr 0 o0; wr 1 o1; wr 2 o2; wr 3 o3; wr 4 o4; wr 5 o5; wr 6 o6; wr 7 o7
           v <- rdW64 pl wi
           fillRows v
+
+-- | Reduced-size inverse DCTs, for decoding at 1/2, 1/4 and 1/8 scale: an
+-- 8x8 block of coefficients becomes an N x N block of samples (N = 4, 2,
+-- 1) that is the full-size block averaged over g x g squares (g = 8 / N).
+-- The averaging is folded into the transform, the idea of DCT-domain
+-- downsampling (Merhav and Bhaskaran, "Fast algorithms for DCT-domain image
+-- down-sampling and for inverse motion compensation", IEEE Trans. Circuits
+-- Syst. Video Technol. 7(3), 1997): the transform is linear, so "inverse
+-- DCT, then sum each group of g outputs" is one N x 8 matrix per axis,
+-- applied separably like 'idct8', and the 8x8 picture never exists.
+--
+-- In 'idct8''s normalisation an 8-point output is
+--   f(m) = x0 + sum over k = 1..7 of sqrt2 cos ((2m + 1) k pi / 16) xk,
+-- so the sum of output n's group, m = g n .. g n + g - 1, gives xk the weight
+--   W(k, n) = sqrt2 * sum over the group of cos ((2m + 1) k pi / 16)
+-- and x0 the weight g. As in 'idct8', each weight is its real value times
+-- 2^13, rounded to nearest (and x0's is exact, x0 << (13 + log2 g)). A
+-- frequency whose cosines cancel over every group has weight zero and is
+-- never read: 4 for N = 4; 2, 4 and 6 for N = 2; every k > 0 for N = 1. The
+-- weights are antisymmetric in n for odd k and symmetric for even k, so
+-- each kernel computes the even and odd sums for the first half of its
+-- outputs and forms the rest by a butterfly, like 'idct8'.
+--
+-- Descaling follows 'idct8''s passes with the group sums' extra factor g
+-- divided out in each: the column pass descales by 11 + log2 g (keeping two
+-- extra fraction bits), the row pass by 18 + log2 g, rounding to nearest,
+-- and the row pass adds the level shift and saturates. A column or row
+-- whose read inputs other than x0 are zero is constant at x0 << 2 or
+-- (x0 + 16) >> 5, exactly what the full arithmetic gives, so it is filled
+-- without it (and a block whose only coefficient is the DC is
+-- (DC * q + 4) >> 3, as at full size). These are the same choices libjpeg
+-- makes for its scaled decode, which is what makes the output identical.
+--
+-- 'kern4': N = 4, g = 2. The weights times 2^13 (outputs 0 and 1; outputs
+-- 3 and 2 are the butterflies):
+--
+-- > x2: 15137, -15137     x6: -6270, 6270     ('idct8''s sqrt2 (c2 + c6), sqrt2 (c2 - c6))
+-- > x1: 20995, 8697       x3: 7373, -17799
+-- > x5: -4926, 11893      x7: -4176, -1730
+--
+-- with x0's weight 2^14.
+{-# INLINE kern4 #-}
+kern4 :: Int -> Int -> Int -> Int -> Int -> Int -> Int -> Int
+      -> (Int -> Int -> Int -> Int -> r) -> r
+kern4 bias x0 x1 x2 x3 x5 x6 x7 k =
+  let !e = (x0 `unsafeShiftL` 14) + bias
+      !t = x2 * 15137 - x6 * 6270
+      !e0 = e + t
+      !e1 = e - t
+      !o0 = x1 * 20995 + x3 * 7373 - x5 * 4926 - x7 * 4176
+      !o1 = x1 * 8697 - x3 * 17799 + x5 * 11893 - x7 * 1730
+  in k (e0 + o0) (e1 + o1) (e1 - o1) (e0 - o0)
+
+-- 'kern2': N = 2, g = 4; only x0 and the odd frequencies are read. The
+-- weights times 2^13 for output 0 (output 1 is the butterfly):
+--
+-- > x1: 29692    x3: -10426    x5: 6967    x7: -5906
+--
+-- with x0's weight 2^15. (For N = 1 every cosine sum but the DC's is zero:
+-- the one sample is x0's.)
+{-# INLINE kern2 #-}
+kern2 :: Int -> Int -> Int -> Int -> Int -> Int -> (Int -> Int -> r) -> r
+kern2 bias x0 x1 x3 x5 x7 k =
+  let !e = (x0 `unsafeShiftL` 15) + bias
+      !o = x1 * 29692 - x3 * 10426 + x5 * 6967 - x7 * 5906
+  in k (e + o) (e - o)
+
+col4Bias, row4Bias, col2Bias, row2Bias :: Int
+col4Bias = 1 `unsafeShiftL` 11                                    -- half of 2^12
+row4Bias = (1 `unsafeShiftL` 18) + (128 `unsafeShiftL` 19)        -- half of 2^19, plus the level shift
+col2Bias = 1 `unsafeShiftL` 12                                    -- half of 2^13
+row2Bias = (1 `unsafeShiftL` 19) + (128 `unsafeShiftL` 20)        -- half of 2^20, plus the level shift
+
+-- One block at N = 4: samples at po + r*pw + i, r, i in 0..3. Classified
+-- like 'jIdctBlock', over the coefficients the kernel reads (rows and
+-- columns 0..3 and 5..7): with rows 1..3 and 5..7 zero every column is
+-- constant, and with row 0's AC zero too the block is one value.
+jIdctBlock4 :: MutableByteArray# s -> ByteArray# -> MutableByteArray# s -> MutableByteArray# s
+            -> Int -> Int -> Int -> ST s ()
+jIdctBlock4 c q pl ws !bo !po !pw = do
+  let !wb = bo `unsafeShiftR` 2
+      rw i = rdW64 c (wb + i)
+      {-# INLINE rw #-}
+  w2 <- rw 2;   w3 <- rw 3;   w4 <- rw 4;   w5 <- rw 5;   w6 <- rw 6;   w7 <- rw 7
+  w10 <- rw 10; w11 <- rw 11; w12 <- rw 12; w13 <- rw 13; w14 <- rw 14; w15 <- rw 15
+  if (w2 .|. w3 .|. w4 .|. w5 .|. w6 .|. w7 .|. w10 .|. w11 .|. w12 .|. w13 .|. w14 .|. w15) /= 0
+    then do
+      -- Columns 0..3 and 5..7 into the workspace's rows 0..3.
+      let col !x
+            | x > 7 = pure ()
+            | x == 4 = col 5
+            | otherwise = do
+                let rd r = do v <- rdI16 c (bo + r*8 + x); pure (v * tabAt q (r*8 + x))
+                    {-# INLINE rd #-}
+                x1 <- rd 1; x2 <- rd 2; x3 <- rd 3; x5 <- rd 5; x6 <- rd 6; x7 <- rd 7; x0 <- rd 0
+                if (x1 .|. x2 .|. x3 .|. x5 .|. x6 .|. x7) == 0
+                  then do
+                    let !d = x0 `unsafeShiftL` 2
+                    wrInt ws x d; wrInt ws (8+x) d; wrInt ws (16+x) d; wrInt ws (24+x) d
+                  else kern4 col4Bias x0 x1 x2 x3 x5 x6 x7 $ \o0 o1 o2 o3 -> do
+                    wrInt ws x (o0 `unsafeShiftR` 12); wrInt ws (8+x) (o1 `unsafeShiftR` 12)
+                    wrInt ws (16+x) (o2 `unsafeShiftR` 12); wrInt ws (24+x) (o3 `unsafeShiftR` 12)
+                col (x + 1)
+          row !r
+            | r > 3 = pure ()
+            | otherwise = do
+                let !o = r*8; !p = po + r*pw
+                x0 <- rdInt ws o; x1 <- rdInt ws (o+1); x2 <- rdInt ws (o+2); x3 <- rdInt ws (o+3)
+                x5 <- rdInt ws (o+5); x6 <- rdInt ws (o+6); x7 <- rdInt ws (o+7)
+                rowOut p x0 x1 x2 x3 x5 x6 x7
+                row (r + 1)
+      col 0
+      row 0
+    else do
+      -- Rows 1..3 and 5..7 are zero: every column is constant at its row-0
+      -- input << 2, so one row transform, copied.
+      let cf k = do v <- rdI16 c (bo + k); pure ((v * tabAt q k) `unsafeShiftL` 2)
+          {-# INLINE cf #-}
+      x0 <- cf 0; x1 <- cf 1; x2 <- cf 2; x3 <- cf 3; x5 <- cf 5; x6 <- cf 6; x7 <- cf 7
+      rowOut po x0 x1 x2 x3 x5 x6 x7
+      forLoop 1 3 $ \r -> forLoop 0 3 $ \i -> rdW8 pl (po + i) >>= wrW8 pl (po + r*pw + i)
+  where
+    -- One workspace row (two extra fraction bits) to four samples at p.
+    rowOut !p x0 x1 x2 x3 x5 x6 x7
+      | (x1 .|. x2 .|. x3 .|. x5 .|. x6 .|. x7) == 0 = do
+          let !v = sat8 ((x0 + rowDcBias) `unsafeShiftR` 5)
+          wrW8 pl p v; wrW8 pl (p+1) v; wrW8 pl (p+2) v; wrW8 pl (p+3) v
+      | otherwise = kern4 row4Bias x0 x1 x2 x3 x5 x6 x7 $ \o0 o1 o2 o3 -> do
+          wrW8 pl p (sat8 (o0 `unsafeShiftR` 19)); wrW8 pl (p+1) (sat8 (o1 `unsafeShiftR` 19))
+          wrW8 pl (p+2) (sat8 (o2 `unsafeShiftR` 19)); wrW8 pl (p+3) (sat8 (o3 `unsafeShiftR` 19))
+    {-# INLINE rowOut #-}
+
+-- One block at N = 2: samples at po + r*pw + i, r, i in 0..1, from rows and
+-- columns 0, 1, 3, 5 and 7, classified the same way.
+jIdctBlock2 :: MutableByteArray# s -> ByteArray# -> MutableByteArray# s -> MutableByteArray# s
+            -> Int -> Int -> Int -> ST s ()
+jIdctBlock2 c q pl ws !bo !po !pw = do
+  let !wb = bo `unsafeShiftR` 2
+      rw i = rdW64 c (wb + i)
+      {-# INLINE rw #-}
+  w2 <- rw 2; w3 <- rw 3; w6 <- rw 6; w7 <- rw 7; w10 <- rw 10; w11 <- rw 11; w14 <- rw 14; w15 <- rw 15
+  if (w2 .|. w3 .|. w6 .|. w7 .|. w10 .|. w11 .|. w14 .|. w15) /= 0
+    then do
+      let col !x
+            | x > 7 = pure ()
+            | otherwise = do
+                let rd r = do v <- rdI16 c (bo + r*8 + x); pure (v * tabAt q (r*8 + x))
+                    {-# INLINE rd #-}
+                x1 <- rd 1; x3 <- rd 3; x5 <- rd 5; x7 <- rd 7; x0 <- rd 0
+                if (x1 .|. x3 .|. x5 .|. x7) == 0
+                  then do
+                    let !d = x0 `unsafeShiftL` 2
+                    wrInt ws x d; wrInt ws (8+x) d
+                  else kern2 col2Bias x0 x1 x3 x5 x7 $ \o0 o1 -> do
+                    wrInt ws x (o0 `unsafeShiftR` 13); wrInt ws (8+x) (o1 `unsafeShiftR` 13)
+                -- Columns 0, 1, 3, 5, 7: the row pass reads no others.
+                col (if x == 0 then 1 else x + 2)
+          row !r
+            | r > 1 = pure ()
+            | otherwise = do
+                let !o = r*8
+                x0 <- rdInt ws o; x1 <- rdInt ws (o+1); x3 <- rdInt ws (o+3)
+                x5 <- rdInt ws (o+5); x7 <- rdInt ws (o+7)
+                rowOut (po + r*pw) x0 x1 x3 x5 x7
+                row (r + 1)
+      col 0
+      row 0
+    else do
+      let cf k = do v <- rdI16 c (bo + k); pure ((v * tabAt q k) `unsafeShiftL` 2)
+          {-# INLINE cf #-}
+      x0 <- cf 0; x1 <- cf 1; x3 <- cf 3; x5 <- cf 5; x7 <- cf 7
+      rowOut po x0 x1 x3 x5 x7
+      rdW8 pl po >>= wrW8 pl (po + pw)
+      rdW8 pl (po + 1) >>= wrW8 pl (po + pw + 1)
+  where
+    rowOut !p x0 x1 x3 x5 x7
+      | (x1 .|. x3 .|. x5 .|. x7) == 0 = do
+          let !v = sat8 ((x0 + rowDcBias) `unsafeShiftR` 5)
+          wrW8 pl p v; wrW8 pl (p+1) v
+      | otherwise = kern2 row2Bias x0 x1 x3 x5 x7 $ \o0 o1 -> do
+          wrW8 pl p (sat8 (o0 `unsafeShiftR` 20)); wrW8 pl (p+1) (sat8 (o1 `unsafeShiftR` 20))
+    {-# INLINE rowOut #-}
 
 -- | Chroma upsampling: the triangle (linear-interpolation) filter for
 -- chroma sited midway between luma samples, which is JFIF's (T.871) and
@@ -2891,7 +3192,7 @@ div255 p = let t = p + 128 in ((t `unsafeShiftR` 8) + t) `unsafeShiftR` 8
 -- | How one component reaches the output grid, decided once per frame.
 data JUp = JUp
   { juMeth :: !Int   -- ^ 'jmFull', 'jmH2V1', 'jmH2V2', 'jmH1V2' or 'jmBox'.
-  , juDs   :: !Int   -- ^ Samples per block side in the component's plane (8: the full-size IDCT).
+  , juDs   :: !Int   -- ^ Samples per block side in the component's plane: 8, 4, 2 or 1 (the IDCT's size).
   , juDw   :: !Int   -- ^ The component's true width in samples (not its MCU padding).
   , juDh   :: !Int   -- ^ Its true height.
   , juNumX :: !Int   -- ^ Box upsampling: output x reads column x * numX `quot` denX ...
@@ -2903,26 +3204,47 @@ data JUp = JUp
 jmFull, jmH2V1, jmH2V2, jmH1V2, jmBox :: Int
 jmFull = 0; jmH2V1 = 1; jmH2V2 = 2; jmH1V2 = 3; jmBox = 4
 
--- | The upsampling a component gets, for a w x h frame with maximum sampling
--- factors hmax x vmax, at the full output scale. A component is expanded
--- by he = hmax / H and ve = vmax / V (with ds-sample blocks, by
--- 8 hmax / (H ds), which is where a reduced-size IDCT would enter); the
--- triangle filter is used for 2x1 and 2x2 on a component more than two
--- samples wide and for 1x2, replication for every other ratio, including
--- the fractional ones a frame can declare.
-jUpFor :: Int -> Int -> Int -> Int -> JComp -> JUp
-jUpFor w h hmax vmax c =
-  let ds = 8
-      numX = jcH c * ds; denX = hmax * 8
-      numY = jcV c * ds; denY = vmax * 8
-      dw = (w * numX + denX - 1) `quot` denX
-      dh = (h * numY + denY - 1) `quot` denY
+-- | How a component of a w x h frame with maximum sampling factors
+-- hmax x vmax reaches the output, decoded at scale mind / 8 (mind = 8 at
+-- full size; 4, 2 or 1 at 1/2, 1/4, 1/8).
+--
+-- Block size: a block of an H x V component covers 8 hmax / H by
+-- 8 vmax / V output samples' worth of the full-size picture, so at scale
+-- mind / 8 a component whose blocks are reconstructed at ds samples a side
+-- is expanded to the output by he = hmax mind / (H ds) and
+-- ve = vmax mind / (V ds). Each component starts at ds = mind (what the
+-- component with the largest factors needs to land at the output size)
+-- and, while both expansions are even and ds < 8, has its ds doubled
+-- instead: the IDCT then enlarges the component, reconstructing from its
+-- coefficients the detail an upsampling filter could only interpolate.
+-- So a 4:2:0 picture at 1/2 is luma at ds 4 and chroma at
+-- ds 8, neither upsampled; at full size every ds is 8, as before. This
+-- choice, like the filter selection below, is libjpeg-turbo's, and
+-- matching its output means making it.
+--
+-- Upsampling: the triangle filter for 2x1 and 2x2 on a component more
+-- than two samples wide and for 1x2, replication for every other ratio,
+-- including the fractional ones a frame can declare; at 1/8 (mind = 1,
+-- one sample per luma block) the filter is not used at all, since its
+-- neighbours are whole blocks apart. Sizes are true sizes: a component is
+-- ceil (w H ds / (8 hmax)) samples wide.
+jUpFor :: Int -> Int -> Int -> Int -> Int -> JComp -> JUp
+jUpFor mind w h hmax vmax c =
+  let grow s | s < 8 && (hmax * mind) `rem` (jcH c * s * 2) == 0
+                     && (vmax * mind) `rem` (jcV c * s * 2) == 0 = grow (2 * s)
+             | otherwise = s
+      ds = grow mind
+      numX = jcH c * ds; denX = hmax * mind
+      numY = jcV c * ds; denY = vmax * mind
+      dw = (w * numX + hmax * 8 - 1) `quot` (hmax * 8)
+      dh = (h * numY + vmax * 8 - 1) `quot` (vmax * 8)
       integral = denX `rem` numX == 0 && denY `rem` numY == 0
       he = denX `quot` numX; ve = denY `quot` numY
+      fancy = mind > 1
       meth | integral && he == 1 && ve == 1 = jmFull
-           | integral && he == 2 && ve == 1 && dw > 2 = jmH2V1
-           | integral && he == 2 && ve == 2 && dw > 2 = jmH2V2
-           | integral && he == 1 && ve == 2 = jmH1V2
+           | fancy && integral && he == 2 && ve == 1 && dw > 2 = jmH2V1
+           | fancy && integral && he == 2 && ve == 2 && dw > 2 = jmH2V2
+           | fancy && integral && he == 1 && ve == 2 = jmH1V2
            | otherwise = jmBox
   in JUp meth ds dw dh numX denX numY denY
 
@@ -4650,6 +4972,7 @@ renderImagePlaced mode cols rows (outW, outH, offX, offY) (cropX, cropY, cropW, 
     [ cellAt r c | r <- [0 .. rows-1], c <- [0 .. cols-1] ]
   where
     iw = imgW img
+    ih = imgH img
     cw = max 1 cropW; ch = max 1 cropH
     pix  = imgPix img
 
@@ -4663,20 +4986,26 @@ renderImagePlaced mode cols rows (outW, outH, offX, offY) (cropX, cropY, cropW, 
           (n, sr, sg, sb, sa) = boxSum x0 x1 y0 y1
       in if n == 0 then (0,0,0,0)
          else (sr `div` n, sg `div` n, sb `div` n, sa `div` n)
-    boxSum x0 x1 y0 y1 = goY y0 (0,0,0,0,0)
+    -- Strict, unboxed accumulators and unchecked reads (pixels outside the
+    -- image are skipped instead): a lazy 5-tuple per source pixel made a
+    -- 1.8 MP picture's cell grid cost 100 ms.
+    boxSum :: Int -> Int -> Int -> Int -> (Int, Int, Int, Int, Int)
+    boxSum !x0 !x1 !y0 !y1 = goY y0 0 0 0 0 0
       where
-        goY y acc@(n,r,g,b,a)
-          | y >= y1   = acc
-          | otherwise = goY (y+1) (goX x0 y (n,r,g,b,a))
-        goX x y acc@(n,r,g,b,a)
-          | x >= x1   = acc
+        goY !y !n !r !g !b !a
+          | y >= y1   = (n, r, g, b, a)
+          | y < 0 || y >= ih = goY (y+1) n r g b a
+          | otherwise = goX x0 (y*iw*4) y n r g b a
+        goX !x !row !y !n !r !g !b !a
+          | x >= x1   = goY (y+1) n r g b a
+          | x < 0 || x >= iw = goX (x+1) row y n r g b a
           | otherwise =
-              let o = (y*iw + x)*4
-              in goX (x+1) y ( n+1
-                             , r + fromIntegral (pix ! o)
-                             , g + fromIntegral (pix ! (o+1))
-                             , b + fromIntegral (pix ! (o+2))
-                             , a + fromIntegral (pix ! (o+3)) )
+              let o = row + x*4
+              in goX (x+1) row y (n+1)
+                     (r + fromIntegral (unsafeAt pix o))
+                     (g + fromIntegral (unsafeAt pix (o+1)))
+                     (b + fromIntegral (unsafeAt pix (o+2)))
+                     (a + fromIntegral (unsafeAt pix (o+3)))
 
     -- Colour of a sub-pixel at output position (sx,sy), or Nothing if outside
     -- the placed image. Composites alpha over a checkerboard so transparency
@@ -4723,46 +5052,127 @@ renderImagePlaced mode cols rows (outW, outH, offX, offY) (cropX, cropY, cropW, 
 -- sampling as 'renderImage', so both views agree on what a pixel looks like.
 scaleRGBA :: Image -> (Int, Int, Int, Int) -> Int -> Int -> BS.ByteString
 scaleRGBA img (cropX, cropY, cropW, cropH) outW0 outH0 =
-  -- Written straight into the result buffer. Building the output as a list of
-  -- boxed Word8s and packing it cost 63 MB and 66 ms per 800x600 placement —
-  -- paid on every resize, every zoom and every sixel animation frame. The box
-  -- sums use unboxed accumulators for the same reason: the previous lazy
-  -- 5-tuple allocated once per source pixel.
-  fst (BS.unfoldrN (outW * outH * 4) step 0)
+  -- Written straight into the result buffer, one output pixel (all four
+  -- channels) per box walk, with unboxed accumulators and unchecked reads;
+  -- the box edges along x are computed once per column. Building the output
+  -- as a list of boxed Word8s and packing it cost 63 MB and 66 ms per
+  -- 800x600 placement, and the per-byte 'BS.unfoldrN' that replaced it still
+  -- walked every box four times (190 ms for a 1.8 MP source).
+  BI.unsafeCreate (outW * outH * 4) $ \ptr ->
+    let row !sy
+          | sy >= outH = pure ()
+          | otherwise = do
+              let !y0 = cropY + (sy * ch) `div` outH
+                  !y1 = max (y0 + 1) (cropY + ((sy + 1) * ch) `div` outH)
+                  col !sx
+                    | sx >= outW = pure ()
+                    | otherwise = do
+                        let !x0 = unsafeAt xs0 sx
+                            !x1 = unsafeAt xs1 sx
+                            !d = (sy * outW + sx) * 4
+                        boxInto x0 x1 y0 y1 $ \r g b a -> do
+                          pokeByteOff ptr d r
+                          pokeByteOff ptr (d + 1) g
+                          pokeByteOff ptr (d + 2) b
+                          pokeByteOff ptr (d + 3) a
+                        col (sx + 1)
+              col 0
+              row (sy + 1)
+    in row 0
   where
     outW = max 1 outW0; outH = max 1 outH0
     cw = max 1 cropW; ch = max 1 cropH
     iw = imgW img
     ih = imgH img
     pix = imgPix img
+    xs0, xs1 :: UArray Int Int
+    xs0 = U.listArray (0, outW - 1) [ cropX + (sx * cw) `div` outW | sx <- [0 .. outW - 1] ]
+    xs1 = U.listArray (0, outW - 1)
+            [ max (cropX + (sx * cw) `div` outW + 1) (cropX + ((sx + 1) * cw) `div` outW) | sx <- [0 .. outW - 1] ]
 
-    step :: Int -> Maybe (Word8, Int)
-    step !i =
-      let (px, chan) = i `quotRem` 4
-          (sy, sx)   = px `quotRem` outW
-      in Just (sample sx sy chan, i + 1)
-
-    sample !sx !sy !chan =
-      let x0 = cropX + (sx * cw) `div` outW
-          x1 = max (x0 + 1) (cropX + ((sx + 1) * cw) `div` outW)
-          y0 = cropY + (sy * ch) `div` outH
-          y1 = max (y0 + 1) (cropY + ((sy + 1) * ch) `div` outH)
-      in boxAvg x0 x1 y0 y1 chan
-
-    -- Average one channel over the source box. Kept per-channel (rather than
-    -- computing all four at once) so the result can be produced by unfoldrN
-    -- without an intermediate; the box is typically 1-4 pixels.
-    boxAvg !x0 !x1 !y0 !y1 !chan = goY y0 0 0
+    -- The mean of each channel over the source box (pixels outside the
+    -- image are not counted; an empty box is 0).
+    boxInto :: Int -> Int -> Int -> Int -> (Word8 -> Word8 -> Word8 -> Word8 -> IO ()) -> IO ()
+    boxInto !x0 !x1 !y0 !y1 k = goY y0 0 0 0 0 0
       where
-        goY !y !n !acc
-          | y >= y1 = if n == 0 then 0 else fromIntegral (acc `div` n)
-          | otherwise = let (n', acc') = goX x0 y n acc in goY (y + 1) n' acc'
-        goX !x !y !n !acc
-          | x >= x1 = (n, acc)
-          | x < 0 || x >= iw || y < 0 || y >= ih = goX (x + 1) y n acc
+        goY !y !n !r !g !b !a
+          | y >= y1 =
+              if n == 0 then k 0 0 0 0
+              else k (fromIntegral (r `div` n)) (fromIntegral (g `div` n))
+                     (fromIntegral (b `div` n)) (fromIntegral (a `div` n))
+          | y < 0 || y >= ih = goY (y + 1) n r g b a
+          | otherwise = goX x0 (y * iw * 4) y n r g b a
+        goX !x !base !y !n !r !g !b !a
+          | x >= x1 = goY (y + 1) n r g b a
+          | x < 0 || x >= iw = goX (x + 1) base y n r g b a
           | otherwise =
-              let o = (y * iw + x) * 4 + chan
-              in goX (x + 1) y (n + 1) (acc + fromIntegral (pix ! o))
+              let o = base + x * 4
+              in goX (x + 1) base y (n + 1)
+                     (r + fromIntegral (unsafeAt pix o) :: Int)
+                     (g + fromIntegral (unsafeAt pix (o + 1)))
+                     (b + fromIntegral (unsafeAt pix (o + 2)))
+                     (a + fromIntegral (unsafeAt pix (o + 3)))
+
+-- | Shrink an image by an integer factor @k@ per side, each output pixel the
+-- mean of its @k x k@ source box (clipped at the right and bottom edges, so
+-- the output is @ceil (w/k) x ceil (h/k)@, the size a JPEG decoded at a
+-- further @1/k@ comes out). The image view uses it to fall back from a
+-- refined JPEG decode to its opening scale when the document goes inactive
+-- ("Cmedit.EditorDoc"'s @parkImage@); the result is a box filter, not
+-- libjpeg's DCT-domain reduction, which is immaterial for a picture that is
+-- area-averaged again on its way to the screen. Every source pixel is read
+-- once, as one word. Factors above 16 are not supported (the identity).
+reduceImage :: Int -> Image -> Image
+reduceImage k img
+  | k <= 1 || k > 16 = img
+  | otherwise = img { imgW = ow, imgH = oh, imgPix = out }
+  where
+    !iw = imgW img
+    !ih = imgH img
+    !ow = (iw + k - 1) `quot` k
+    !oh = (ih + k - 1) `quot` k
+    !src@(UArray _ _ _ ba) = imgPix img
+    -- One 32-bit load per pixel, the four channels summed two at a time in
+    -- 16-bit lanes (a box is at most 16 x 16 = 256 pixels, 65280 per lane).
+    -- Bytes 0 and 2 accumulate in @ev@, bytes 1 and 3 in @od@; which byte
+    -- is which channel depends on the load's byte order.
+    px :: Int -> Word
+    px (I# i) = fromIntegral (W32# (indexWord32Array# ba i))
+    le = targetByteOrder == LittleEndian
+    out = src `seq` runSTUArray $ do
+      a <- unsafeNewArray_ (0, ow * oh * 4 - 1)
+      let pixel !ox !oy = do
+            let !x0 = ox * k
+                !x1 = min iw (x0 + k)
+                !y0 = oy * k
+                !y1 = min ih (y0 + k)
+                !n = (x1 - x0) * (y1 - y0)
+                !h = n `quot` 2
+                goY !y !ev !od
+                  | y >= y1 = (ev, od)
+                  | otherwise = goX x0 (y * iw) y ev od
+                goX !x !base !y !ev !od
+                  | x >= x1 = goY (y + 1) ev od
+                  | otherwise =
+                      let !w = px (base + x)
+                      in goX (x + 1) base y (ev + (w .&. 0x00ff00ff)) (od + ((w `unsafeShiftR` 8) .&. 0x00ff00ff))
+                (e, o) = goY y0 0 0
+                lo16 v = fromIntegral (v .&. 0xffff) :: Int
+                hi16 v = fromIntegral (v `unsafeShiftR` 16) :: Int
+                (sr, sg, sb, sa)
+                  | le        = (lo16 e, lo16 o, hi16 e, hi16 o)
+                  | otherwise = (hi16 o, hi16 e, lo16 o, lo16 e)
+                !d = (oy * ow + ox) * 4
+            unsafeWrite a d (fromIntegral ((sr + h) `quot` n) :: Word8)
+            unsafeWrite a (d + 1) (fromIntegral ((sg + h) `quot` n))
+            unsafeWrite a (d + 2) (fromIntegral ((sb + h) `quot` n))
+            unsafeWrite a (d + 3) (fromIntegral ((sa + h) `quot` n))
+          rows !oy | oy >= oh = pure ()
+                   | otherwise = cols 0 oy >> rows (oy + 1)
+          cols !ox !oy | ox >= ow = pure ()
+                       | otherwise = pixel ox oy >> cols (ox + 1) oy
+      rows 0
+      pure a
 
 -- ASCII luminance ramp, darkest -> brightest (more ink == brighter pixel on a
 -- dark terminal).
