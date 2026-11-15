@@ -28,6 +28,7 @@ import SvgViewSpec (svgViewSpec)
 import PdfViewSpec (pdfViewSpec)
 import PdfRenderSpec (pdfRenderSpec)
 import qualified Cmedit.JxlVarDct as JVD
+import qualified Cmedit.Jxl as Jxl
 import qualified Control.Monad.ST as ST
 import qualified Data.Array.ST as STA
 import qualified Data.Array.Base as AB
@@ -1000,6 +1001,25 @@ main = do
             vy <- AB.unsafeRead y i
             pure (castFloatToWord32 vx == castFloatToWord32 vy)))
     check ("JPEG XL filter bands exact across " ++ show (w,h)) same
+  -- The spline work bound (Jxl.splineArea), the one thing between a few
+  -- hundred bytes and an unbounded spline render. Three edge cases a
+  -- hostile file can reach: a stroke with every colour coefficient zero still
+  -- costs its length (it used to score 0 and pass any limit); a sigma of 1
+  -- counts as 1, not 4 (the old (1 + w)^2 refused files libjxl accepts); and
+  -- 32-bit coefficients on a 2^60 polygon must not wrap round to something
+  -- small and get through.
+  let spline man xyb sig = Jxl.QSpline { Jxl.qsPoints = [], Jxl.qsManhattan = man
+                                       , Jxl.qsXyb = xyb, Jxl.qsSigma = sig }
+      zeros32 = replicate 32 0
+  checkEq "JPEG XL spline area: zero colour still costs its length"
+    (Jxl.splineArea [spline 1000000 [[0],[0],[0]] zeros32] 0 (0, 0)) (32 * 1000000)
+  checkEq "JPEG XL spline area: sigma 1 weighs 1, not (1+1)^2"
+    (Jxl.splineArea [spline 100 [[0],[1],[0]] (replicate 32 1)] 0 (0, 0)) (100 * 32 * 1)
+  let hostile = Jxl.splineArea [spline (2 ^ (60 :: Int)) (replicate 3 (replicate 32 maxBound32))
+                                       (replicate 32 maxBound32)] 0 (1, 1)
+      maxBound32 = 2147483647 :: Int
+  check "JPEG XL spline area: huge coefficients do not wrap"
+    (hostile > Jxl.splineAreaLimit (2 ^ (30 :: Int)) && hostile > 0)
   -- ALPH scanline filters (1 horizontal, 2 vertical, 3 gradient), which the
   -- decoder undoes in place: a known alpha plane, forward-filtered here into
   -- a raw ALPH chunk around the 8x8 lossy frame, must come back exactly.

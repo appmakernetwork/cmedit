@@ -233,7 +233,12 @@ readModHeader br chans = do
   where
     sameSize a b = ciW a == ciW b && ciH a == ciH b
 
--- libjxl's default squeeze script, when the transform gives no parameters.
+-- The squeeze steps the format defines for a transform that lists none
+-- (ISO/IEC 18181-1, the Squeeze clause's default parameters): the two
+-- chroma channels first when they match the first channel's size, then
+-- alternate horizontal and vertical steps over every channel until the
+-- first one is at most 8 x 8, starting with the vertical step unless the
+-- image is wider than it is tall.
 defaultSqueeze :: [ChInfo] -> Int -> [SqParam]
 defaultSqueeze cs first
   | first >= length cs = []

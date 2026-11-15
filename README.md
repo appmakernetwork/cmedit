@@ -630,7 +630,9 @@ sources each one is written from:
   recursion of B. G. Lee (IEEE Trans. ASSP 32, 1984) in the self-recursive
   form of S. M. Perera and J. Liu (SIAM J. Matrix Anal. Appl. 39, 2018); the
   noise generator is S. Vigna's xorshift128+ seeded with SplitMix64, as the
-  standard prescribes. Output is held to libjxl's.
+  standard prescribes. The bounds on spline counts and on the area splines
+  may paint are the level 10 limits of the standard's Annex M. Output is
+  held to libjxl's.
 - **CCITT fax (PDF).** ITU-T T.4 and T.6, and the `CCITTFaxDecode`
   parameters of ISO 32000-1.
 - **PDF.** ISO 32000-1 and Adobe's *PDF Reference*, sixth edition, whose
@@ -644,7 +646,11 @@ sources each one is written from:
 - **Vector rasteriser.** Coverage is the signed-area accumulation buffer
   described by Raph Levien for font-rs (*Inside the fastest font renderer in
   the world*, 2016); compositing follows W3C *Compositing and Blending
-  Level 1*. Output is compared with resvg's.
+  Level 1*. Filters follow W3C *Filter Effects Module Level 1* (and SVG 1.1's
+  filters chapter): a large Gaussian blur is the three successive box blurs
+  the specification describes, with the box widths chosen to match the
+  Gaussian's variance as in P. Kovesi, *Fast Almost-Gaussian Filtering*
+  (DICTA 2010). Output is compared with resvg's.
 
 The two BSD-licensed sources named above carry this licence, with "Google"
 and "Adobe" respectively as the copyright holder's name:

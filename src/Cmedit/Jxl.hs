@@ -10,6 +10,10 @@
 module Cmedit.Jxl
   ( decodeJxl
   , isJxl
+    -- * Spline work bound (exported for the tests)
+  , QSpline(..)
+  , splineArea
+  , splineAreaLimit
   ) where
 
 import Control.Monad (forM, forM_, unless, when, replicateM, foldM)
@@ -612,7 +616,7 @@ frames br ih refs = do
     img1 <- applyPatches ih refs (ftPatches feats) img0
     case ftSplines feats of
       Just (qs, qa) | length (imColour img1) == 3 -> do
-        jguard (splineArea qs qa (ftCorr feats) <= min (1 `shiftL` 42) (1024 * fhW fh * fhH fh + (1 `shiftL` 32)))
+        jguard (splineArea qs qa (ftCorr feats) <= splineAreaLimit (fhW fh * fhH fh))
           "JPEG XL: spline area too large"
         liftJ (renderSplines fh qs qa (ftCorr feats) img1)
       _ -> pure ()
@@ -866,7 +870,8 @@ readFeatures r ih fh = do
     pure (Just (listArray (0, 8) (lut ++ [last lut])))
   pure (Features ps sp noise (0, 1))
 
--- | A quantised spline: control points, colour DCTs (X, Y, B) and sigma DCT.
+-- | A quantised spline: control points, the Manhattan length of the
+-- control polygon, colour DCTs (X, Y, B) and sigma DCT.
 data QSpline = QSpline { qsPoints :: [(Int, Int)], qsManhattan :: !Int, qsXyb :: [[Int]], qsSigma :: [Int] }
 
 readSplines :: BR s -> FrameHdr -> J s ([QSpline], Int)
@@ -875,6 +880,9 @@ readSplines r fh = do
   st <- liftJ (newCodeSt r code 65536)
   let rd ctx = liftJ (readSym code st r ctx 0)
       npix = fhW fh * fhH fh
+      manCap = 1 `shiftL` 60 :: Int
+  -- Annex M's counts for a frame: at most min(2^24, pixels/4) splines and
+  -- min(2^20, pixels/2) control points among them
   n0 <- rd 2
   jguard (n0 < min (1 `shiftL` 24) (npix `div` 4)) "JPEG XL: too many splines"
   let n = n0 + 1
@@ -894,7 +902,9 @@ readSplines r fh = do
                   let dlt' = (fst dlt + dx, snd dlt + dy)
                       cur' = (fst cur + fst dlt', snd cur + snd dlt')
                   jguard (cur' /= cur) "JPEG XL: repeated spline point"
-                  pts (k + 1) cur' dlt' (man + abs (fst dlt') + abs (snd dlt')) (cur' : ps)
+                  -- (the length saturates, far above any limit 'splineArea' is
+                  -- held to, so that a hostile file cannot wrap it round)
+                  pts (k + 1) cur' dlt' (min manCap (man + min manCap (abs (fst dlt')) + min manCap (abs (snd dlt')))) (cur' : ps)
         (ps, man) <- pts (0 :: Int) start (0, 0) 0 [start]
         xyb <- replicateM 3 (replicateM 32 (unpackSigned <$> rd 5))
         sig <- replicateM 32 (unpackSigned <$> rd 5)
@@ -1751,20 +1761,55 @@ blendRegion mode clampA isAlphaCh premul base bst new nst mba mna bx by nx ny w 
       Just v -> unsafeWrite base bi v
       Nothing -> pure ()
 
--- | libjxl's bound on the work splines may ask for (an estimate of the
--- area they paint), checked before rendering any.
-splineArea :: [QSpline] -> Int -> (Float, Float) -> Int
-splineArea qs qa (cx, cb) = sum (map one qs)
+-- | How much painting a frame's splines ask for, in the measure the
+-- standard's level limits are stated in (ISO/IEC 18181-1, the splines
+-- clause's estimated area; Annex M bounds its total over a frame, and
+-- 'splineAreaLimit' is that bound at level 10, the wider of the two levels,
+-- so that a file a conforming decoder accepts is not refused here). It is
+-- what stands between a few hundred bytes and an unbounded render: the
+-- painter visits every unit step of each curve and fills a square around it
+-- whose side grows with the stroke's width and with its colour.
+--
+-- Per spline, three factors multiply:
+--
+--  * its length, as the Manhattan length of the control polygon;
+--  * a width term, the sum over the 32 sigma coefficients of the square of
+--    each one's magnitude (a stroke of twice the width covers four times
+--    the area), no coefficient counting for less than 1;
+--  * the number of bits in its largest colour magnitude (a stronger stroke
+--    is painted further out from its centre line), at least 1.
+--
+-- Magnitudes are the quantised coefficients scaled by the frame's
+-- quantisation adjustment and rounded up, and X and B take their share of
+-- Y through the colour correlation, as the dequantiser will. Everything is
+-- an 'Integer': the coefficients are 32-bit values chosen by the file, and
+-- a product that wrapped round would let through exactly the splines this
+-- exists to stop.
+splineArea :: [QSpline] -> Int -> (Float, Float) -> Integer
+splineArea qs qa (cx, cb) =
+  sum [ toInteger (qsManhattan q) * widthTerm q * colourBits q | q <- qs ]
   where
-    divQa d | qa >= 0 = (8 * d + 7 + qa) `div` (8 + qa)
-            | otherwise = d + ((d * negate qa) + 7) `div` 8
-    corrX = ceiling (abs cx) :: Int
-    corrB = ceiling (abs cb) :: Int
-    one q =
-      let (cX, cY, cB) = tri ([ sum (map (divQa . abs) c) | c <- qsXyb q ])
-          logColor = ceilLog2 (maximum [cX + corrX * cY, cY, cB + corrB * cY])
-          widthEst = sum [ let wt = 1 + divQa (abs s) in wt * wt * logColor | s <- qsSigma q ]
-      in widthEst * qsManhattan q
+    -- |v| after the quantisation adjustment, rounded up: the dequantiser
+    -- multiplies by 8/(8 + qa) when qa >= 0 and by (8 - qa)/8 below zero.
+    mag :: Int -> Integer
+    mag v
+      | qa >= 0 = (8 * m + adj + 7) `div` (adj + 8)
+      | otherwise = (m * (adj + 8) + 7) `div` 8
+      where m = abs (toInteger v)
+            adj = abs (toInteger qa)
+    share :: Float -> Integer
+    share r = let a = abs r in if a <= 1e9 then ceiling a else 1000000000
+    widthTerm q = sum [ wd * wd | sg <- qsSigma q, let wd = max 1 (mag sg) ]
+    colourBits q = case map (sum . map mag) (qsXyb q) of
+      [x, y, b] -> max 1 (bitLength (maximum [x + share cx * y, y, b + share cb * y]))
+      _ -> 1
+    bitLength :: Integer -> Integer
+    bitLength n = if n <= 0 then 0 else 1 + bitLength (n `div` 2)
+
+-- | Annex M's ceiling on 'splineArea' at level 10, for a frame of the given
+-- pixel count.
+splineAreaLimit :: Int -> Integer
+splineAreaLimit npix = min (2 ^ (42 :: Int)) (1024 * toInteger npix + 2 ^ (32 :: Int))
 
 -- | Paint the splines (§K.? splines) onto XYB colour planes: each one's
 -- Catmull-Rom curve is resampled at unit arc length, and every sample adds

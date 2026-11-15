@@ -11,17 +11,24 @@
 -- linearRGB primitives pays for one conversion in and one out, and an
 -- offset or a merge never converts at all. The output is always sRGB.
 --
--- __Parameters are scaled the way resvg scales them__, because resvg is the
--- reference this module is held to: a blur's standard deviations and an
--- offset's distances are multiplied by the matrix's x and y scale (the
--- lengths of its columns) rather than transformed as vectors, and an offset
--- is truncated to whole device pixels. Under rotation or skew that is an
--- approximation (the spec would rotate the blur's axes), and it is the one
--- every renderer we compare against makes. Gaussian blur follows resvg as
--- well: a true Gaussian kernel for small deviations, and for larger ones
--- three box blurs whose widths are chosen so their variance matches
--- (Kovesi's construction), which is what keeps a large blur linear in the
--- area rather than in area × radius.
+-- __Lengths are scaled per axis.__ @stdDeviation@ is a pair of lengths
+-- along the x and y axes of the filter's user space (Filter Effects Level 1,
+-- @feGaussianBlur@), so each is multiplied by how long the matrix makes a
+-- unit step along that axis (the length of its column), and the blur stays
+-- separable along the device axes. Under rotation or skew that is an
+-- approximation (the blur's axes ought to turn with the element); it is the
+-- one the renderers we compare against make too, and this module's output
+-- is held to resvg's. An offset is a vector, so it goes through the whole
+-- linear part of the matrix, and lands on whole device pixels.
+--
+-- __Gaussian blur__ is the specification's two-regime scheme: the true
+-- kernel for small deviations, and beyond its threshold of 2 three
+-- successive box blurs, which make a piecewise-quadratic kernel and keep a
+-- large blur linear in the area rather than in area × radius. The spec's
+-- note sizes the boxes by @d = floor(s·3·√(2π)/4 + 0.5)@ with half-pixel
+-- shifts when @d@ is even; ours are sized instead so that their variances
+-- sum to the Gaussian's (P. Kovesi, /Fast Almost-Gaussian Filtering/,
+-- DICTA 2010), which needs only odd, centred boxes. See 'boxRadii'.
 module Cmedit.RasterFilter
   ( runFilter
   , filterMargin
@@ -56,9 +63,9 @@ filterMargin m prims = sum (map (one . fpOp) prims) + 2
 
 -- | An offset vector in the filter's user space as whole device pixels: the
 -- full linear part of the matrix, so a rotated or flipped element's shadow
--- falls where the spec (and the browsers) put it. Truncated toward zero
--- like resvg's, which only matters for fractional results; non-finite or
--- absurd offsets become no shift.
+-- falls where the spec (and the browsers) put it. A fractional result drops
+-- its fraction (toward zero), which is where the reference renderer puts
+-- such a shadow; non-finite or absurd offsets become no shift.
 deviceOffset :: Affine -> Double -> Double -> (Int, Int)
 deviceOffset m dx dy =
   let Pt x y = applyLinearA m (Pt dx dy)
@@ -314,19 +321,35 @@ blurLine b tmp off stride len sigma
   | sigma > 2 = mapM_ (boxPass b tmp off stride len) (boxRadii sigma)
   | otherwise = gaussPass b tmp off stride len (gaussKernel sigma)
 
--- Box widths whose three-fold convolution approximates the Gaussian.
+-- The radii of three centred boxes whose successive convolution stands in
+-- for a Gaussian of deviation sigma (Kovesi 2010). A box of odd width w
+-- is a uniform distribution over w pixels, of variance (w² − 1)/12, and
+-- variances add under convolution, so the three widths must satisfy
+--
+-- >  (w1² − 1) + (w2² − 1) + (w3² − 1) = 12σ²
+--
+-- Equal widths would each be √(4σ² + 1), which is rarely an odd integer.
+-- So take the odd width at or below that, @lo@, and the next odd one up,
+-- @hi = lo + 2@, and use @k@ of the first and @3 − k@ of the second, with
+-- k solving the equation above:
+--
+-- >  k = (3(hi² − 1) − 12σ²) / ((hi² − 1) − (lo² − 1))
+--
+-- rounded to the nearest whole box. The narrow boxes go first (the order
+-- does not matter to the result, convolution being commutative).
 boxRadii :: Double -> [Int]
 boxRadii sigma =
-  let n = 3 :: Int
-      nd = fromIntegral n
-      wIdeal = sqrt (12 * sigma * sigma / nd + 1)
-      wl0 = if wIdeal < 1e9 then floor wIdeal else 1000000000 :: Int
-      wl = if even wl0 then wl0 - 1 else wl0
-      wu = wl + 2
-      wlD = fromIntegral wl
-      mIdeal = (12 * sigma * sigma - nd * wlD * wlD - 4 * nd * wlD - 3 * nd) / (-4 * wlD - 4)
-      m = if abs mIdeal < 10 then round mIdeal else 0 :: Int
-  in [ (if i < m then wl else wu) `div` 2 | i <- [0 .. n - 1] ]
+  let want = 12 * sigma * sigma                 -- twelve times the variance wanted
+      var12 w = fromIntegral (w * w - 1) :: Double  -- twelve times a width-w box's
+      equal = sqrt (want / 3 + 1)
+      whole = if equal < 1e9 then floor equal else 1000000000 :: Int
+      lo = if even whole then whole - 1 else whole
+      hi = lo + 2
+      kIdeal = (3 * var12 hi - want) / (var12 hi - var12 lo)
+      -- (a deviation too large for the arithmetic gets three wide boxes; the
+      -- line is far shorter than any of them by then)
+      k = if abs kIdeal < 10 then round kIdeal else 0 :: Int
+  in [ w `div` 2 | w <- replicate (max 0 (min 3 k)) lo ++ replicate (3 - max 0 (min 3 k)) hi ]
 
 -- Copy one line out to the scratch row (4 floats per pixel).
 loadLine :: Buf s -> Buf s -> Int -> Int -> Int -> ST s ()
