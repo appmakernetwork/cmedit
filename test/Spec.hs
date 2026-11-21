@@ -5556,6 +5556,71 @@ main = do
           (map (csvBorderColAt vcw1) [2, 6, 8, 33]) [Nothing, Nothing, Nothing, Nothing]
   checkEq "csv csvColStartX honours the horizontal scroll"
           (map (csvColStartX vcw1 { csvLeft = 1 }) [0, 1, 2]) [Nothing, Just 3, Just 24]
+  -- User row heights (dragging a tall row's gutter '+') ----------------------
+  -- An override only ever expands: it is clamped at use to [auto, lines], it
+  -- follows its row across inserts, deletes and sorts, and undo forgets one
+  -- past the last row.
+  let tall n = T.intercalate (T.pack "\n") [ T.pack (show i) | i <- [1 .. n :: Int] ]
+      quoted t = T.concat [T.pack "\"", t, T.pack "\""]
+      vrh0 = mkCsvView ',' (T.concat [ T.pack "h,k\n", quoted (tall 10), T.pack ",b\n"
+                                     , T.pack "short,", quoted (tall 2), T.pack "\n" ])
+      vrh1 = setRowHeight 1 6 vrh0
+  checkEq "csv row height starts capped" (map (rowHeight vrh0) [0, 1, 2]) [1, 3, 2]
+  checkEq "csv setRowHeight expands one row" (map (rowHeight vrh1) [0, 1, 2]) [1, 6, 2]
+  checkEq "csv setRowHeight clamps to the row's lines" (rowHeight (setRowHeight 1 99 vrh0) 1) 10
+  checkEq "csv setRowHeight never shrinks below auto" (rowHeight (setRowHeight 1 1 vrh0) 1) 3
+  checkEq "csv setRowHeight cannot grow a short row" (rowHeight (setRowHeight 2 9 vrh0) 2) 2
+  checkEq "csv resetRowHeight restores the capped height" (rowHeight (resetRowHeight 1 vrh1) 1) 3
+  checkEq "csv row height override follows its row past an insert"
+          (map (rowHeight (insertRowAbove (setCursor 1 0 vrh1))) [1, 2]) [1, 6]
+  checkEq "csv row height override follows its row past a delete"
+          (rowHeight (deleteRow (setCursor 0 0 vrh1)) 0) 6
+  checkEq "csv deleting the sized row drops its override"
+          (csvUserH (deleteRow (setCursor 1 0 vrh1))) M.empty
+  checkEq "csv row height override follows its row through a sort"
+          (let vs = sortByColumn 0 False True vrh1   -- descending, header pinned
+           in (cellAt 2 1 vs, rowHeight vs 2)) (T.pack "b", 6)
+  checkEq "csv undo drops a row override past the last row"
+          (csvUserH (undo (setRowHeight 3 9 (insertRowBelow (setCursor 2 0 vrh0)))))
+          M.empty
+  -- Through the editor: drag the '+' down two lines, release; double-click
+  -- the handle expands as far as it can, double-click again restores auto.
+  let edRH0 = setLoaded "/tmp/rh.csv" (mkLR (T.unpack (csvToText vrh0)))
+                (newEditor (24, 80) defaultConfig)
+      Just vRH = edCsv edRH0
+      loRH = computeLayout edRH0
+      markerRH = [ (r, c) | r <- [0 .. 23], c <- [0 .. 79]
+                          , isJust (csvRowMarkerAt edRH0 vRH r c) ]
+      rowOfRH ed = maybe 0 (\v -> rowHeight v 1) (edCsv ed)
+      mouseRH r c pressed drag clicks =
+        KMouse (MouseEvent MBLeft c r pressed drag noMods clicks)
+      runRH = foldl (\e k -> fst (update k e))
+  case markerRH of
+    ((mr, mc) : _) -> do
+      let scrRH = renderEditor edRH0
+      checkEq "csv tall row draws its '+' on the marker cell"
+              (cellChar (scrCells scrRH A.! (mr * scrW scrRH + loContentLeft loRH + 1))) '+'
+      checkEq "csv marker sits on the tall row's last line" (csvRowMarkerAt edRH0 vRH mr mc)
+              (Just (1, mr - 2))
+      checkEq "pointer: a tall row's handle offers row-resize" (pointerShapeFor edRH0 mr mc) "row-resize"
+      let edDrag = runRH edRH0 [mouseRH mr mc True False 1, mouseRH (mr + 2) mc True True 1]
+          edRel  = runRH edDrag [mouseRH (mr + 2) mc False False 1]
+      check "csv handle press starts a row drag" (edCsvRowDrag edDrag == Just 1)
+      checkEq "csv dragging the handle grows the row" (rowOfRH edDrag) 5
+      check "csv release ends the row drag" (not (isJust (edCsvRowDrag edRel)))
+      checkEq "csv the dragged height sticks" (rowOfRH edRel) 5
+      checkEq "csv the expanded row shows a '-' handle once fully open"
+              (let edFull = runRH edRH0 [mouseRH mr mc True False 2]
+                   s' = renderEditor edFull
+               in (rowOfRH edFull, cellChar (scrCells s' A.! ((mr + 7) * scrW s' + loContentLeft loRH + 1))))
+              (10, '\x2212')
+      checkEq "csv double-clicking an expanded handle restores auto"
+              (rowOfRH (runRH edRH0 [mouseRH mr mc True False 2, mouseRH (mr + 7) mc True False 2])) 3
+      checkEq "csv dragging back to auto drops the override"
+              (fmap csvUserH (edCsv (runRH edRH0 [ mouseRH mr mc True False 1, mouseRH (mr + 3) mc True True 1
+                                                 , mouseRH (mr - 1) mc True True 1, mouseRH (mr - 1) mc False False 1 ])))
+              (Just M.empty)
+    [] -> check "csv tall row has a gutter handle" False
   -- Perf tripwire: navigating a 200k-row table must not rescan every cell per
   -- keystroke (this regresses to many seconds if the width cache is bypassed).
   let vHuge = mkCsvView ',' (T.intercalate (T.pack "\n")

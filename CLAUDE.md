@@ -1069,6 +1069,16 @@ in `README.md`; the cross-cutting structure that matters when editing:
   `docCsv`. `csvBorderColAt`/`csvColStartX` (EditorState, where
   `csvGutterWidthFor` also lives) are the shared border geometry for the hub's
   hit-test/drag and the `col-resize` pointer hint.
+  **User row heights** are the same gesture turned sideways: a row taller than
+  `maxCellLines` shows a `+` on its last gutter line (`−` once fully open);
+  dragging it (`edCsvRowDrag`) sets a sparse per-row override (`csvUserH`) and
+  a double-click toggles fully-open (as far as the screen allows) / auto.
+  `rowHeight` clamps the override *at use* to [auto height, the row's line
+  count], so it only ever expands and never needs maintaining across cell
+  edits; it follows its row through insert/delete/sort (`remapUserH`) and undo
+  drops any past the last row (`dropStaleUserW`). `csvRowLayout` now lives in
+  EditorState so `csvRowMarkerAt` (pointer hint + press hit-test) and
+  `Render.drawCsvTable` share one geometry.
 
 - **Image view mode (`Cmedit.Image`, `edImage`/`docImage`).** A third,
   read-only view mode, structured exactly like CSV but sharing none of its

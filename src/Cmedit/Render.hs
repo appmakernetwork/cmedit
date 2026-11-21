@@ -2592,9 +2592,12 @@ drawCsvTable th ed v lo arr = do
     let numStr = show (r + 1)
         gstyle = if inSelRow r then gutSel else gutS
     drawStr arr cols rows sl (cl + max 0 (gut - 1 - length numStr)) gstyle numStr
-    -- A row taller than the cap shows a '+' on its last visible gutter line.
-    when (Csv.rowLineCount v r > Csv.maxCellLines && visH >= 2) $
-      drawStr arr cols rows (sl + visH - 1) (cl + max 0 (gut - 2)) gstyle "+"
+    -- A row taller than the cap carries a drag handle on its last visible
+    -- gutter line: '+' while lines are hidden, '−' once it is fully expanded.
+    -- 'csvRowMarkerAt' hit-tests the same cell.
+    when (csvRowExpandable v r && visH >= 2) $
+      drawStr arr cols rows (sl + visH - 1) (cl + max 0 (gut - 2)) gstyle
+        (if Csv.rowHeight v r < Csv.rowLineCount v r then "+" else "\x2212")
     forM_ visCols $ \(c, x) -> do
       let w = ws !! c
           sx = cl + gut + x - xoff
@@ -2616,24 +2619,6 @@ drawCsvTable th ed v lo arr = do
         drawStrClipL arr cols rows (sl + li) sx minC st (takeCellsPad w s)
         when (sx + w >= minC) $
           putCell arr cols rows (sl + li) (sx + w) (Cell '\x2502' sepS)
-
--- Screen layout of the visible table rows: (tableRow, firstScreenLine, height).
--- Rows have variable height (capped); the last one may be clipped at the bottom.
--- When @freeze@ is on, row 0 is pinned directly under the column header and the
--- scrolling rows (>= 1) flow beneath it.
-csvRowLayout :: Bool -> CsvView -> Layout -> [(Int, Int, Int)]
-csvRowLayout freeze v lo =
-  let dataTop = loTextTop lo + 1
-      dataEnd = loTextTop lo + loTextHeight lo
-      walk sl r
-        | sl >= dataEnd     = []
-        | r >= Csv.nRows v  = []
-        | otherwise         = let h = Csv.rowHeight v r
-                              in (r, sl, min h (dataEnd - sl)) : walk (sl + h) (r + 1)
-  in if freeze && Csv.nRows v > 0
-       then let h0 = Csv.rowHeight v 0
-            in (0, dataTop, min h0 (dataEnd - dataTop)) : walk (dataTop + h0) (max 1 (csvTop v))
-       else walk dataTop (csvTop v)
 
 -- The @visH@ display strings (each ≤ w wide) for a cell. When editing (mCur is
 -- the in-cell cursor), the cell scrolls vertically to keep the cursor line shown

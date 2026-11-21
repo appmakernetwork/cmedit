@@ -23,6 +23,9 @@ module Cmedit.Csv
   , cellWidth
   , setColWidth
   , resetColWidth
+  , setRowHeight
+  , resetRowHeight
+  , autoRowHeight
   , maxCellLines
   , cellLineCount
   , rowLineCount
@@ -266,6 +269,8 @@ data CsvView = CsvView
                                       --   grid per keystroke would freeze large tables).
   , csvUserW  :: !(Map Int Int)       -- ^ User width overrides (header-border drag), by column.
                                       --   Sparse; wins over the content-fitted 'csvWidths' entry.
+  , csvUserH  :: !(Map Int Int)       -- ^ User row-height overrides (dragging a tall row's @+@
+                                      --   marker in the gutter), by row. Sparse; see 'rowHeight'.
   , csvNl     :: !(Map Int Int)       -- ^ Rows that carry embedded newlines, and how many each
                                       --   contributes to the serialised CSV. Sparse — absent
                                       --   means zero — and kept in sync with 'csvRows' by
@@ -325,7 +330,7 @@ mkCsvRows delim rows0 =
        , csvXOff = 0
        , csvEdit = Nothing, csvDelim = delim, csvUndo = Seq.empty, csvRedo = Seq.empty
        , csvSaved = rows, csvDirty = DirtyCells 0, csvSelAnchor = Nothing
-       , csvWidths = computeWidths rows, csvUserW = Map.empty
+       , csvWidths = computeWidths rows, csvUserW = Map.empty, csvUserH = Map.empty
        , csvNl = computeNl delim rows }
 
 -- | Serialise the grid back to CSV text (records joined by @\\n@; the caller's
@@ -1032,9 +1037,42 @@ rowLineCount v r = case rowAt r v of
   PackedRow _ _ _ _ edits -> Map.foldl' (\ !a c -> max a (cellLineCount c)) 1 edits
   row                     -> maximum (1 : map cellLineCount (rowToList row))
 
--- | On-screen height of a table row: its tallest cell, capped at 'maxCellLines'.
+-- | On-screen height of a table row: its tallest cell, capped at
+-- 'maxCellLines' unless the user has dragged the row taller ('setRowHeight').
+-- An override is clamped at use, never stored clamped, against the row's
+-- current content: never below the automatic height (the gesture only
+-- expands) and never past the lines the row actually has, so an edit that
+-- shortens the row shrinks it without the override having to be maintained.
 rowHeight :: CsvView -> Int -> Int
-rowHeight v r = min maxCellLines (rowLineCount v r)
+rowHeight v r
+  | Map.null (csvUserH v) = autoRowHeight v r
+  | otherwise = case Map.lookup r (csvUserH v) of
+      Nothing -> autoRowHeight v r
+      Just h  -> let n = rowLineCount v r
+                 in max (min maxCellLines n) (min n h)
+
+-- | A row's height with no override: its tallest cell, capped at 'maxCellLines'.
+autoRowHeight :: CsvView -> Int -> Int
+autoRowHeight v r = min maxCellLines (rowLineCount v r)
+
+-- | Set a user height override for a row (dragging its gutter marker). Sticks
+-- until 'resetRowHeight'; 'rowHeight' clamps it to the row's content.
+setRowHeight :: Int -> Int -> CsvView -> CsvView
+setRowHeight r h v
+  | r < 0 || r >= nRows v = v
+  | otherwise = v { csvUserH = Map.insert r (max 1 h) (csvUserH v) }
+
+-- | Drop a row's height override, returning it to the capped automatic height.
+resetRowHeight :: Int -> CsvView -> CsvView
+resetRowHeight r v = v { csvUserH = Map.delete r (csvUserH v) }
+
+-- Height overrides follow their rows across a structural change: @f@ maps an
+-- old row index to its new one, or 'Nothing' for a row that went away.
+remapUserH :: (Int -> Maybe Int) -> CsvView -> CsvView
+remapUserH f v
+  | Map.null (csvUserH v) = v
+  | otherwise = v { csvUserH = Map.fromList [ (k', h) | (k, h) <- Map.toList (csvUserH v)
+                                                      , Just k' <- [f k] ] }
 
 -- | The (line, column) of a character index within (possibly multi-line) text.
 cursorLineCol :: Text -> Int -> (Int, Int)
@@ -1566,22 +1604,30 @@ emptyRow v = rowFromList (replicate (nCols v) T.empty)
 
 insertRowAbove :: CsvView -> CsvView
 insertRowAbove v =
-  let v' = snapshot v
+  let v' = shiftUserH (csvCurRow v) (snapshot v)
   in clampCursor (withRows (Seq.insertAt (csvCurRow v) (emptyRow v)) v')
 
 insertRowBelow :: CsvView -> CsvView
 insertRowBelow v =
-  let v' = snapshot v
-      r  = csvCurRow v + 1
+  let r  = csvCurRow v + 1
+      v' = shiftUserH r (snapshot v)
   in clampCursor (withRows (Seq.insertAt r (emptyRow v)) v') { csvCurRow = r }
 
 deleteRow :: CsvView -> CsvView
 deleteRow v
   | nRows v <= 1 = withRows (const (Seq.singleton (rowFromList [T.empty]))) (snapshot v)
-                     { csvCurRow = 0, csvCurCol = 0 }
+                     { csvCurRow = 0, csvCurCol = 0, csvUserH = Map.empty }
   | otherwise =
-      let v' = snapshot v
-      in clampCursor (withRows (Seq.deleteAt (csvCurRow v)) v')
+      let r  = csvCurRow v
+          v' = remapUserH (\k -> case compare k r of
+                                   LT -> Just k
+                                   EQ -> Nothing
+                                   GT -> Just (k - 1)) (snapshot v)
+      in clampCursor (withRows (Seq.deleteAt r) v')
+
+-- Height overrides at or below an inserted row move down with their rows.
+shiftUserH :: Int -> CsvView -> CsvView
+shiftUserH r = remapUserH (\k -> Just (if k >= r then k + 1 else k))
 
 insertColAt :: Int -> CsvView -> CsvView
 insertColAt c v =
@@ -1703,7 +1749,11 @@ sortByColumn c asc keepHeader v0 =
       oldCur = csvCurRow v1
       cur' | oldCur < hdrN = oldCur
            | otherwise = hdrN + fromMaybe 0 (elemIndex (oldCur - hdrN) order)
-  in clampCursor (withRows (const rows') v1) { csvCurRow = cur' }
+      -- Height overrides travel with their rows to the rows' new positions.
+      newPos = Map.fromList [ (i + hdrN, j + hdrN) | (j, i) <- zip [0 ..] order ]
+      v2 | Map.null (csvUserH v1) = v1
+         | otherwise = remapUserH (\k -> if k < hdrN then Just k else Map.lookup k newPos) v1
+  in clampCursor (withRows (const rows') v2) { csvCurRow = cur' }
 
 -- | Are the (non-pinned) rows already in ascending order by column @c@? Used
 -- to make the sort key toggle: ascending first, descending when re-applied.
@@ -1973,10 +2023,17 @@ redo v = case Seq.viewl (csvRedo v) of
 -- can change the column count behind 'csvUserW''s back, and an override left
 -- past the last column would be inherited by whatever column is added there
 -- next.
+--
+-- Row-height overrides get the same treatment for rows. (They are clamped to
+-- the content at use, so one that lands on a different row after an undo can
+-- at worst show that row expanded, never draw past its lines.)
 dropStaleUserW :: CsvView -> CsvView
-dropStaleUserW v
-  | Map.null (csvUserW v) = v
-  | otherwise = v { csvUserW = Map.filterWithKey (\k _ -> k < nCols v) (csvUserW v) }
+dropStaleUserW v0 = dropH (dropW v0)
+  where
+    dropW v | Map.null (csvUserW v) = v
+            | otherwise = v { csvUserW = Map.filterWithKey (\k _ -> k < nCols v) (csvUserW v) }
+    dropH v | Map.null (csvUserH v) = v
+            | otherwise = v { csvUserH = fst (Map.split (nRows v) (csvUserH v)) }
 
 -- | Give @new@ the undo history of @old@, with @old@'s grid pushed as the most
 -- recent undo step. Used when a CSV document is edited as plain text and then

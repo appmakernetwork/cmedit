@@ -349,6 +349,9 @@ module Cmedit.Editor
   , syncCsvToBuffer
   , csvGutterWidthFor
   , csvBorderColAt
+  , csvRowLayout
+  , csvRowExpandable
+  , csvRowMarkerAt
   , csvColStartX
     -- * Pure helpers exposed for testing
   , replaceAllText
@@ -1403,6 +1406,9 @@ dispatchKey key ed
 -- A CSV column-width drag (grabbed on a header border) swallows the mouse too.
 dispatchKey key ed
   | KMouse me <- key, Just c <- edCsvColDrag ed = noEff (csvColDragMove me c ed)
+-- So does a CSV row-height drag (grabbed on a tall row's gutter handle).
+dispatchKey key ed
+  | KMouse me <- key, Just r <- edCsvRowDrag ed = noEff (csvRowDragMove me r ed)
 dispatchKey key ed = case edFocus ed of
   -- The Find/Replace dialogs keep a live match count in their message line;
   -- any key other than Up/Down ends a history-browsing run.
@@ -3274,6 +3280,20 @@ csvMouse me v ed
         then (csvPut (Csv.resetColWidth c v) ed)
                { edStatus = T.pack ("Column " ++ Csv.colLabel c ++ " width: auto") }
         else ed { edCsvColDrag = Just c }
+  -- A press on a tall row's gutter handle grabs it for a height drag; a
+  -- double-click toggles between fully expanded (as far as the screen
+  -- allows) and the automatic, capped height.
+  | mePressed me && meButton me == MBLeft && not (meDrag me)
+  , Just (r, sl) <- csvRowMarkerAt ed v (meRow me) (meCol me) =
+      if meClicks me >= 2
+        then if Csv.rowHeight v r > Csv.autoRowHeight v r
+          then (csvPut (Csv.resetRowHeight r v) ed)
+                 { edStatus = T.pack ("Row " ++ show (r + 1) ++ " height: auto") }
+          else let lo = computeLayout ed
+                   room = loTextTop lo + loTextHeight lo - sl
+                   v' = Csv.setRowHeight r (min (Csv.rowLineCount v r) room) v
+               in (csvPut v' ed) { edStatus = rowHeightMsg v' r }
+        else ed { edCsvRowDrag = Just r }
   | mePressed me && meButton me == MBLeft =
       let lo = computeLayout ed
           cl = loContentLeft lo
@@ -3311,6 +3331,35 @@ csvColDragMove me c ed = case edCsv ed of
               w' = Csv.columnWidths v' !! c
           in ed { edCsv = Just v'
                 , edStatus = T.pack ("Column " ++ Csv.colLabel c ++ " width: " ++ show w') }
+
+-- Resize the grabbed row from a gutter-handle drag: the handle follows the
+-- pointer, so the height is (pointer row − the row's first line + 1), clamped
+-- to the data area and, by 'Csv.rowHeight', to the row's content. As with the
+-- column drag, 'csvPut' waits for the release so the vertical scroll can't
+-- move the row out from under the pointer mid-drag.
+csvRowDragMove :: MouseEvent -> Int -> Editor -> Editor
+csvRowDragMove me r ed = case edCsv ed of
+  Nothing -> ed { edCsvRowDrag = Nothing }
+  Just v
+    -- Released back at the automatic height: drop the override rather than
+    -- keep one that says nothing.
+    | not (mePressed me) ->
+        let v' = if Csv.rowHeight v r <= Csv.autoRowHeight v r then Csv.resetRowHeight r v else v
+        in (csvPut v' ed) { edCsvRowDrag = Nothing }
+    | otherwise ->
+        let lo = computeLayout ed
+        in case find (\(r', _, _) -> r' == r) (csvRowLayout (edFreezeHeader ed) v lo) of
+             Nothing -> ed { edCsvRowDrag = Nothing }       -- row scrolled away
+             Just (_, sl, _) ->
+               let dataEnd = loTextTop lo + loTextHeight lo
+                   h  = max 1 (min (dataEnd - sl) (meRow me - sl + 1))
+                   v' = Csv.setRowHeight r h v
+               in ed { edCsv = Just v', edStatus = rowHeightMsg v' r }
+
+-- "Row 7 height: 5 of 12 lines" — the status line while sizing a row.
+rowHeightMsg :: CsvView -> Int -> Text
+rowHeightMsg v r = T.pack ("Row " ++ show (r + 1) ++ " height: " ++ show (Csv.rowHeight v r)
+                           ++ " of " ++ show (Csv.rowLineCount v r) ++ " lines")
 
 -- Which column index a screen x falls in, given the gutter width. The
 -- accumulator starts at -csvXOff so a click in the partially clipped leftmost

@@ -543,6 +543,7 @@ data Editor = Editor
   , edScrollDrag    :: !Bool            -- ^ A vertical scrollbar-thumb drag is in progress (swallows mouse until release).
   , edHScrollDrag   :: !Bool            -- ^ A horizontal scrollbar-thumb drag is in progress (swallows mouse until release).
   , edCsvColDrag    :: !(Maybe Int)     -- ^ A CSV column-width drag (on a header border) is in progress: the column being resized.
+  , edCsvRowDrag    :: !(Maybe Int)     -- ^ A CSV row-height drag (on a tall row's gutter @+@) is in progress: the row being resized.
   , edLoading       :: !(Maybe (String, Int)) -- ^ A file is loading in the background: (display name, spinner frame).
   , edAboutTick     :: !Int             -- ^ Frame counter of the About-box animation (reset when the dialog opens).
   , edSearch        :: !(Maybe SearchState) -- ^ Workspace-wide find/replace panel state (global, not per-document).
@@ -739,6 +740,7 @@ newEditor size cfg = Editor
   , edScrollDrag    = False
   , edHScrollDrag   = False
   , edCsvColDrag    = Nothing
+  , edCsvRowDrag    = Nothing
   , edLoading       = Nothing
   , edAboutTick     = 0
   , edSearch        = Nothing
@@ -1052,6 +1054,45 @@ csvBorderColAt v x = go (csvLeft v) (csvGutterWidthFor v - csvXOff v)
       | x <  bx + ws !! c = Nothing
       | otherwise         = go (c + 1) (bx + ws !! c + 1)
 
+-- | Screen layout of the visible table rows: (tableRow, firstScreenLine, height).
+-- Rows have variable height (capped); the last one may be clipped at the bottom.
+-- When @freeze@ is on, row 0 is pinned directly under the column header and the
+-- scrolling rows (>= 1) flow beneath it.
+csvRowLayout :: Bool -> CsvView -> Layout -> [(Int, Int, Int)]
+csvRowLayout freeze v lo =
+  let dataTop = loTextTop lo + 1
+      dataEnd = loTextTop lo + loTextHeight lo
+      walk sl r
+        | sl >= dataEnd     = []
+        | r >= Csv.nRows v  = []
+        | otherwise         = let h = Csv.rowHeight v r
+                              in (r, sl, min h (dataEnd - sl)) : walk (sl + h) (r + 1)
+  in if freeze && Csv.nRows v > 0
+       then let h0 = Csv.rowHeight v 0
+            in (0, dataTop, min h0 (dataEnd - dataTop)) : walk (dataTop + h0) (max 1 (csvTop v))
+       else walk dataTop (csvTop v)
+
+-- | Does row @r@ have more lines than the automatic height shows, so that its
+-- gutter carries the expand/collapse drag handle?
+csvRowExpandable :: CsvView -> Int -> Bool
+csvRowExpandable v r = Csv.rowLineCount v r > Csv.maxCellLines
+
+-- | The row whose gutter drag handle (the @+@ \/ @−@ on its last visible line,
+-- drawn by 'Cmedit.Render.drawCsvTable') is at screen (@row@, @col@), together
+-- with the row's first screen line. The handle cell and the blank column after
+-- it both count, so the target is two cells wide. Shared by the pointer-shape
+-- hint and the hub's row-resize press.
+csvRowMarkerAt :: Editor -> CsvView -> Int -> Int -> Maybe (Int, Int)
+csvRowMarkerAt ed v row col =
+  let lo  = computeLayout ed
+      gut = csvGutterWidthFor v
+      x   = col - loContentLeft lo
+      hit (r, sl, visH) = visH >= 2 && row == sl + visH - 1 && csvRowExpandable v r
+  in if x < gut - 2 || x >= gut then Nothing
+     else case filter hit (csvRowLayout (edFreezeHeader ed) v lo) of
+            ((r, sl, _) : _) -> Just (r, sl)
+            []               -> Nothing
+
 -- | Screen column (relative to 'loContentLeft') where column @c@'s cells
 -- begin, honouring the horizontal scroll; 'Nothing' if it is scrolled off.
 csvColStartX :: CsvView -> Int -> Maybe Int
@@ -1074,6 +1115,7 @@ pointerShapeFor :: Editor -> Int -> Int -> String
 pointerShapeFor ed row col
   | isJust (edLoading ed)   = "wait"
   | isJust (edCsvColDrag ed) = "col-resize"                -- mid column-width drag
+  | isJust (edCsvRowDrag ed) = "row-resize"                -- mid row-height drag
   | edSidebarDrag ed         = "col-resize"                -- mid panel-width drag
   | edFocus ed `elem` [FDialog, FBrowser, FDefPick, FQuickOpen, FMenu] = "default"
   | edShowMenu ed   && row == loMenuRow lo   = "pointer"
@@ -1088,6 +1130,8 @@ pointerShapeFor ed row col
   | Just v <- edCsv ed, row == loTextTop lo, inContent
   , isJust (csvBorderColAt v (col - loContentLeft lo))
                                              = "col-resize" -- header column border
+  | Just v <- edCsv ed, inContent
+  , isJust (csvRowMarkerAt ed v row col)     = "row-resize" -- tall row's gutter handle
   | isJust (edCsv ed) && inContent           = "default"
   | inText                                   = "text"
   | otherwise                                = "default"
