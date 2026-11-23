@@ -18,9 +18,10 @@ module Cmedit.JxlPar
   ( parOrdered
   , parOrderedResumable
   , parWorkers
+  , workerCap
   ) where
 
-import Control.Concurrent (forkIOWithUnmask, killThread, getNumCapabilities, myThreadId, throwTo)
+import Control.Concurrent (forkOnWithUnmask, killThread, getNumCapabilities, myThreadId, throwTo, threadCapability)
 import Control.Concurrent.MVar
 import Control.Concurrent.QSem
 import Control.Exception
@@ -31,6 +32,17 @@ import Data.Array (Array, listArray, (!))
 -- count, which the decoder never changes. One means "run sequentially".
 parWorkers :: IO Int
 parWorkers = getNumCapabilities
+
+-- | The capability for worker @j@ of a stage started on this thread: the
+-- ones after the caller's, in turn. Workers are placed explicitly rather
+-- than left to the scheduler's load balancing, so a stage keeps its
+-- parallelism when that balancing is off (the editor runs with @-qm@; see
+-- the Makefile's RTSOPTS).
+workerCap :: Int -> IO Int
+workerCap j = do
+  (c, _) <- threadCapability =<< myThreadId
+  n <- getNumCapabilities
+  pure ((c + 1 + j) `mod` max 1 n)
 
 -- | @parOrdered nworkers look n job consume@ runs @job i@ for every
 -- @i@ in @[0 .. n - 1]@ on @nworkers@ threads and hands each result to
@@ -117,12 +129,13 @@ parCore resumable nworkers look n job consume
                 Left e | isAsync e -> throwIO e
                 _ -> worker unmask
       dones <- replicateM (min nworkers n) newEmptyMVar
-      let spawn [] = pure []
-          spawn (done : rest) = do
-            tid <- forkIOWithUnmask $ \unmask -> worker unmask `finally` putMVar done ()
-            tids <- spawn rest `onException` uninterruptibleMask_ (killThread tid >> readMVar done)
+      let spawn _ [] = pure []
+          spawn !j (done : rest) = do
+            cap <- workerCap j
+            tid <- forkOnWithUnmask cap $ \unmask -> worker unmask `finally` putMVar done ()
+            tids <- spawn (j + 1) rest `onException` uninterruptibleMask_ (killThread tid >> readMVar done)
             pure (tid : tids)
-      tids <- spawn dones
+      tids <- spawn (0 :: Int) dones
       let stopAll = uninterruptibleMask_ $ do
             mapM_ killThread tids
             mapM_ readMVar dones
