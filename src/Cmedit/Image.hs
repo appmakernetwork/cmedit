@@ -1219,12 +1219,14 @@ paethLanes a b c =
   let h = 0x8000800080008000
       k = c + c + c
       a2 = a + a
-      b2 = b + b
-      e1 = ((k .|. h) - b) - a2            -- u <= k
-      e2 = ((k .|. h) - b2) - a            -- v <= k
-      f1 = ((b .|. h) - k) + a2            -- u >= k
-      f2 = ((b2 .|. h) - k) + a            -- v >= k
-      g  = (b .|. h) - a                   -- a <= b
+      t0 = (k + h) - b
+      bh = b + h
+      s0 = bh - k
+      e1 = t0 - a2                         -- u <= k
+      e2 = (t0 - b) - a                    -- v <= k
+      f1 = s0 + a2                         -- u >= k
+      f2 = (s0 + b) + a                    -- v >= k
+      g  = bh - a                          -- a <= b
       c1 = e1 .&. e2                       -- take min a b
       c2 = f1 .&. f2                       -- else take max a b
       sw = (c1 `xor` c2) .&. g
@@ -1272,9 +1274,14 @@ pngFuse ft nb buf i0 o0 w = go i0 o0 0 0
                 in (v1 .|. (v1 `unsafeShiftL` 8)) .&. 0x00ff00ff00ff00ff
     squeeze v0 = let v1 = (v0 .|. (v0 `unsafeShiftR` 8)) .&. 0x0000ffff0000ffff
                  in v1 .|. (v1 `unsafeShiftR` 16)
+    -- Three bytes to lanes with one multiplication: the three copies it
+    -- adds (0, 24 and 48 bits up) do not overlap, and bytes 0, 2 and 1 are
+    -- then at bits 0, 16 and 32. The lanes' order is nobody's business but
+    -- the store's, which shifts byte 1 back down.
+    spread3 v = ((v .&. 0xffffff) * 0x1000001000001) .&. 0x000000ff00ff00ff
     put o v = pngWr32 buf o (if nb == 3 then v .|. 0xff000000 else v)
     go !i !o !a !c
-      | o >= oLast = pngLastPixel ft nb buf i o w
+      | o >= oLast = pngLastPixel ft nb buf i o wd
       | otherwise = do
           x <- pngRd32 buf i
           case ft of
@@ -1286,24 +1293,31 @@ pngFuse ft nb buf i0 o0 w = go i0 o0 0 0
                     let r = swarAdd x ((a .&. b) + (((a `xor` b) .&. 0xfefefefefefefefe) `unsafeShiftR` 1))
                     put o r; go (i + nb) (o + 4) r 0
             4 -> do b0 <- pngRd32 buf (o - wd)
-                    let b = spread b0
-                        r = (spread x + paethLanes a b c) .&. 0x00ff00ff00ff00ff
-                    put o (squeeze r); go (i + nb) (o + 4) r b
+                    if nb == 3
+                      then do
+                        let b = spread3 b0
+                            r = (spread3 x + paethLanes a b c) .&. 0x000000ff00ff00ff
+                        put o ((r .|. (r `unsafeShiftR` 24)) .&. 0xffffff)
+                        go (i + nb) (o + 4) r b
+                      else do
+                        let b = spread b0
+                            r = (spread x + paethLanes a b c) .&. 0x00ff00ff00ff00ff
+                        put o (squeeze r); go (i + nb) (o + 4) r b
             _ -> do put o x; go (i + nb) (o + 4) 0 0
 
--- The last pixel of a 'pngFuse' row, a byte at a time.
+-- The last pixel of a 'pngFuse' row, a byte at a time (wd = 4w). Strict in
+-- its numbers: boxed, they cost the caller's loop a heap check per pixel.
 pngLastPixel :: Int -> Int -> STUArray s Int Word8 -> Int -> Int -> Int -> ST s ()
-pngLastPixel ft nb buf i o w = go 0
+pngLastPixel !ft !nb buf !i !o !wd = go 0
   where
-    !wd = 4*w
     rdI j = (fromIntegral :: Word8 -> Int) <$> unsafeRead buf j
     go !ch
       | ch >= nb = when (nb == 3) $ unsafeWrite buf (o + 3) 255
       | otherwise = do
           x <- rdI (i + ch)
           b <- rdI (o - wd + ch)
-          a <- if w > 1 then rdI (o - 4 + ch) else pure 0
-          c <- if w > 1 then rdI (o - wd - 4 + ch) else pure 0
+          a <- if wd > 4 then rdI (o - 4 + ch) else pure 0
+          c <- if wd > 4 then rdI (o - wd - 4 + ch) else pure 0
           unsafeWrite buf (o + ch) (fromIntegral (x + paethPredict ft a b c))
           go (ch + 1)
 
