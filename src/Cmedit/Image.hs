@@ -5694,29 +5694,7 @@ renderImagePlaced mode cols rows (outW, outH, offX, offY) (cropX, cropY, cropW, 
           x1 = max (x0+1) (cropX + ((sx+1) * cw) `div` outW)
           y0 = cropY + (sy * ch) `div` outH
           y1 = max (y0+1) (cropY + ((sy+1) * ch) `div` outH)
-          (n, sr, sg, sb, sa) = boxSum x0 x1 y0 y1
-      in if n == 0 then (0,0,0,0)
-         else (sr `div` n, sg `div` n, sb `div` n, sa `div` n)
-    -- Strict, unboxed accumulators and unchecked reads (pixels outside the
-    -- image are skipped instead): a lazy 5-tuple per source pixel made a
-    -- 1.8 MP picture's cell grid cost 100 ms.
-    boxSum :: Int -> Int -> Int -> Int -> (Int, Int, Int, Int, Int)
-    boxSum !x0 !x1 !y0 !y1 = goY y0 0 0 0 0 0
-      where
-        goY !y !n !r !g !b !a
-          | y >= y1   = (n, r, g, b, a)
-          | y < 0 || y >= ih = goY (y+1) n r g b a
-          | otherwise = goX x0 (y*iw*4) y n r g b a
-        goX !x !row !y !n !r !g !b !a
-          | x >= x1   = goY (y+1) n r g b a
-          | x < 0 || x >= iw = goX (x+1) row y n r g b a
-          | otherwise =
-              let o = row + x*4
-              in goX (x+1) row y (n+1)
-                     (r + fromIntegral (unsafeAt pix o))
-                     (g + fromIntegral (unsafeAt pix (o+1)))
-                     (b + fromIntegral (unsafeAt pix (o+2)))
-                     (a + fromIntegral (unsafeAt pix (o+3)))
+      in boxMean pix iw ih x0 x1 y0 y1
 
     -- Colour of a sub-pixel at output position (sx,sy), or Nothing if outside
     -- the placed image. Composites alpha over a checkerboard so transparency
@@ -5756,6 +5734,31 @@ renderImagePlaced mode cols rows (outW, outH, offX, offY) (cropX, cropY, cropW, 
     avgC vs = let n = length vs
                   (sr,sg,sb) = foldr (\(a,b,c) (x,y,z) -> (a+x,b+y,c+z)) (0,0,0) vs
               in (sr `div` n, sg `div` n, sb `div` n)
+
+-- | The mean RGBA of the source box @[x0,x1) x [y0,y1)@ (pixels outside
+-- the image are not counted; an empty box is all zeros), for 'renderImage'.
+-- Out of line with strict loops: as a local function of 'renderImagePlaced'
+-- it boxed its accumulators, 1.1 GB of allocation and 100 ms for the cell
+-- picture of a 4096x4096 image (67 bytes per source pixel).
+{-# NOINLINE boxMean #-}
+boxMean :: UArray Int Word8 -> Int -> Int -> Int -> Int -> Int -> Int -> (Int, Int, Int, Int)
+boxMean !pix !iw !ih !x0 !x1 !y0 !y1 = goY y0 0 0 0 0 0
+  where
+    goY !y !n !r !g !b !a
+      | y >= y1 = if n == 0 then (0, 0, 0, 0)
+                  else (r `div` n, g `div` n, b `div` n, a `div` n)
+      | y < 0 || y >= ih = goY (y + 1) n r g b a
+      | otherwise = goX x0 (y * iw * 4) y n r g b a
+    goX !x !row !y !n !r !g !b !a
+      | x >= x1 = goY (y + 1) n r g b a
+      | x < 0 || x >= iw = goX (x + 1) row y n r g b a
+      | otherwise =
+          let o = row + x * 4
+          in goX (x + 1) row y (n + 1)
+                 (r + fromIntegral (unsafeAt pix o))
+                 (g + fromIntegral (unsafeAt pix (o + 1)))
+                 (b + fromIntegral (unsafeAt pix (o + 2)))
+                 (a + fromIntegral (unsafeAt pix (o + 3)))
 
 -- | Area-average a source crop rectangle @(cropX, cropY, cropW, cropH)@ down
 -- to exactly @outW x outH@ raw RGBA bytes — the pixel payload for the
