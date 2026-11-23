@@ -39,6 +39,7 @@ module Cmedit.Image
   , maxPixels
   , decodeFrames
   , decodePNGParts
+  , pngParRetry
   , decodeGIFFrames
   , sniffImage
   , renderImage
@@ -897,15 +898,33 @@ lzwSlowEmit prefix suffix stack root count sink c outPos = do
 decodePNG :: BS.ByteString -> Either String Image
 decodePNG bs = do
   when' (BS.length bs < 8 || BS.take 8 bs /= pngSig) "not a PNG file"
-  pngChunks bs 8 Nothing BS.empty BS.empty [] >>= decodePNGParts
+  parts <- pngChunks bs 8 Nothing BS.empty BS.empty []
+  -- The chunks are slices of bs, so the second decode reads them again.
+  case decodePNGParts True parts of
+    Left e | e == pngParRetry -> decodePNGParts False parts
+    r -> r
+
+-- | What 'decodePNGParts' answers when its parallel stage was interrupted
+-- and the thunk forced again (see 'parOrderedResumable'): the rows are then
+-- in an unknown state, and the caller must decode again from the chunks
+-- with the stage off. 'decodePNG' does; a caller whose payloads were a
+-- stream it cannot replay has to read them again (@Cmedit.App.streamPng@
+-- gives the file to the whole-file read).
+pngParRetry :: String
+pngParRetry = "\0PNG parallel stage interrupted"
 
 -- | 'decodePNG' from a file's chunks, already walked: IHDR's fields, PLTE,
 -- tRNS and the IDAT payloads in order. The payloads are consumed as a
 -- stream (see 'inflateIntoSegs'), so a lazily read list of them is never
 -- resident as a whole; the editor reads a PNG that way (@Cmedit.App.streamPng@).
-decodePNGParts :: ((Int,Int,Int,Int,Int), BS.ByteString, BS.ByteString, [BS.ByteString])
+--
+-- @allowPar@ permits unfiltering rows on several capabilities ('pngParJobs',
+-- 'pngWaveJob'); with it the answer may be @Left pngParRetry@, which is not
+-- an error to show but a request to call again with 'False'.
+decodePNGParts :: Bool
+               -> ((Int,Int,Int,Int,Int), BS.ByteString, BS.ByteString, [BS.ByteString])
                -> Either String Image
-decodePNGParts (ihdr, plte, trns, idats) = do
+decodePNGParts allowPar (ihdr, plte, trns, idats) = do
   let (w,h,bd,ct,interlace) = ihdr
   checkDims w h
   chans <- pngChannels ct
@@ -1001,7 +1020,7 @@ decodePNGParts (ihdr, plte, trns, idats) = do
                        unsafeRead recon (i + 2) >>= unsafeWrite a (o + 2)
                        unsafeRead recon (i + 3) >>= unsafeWrite a (o + 3)
            (2, 8) | Nothing <- rgbTrans ->
-                     \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
+                     \recon ro o0 st n -> if st == 4 && pngWordsOk then pngRgbRow recon ro a o0 n else forLoop 0 (n-1) $ \px -> do
                        let i = ro + 3*px
                        r <- unsafeRead recon i
                        g <- unsafeRead recon (i + 1)
@@ -1104,6 +1123,9 @@ decodePNGParts (ihdr, plte, trns, idats) = do
      -- Eight-bit RGB and RGBA, not interlaced, go from the filtered row
      -- straight to the output ('pngFuseRow').
      let fused = inPlace && pngWordsOk && bd == 8 && (ct == 6 || (ct == 2 && isNothing rgbTrans))
+     nwAll <- if allowPar then unsafeIOToST parWorkers else pure 1
+     let nw = min 4 nwAll
+     interrupted <- newSTRef False
      _ <- foldM (\off (x0,y0,dx,dy,pw,ph) ->
              if pw <= 0 || ph <= 0 then pure off else do
                let !rb = rowBytes pw
@@ -1111,10 +1133,31 @@ decodePNGParts (ihdr, plte, trns, idats) = do
                    !o0 = (y0*w + x0)*4
                    !ostep = dy*w*4
                    !st = 4*dx
-               unfilterPngRow rawArr l0 bpp rb zrow 0 False
-               if fused
+                   unfilterRow ry
+                     | ry == 0 = unfilterPngRow rawArr l0 bpp rb zrow 0 False
+                     | otherwise = let !l = l0 + ry*(1+rb)
+                                   in unfilterPngRow rawArr l bpp rb rawArr (l - rb) pngWordsOk
+               jobs <- if inPlace && pngWordsOk && nw > 1 && ph >= 64 && ph*rb >= 0x100000
+                         then pngParJobs rawArr l0 rb ph (4*nw) else pure []
+               if not (null jobs)
+                 then do
+                   -- Runs of rows that begin with a row no filter ties to
+                   -- the one above it, each unfiltered where it lies by one
+                   -- worker: a job reads and writes its own rows only, so
+                   -- the result does not depend on the schedule. The rows
+                   -- are converted afterwards, in order, as the in-place
+                   -- argument requires.
+                   let jobArr = listArray (0, length jobs - 1) jobs :: Array Int (Int, Int)
+                       job j = let (r0, r1) = jobArr A.! j in forLoop r0 (r1 - 1) unfilterRow
+                   ok <- unsafeIOToST $ parOrderedResumable nw nw (length jobs)
+                           (\j -> unsafeSTToIO (job j)) (\_ _ -> pure True)
+                   if ok then forLoop 0 (ph-1) $ \ry ->
+                                conv rawArr (l0 + ry*(1+rb) + 1) (o0 + ry*ostep) st pw
+                         else writeSTRef interrupted True
+                 else if fused
                  then do
                    -- (inPlace: rawArr is a, and the pass is the image.)
+                   unfilterRow 0
                    conv rawArr (l0 + 1) o0 st pw
                    forLoop 1 (ph-1) $ \ry -> do
                      let !l = l0 + ry*(1+rb)
@@ -1122,15 +1165,17 @@ decodePNGParts (ihdr, plte, trns, idats) = do
                      if bpp == 3 then pngFuseRow3 (fromIntegral ft) a (l + 1) (ry*ostep) pw
                                  else pngFuseRow4 (fromIntegral ft) a (l + 1) (ry*ostep) pw
                  else do
+                   unfilterRow 0
                    forLoop 1 (ph-1) $ \ry -> do
-                     let !l = l0 + ry*(1+rb)
-                     unfilterPngRow rawArr l bpp rb rawArr (l - rb) pngWordsOk
-                     conv rawArr (l - rb) (o0 + (ry-1)*ostep) st pw
+                     unfilterRow ry
+                     conv rawArr (l0 + (ry-1)*(1+rb) + 1) (o0 + (ry-1)*ostep) st pw
                    conv rawArr (l0 + (ph-1)*(1+rb) + 1) (o0 + (ph-1)*ostep) st pw
                pure (off + ph*(1+rb)))
            0 passes
-     a' <- if bufSize > outSize then shrinkBytes a outSize else pure a
-     Right <$> unsafeFreeze a'
+     stopped <- readSTRef interrupted
+     if stopped then pure (Left pngParRetry) else do
+       a' <- if bufSize > outSize then shrinkBytes a outSize else pure a
+       Right <$> unsafeFreeze a'
   pure (Image w h "PNG" px)
 
 -- Unfilter one row where it lies. Dispatch once per row and read only the
@@ -1150,8 +1195,10 @@ unfilterPngRow raw lineOff bpp rb prev prevOff wordsOk = do
       -- d: from a row position to the same byte of the row above.
       !d = prevOff - rowOff
   case ftype of
-    1 -> pngSubBytes raw (rowOff + lead) end bpp
-    2 -> pngUpBytes raw rowOff end prev d
+    1 -> if wordsOk then pngSubWords bpp raw (rowOff + lead) end
+                    else pngSubBytes raw (rowOff + lead) end bpp
+    2 -> if wordsOk then pngUpWords raw rowOff end d
+                    else pngUpBytes raw rowOff end prev d
     3 -> do
       let goLead !i | i >= rowOff + lead = pure ()
                     | otherwise = do
@@ -1160,7 +1207,8 @@ unfilterPngRow raw lineOff bpp rb prev prevOff wordsOk = do
                         unsafeWrite raw i (v + (b `shiftR` 1))
                         goLead (i + 1)
       goLead rowOff
-      pngAvgBytes raw (rowOff + lead) end bpp prev d
+      if wordsOk then pngAvgWords bpp raw (rowOff + lead) end d
+                 else pngAvgBytes raw (rowOff + lead) end bpp prev d
     4 -> do
       pngUpBytes raw rowOff (rowOff + lead) prev d
       let from = rowOff + lead
@@ -1229,7 +1277,7 @@ pngPaethWords nb raw from end d
   | otherwise = do
       a <- pngRd32 raw (from - nb)
       c <- pngRd32 raw (from - nb + d)
-      go1 from (spread a) (spread c)
+      go1 from (spreadN a) (spreadN c)
   where
     lw = if nb > 4 then 8 else 4 :: Int
     lo32 v = v .&. 0xffffffff
@@ -1238,15 +1286,20 @@ pngPaethWords nb raw from end d
                 in (v1 .|. (v1 `unsafeShiftL` 8)) .&. 0x00ff00ff00ff00ff
     squeeze v0 = let v1 = (v0 .|. (v0 `unsafeShiftR` 8)) .&. 0x0000ffff0000ffff
                  in (v1 .|. (v1 `unsafeShiftR` 16)) .&. 0xffffffff
+    -- Three bytes spread with one multiplication (see 'pngFuse'); the
+    -- lanes then hold bytes 0, 2, 1, which only the store needs to know.
+    spreadN v = if nb == 3 then ((v .&. 0xffffff) * 0x1000001000001) .&. 0x000000ff00ff00ff
+                           else spread v
+    squeezeN v = if nb == 3 then (v .|. (v `unsafeShiftR` 24)) .&. 0xffffff else squeeze v
     step a b c x = (x + paethLanes a b c) .&. 0x00ff00ff00ff00ff
     go1 !i !a !c
       | i + 4 > end = pngPaethBytes raw i end nb raw d
       | otherwise = do
           x <- pngRd32 raw i
           b0 <- pngRd32 raw (i + d)
-          let b = spread b0
-              r = step a b c (spread x)
-              o = squeeze r
+          let b = spreadN b0
+              r = step a b c (spreadN x)
+              o = squeezeN r
           case nb of
             1 -> unsafeWrite raw i (fromIntegral o)
             2 -> pngWr16 raw i o
@@ -1500,6 +1553,114 @@ pngPalRow4 pal src ro out o0 st n = pngPalRow 4 pal src ro out o0 st n
 {-# NOINLINE pngPalRow1 #-}
 {-# NOINLINE pngPalRow2 #-}
 {-# NOINLINE pngPalRow4 #-}
+
+-- Sub (ft 1) or Average (ft 3) over whole pixels of nb bytes, in place,
+-- both literals at every call. As in 'pngPaethWords' the left pixel is
+-- carried in a register and the row above is d bytes away in the same
+-- array, but a pixel stays packed: both filters are additions within byte
+-- lanes ('swarAdd'; the average of two bytes is their common bits plus half
+-- their differing ones). Bytes loaded past the pixel are lanes nobody
+-- stores.
+{-# INLINE pngAddWords #-}
+pngAddWords :: Int -> Int -> STUArray s Int Word8 -> Int -> Int -> Int -> ST s ()
+pngAddWords ft nb raw from end d
+  | from + lw > end = bytes from
+  | otherwise = load (from - nb) >>= go from
+  where
+    lw = if nb > 4 then 8 else 4 :: Int
+    load i = if nb > 4 then pngRd64 raw i else pngRd32 raw i
+    bytes i = if ft == 1 then pngSubBytes raw i end nb else pngAvgBytes raw i end nb raw d
+    go !i !a
+      | i + lw > end = bytes i
+      | otherwise = do
+          x <- load i
+          r <- if ft == 1 then pure (swarAdd x a) else do
+                 b <- load (i + d)
+                 pure (swarAdd x ((a .&. b) + (((a `xor` b) .&. 0xfefefefefefefefe) `unsafeShiftR` 1)))
+          case nb of
+            1 -> unsafeWrite raw i (fromIntegral r)
+            2 -> pngWr16 raw i r
+            3 -> pngWr16 raw i r >> unsafeWrite raw (i + 2) (fromIntegral (r `unsafeShiftR` 16))
+            4 -> pngWr32 raw i r
+            6 -> pngWr32 raw i r >> pngWr16 raw (i + 4) (r `unsafeShiftR` 32)
+            _ -> pngWr64 raw i r
+          go (i + nb) r
+
+-- (bytes per pixel, buffer, from, end[, distance to the row above])
+pngSubWords :: Int -> STUArray s Int Word8 -> Int -> Int -> ST s ()
+pngSubWords bpp raw from end = case bpp of
+  1 -> pngAddWords 1 1 raw from end 0
+  2 -> pngAddWords 1 2 raw from end 0
+  3 -> pngAddWords 1 3 raw from end 0
+  4 -> pngAddWords 1 4 raw from end 0
+  6 -> pngAddWords 1 6 raw from end 0
+  8 -> pngAddWords 1 8 raw from end 0
+  _ -> pngSubBytes raw from end bpp
+{-# NOINLINE pngSubWords #-}
+
+pngAvgWords :: Int -> STUArray s Int Word8 -> Int -> Int -> Int -> ST s ()
+pngAvgWords bpp raw from end d = case bpp of
+  1 -> pngAddWords 3 1 raw from end d
+  2 -> pngAddWords 3 2 raw from end d
+  3 -> pngAddWords 3 3 raw from end d
+  4 -> pngAddWords 3 4 raw from end d
+  6 -> pngAddWords 3 6 raw from end d
+  8 -> pngAddWords 3 8 raw from end d
+  _ -> pngAvgBytes raw from end bpp raw d
+{-# NOINLINE pngAvgWords #-}
+
+-- Up, eight bytes at a time; the row above is d bytes away.
+pngUpWords :: STUArray s Int Word8 -> Int -> Int -> Int -> ST s ()
+pngUpWords raw from end d = go from
+  where go !i | i + 8 > end = pngUpBytes raw i end raw d
+              | otherwise = do
+                  x <- pngRd64 raw i
+                  b <- pngRd64 raw (i + d)
+                  pngWr64 raw i (swarAdd x b)
+                  go (i + 8)
+
+-- Where to cut a pass of ph rows (filter bytes at l0, l0 + 1 + rb, ...)
+-- into about njobs runs that can be unfiltered independently: a run starts
+-- at a row whose filter does not read the row above (None, Sub or an
+-- unknown type; the first row reads zeros). Encoders that choose a filter
+-- per row emit such rows regularly. The answer is [] when the cut is not
+-- worth making: fewer than two runs, one run of more than half the rows
+-- (the workers would wait for it), or mostly rows that need no work.
+pngParJobs :: STUArray s Int Word8 -> Int -> Int -> Int -> Int -> ST s [(Int, Int)]
+pngParJobs raw l0 rb ph njobs = go 1 0 1 0 0 []
+  where
+    -- y: row; s: start of the open run; k: next cut is due at row k*ph/njobs;
+    -- dep: rows that read the row above; big: longest run so far.
+    go !y !s !k !dep !big acc
+      | y >= ph =
+          let runs = reverse ((s, ph) : acc)
+              big' = max big (ph - s)
+          in pure (if null acc || 2*big' > ph || 2*dep < ph then [] else runs)
+      | otherwise = do
+          ft <- unsafeRead raw (l0 + y*(1+rb))
+          let needsAbove = ft >= 2 && ft <= 4
+          if not needsAbove && y*njobs >= k*ph
+            then go (y + 1) y (y*njobs `quot` ph + 1) dep (max big (y - s)) ((s, y) : acc)
+            else go (y + 1) s k (if needsAbove then dep + 1 else dep) big acc
+
+-- A row of 8-bit RGB to opaque RGBA, a pixel per word. The fourth byte
+-- loaded is the next pixel's first, so the last pixel goes a byte at a
+-- time; in place, each word is read before the write that may overlap it.
+pngRgbRow :: STUArray s Int Word8 -> Int -> STUArray s Int Word8 -> Int -> Int -> ST s ()
+pngRgbRow src !ro out !o0 !n = go ro o0
+  where
+    !oLast = o0 + 4*(n - 1)
+    go !i !o
+      | o < oLast = do
+          x <- pngRd32 src i
+          pngWr32 out o (x .|. 0xff000000)
+          go (i + 3) (o + 4)
+      | otherwise = do
+          r <- unsafeRead src i
+          g <- unsafeRead src (i + 1)
+          b <- unsafeRead src (i + 2)
+          unsafeWrite out o r; unsafeWrite out (o + 1) g; unsafeWrite out (o + 2) b
+          unsafeWrite out (o + 3) 255
 
 -- The byte-at-a-time filter loops over raw[from, end), in place.
 pngSubBytes :: STUArray s Int Word8 -> Int -> Int -> Int -> ST s ()

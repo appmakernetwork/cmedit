@@ -72,7 +72,7 @@ import Cmedit.Definition (DefReq(..))
 import qualified Cmedit.Definition as D
 import Cmedit.Editor
 import Cmedit.Gfx
-import Cmedit.Image (Image, imgW, imgH, sniffImage, decodeFrames, decodeJPEGScaled, jpegDims, jpegFitScale, scaleRGBA, jpegCostHint, decodePNGParts)
+import Cmedit.Image (Image, imgW, imgH, sniffImage, decodeFrames, decodeJPEGScaled, jpegDims, jpegFitScale, scaleRGBA, jpegCostHint, decodePNGParts, pngParRetry)
 import System.IO.Unsafe (unsafeInterleaveIO)
 import Data.Bits (shiftL, (.|.))
 import Cmedit.Jobs (JobTable, newJobTable, startJobIn, cancelJobIn)
@@ -2868,11 +2868,14 @@ classifyFileWith pagedOK path = do
 -- count). Its answer differs from that one only if IHDR, PLTE or tRNS
 -- appears after the first IDAT (a later one wins there) or no IHDR precedes
 -- it; after the decode the rest of the chunk table is walked, by headers, to
--- rule that out. That, a read that fails or comes up short, or a file whose
--- size or mtime moved while it was read, makes the attempt Nothing.
+-- rule that out. That, a read that fails or comes up short, a file whose
+-- size or mtime moved while it was read, or a decode that asks to be run
+-- again ('pngParRetry'), makes the attempt Nothing.
 streamPng :: FilePath -> IO (Maybe LoadOutcome)
 streamPng path = do
-  r <- try (withBinaryFile path ReadMode go) :: IO (Either SomeException (Maybe LoadOutcome))
+  -- ('trySync': a kill aimed at the loading thread must end it, not turn
+  -- into a second, whole-file decode of a picture nobody is waiting for.)
+  r <- trySync (withBinaryFile path ReadMode go)
   pure (either (const Nothing) id r)
   where
     go h = do
@@ -2962,16 +2965,16 @@ streamPng path = do
       (firstIdat, mihdr, plte, trns) <- prefix 8 Nothing BS.empty BS.empty
       result <- case (firstIdat, mihdr) of
         (_, Nothing) -> pure Nothing            -- an IHDR may yet follow: not ours to say
-        (Nothing, Just ih) -> Just <$> force (decodePNGParts (ih, plte, trns, []))
+        (Nothing, Just ih) -> replayable <$> force (decodePNGParts True (ih, plte, trns, []))
         (Just p0, Just ih) -> do
           -- The walk stands at the first IDAT until the decoder pulls
           -- something (it may reject the picture without reading any).
           writeIORef walkPos (Just p0)
           idats <- chunks p0
-          d <- force (decodePNGParts (ih, plte, trns, idats))
+          d <- force (decodePNGParts True (ih, plte, trns, idats))
           writeIORef cur (0, BS.empty)
           readIORef walkPos >>= maybe (pure ()) (\p -> tailWalk p 100000)
-          pure (Just d)
+          pure (replayable d)
       failed <- (||) <$> readIORef bad <*> readIORef late
       size1 <- hFileSize h
       mt1 <- fileMtime path
@@ -2980,6 +2983,13 @@ streamPng path = do
           Left err  -> OutError (takeFileName path ++ ": " ++ err)
           Right img -> OutImage path (fullDecode [(img, 0)]) { dcMtime = mt1, dcStream = False }
         _ -> Nothing
+    -- The decoder asking to be run again without its parallel stage: the
+    -- payloads it was given were this handle's reads, consumed and gone,
+    -- so nothing here can be replayed. The attempt is Nothing, and the
+    -- whole-file read decodes the file from its bytes.
+    replayable d = case d of
+      Left err | err == pngParRetry -> Nothing
+      _ -> Just d
     force d = case d of
       Left err -> evaluate (length err) >> pure d
       Right img -> evaluate (imgW img) >> pure d
