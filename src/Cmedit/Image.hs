@@ -1031,54 +1031,105 @@ decodePNG bs = do
                   unsafeWrite a (o + 1) (fromIntegral g)
                   unsafeWrite a (o + 2) (fromIntegral b)
                   unsafeWrite a (o + 3) (fromIntegral al)
+     -- Rows are unfiltered where they were inflated: the row above is the
+     -- unfiltered raw row above, and the first row of a pass reads a row of
+     -- zeros instead. In place, converting row y can overwrite raw row y
+     -- (never row y+1, by the argument above), so a row is converted only
+     -- after the row below it has been unfiltered against it.
+     zrow <- newBytes (rowBytes w + 8)
      _ <- foldM (\off (x0,y0,dx,dy,pw,ph) ->
              if pw <= 0 || ph <= 0 then pure off else do
-               let rb = rowBytes pw
-               -- Only this row and its predecessor are needed. Start each
-               -- Adam7 pass with a zero predecessor, then alternate the slots.
-               recon <- newArray (0, 2*rb - 1) 0 :: ST s (STUArray s Int Word8)
-               forLoop 0 (ph-1) $ \ry -> do
-                 let lineOff = off + ry*(1+rb)
-                     rowOff = (ry .&. 1)*rb
-                 unfilterPngRow rawArr (base + lineOff) bpp rb recon rowOff (rb-rowOff)
-                 -- Convert before reusing the row's scratch slot.
-                 conv recon rowOff (((y0 + ry*dy)*w + x0)*4) (4*dx) pw
+               let !rb = rowBytes pw
+                   !l0 = base + off
+                   !o0 = (y0*w + x0)*4
+                   !ostep = dy*w*4
+                   !st = 4*dx
+               unfilterPngRow rawArr l0 bpp rb zrow 0
+               forLoop 1 (ph-1) $ \ry -> do
+                 let !l = l0 + ry*(1+rb)
+                 unfilterPngRow rawArr l bpp rb rawArr (l - rb)
+                 conv rawArr (l - rb) (o0 + (ry-1)*ostep) st pw
+               conv rawArr (l0 + (ph-1)*(1+rb) + 1) (o0 + (ph-1)*ostep) st pw
                pure (off + ph*(1+rb)))
            0 passes
      a' <- if bufSize > outSize then shrinkBytes a outSize else pure a
      Right <$> unsafeFreeze a'
   pure (Image w h "PNG" px)
 
--- Dispatch once per row and read only the neighbours used by that filter.
--- Each loop is split at bpp: before it there is no left neighbour, so Sub
--- and None copy, Average halves the byte above, and Paeth (whose predictor
+-- Unfilter one row where it lies. Dispatch once per row and read only the
+-- neighbours used by that filter. Each loop is split at bpp: before it there
+-- is no left neighbour, so Sub leaves the bytes alone, Average halves the byte above, and Paeth (whose predictor
 -- with left = upper-left = 0 is always the byte above) takes the byte above.
 -- Reads of the inflated stream are unchecked: it is exactly as long as the
 -- passes' rows, which is what 'inflate' was asked for.
-{-# INLINE unfilterPngRow #-}
+{-# NOINLINE unfilterPngRow #-}
 unfilterPngRow :: STUArray s Int Word8 -> Int -> Int -> Int
-               -> STUArray s Int Word8 -> Int -> Int -> ST s ()
-unfilterPngRow raw lineOff bpp rb recon rowOff prevOff = do
+               -> STUArray s Int Word8 -> Int -> ST s ()
+unfilterPngRow raw lineOff bpp rb prev prevOff = do
   ftype <- unsafeRead raw lineOff
-  let lead = min bpp rb
-      left i = (fromIntegral :: Word8 -> Int) <$> unsafeRead recon (rowOff+i-bpp)
-      above i = (fromIntegral :: Word8 -> Int) <$> unsafeRead recon (prevOff+i)
-      put i predictor = do
-        v <- (fromIntegral :: Word8 -> Int) <$> unsafeRead raw (lineOff+1+i)
-        unsafeWrite recon (rowOff+i) (fromIntegral (v + predictor))
+  let !lead = min bpp rb
+      !rowOff = lineOff + 1
+      !end = rowOff + rb
+      -- d: from a row position to the same byte of the row above.
+      !d = prevOff - rowOff
   case ftype of
-    1 -> do forLoop 0 (lead-1) $ \i -> put i 0
-            forLoop lead (rb-1) $ \i -> left i >>= put i
-    2 -> forLoop 0 (rb-1) $ \i -> above i >>= put i
-    3 -> do forLoop 0 (lead-1) $ \i -> do b <- above i; put i (b `shiftR` 1)
-            forLoop lead (rb-1) $ \i -> do
-              a <- left i; b <- above i
-              put i ((a+b) `shiftR` 1)
-    4 -> do forLoop 0 (lead-1) $ \i -> above i >>= put i
-            forLoop lead (rb-1) $ \i -> do
-              a <- left i; b <- above i; c <- above (i-bpp)
-              put i (paethPredict 4 a b c)
-    _ -> copyBytesU8 raw (lineOff+1) recon rowOff rb   -- None (and unknown): a copy
+    1 -> pngSubBytes raw (rowOff + lead) end bpp
+    2 -> pngUpBytes raw rowOff end prev d
+    3 -> do
+      let goLead !i | i >= rowOff + lead = pure ()
+                    | otherwise = do
+                        v <- unsafeRead raw i
+                        b <- unsafeRead prev (i + d)
+                        unsafeWrite raw i (v + (b `shiftR` 1))
+                        goLead (i + 1)
+      goLead rowOff
+      pngAvgBytes raw (rowOff + lead) end bpp prev d
+    4 -> do
+      pngUpBytes raw rowOff (rowOff + lead) prev d
+      pngPaethBytes raw (rowOff + lead) end bpp prev d
+    _ -> pure ()   -- None (and unknown): the row is already itself
+
+-- The byte-at-a-time filter loops over raw[from, end), in place.
+pngSubBytes :: STUArray s Int Word8 -> Int -> Int -> Int -> ST s ()
+pngSubBytes raw from end bpp = go from
+  where go !i | i >= end = pure ()
+              | otherwise = do
+                  v <- unsafeRead raw i
+                  a <- unsafeRead raw (i - bpp)
+                  unsafeWrite raw i (v + a)
+                  go (i + 1)
+
+pngUpBytes :: STUArray s Int Word8 -> Int -> Int -> STUArray s Int Word8 -> Int -> ST s ()
+pngUpBytes raw from end prev d = go from
+  where go !i | i >= end = pure ()
+              | otherwise = do
+                  v <- unsafeRead raw i
+                  b <- unsafeRead prev (i + d)
+                  unsafeWrite raw i (v + b)
+                  go (i + 1)
+
+pngAvgBytes :: STUArray s Int Word8 -> Int -> Int -> Int -> STUArray s Int Word8 -> Int -> ST s ()
+pngAvgBytes raw from end bpp prev d = go from
+  where go !i | i >= end = pure ()
+              | otherwise = do
+                  v <- unsafeRead raw i
+                  a <- unsafeRead raw (i - bpp)
+                  b <- unsafeRead prev (i + d)
+                  let m = (fromIntegral a + fromIntegral b :: Int) `shiftR` 1
+                  unsafeWrite raw i (v + fromIntegral m)
+                  go (i + 1)
+
+pngPaethBytes :: STUArray s Int Word8 -> Int -> Int -> Int -> STUArray s Int Word8 -> Int -> ST s ()
+pngPaethBytes raw from end bpp prev d = go from
+  where go !i | i >= end = pure ()
+              | otherwise = do
+                  v <- unsafeRead raw i
+                  a <- unsafeRead raw (i - bpp)
+                  b <- unsafeRead prev (i + d)
+                  c <- unsafeRead prev (i + d - bpp)
+                  let pr = paethPredict 4 (fromIntegral a) (fromIntegral b) (fromIntegral c)
+                  unsafeWrite raw i (v + fromIntegral pr)
+                  go (i + 1)
 
 -- Convert one pixel (component samples) from an unfiltered scanline to RGBA.
 {-# INLINE pngPixel #-}
