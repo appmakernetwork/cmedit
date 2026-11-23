@@ -266,12 +266,11 @@ le64Raw addr# fpc (I# pos#) =
 
 -- Non-empty input slices with cumulative byte offsets, padded with one
 -- trailing sentinel so @segStarts ! (k + 1)@ is always in bounds for @k <= n@.
-data Segs = Segs
-  { segCount  :: !Int
-  , segTotal  :: !Int
-  , segStarts :: !(UArray Int Int)
-  , segArr    :: !(Array Int BS.ByteString)
-  }
+data Segs = Segs !Int !Int !(UArray Int Int) !(Array Int BS.ByteString)
+
+{-# INLINE segTotal #-}
+segTotal :: Segs -> Int
+segTotal (Segs _ tot _ _) = tot
 
 mkSegs :: [BS.ByteString] -> Segs
 mkSegs raw =
@@ -540,7 +539,7 @@ buildClTableST !lens !counts !offs !syms !table = do
 
 -- Combined 2-level lit/len table entry encoding (signed Int):
 --   e < 0                         : LITERAL  (minBound | bytes<<8 | cnt<<4 | totLen)
---   0 < e < 0x40000000            : LENGTH   (lenBase<<16 | extraMask<<8 | extraBits<<4 | len)
+--   0 < e < 0x40000000            : LENGTH   (lenBase<<16 | extraMask<<8 | (len+extraBits)<<4 | len)
 --   0x40000000 <= e < 0x50000000  : EOB      (0x40000000 | len)
 --   0x50000000 <= e < 0x60000000  : SUBTABLE (0x50000000 | subMask<<16 | subOff<<4 | litRootBits)
 --   e >= 0x60000000               : INVALID  (0x60000000 | len)
@@ -560,11 +559,11 @@ mkLitEntry !sym !len
              let !lb = lenBase `unsafeAt` li
                  !ex = lenExtra `unsafeAt` li
                  !em = (1 `unsafeShiftL` ex) - 1
-             in (lb `unsafeShiftL` 16) .|. (em `unsafeShiftL` 8) .|. (ex `unsafeShiftL` 4) .|. len
+             in (lb `unsafeShiftL` 16) .|. (em `unsafeShiftL` 8) .|. ((len + ex) `unsafeShiftL` 4) .|. len
            else 0x60000000 .|. len
 
 -- Combined 2-level distance table entry encoding (signed Int):
---   de > 0                        : VALID    (dmask<<32 [64-bit] | distBase<<16 | extraBits<<4 | len)
+--   de > 0                        : VALID    (dmask<<32 [64-bit] | distBase<<16 | (len+extraBits)<<4 | len)
 --   de < 0 && de .&. 0x40000000==0: SUBTABLE (minBound | subMask<<16 | subOff<<4 | distRootBits)
 --   de < 0 && de .&. 0x40000000/=0: INVALID  (minBound | 0x40000000 | len)
 --   de == 0                       : slow canonical walk fallback
@@ -576,7 +575,7 @@ mkDistEntry !sym !len
           !ex = distExtra `unsafeAt` sym
           !dm = (1 `unsafeShiftL` ex) - 1
           !hi = if finiteBitSize (0 :: Int) == 64 then dm `unsafeShiftL` 32 else 0
-      in hi .|. (db `unsafeShiftL` 16) .|. (ex `unsafeShiftL` 4) .|. len
+      in hi .|. (db `unsafeShiftL` 16) .|. ((len + ex) `unsafeShiftL` 4) .|. len
   | otherwise = litFlag .|. 0x40000000 .|. len
 
 {-# NOINLINE buildLitTableST #-}
@@ -1018,20 +1017,18 @@ huffFastLoop cur0# endPtr# arr# !base !fastOutEnd !tbl !bb0 !bc0 !o0 =
                 else if e2 > 0 && e2 < 0x40000000
                   then
                     let !llen  = e2 .&. 15
-                        !lex   = (e2 `unsafeShiftR` 4) .&. 15
+                        !ltot  = (e2 `unsafeShiftR` 4) .&. 15
                         !lmask = (e2 `unsafeShiftR` 8) .&. 31
-                        !bb3   = bb2 `unsafeShiftR` llen
-                        !mlen  = (e2 `unsafeShiftR` 16) + (fromIntegral bb3 .&. lmask)
-                    in decodeDist cur1# (bb3 `unsafeShiftR` lex) (bc2 - llen - lex) o2 mlen
+                        !mlen  = (e2 `unsafeShiftR` 16) + (fromIntegral (bb2 `unsafeShiftR` llen) .&. lmask)
+                    in decodeDist cur1# (bb2 `unsafeShiftR` ltot) (bc2 - ltot) o2 mlen
                   else loop cur1# bb2 bc2 o2
             else if e > 0 && e < 0x40000000
               then
                 let !llen  = e .&. 15
-                    !lex   = (e `unsafeShiftR` 4) .&. 15
+                    !ltot  = (e `unsafeShiftR` 4) .&. 15
                     !lmask = (e `unsafeShiftR` 8) .&. 31
-                    !bb2   = bb1 `unsafeShiftR` llen
-                    !mlen  = (e `unsafeShiftR` 16) + (fromIntegral bb2 .&. lmask)
-                in decodeDist cur1# (bb2 `unsafeShiftR` lex) (bc1 - llen - lex) o mlen
+                    !mlen  = (e `unsafeShiftR` 16) + (fromIntegral (bb1 `unsafeShiftR` llen) .&. lmask)
+                in decodeDist cur1# (bb1 `unsafeShiftR` ltot) (bc1 - ltot) o mlen
               else if e >= 0x40000000
                 then if e < 0x50000000
                   then let !len = e .&. 15 in ret 0 cur1# (bb1 `unsafeShiftR` len) (bc1 - len) o
@@ -1050,11 +1047,10 @@ huffFastLoop cur0# endPtr# arr# !base !fastOutEnd !tbl !bb0 !bc0 !o0 =
                         else if se > 0 && se < 0x40000000
                           then
                             let !llen  = se .&. 15
-                                !lex   = (se `unsafeShiftR` 4) .&. 15
+                                !ltot  = (se `unsafeShiftR` 4) .&. 15
                                 !lmask = (se `unsafeShiftR` 8) .&. 31
-                                !bb3   = bb2 `unsafeShiftR` llen
-                                !mlen  = (se `unsafeShiftR` 16) + (fromIntegral bb3 .&. lmask)
-                            in decodeDist cur1# (bb3 `unsafeShiftR` lex) (bc2 - llen - lex) o mlen
+                                !mlen  = (se `unsafeShiftR` 16) + (fromIntegral (bb2 `unsafeShiftR` llen) .&. lmask)
+                            in decodeDist cur1# (bb2 `unsafeShiftR` ltot) (bc2 - ltot) o mlen
                           else if se >= 0x40000000
                             then if se < 0x50000000
                               then let !len = se .&. 15 in ret 0 cur1# (bb2 `unsafeShiftR` len) (bc2 - len) o
@@ -1067,11 +1063,10 @@ huffFastLoop cur0# endPtr# arr# !base !fastOutEnd !tbl !bb0 !bc0 !o0 =
       if de > 0
         then
           let !dlen  = de .&. 15
-              !dex   = (de `unsafeShiftR` 4) .&. 15
-              !bb1   = bb `unsafeShiftR` dlen
-              !dmask = if finiteBitSize (0 :: Int) == 64 then de `unsafeShiftR` 32 else (1 `unsafeShiftL` dex) - 1
-              !d     = ((de `unsafeShiftR` 16) .&. 0x7FFF) + (fromIntegral bb1 .&. dmask)
-          in doCopy cur# (bb1 `unsafeShiftR` dex) (bc - dlen - dex) o mlen d
+              !dtot  = (de `unsafeShiftR` 4) .&. 31
+              !dmask = if finiteBitSize (0 :: Int) == 64 then de `unsafeShiftR` 32 else (1 `unsafeShiftL` (dtot - dlen)) - 1
+              !d     = ((de `unsafeShiftR` 16) .&. 0x7FFF) + (fromIntegral (bb `unsafeShiftR` dlen) .&. dmask)
+          in doCopy cur# (bb `unsafeShiftR` dtot) (bc - dtot) o mlen d
         else if de < 0
           then if (de .&. 0x40000000) == 0
             then do
@@ -1083,11 +1078,10 @@ huffFastLoop cur0# endPtr# arr# !base !fastOutEnd !tbl !bb0 !bc0 !o0 =
               if sde > 0
                 then
                   let !dlen  = sde .&. 15
-                      !dex   = (sde `unsafeShiftR` 4) .&. 15
-                      !bb2   = bb1 `unsafeShiftR` dlen
-                      !dmask = if finiteBitSize (0 :: Int) == 64 then sde `unsafeShiftR` 32 else (1 `unsafeShiftL` dex) - 1
-                      !d     = ((sde `unsafeShiftR` 16) .&. 0x7FFF) + (fromIntegral bb2 .&. dmask)
-                  in doCopy cur# (bb2 `unsafeShiftR` dex) (bc1 - dlen - dex) o mlen d
+                      !dtot  = (sde `unsafeShiftR` 4) .&. 31
+                      !dmask = if finiteBitSize (0 :: Int) == 64 then sde `unsafeShiftR` 32 else (1 `unsafeShiftL` (dtot - dlen)) - 1
+                      !d     = ((sde `unsafeShiftR` 16) .&. 0x7FFF) + (fromIntegral (bb1 `unsafeShiftR` dlen) .&. dmask)
+                  in doCopy cur# (bb1 `unsafeShiftR` dtot) (bc1 - dtot) o mlen d
                 else if sde < 0
                   then let !dlen = sde .&. 15 in ret 3 cur# (bb1 `unsafeShiftR` dlen) (bc1 - dlen) o
                   else ret (4 + mlen) cur# bb bc o
@@ -1207,11 +1201,10 @@ huffBlockST !segs@(Segs !nSeg _ !starts !segArr) !arr@(STUArray _ _ _ arr#) !bas
         else if e > 0 && e < 0x40000000
           then
             let !llen  = e .&. 15
-                !lex   = (e `unsafeShiftR` 4) .&. 15
+                !ltot  = (e `unsafeShiftR` 4) .&. 15
                 !lmask = (e `unsafeShiftR` 8) .&. 31
-                !bb1   = bb `unsafeShiftR` llen
-                !mlen  = (e `unsafeShiftR` 16) + (fromIntegral bb1 .&. lmask)
-            in decodeDistSlow k p (bb1 `unsafeShiftR` lex) (bc - llen - lex) o mlen
+                !mlen  = (e `unsafeShiftR` 16) + (fromIntegral (bb `unsafeShiftR` llen) .&. lmask)
+            in decodeDistSlow k p (bb `unsafeShiftR` ltot) (bc - ltot) o mlen
           else if e >= 0x40000000
             then if e < 0x50000000
               then let !len = e .&. 15 in pure (BlockRes k p (bb `unsafeShiftR` len) (bc - len) o Nothing)
@@ -1230,11 +1223,10 @@ huffBlockST !segs@(Segs !nSeg _ !starts !segArr) !arr@(STUArray _ _ _ arr#) !bas
                     else if se > 0 && se < 0x40000000
                       then
                         let !llen  = se .&. 15
-                            !lex   = (se `unsafeShiftR` 4) .&. 15
+                            !ltot  = (se `unsafeShiftR` 4) .&. 15
                             !lmask = (se `unsafeShiftR` 8) .&. 31
-                            !bb2   = bb1 `unsafeShiftR` llen
-                            !mlen  = (se `unsafeShiftR` 16) + (fromIntegral bb2 .&. lmask)
-                        in decodeDistSlow k p (bb2 `unsafeShiftR` lex) (bc1 - llen - lex) o mlen
+                            !mlen  = (se `unsafeShiftR` 16) + (fromIntegral (bb1 `unsafeShiftR` llen) .&. lmask)
+                        in decodeDistSlow k p (bb1 `unsafeShiftR` ltot) (bc1 - ltot) o mlen
                       else if se >= 0x40000000
                         then if se < 0x50000000
                           then let !len = se .&. 15 in pure (BlockRes k p (bb1 `unsafeShiftR` len) (bc1 - len) o Nothing)
@@ -1269,11 +1261,10 @@ huffBlockST !segs@(Segs !nSeg _ !starts !segArr) !arr@(STUArray _ _ _ arr#) !bas
       if de > 0
         then
           let !dlen  = de .&. 15
-              !dex   = (de `unsafeShiftR` 4) .&. 15
-              !bb1   = bb `unsafeShiftR` dlen
-              !dmask = if finiteBitSize (0 :: Int) == 64 then de `unsafeShiftR` 32 else (1 `unsafeShiftL` dex) - 1
-              !d     = ((de `unsafeShiftR` 16) .&. 0x7FFF) + (fromIntegral bb1 .&. dmask)
-          in doCopySlow k p (bb1 `unsafeShiftR` dex) (bc - dlen - dex) o mlen d
+              !dtot  = (de `unsafeShiftR` 4) .&. 31
+              !dmask = if finiteBitSize (0 :: Int) == 64 then de `unsafeShiftR` 32 else (1 `unsafeShiftL` (dtot - dlen)) - 1
+              !d     = ((de `unsafeShiftR` 16) .&. 0x7FFF) + (fromIntegral (bb `unsafeShiftR` dlen) .&. dmask)
+          in doCopySlow k p (bb `unsafeShiftR` dtot) (bc - dtot) o mlen d
         else if de < 0
           then if (de .&. 0x40000000) == 0
             then do
@@ -1285,11 +1276,10 @@ huffBlockST !segs@(Segs !nSeg _ !starts !segArr) !arr@(STUArray _ _ _ arr#) !bas
               if sde > 0
                 then
                   let !dlen  = sde .&. 15
-                      !dex   = (sde `unsafeShiftR` 4) .&. 15
-                      !bb2   = bb1 `unsafeShiftR` dlen
-                      !dmask = if finiteBitSize (0 :: Int) == 64 then sde `unsafeShiftR` 32 else (1 `unsafeShiftL` dex) - 1
-                      !d     = ((sde `unsafeShiftR` 16) .&. 0x7FFF) + (fromIntegral bb2 .&. dmask)
-                  in doCopySlow k p (bb2 `unsafeShiftR` dex) (bc1 - dlen - dex) o mlen d
+                      !dtot  = (sde `unsafeShiftR` 4) .&. 31
+                      !dmask = if finiteBitSize (0 :: Int) == 64 then sde `unsafeShiftR` 32 else (1 `unsafeShiftL` (dtot - dlen)) - 1
+                      !d     = ((sde `unsafeShiftR` 16) .&. 0x7FFF) + (fromIntegral (bb1 `unsafeShiftR` dlen) .&. dmask)
+                  in doCopySlow k p (bb1 `unsafeShiftR` dtot) (bc1 - dtot) o mlen d
                 else if sde < 0
                   then let !dlen = sde .&. 15 in pure (BlockRes k p (bb1 `unsafeShiftR` dlen) (bc1 - dlen) o (Just "invalid distance code"))
                   else walkDist k p bb bc o mlen
