@@ -22,8 +22,13 @@ TESTDIR  := dist-test
 #   -T  Cheap RTS counters, so `debug-stats` / GHC.Stats can report live heap.
 #   -I2 Idle GC every 2s rather than 0.3s; the editor is idle constantly and
 #       schedules its own collection after a quiet stretch (see idleGcDelayUs).
+#   -qm No automatic thread migration between capabilities. Every capability
+#       a thread runs on touches its own allocation area, so threads that hop
+#       made the resident set grow by allocation areas nobody needed. The
+#       threads that should run elsewhere are placed explicitly instead
+#       (Cmedit.Jobs.backgroundCap, Cmedit.JxlPar.workerCap).
 # -rtsopts lets a user add +RTS -s / -hT when chasing a problem.
-RTSOPTS = -rtsopts "-with-rtsopts=--disable-delayed-os-memory-return -T -I2"
+RTSOPTS = -rtsopts "-with-rtsopts=--disable-delayed-os-memory-return -T -I2 -qm"
 
 # Packages shared by every platform; POSIX targets add -package unix.
 PKGS = -package base -package bytestring -package text -package containers \
