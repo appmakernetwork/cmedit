@@ -951,7 +951,7 @@ decodePNGParts (ihdr, plte, trns, idats) = do
       grayWords = U.listArray (0, 255)
                     [ if le then pack al g g g else pack g g g al
                     | i <- [0 .. 255]
-                    , let g = if bd < 8 && i < (1 `shiftL` bd) then scale i else 0
+                    , let g = if bd <= 8 && i < (1 `shiftL` bd) then scale i else 0
                           al = if grayTrans == Just i then 0 else 255 ] :: UArray Int Word32
       -- A pixel as one word, its bytes r, g, b, a in memory.
       rgbaWord :: Word8 -> Word8 -> Word8 -> Word8 -> Word64
@@ -1041,6 +1041,38 @@ decodePNGParts (ihdr, plte, trns, idats) = do
                        1 -> pngPalRow1 grayWords recon ro a o0 st n
                        2 -> pngPalRow2 grayWords recon ro a o0 st n
                        _ -> pngPalRow4 grayWords recon ro a o0 st n
+           -- The tRNS colour-key layouts: alpha is 0 where the samples as
+           -- stored equal the key, as in 'pngPixel'.
+           (0, 8) -> \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
+                       g <- unsafeRead recon (ro + px)
+                       pngWr32 a (o0 + px*st) (fromIntegral (grayWords `unsafeAt` fromIntegral g))
+           (0, 16) | Just t <- grayTrans ->
+                     \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
+                       let i = ro + 2*px
+                       hi <- unsafeRead recon i
+                       lo <- unsafeRead recon (i + 1)
+                       let g = if lo < hi then hi - 1 else hi
+                           al = if fromIntegral hi * 256 + fromIntegral lo == t then 0 else 255
+                       pngWr32 a (o0 + px*st) (rgbaWord g g g al)
+           (2, 8) | Just (tr, tg, tb) <- rgbTrans ->
+                     \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
+                       let i = ro + 3*px
+                       r <- unsafeRead recon i
+                       g <- unsafeRead recon (i + 1)
+                       b <- unsafeRead recon (i + 2)
+                       let al = if fromIntegral r == tr && fromIntegral g == tg
+                                   && fromIntegral b == tb then 0 else 255
+                       pngWr32 a (o0 + px*st) (rgbaWord r g b al)
+           (2, 16) | Just (tr, tg, tb) <- rgbTrans ->
+                     \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
+                       let i = ro + 6*px
+                           raw16 j = do hi <- unsafeRead recon j
+                                        lo <- unsafeRead recon (j + 1)
+                                        pure (fromIntegral hi * 256 + fromIntegral lo :: Int)
+                       rv <- raw16 i; gv <- raw16 (i + 2); bv <- raw16 (i + 4)
+                       r <- s16 recon i; g <- s16 recon (i + 2); b <- s16 recon (i + 4)
+                       let al = if rv == tr && gv == tg && bv == tb then 0 else 255
+                       pngWr32 a (o0 + px*st) (rgbaWord r g b al)
            (0, _) | bd <= 8 -> \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
                        v <- rawSampleU recon ro bd px
                        let g = fromIntegral (scale v)
