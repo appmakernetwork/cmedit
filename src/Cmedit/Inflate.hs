@@ -1,4 +1,8 @@
 {-# LANGUAGE MagicHash, UnboxedTuples, BangPatterns #-}
+-- Pinned function alignment: the decode loops measured up to ~12% apart
+-- between builds that differed only in unrelated code, from where the
+-- linker happened to place them. 64-byte alignment removes that swing.
+{-# OPTIONS_GHC -fproc-alignment=64 #-}
 -- | DEFLATE decompression (RFC 1951), hand-rolled.
 --
 -- This started life inside "Cmedit.Image" as PNG's decompressor and moved out
