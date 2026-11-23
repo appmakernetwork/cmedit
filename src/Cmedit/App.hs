@@ -14,7 +14,7 @@ module Cmedit.App
   , LoadOutcome(..)
   ) where
 
-import Control.Concurrent (ThreadId, forkIO, getNumCapabilities, killThread, myThreadId)
+import Control.Concurrent (ThreadId, forkIO, forkOn, getNumCapabilities, killThread, myThreadId)
 import Control.Concurrent.MVar (MVar, newMVar, modifyMVar, modifyMVar_, readMVar)
 import Control.Concurrent.STM
 import GHC.Conc (getNumProcessors, setNumCapabilities)
@@ -75,7 +75,8 @@ import Cmedit.Gfx
 import Cmedit.Image (Image, imgW, imgH, sniffImage, decodeFrames, decodeJPEGScaled, jpegDims, jpegFitScale, scaleRGBA, jpegCostHint, decodePNGParts, pngParRetry)
 import System.IO.Unsafe (unsafeInterleaveIO)
 import Data.Bits (shiftL, (.|.))
-import Cmedit.Jobs (JobTable, newJobTable, startJobIn, cancelJobIn)
+import Cmedit.Jobs (JobTable, newJobTable, startJobIn, cancelJobIn, forkBackground)
+import Cmedit.JxlPar (workerCap)
 import Cmedit.FontProvider (FontProvider, newFontProvider, startFontDiscovery, providerFiles, facesForQueries, fontFor)
 import qualified Cmedit.PdfRender as PR
 import qualified Cmedit.PdfObj as PO
@@ -2123,7 +2124,7 @@ perform drv eff ed = let loadQ = drvLoadQ drv in case eff of
 -- (only for the Settings dialog, which shows them; see 'detectLinters').
 forkDetectLinters :: Drv -> Bool -> Maybe FilePath -> IO ()
 forkDetectLinters drv versions mroot =
-  void $ forkIO $ do
+  void $ forkBackground $ do
     av <- detectLinters versions mroot
     atomically (writeTQueue (drvSearchQ drv) (SMLintAvail av))
 
@@ -4258,7 +4259,7 @@ runScan spec = do
   -- The pool is bracketed: if this walk is cancelled (a newer search
   -- superseded it), the workers must go with it — they would otherwise sit on
   -- the queue forever, and the end-of-walk wait below would never complete.
-  bracket (forM [1 .. nWorkers] (\_ -> forkIO worker))
+  bracket (forM [1 .. nWorkers] (\j -> workerCap (j - 1) >>= \c -> forkOn c worker))
           (mapM_ killThread)
           $ \_ -> do
     walk (scRoot spec)

@@ -21,13 +21,16 @@ module Cmedit.Jobs
   , startJobIn
   , cancelJobIn
   , runningJob
+  , backgroundCap
+  , forkBackground
   ) where
 
-import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, myThreadId)
+import Control.Concurrent (ThreadId, forkOn, forkOnWithUnmask, getNumCapabilities, killThread, myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (finally, mask_)
 import Data.IORef
 import qualified Data.Map.Strict as M
+import System.IO.Unsafe (unsafePerformIO)
 
 -- | The running job of each kind.
 type JobTable k = IORef (M.Map k ThreadId)
@@ -46,7 +49,8 @@ startJobIn tbl kind act = mask_ $ do
   -- finishes instantly can never run its 'clear' before the insert and leave
   -- a dead entry behind.
   go <- newEmptyMVar
-  tid <- forkIOWithUnmask (\unmask -> (takeMVar go >> unmask act) `finally` clear)
+  cap <- backgroundCap
+  tid <- forkOnWithUnmask cap (\unmask -> (takeMVar go >> unmask act) `finally` clear)
   atomicModifyIORef' tbl (\m -> (M.insert kind tid m, ()))
   putMVar go ()
   pure (maybe False (const True) prev)
@@ -67,3 +71,25 @@ cancelJobIn tbl kind = mask_ $ do
 -- | Is a job of this kind running?
 runningJob :: Ord k => JobTable k -> k -> IO Bool
 runningJob tbl kind = M.member kind <$> readIORef tbl
+
+-- | A capability for a background thread: the capabilities other than the
+-- UI thread's (0, where the main thread starts) in turn, or 0 when there is
+-- only one. Background work is placed explicitly because the editor runs
+-- with the scheduler's automatic thread migration off (@-qm@ in the
+-- Makefile's RTSOPTS): a thread left where it was forked would share the UI
+-- thread's capability, and one that migrates touches the allocation area of
+-- every capability it visits.
+backgroundCap :: IO Int
+backgroundCap = do
+  n <- getNumCapabilities
+  if n <= 1 then pure 0 else do
+    k <- atomicModifyIORef' bgNext (\i -> (i + 1, i))
+    pure (1 + k `mod` (n - 1))
+
+{-# NOINLINE bgNext #-}
+bgNext :: IORef Int
+bgNext = unsafePerformIO (newIORef 0)
+
+-- | 'forkIO' onto a 'backgroundCap'.
+forkBackground :: IO () -> IO ThreadId
+forkBackground act = backgroundCap >>= \c -> forkOn c act

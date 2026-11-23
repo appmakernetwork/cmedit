@@ -57,7 +57,7 @@ module Cmedit.FontProvider
   , trySync
   ) where
 
-import Control.Concurrent (forkIO)
+import Cmedit.Jobs (forkBackground)
 import Control.Concurrent.MVar
 import Control.Exception (SomeException, SomeAsyncException, evaluate, fromException, throwIO, try)
 import Control.Monad (forM)
@@ -201,7 +201,7 @@ newFontProvider = FontProvider <$> newEmptyMVar <*> newMVar emptyFontCache
 -- published exactly once, even if the walk throws (as an empty list then).
 startFontDiscovery :: FontProvider -> IO () -> IO ()
 startFontDiscovery fp onDone = do
-  _ <- forkIO $ do
+  _ <- forkBackground $ do
     r <- trySync (do home <- either (const "") id <$> trySync getHomeDirectory
                      env <- forM fontEnvVars (\k -> fmap ((,) k) <$> lookupEnv k)
                      discoverFontFiles (fontDirectories hostOS [ kv | Just kv <- env ] home))
