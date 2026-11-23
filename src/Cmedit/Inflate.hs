@@ -28,6 +28,11 @@ module Cmedit.Inflate
   , inflateInto
   , inflateIntoSegs
   , inflateIntoSegsW
+  , InflateStream
+  , InflateStepRes(..)
+  , newInflateStream
+  , newInflateStreamW
+  , inflateStep
     -- * Canonical Huffman tables (shared with JPEG)
   , Huff(..)
   , buildHuff
@@ -288,9 +293,6 @@ advanceWindow _ (Segs n tot starts arr _) rest lo hi =
       (added, rest') = grab [] tot rest
   in (mkSegsAt base (kept ++ added) (not (null rest')), rest')
 
--- The status a Huffman block returns when its window ran out mid-block.
-needInput :: String
-needInput = "\0need input"
 
 --------------------------------------------------------------------------------
 -- Fast known-size DEFLATE decoder ('inflateFixed')
@@ -325,6 +327,10 @@ data Segs = Segs !Int !Int !(UArray Int Int) !(Array Int BS.ByteString) !Bool
 {-# INLINE segTotal #-}
 segTotal :: Segs -> Int
 segTotal (Segs _ tot _ _ _) = tot
+
+{-# INLINE segMore #-}
+segMore :: Segs -> Bool
+segMore (Segs _ _ _ _ more) = more
 
 mkSegs :: [BS.ByteString] -> Segs
 mkSegs raw = mkSegsAt 0 raw False
@@ -975,7 +981,13 @@ decodeSymSlowM bb0# bc0# cnts# syms# maxLen# s0# = go 1 0 0 0 (W64# bb0#) (I# bc
                                case (bb', bc') of (W64# b#, I# c#) -> (# s2#, sym#, b#, c# #)
                       else go (len + 1) (code1 `unsafeShiftL` 1) ((first + cnt) `unsafeShiftL` 1) (index + cnt) bb' bc' s1#
 
-data BlockRes = BlockRes !Int !Int !Word64 !Int !Int !(Maybe String)
+data BlockStop
+  = BlockDone
+  | BlockNeedInput
+  | BlockNeedOutput
+  | BlockError !String
+
+data BlockRes = BlockRes !Int !Int !Word64 !Int !Int !BlockStop
 data FastRes  = FastRes  !Int Addr# !Word64 !Int !Int
 
 {-# INLINE le64Ptr #-}
@@ -1206,22 +1218,23 @@ huffFastLoop cur0# endPtr# arr# !base !fastOutEnd !tbl !bb0 !bc0 !o0 =
               copy8 cur# bb bc end (o - d) prepEnd
 
 {-# NOINLINE huffBlockST #-}
-huffBlockST :: Segs -> STUArray s Int Word8 -> Int -> Int
+huffBlockST :: Segs -> STUArray s Int Word8 -> Int -> Int -> Int
             -> STUArray s Int Int
             -> STUArray s Int Int -> STUArray s Int Int -> Int
             -> STUArray s Int Int -> STUArray s Int Int -> Int
             -> Int -> Int -> Word64 -> Int -> Int
             -> ST s BlockRes
-huffBlockST !segs@(Segs !nSeg _ !starts !segArr _) !arr@(STUArray _ _ _ arr#) !base !limit
+huffBlockST !segs@(Segs !nSeg _ !starts !segArr _) !arr@(STUArray _ _ _ arr#) !base !limit !stopAt
             !tbl
             !(STUArray _ _ _ litCnt#) !(STUArray _ _ _ litSym#) !(I# litMax#)
             !(STUArray _ _ _ distCnt#) !(STUArray _ _ _ distSym#) !(I# distMax#)
             !k0 !p0 !bb0 !bc0 !o0 =
   driver k0 p0 bb0 bc0 o0
   where
-    !fastOutEnd = limit - 274
+    !fastOutEnd = min stopAt (limit - 274)
     driver !k !p !bb !bc !o
-      | o >= limit = pure (BlockRes k p bb bc o Nothing)
+      | o >= limit  = pure (BlockRes k p bb bc o BlockDone)
+      | o >= stopAt = pure (BlockRes k p bb bc o BlockNeedOutput)
       | o < fastOutEnd && k < nSeg
       , let !s0 = starts `unsafeAt` k
             !s1 = starts `unsafeAt` (k + 1)
@@ -1235,19 +1248,22 @@ huffBlockST !segs@(Segs !nSeg _ !starts !segArr _) !arr@(STUArray _ _ _ arr#) !b
           unsafeIOToST (IO $ \s# -> case touch# segFpc s# of s1# -> (# s1#, () #))
           let !p1 = s0 + I# (minusAddr# cur1# segAddr#)
           case st of
-            0 -> pure (BlockRes k p1 bb1 bc1 o1 Nothing)
-            2 -> pure (BlockRes k p1 bb1 bc1 o1 (Just "invalid length code"))
-            3 -> pure (BlockRes k p1 bb1 bc1 o1 (Just "invalid distance code"))
-            1 -> slowStep k p1 bb1 bc1 o1
+            0 -> pure (BlockRes k p1 bb1 bc1 o1 BlockDone)
+            2 -> pure (BlockRes k p1 bb1 bc1 o1 (BlockError "invalid length code"))
+            3 -> pure (BlockRes k p1 bb1 bc1 o1 (BlockError "invalid distance code"))
+            1 -> if o1 >= stopAt && o1 < limit
+                   then pure (BlockRes k p1 bb1 bc1 o1 BlockNeedOutput)
+                   else slowStep k p1 bb1 bc1 o1
             _ -> walkDist k p1 bb1 bc1 o1 (st - 4)
       | otherwise = slowStep k p bb bc o
     slowStep !k !p !bb !bc !o
-      | o >= limit = pure (BlockRes k p bb bc o Nothing)
+      | o >= limit  = pure (BlockRes k p bb bc o BlockDone)
+      | o >= stopAt = pure (BlockRes k p bb bc o BlockNeedOutput)
       | otherwise =
           case refillSeg segs k p bb bc of
             (# k1#, p1#, bb1#, bc1# #)
               -- only a window's end leaves fewer than 56 bits: resume there
-              | isTrue# (bc1# <# 56#) -> pure (BlockRes (I# k1#) (I# p1#) (W64# bb1#) (I# bc1#) o (Just needInput))
+              | isTrue# (bc1# <# 56#) -> pure (BlockRes (I# k1#) (I# p1#) (W64# bb1#) (I# bc1#) o BlockNeedInput)
               | otherwise -> decodeLitSlow (I# k1#) (I# p1#) (W64# bb1#) (I# bc1#) o
     decodeLitSlow !k !p !bb !bc !o = do
       !e <- unsafeRead tbl (fromIntegral bb .&. litRootMask)
@@ -1270,7 +1286,7 @@ huffBlockST !segs@(Segs !nSeg _ !starts !segArr _) !arr@(STUArray _ _ _ arr#) !b
             in decodeDistSlow k p (bb `unsafeShiftR` ltot) (bc - ltot) o mlen
           else if e >= 0x40000000
             then if e < 0x50000000
-              then let !len = e .&. 15 in pure (BlockRes k p (bb `unsafeShiftR` len) (bc - len) o Nothing)
+              then let !len = e .&. 15 in pure (BlockRes k p (bb `unsafeShiftR` len) (bc - len) o BlockDone)
               else if e < 0x60000000
                 then do
                   let !bb1    = bb `unsafeShiftR` litRootBits
@@ -1292,10 +1308,10 @@ huffBlockST !segs@(Segs !nSeg _ !starts !segArr _) !arr@(STUArray _ _ _ arr#) !b
                         in decodeDistSlow k p (bb1 `unsafeShiftR` ltot) (bc1 - ltot) o mlen
                       else if se >= 0x40000000
                         then if se < 0x50000000
-                          then let !len = se .&. 15 in pure (BlockRes k p (bb1 `unsafeShiftR` len) (bc1 - len) o Nothing)
-                          else let !len = se .&. 15 in pure (BlockRes k p (bb1 `unsafeShiftR` len) (bc1 - len) o (Just "invalid length code"))
+                          then let !len = se .&. 15 in pure (BlockRes k p (bb1 `unsafeShiftR` len) (bc1 - len) o BlockDone)
+                          else let !len = se .&. 15 in pure (BlockRes k p (bb1 `unsafeShiftR` len) (bc1 - len) o (BlockError "invalid length code"))
                         else walkLit k p bb bc o
-                else let !len = e .&. 15 in pure (BlockRes k p (bb `unsafeShiftR` len) (bc - len) o (Just "invalid length code"))
+                else let !len = e .&. 15 in pure (BlockRes k p (bb `unsafeShiftR` len) (bc - len) o (BlockError "invalid length code"))
             else walkLit k p bb bc o
     walkLit !k !p !bb !bc !o =
       case (bb, bc) of
@@ -1305,15 +1321,15 @@ huffBlockST !segs@(Segs !nSeg _ !starts !segArr _) !arr@(STUArray _ _ _ arr#) !b
               case handleSymWalk k p (W64# bb2#) (I# bc2#) o (I# sym#) of
                 ST f -> f s1#
     handleSymWalk !k !p !bb !bc !o !sym
-      | sym < 0    = pure (BlockRes k p bb bc o (Just "invalid Huffman code"))
+      | sym < 0    = pure (BlockRes k p bb bc o (BlockError "invalid Huffman code"))
       | sym < 256  = do
           unsafeWrite arr o (fromIntegral sym)
           driver k p bb bc (o + 1)
-      | sym == 256 = pure (BlockRes k p bb bc o Nothing)
+      | sym == 256 = pure (BlockRes k p bb bc o BlockDone)
       | otherwise  =
           let !li = sym - 257
           in if li >= nLenCodes
-               then pure (BlockRes k p bb bc o (Just "invalid length code"))
+               then pure (BlockRes k p bb bc o (BlockError "invalid length code"))
                else
                  let !lex   = lenExtra `unsafeAt` li
                      !extra = fromIntegral bb .&. ((1 `unsafeShiftL` lex) - 1)
@@ -1344,9 +1360,9 @@ huffBlockST !segs@(Segs !nSeg _ !starts !segArr _) !arr@(STUArray _ _ _ arr#) !b
                       !d     = ((sde `unsafeShiftR` 16) .&. 0x7FFF) + (fromIntegral (bb1 `unsafeShiftR` dlen) .&. dmask)
                   in doCopySlow k p (bb1 `unsafeShiftR` dtot) (bc1 - dtot) o mlen d
                 else if sde < 0
-                  then let !dlen = sde .&. 15 in pure (BlockRes k p (bb1 `unsafeShiftR` dlen) (bc1 - dlen) o (Just "invalid distance code"))
+                  then let !dlen = sde .&. 15 in pure (BlockRes k p (bb1 `unsafeShiftR` dlen) (bc1 - dlen) o (BlockError "invalid distance code"))
                   else walkDist k p bb bc o mlen
-            else let !dlen = de .&. 15 in pure (BlockRes k p (bb `unsafeShiftR` dlen) (bc - dlen) o (Just "invalid distance code"))
+            else let !dlen = de .&. 15 in pure (BlockRes k p (bb `unsafeShiftR` dlen) (bc - dlen) o (BlockError "invalid distance code"))
           else walkDist k p bb bc o mlen
     walkDist !k !p !bb !bc !o !mlen =
       case (bb, bc) of
@@ -1356,7 +1372,7 @@ huffBlockST !segs@(Segs !nSeg _ !starts !segArr _) !arr@(STUArray _ _ _ arr#) !b
               case handleDistWalk k p (W64# bb3#) (I# bc3#) o mlen (I# dsym#) of
                 ST f -> f s1#
     handleDistWalk !k !p !bb !bc !o !mlen !dsym
-      | dsym < 0 || dsym >= nDistCodes = pure (BlockRes k p bb bc o (Just "invalid distance code"))
+      | dsym < 0 || dsym >= nDistCodes = pure (BlockRes k p bb bc o (BlockError "invalid distance code"))
       | otherwise =
           let !dex = distExtra `unsafeAt` dsym
               !d   = distBase `unsafeAt` dsym + (fromIntegral bb .&. ((1 `unsafeShiftL` dex) - 1))
@@ -1511,22 +1527,175 @@ inflateFixed !win !segs0 rest0 !startByte arr !base !size = do
                    huffBlock segs rest litMax distMax bfinal k2 p2 bb2 bc2 o
                  _ -> finish o (Just "invalid DEFLATE block type")
       -- A Huffman block, resumed with the window moved on whenever it
-      -- stops at the window's end ('needInput'): the tables are still in
-      -- the scratch arrays, and nothing was decoded from bits it lacked.
+      -- stops at the window's end ('BlockNeedInput'): the tables are still
+      -- in the scratch arrays, and nothing was decoded from bits it lacked.
       huffBlock segs rest !litMax !distMax !bfinal !k !p !bb !bc !o = do
-        BlockRes k' p' bb' bc' o' err <- huffBlockST segs arr base limit
+        BlockRes k' p' bb' bc' o' stop <- huffBlockST segs arr base limit limit
           (scTable sc)
           (scLitCounts sc) (scLitSyms sc) litMax
           (scDistCounts sc) (scDistSyms sc) distMax
           k p bb bc o
-        case err of
-          Just e
-            | e == needInput ->
-                let (segs', rest') = slide segs rest (p' - 16) (p' + win)
-                in huffBlock segs' rest' litMax distMax bfinal (seekSeg segs' p') p' bb' bc' o'
-            | otherwise -> finish o' err
-          Nothing -> if bfinal == 1 then finish o' Nothing else blockLoop segs rest k' p' bb' bc' o'
+        case stop of
+          BlockNeedInput ->
+            let (segs', rest') = slide segs rest (p' - 16) (p' + win)
+            in huffBlock segs' rest' litMax distMax bfinal (seekSeg segs' p') p' bb' bc' o'
+          BlockError e -> finish o' (Just e)
+          _ -> if bfinal == 1 then finish o' Nothing else blockLoop segs rest k' p' bb' bc' o'
   blockLoop segs0 rest0 (seekSeg segs0 startByte) startByte 0 0 base
+
+-- | Outcome of one bounded step of 'inflateStep'.
+data InflateStepRes
+  = InflatePaused !Int
+    -- ^ Inflate paused with @prod@ bytes (relative to @base@) finalized in
+    -- the output buffer; more stream data remains.
+  | InflateDone !Int !(Maybe String)
+    -- ^ Inflate finished with @prod@ bytes (relative to @base@, clamped to
+    -- @outSize@) written and any trailing sloppy bytes zeroed.
+  deriving (Eq, Show)
+
+data InflatePhase
+  = PhaseBlock  !Segs [BS.ByteString] !Int !Int !Word64 !Int !Int
+  | PhaseStored !Segs [BS.ByteString] !Int !Int !Int !Int
+  | PhaseHuff   !Segs [BS.ByteString] !Int !Int !Int !Int !Int !Word64 !Int !Int
+  | PhaseDone   !Int !(Maybe String)
+
+-- | Resumable, windowed fixed-size DEFLATE decoder writing into a
+-- caller-supplied output buffer. Unifies input-side window sliding
+-- ('BlockNeedInput') with output-side suspension ('BlockNeedOutput') so
+-- downstream passes can consume completed rows while lazily-read input
+-- slices are released behind the read cursor.
+data InflateStream s = InflateStream
+  !Int !(STUArray s Int Word8) !Int !Int !(InflateScratch s) !(STRef s InflatePhase)
+
+-- | Create a resumable fixed-size DEFLATE stream over a lazily-consumed list
+-- of byte slices using the default 'streamWindow'.
+newInflateStream :: [BS.ByteString] -> Int -> STUArray s Int Word8 -> Int -> Int
+                 -> ST s (InflateStream s)
+newInflateStream = newInflateStreamW streamWindow
+
+-- | 'newInflateStream' with an explicit input window size (@<= 0@ disables
+-- windowing and builds one 'Segs' upfront).
+newInflateStreamW :: Int -> [BS.ByteString] -> Int -> STUArray s Int Word8 -> Int -> Int
+                  -> ST s (InflateStream s)
+newInflateStreamW win chunks startByte arr base outSize = do
+  let (!w, !segs0, rest0)
+        | win <= 0  = (0, mkSegs chunks, [])
+        | otherwise =
+            let !w' = max minWindow win
+                (s0, r0) = advanceWindow w' (mkSegsAt 0 [] True) chunks 0 (startByte + w')
+            in (w', s0, r0)
+      !limit = base + max 0 outSize
+  sc  <- newInflateScratch
+  ref <- newSTRef (PhaseBlock segs0 rest0 (seekSeg segs0 startByte) startByte 0 0 base)
+  pure (InflateStream w arr base limit sc ref)
+
+-- | Advance a resumable DEFLATE stream until at least @targetBytes@ bytes
+-- (relative to @base@) have been finalized, or until the stream ends / hits
+-- a hard error. Input window slides happen transparently inside the call.
+{-# NOINLINE inflateStep #-}
+inflateStep :: InflateStream s -> Int -> ST s InflateStepRes
+inflateStep (InflateStream !win !arr !base !limit !sc !phaseRef) !targetBytes = do
+  let !stopAt = min limit (base + max 0 targetBytes)
+      slide !segs rest !lo !hi = advanceWindow win segs rest lo hi
+      finish !o !err = do
+        when (o < limit) $ do
+          let !zEnd = min limit (o + 16)
+              zeroTail !i
+                | i >= zEnd = pure ()
+                | otherwise = unsafeWrite arr i 0 >> zeroTail (i + 1)
+          zeroTail o
+        let !oClamped = min limit o
+        writeSTRef phaseRef (PhaseDone oClamped err)
+        pure (InflateDone (oClamped - base) err)
+      storedLoop !segs rest !bfinal !srcPos !remLen !o
+        | o >= limit = finish o Nothing
+        | remLen <= 0 =
+            if bfinal == 1 then finish o Nothing
+            else blockLoop segs rest (seekSeg segs srcPos) srcPos 0 0 o
+        | o >= stopAt = do
+            writeSTRef phaseRef (PhaseStored segs rest bfinal srcPos remLen o)
+            pure (InflatePaused (o - base))
+        | otherwise = do
+            let !step = min remLen (stopAt - o)
+                (segsS, restS)
+                  | segMore segs && srcPos + step > segTotal segs =
+                      slide segs rest (srcPos - 16) (srcPos + step + win)
+                  | otherwise = (segs, rest)
+            copyStoredSegs segsS srcPos step arr o
+            let !rem' = remLen - step
+                !src' = srcPos + step
+                !o'   = o + step
+            if rem' == 0
+              then if bfinal == 1 then finish o' Nothing
+                   else blockLoop segsS restS (seekSeg segsS src') src' 0 0 o'
+              else if o' >= limit
+                     then finish o' Nothing
+                     else do
+                       writeSTRef phaseRef (PhaseStored segsS restS bfinal src' rem' o')
+                       pure (InflatePaused (o' - base))
+      huffLoop !segs rest !bfinal !litMax !distMax !k !p !bb !bc !o
+        | o >= limit  = finish o Nothing
+        | o >= stopAt = do
+            writeSTRef phaseRef (PhaseHuff segs rest bfinal litMax distMax k p bb bc o)
+            pure (InflatePaused (o - base))
+        | otherwise = do
+            BlockRes k' p' bb' bc' o' stop <- huffBlockST segs arr base limit stopAt
+              (scTable sc)
+              (scLitCounts sc) (scLitSyms sc) litMax
+              (scDistCounts sc) (scDistSyms sc) distMax
+              k p bb bc o
+            case stop of
+              BlockNeedInput ->
+                let (segs', rest') = slide segs rest (p' - 16) (p' + win)
+                in huffLoop segs' rest' bfinal litMax distMax (seekSeg segs' p') p' bb' bc' o'
+              BlockNeedOutput -> do
+                writeSTRef phaseRef (PhaseHuff segs rest bfinal litMax distMax k' p' bb' bc' o')
+                pure (InflatePaused (o' - base))
+              BlockError e -> finish o' (Just e)
+              BlockDone
+                | bfinal == 1 || o' >= limit -> finish o' Nothing
+                | otherwise -> blockLoop segs rest k' p' bb' bc' o'
+      blockLoop segs@(Segs _ _ _ _ more) rest !k !p !bb !bc !o
+        | o >= limit = finish o Nothing
+        | more && segTotal segs - p < win `unsafeShiftR` 1 =
+            let (segs', rest') = slide segs rest (p - 16) (p + win)
+            in blockLoop segs' rest' (seekSeg segs' p) p bb bc o
+        | p * 8 - bc >= 8 * segTotal segs = finish o Nothing
+        | o >= stopAt = do
+            writeSTRef phaseRef (PhaseBlock segs rest k p bb bc o)
+            pure (InflatePaused (o - base))
+        | bc < 3 = case refillSeg segs k p bb bc of
+            (# k'#, p'#, bb'#, bc'# #) -> blockLoop segs rest (I# k'#) (I# p'#) (W64# bb'#) (I# bc'#) o
+        | otherwise =
+            let !bfinal = fromIntegral (bb .&. 1) :: Int
+                !btype  = fromIntegral ((bb `unsafeShiftR` 1) .&. 3) :: Int
+                !bb1    = bb `unsafeShiftR` 3
+                !bc1    = bc - 3
+            in case btype of
+                 0 -> do
+                   let !curBitPos   = p * 8 - bc1
+                       !alignedByte = ((curBitPos + 7) .&. complement 7) `unsafeShiftR` 3
+                       !len         = segByteAt segs alignedByte .|. (segByteAt segs (alignedByte + 1) `unsafeShiftL` 8)
+                       !srcStart    = alignedByte + 4
+                   storedLoop segs rest bfinal srcStart len o
+                 1 -> do
+                   forLoop 0 287 $ \i -> unsafeWrite (scAllLens sc) i (fixedLitLensU `unsafeAt` i)
+                   forLoop 0 29  $ \i -> unsafeWrite (scAllLens sc) (288 + i) (fixedDistLensU `unsafeAt` i)
+                   !litMax  <- buildLitTableST (scAllLens sc) 0 288
+                                 (scLitCounts sc) (scOffs sc) (scLitSyms sc) (scTable sc) (scShortLits sc)
+                   !distMax <- buildDistTableST (scAllLens sc) 288 30
+                                 (scDistCounts sc) (scOffs sc) (scDistSyms sc) (scTable sc)
+                   huffLoop segs rest bfinal litMax distMax k p bb1 bc1 o
+                 2 -> do
+                   DynRes litMax distMax k2 p2 bb2 bc2 <- readDynamicST segs sc k p bb1 bc1
+                   huffLoop segs rest bfinal litMax distMax k2 p2 bb2 bc2 o
+                 _ -> finish o (Just "invalid DEFLATE block type")
+  phase <- readSTRef phaseRef
+  case phase of
+    PhaseDone o err                                      -> pure (InflateDone (o - base) err)
+    PhaseBlock segs rest k p bb bc o                     -> blockLoop segs rest k p bb bc o
+    PhaseStored segs rest bfinal srcPos remLen o         -> storedLoop segs rest bfinal srcPos remLen o
+    PhaseHuff segs rest bfinal litMax distMax k p bb bc o -> huffLoop segs rest bfinal litMax distMax k p bb bc o
 
 -- | Inflate a stream of unknown output size, stopping at @maxOut@ bytes.
 --

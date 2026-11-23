@@ -1214,6 +1214,100 @@ main = do
         , runInflateSegsW w segs 0 5 size /= runInflateFlat (BS.concat segs) 0 5 size
         ]
   checkEq "inflateIntoSegsW: every window size decodes as the contiguous stream" windowFailures []
+  -- Differential test: resumable windowed inflateStep (newInflateStreamW)
+  -- must match inflateInto byte-for-byte across step sizes, window sizes
+  -- (so both input-window suspension and output-target suspension fire inside
+  -- the same blocks), splits, truncations and corruptions.
+  let runInflateFlatArr raw startByte base outSize = ST.runST $ do
+        arr <- STA.newArray (0, base + outSize + 15) 0xA5 :: ST.ST s (STA.STUArray s Int Word8)
+        err <- Inflate.inflateInto raw startByte arr base outSize
+        frozen <- STA.freeze arr
+        pure (err, frozen :: U.UArray Int Word8)
+      runInflateSteppedW w segs startByte base outSize stepSeq = ST.runST $ do
+        arr <- STA.newArray (0, base + outSize + 15) 0xA5 :: ST.ST s (STA.STUArray s Int Word8)
+        st <- Inflate.newInflateStreamW w segs startByte arr base outSize
+        let go prev [] = do
+              r <- Inflate.inflateStep st outSize
+              case r of
+                Inflate.InflatePaused p
+                  | p < prev -> pure (Just "step regressed")
+                  | otherwise -> go p []
+                Inflate.InflateDone _ err -> do
+                  r2 <- Inflate.inflateStep st outSize
+                  case r2 of
+                    Inflate.InflateDone _ err2 | err2 == err -> pure err
+                    _ -> pure (Just "post-done not idempotent")
+            go prev (d : ds) = do
+              let target = prev + d
+              r <- Inflate.inflateStep st target
+              case r of
+                Inflate.InflatePaused p
+                  | p < min outSize target || p < prev -> pure (Just "step under-produced")
+                  | otherwise -> go p ds
+                Inflate.InflateDone _ err -> pure err
+        err <- go 0 stepSeq
+        frozen <- STA.freeze arr
+        pure (err, frozen :: U.UArray Int Word8)
+      prngSteps :: Word64 -> Int -> [Int]
+      prngSteps seed n = go seed n
+        where
+          go _ k | k <= 0 = []
+          go sd k =
+            let s1 = sd * 6364136223846793005 + 1442695040888963407
+                r  = fromIntegral ((s1 `shiftR` 33) .&. 15) :: Int
+                step | r == 0    = 0
+                     | r <= 4    = r
+                     | r <= 8    = 13 + r * 7
+                     | r <= 12   = 270 + r * 11
+                     | otherwise = 1024 + r * 257
+            in step : go s1 (k - 1)
+      stepSmallFailures =
+        [ label ++ " " ++ variant ++ " " ++ sname ++ " w=" ++ show w
+        | (label, raw, expectedLen) <- diffStreams
+        , let prefixed = BS.pack [0x78, 0x9c] <> raw
+              cases =
+                [ ("flat", [raw], 0, 0, expectedLen)
+                , ("1-byte chunks", splitEvery 1 raw, 0, 17, expectedLen)
+                , ("prng start=2 base=31", splitPRNG 42 prefixed, 2, 31, expectedLen)
+                , ("over-limit", splitPRNG 99 raw, 0, 7, expectedLen + 33)
+                , ("short-limit", splitPRNG 123 raw, 0, 5, max 1 (expectedLen `div` 2))
+                , ("trunc-mid", splitPRNG 555 (BS.take (BS.length raw `div` 2) raw), 0, 9, expectedLen)
+                , ("trunc-0", [], 0, 3, expectedLen)
+                , ("corrupt-mid", splitPRNG 777 (flipByteAt (BS.length raw `div` 2) raw), 0, 3, expectedLen)
+                ]
+              stepPlans =
+                [ ("step-1", 0 : replicate (min 64 (expectedLen + 4)) 1)
+                , ("step-274", replicate (expectedLen `div` 274 + 4) 274)
+                , ("step-prng", prngSteps 314159 48)
+                , ("one-shot", [expectedLen + 100])
+                ]
+        , (variant, segs, startByte, base, outSize) <- cases
+        , let !expected = runInflateFlatArr (BS.concat segs) startByte base outSize
+        , w <- [0, 4096]
+        , (sname, plan) <- stepPlans
+        , runInflateSteppedW w segs startByte base outSize plan /= expected
+        ]
+      stepWindowFailures =
+        [ label ++ " " ++ variant ++ " " ++ sname ++ " w=" ++ show w
+        | (label, raw, outLen) <- [ ("fixed 60k", bigFixed, 60000), ("fixed x4", multiFixed, 60000)
+                                  , ("stored 3x30k", bigStored, 90000) ]
+        , let cases = [ ("1000-byte slices", splitEvery 1000 raw, outLen)
+                      , ("prng slices", splitPRNG 5 raw, outLen)
+                      , ("short limit", splitEvery 777 raw, outLen `div` 3)
+                      , ("truncated", splitEvery 999 (BS.take (BS.length raw * 2 `div` 3) raw), outLen)
+                      , ("corrupt", splitEvery 1500 (flipByteAt (BS.length raw `div` 2) raw), outLen) ]
+        , ((variant, segs, size), (w, sname, plan)) <- zip cases
+            [ (4096, "step-137", replicate (outLen `div` 137 + 4) 137)
+            , (5000, "step-prng", prngSteps 271828 96)
+            , (4096, "step-4096", 0 : replicate (outLen `div` 4096 + 4) 4096)
+            , (4096, "step-prng", prngSteps 271828 96)
+            , (5000, "step-4096", 0 : replicate (outLen `div` 4096 + 4) 4096)
+            ]
+        , let !expected = runInflateFlatArr (BS.concat segs) 0 5 size
+        , runInflateSteppedW w segs 0 5 size plan /= expected
+        ]
+  checkEq "resumable windowed inflateStep matches inflateInto across step sizes, splits, truncations and corruptions"
+    (stepSmallFailures ++ stepWindowFailures) []
   checkEq "fixed 60k literals decode through 4 KB windows"
     (let (err, buf) = runInflateSegsW 4096 (splitEvery 3000 bigFixed) 0 0 60000
      in (err, take 60000 buf == map fromIntegral (lits 60000 7)))
