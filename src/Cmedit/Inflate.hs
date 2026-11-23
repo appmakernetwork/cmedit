@@ -352,6 +352,7 @@ data InflateScratch s = InflateScratch
   , scLitSyms    :: !(STUArray s Int Int)    -- 288
   , scDistCounts :: !(STUArray s Int Int)    -- 16
   , scDistSyms   :: !(STUArray s Int Int)    -- 464
+  , scShortLits  :: !(STUArray s Int Int)    -- 256 (packed rev<<16 | sym<<8 | len)
   }
 
 newInflateScratch :: ST s (InflateScratch s)
@@ -367,6 +368,7 @@ newInflateScratch = InflateScratch
   <*> newArray (0, 287) 0
   <*> newArray (0, 15) 0
   <*> newArray (0, 463) 0
+  <*> newArray (0, 255) 0
 
 -- Build the 7-bit code-length Huffman table into reusable STUArrays.
 {-# NOINLINE buildClTableST #-}
@@ -472,8 +474,8 @@ mkDistEntry !sym !len
 {-# NOINLINE buildLitTableST #-}
 buildLitTableST :: STUArray s Int Int -> Int -> Int
                 -> STUArray s Int Int -> STUArray s Int Int -> STUArray s Int Int
-                -> STUArray s Int Int -> ST s Int
-buildLitTableST !lens !off !n !counts !offs !syms !table = do
+                -> STUArray s Int Int -> STUArray s Int Int -> ST s Int
+buildLitTableST !lens !off !n !counts !offs !syms !table !shortLits = do
   zeroIntArr counts 16
   let countLoop !i !ml
         | i >= n = pure ml
@@ -487,13 +489,13 @@ buildLitTableST !lens !off !n !counts !offs !syms !table = do
               else countLoop (i + 1) ml
   !maxLen <- countLoop 0 0
   let offLoop !l !acc !slots !ok
-        | l > maxLen = pure ok
+        | l > maxLen = pure (ok, slots)
         | otherwise = do
             !c <- unsafeRead counts l
             unsafeWrite offs l acc
             let !nextSlots = slots * 2 - c
             offLoop (l + 1) (acc + c) nextSlots (ok && nextSlots >= 0)
-  !valid <- offLoop 1 0 1 True
+  (!valid, !finalSlots) <- offLoop 1 0 1 True
   let sortLoop !i
         | i >= n = pure ()
         | otherwise = do
@@ -505,17 +507,18 @@ buildLitTableST !lens !off !n !counts !offs !syms !table = do
             sortLoop (i + 1)
   sortLoop 0
   let !rootSize = 1 `unsafeShiftL` litRootBits
-  zeroIntArr table rootSize
+      !complete = valid && maxLen > 0 && finalSlots == 0
+  when (not complete) $ zeroIntArr table rootSize
   when valid $ do
     let !lim = min litRootBits maxLen
-        fillRoot !len !first !index
-          | len > lim = pure (first, index)
+        fillRoot !len !first !index !nShort !minLit
+          | len > lim = pure (first, index, nShort, minLit)
           | otherwise = do
               !cnt <- unsafeRead counts len
               let !step  = 1 `unsafeShiftL` len
                   !shift = 10 - len
-                  fillSyms !j
-                    | j >= cnt = pure ()
+                  fillSyms !j !ns !ml
+                    | j >= cnt = pure (ns, ml)
                     | otherwise = do
                         !sym <- unsafeRead syms (index + j)
                         let !rev   = rev10 `unsafeAt` ((first + j) `unsafeShiftL` shift)
@@ -524,41 +527,76 @@ buildLitTableST !lens !off !n !counts !offs !syms !table = do
                               | idx >= rootSize = pure ()
                               | otherwise       = unsafeWrite table idx entry >> fillSlots (idx + step)
                         fillSlots rev
-                        fillSyms (j + 1)
-              fillSyms 0
-              fillRoot (len + 1) ((first + cnt) `unsafeShiftL` 1) (index + cnt)
-    (!firstLong, !idxLong) <- fillRoot 1 0 0
-    -- Pack up to 4 short literals whose combined code length <= litRootBits
-    -- into a single 64-bit root entry. Iterating downwards keeps table[i >> totLen]
-    -- as an untouched 1-literal entry for all i >= 0.
-    let !maxPack = if finiteBitSize (0 :: Int) == 64 then 4 else 1
-        packMulti !i
-          | i < 0 = pure ()
-          | otherwise = do
-              !e1 <- unsafeRead table i
-              when (e1 < 0) $ do
-                let !l1 = e1 .&. 15
-                    !s1 = (e1 `unsafeShiftR` 8) .&. 255
-                    go !bytes !totLen !cnt
-                      | cnt >= maxPack || totLen >= litRootBits =
-                          when (cnt > 1) $
-                            unsafeWrite table i (litFlag .|. (bytes `unsafeShiftL` 8) .|. (cnt `unsafeShiftL` 4) .|. totLen)
-                      | otherwise = do
-                          !en <- unsafeRead table (i `unsafeShiftR` totLen)
-                          if en < 0
-                            then
-                              let !ln = en .&. 15
-                              in if totLen + ln <= litRootBits
-                                   then
-                                     let !sn = (en `unsafeShiftR` 8) .&. 255
-                                     in go (bytes .|. (sn `unsafeShiftL` (cnt `unsafeShiftL` 3))) (totLen + ln) (cnt + 1)
-                                   else when (cnt > 1) $
-                                          unsafeWrite table i (litFlag .|. (bytes `unsafeShiftL` 8) .|. (cnt `unsafeShiftL` 4) .|. totLen)
-                            else when (cnt > 1) $
-                                   unsafeWrite table i (litFlag .|. (bytes `unsafeShiftL` 8) .|. (cnt `unsafeShiftL` 4) .|. totLen)
-                go s1 l1 1
-              packMulti (i - 1)
-    packMulti (rootSize - 1)
+                        if sym < 256 && len + ml <= litRootBits
+                          then do
+                            let !ml' = if ns == 0 then len else ml
+                            if len + ml' <= litRootBits
+                              then do
+                                unsafeWrite shortLits ns ((rev `unsafeShiftL` 16) .|. (sym `unsafeShiftL` 8) .|. len)
+                                fillSyms (j + 1) (ns + 1) ml'
+                              else fillSyms (j + 1) ns ml'
+                          else fillSyms (j + 1) ns ml
+              (!ns', !ml') <- fillSyms 0 nShort minLit
+              fillRoot (len + 1) ((first + cnt) `unsafeShiftL` 1) (index + cnt) ns' ml'
+    (!firstLong, !idxLong, !nShort, !minLit) <- fillRoot 1 0 0 0 1
+    -- Symbol-driven multi-literal packing (up to 4 short literals whose combined
+    -- length <= litRootBits): iterates only over short literals sorted by length,
+    -- avoiding all root-table reads and branch mispredictions.
+    when (finiteBitSize (0 :: Int) == 64 && nShort > 0 && minLit + minLit <= litRootBits) $ do
+      let fillStride !ent !step !idx
+            | idx >= rootSize = pure ()
+            | otherwise       = unsafeWrite table idx ent >> fillStride ent step (idx + step)
+          pack4 !rev3 !b3 !l3 !k4
+            | k4 >= nShort = pure ()
+            | otherwise = do
+                !p4 <- unsafeRead shortLits k4
+                let !len4 = p4 .&. 15
+                    !l4   = l3 + len4
+                when (l4 <= litRootBits) $ do
+                  let !s4   = (p4 `unsafeShiftR` 8) .&. 255
+                      !rev4 = rev3 .|. ((p4 `unsafeShiftR` 16) `unsafeShiftL` l3)
+                      !b4   = b3 .|. (s4 `unsafeShiftL` 24)
+                      !ent4 = litFlag .|. (b4 `unsafeShiftL` 8) .|. (4 `unsafeShiftL` 4) .|. l4
+                  fillStride ent4 (1 `unsafeShiftL` l4) rev4
+                  pack4 rev3 b3 l3 (k4 + 1)
+          pack3 !rev2 !b2 !l2 !k3
+            | k3 >= nShort = pure ()
+            | otherwise = do
+                !p3 <- unsafeRead shortLits k3
+                let !len3 = p3 .&. 15
+                    !l3   = l2 + len3
+                when (l3 <= litRootBits) $ do
+                  let !s3   = (p3 `unsafeShiftR` 8) .&. 255
+                      !rev3 = rev2 .|. ((p3 `unsafeShiftR` 16) `unsafeShiftL` l2)
+                      !b3   = b2 .|. (s3 `unsafeShiftL` 16)
+                      !ent3 = litFlag .|. (b3 `unsafeShiftL` 8) .|. (3 `unsafeShiftL` 4) .|. l3
+                  fillStride ent3 (1 `unsafeShiftL` l3) rev3
+                  when (l3 + minLit <= litRootBits) $ pack4 rev3 b3 l3 0
+                  pack3 rev2 b2 l2 (k3 + 1)
+          pack2 !rev1 !s1 !l1 !k2
+            | k2 >= nShort = pure ()
+            | otherwise = do
+                !p2 <- unsafeRead shortLits k2
+                let !len2 = p2 .&. 15
+                    !l2   = l1 + len2
+                when (l2 <= litRootBits) $ do
+                  let !s2   = (p2 `unsafeShiftR` 8) .&. 255
+                      !rev2 = rev1 .|. ((p2 `unsafeShiftR` 16) `unsafeShiftL` l1)
+                      !b2   = s1 .|. (s2 `unsafeShiftL` 8)
+                      !ent2 = litFlag .|. (b2 `unsafeShiftL` 8) .|. (2 `unsafeShiftL` 4) .|. l2
+                  fillStride ent2 (1 `unsafeShiftL` l2) rev2
+                  when (l2 + minLit <= litRootBits) $ pack3 rev2 b2 l2 0
+                  pack2 rev1 s1 l1 (k2 + 1)
+          pack1 !k1
+            | k1 >= nShort = pure ()
+            | otherwise = do
+                !p1 <- unsafeRead shortLits k1
+                let !l1   = p1 .&. 15
+                    !s1   = (p1 `unsafeShiftR` 8) .&. 255
+                    !rev1 = p1 `unsafeShiftR` 16
+                pack2 rev1 s1 l1 0
+                pack1 (k1 + 1)
+      pack1 0
     when (maxLen > litRootBits) $ do
       -- Pass A: record max subBits for each root prefix needing a subtable.
       let markSub !len !first
@@ -639,13 +677,13 @@ buildDistTableST !lens !off !n !counts !offs !syms !table = do
               else countLoop (i + 1) ml
   !maxLen <- countLoop 0 0
   let offLoop !l !acc !slots !ok
-        | l > maxLen = pure ok
+        | l > maxLen = pure (ok, slots)
         | otherwise = do
             !c <- unsafeRead counts l
             unsafeWrite offs l acc
             let !nextSlots = slots * 2 - c
             offLoop (l + 1) (acc + c) nextSlots (ok && nextSlots >= 0)
-  !valid <- offLoop 1 0 1 True
+  (!valid, !finalSlots) <- offLoop 1 0 1 True
   let sortLoop !i
         | i >= n = pure ()
         | otherwise = do
@@ -657,7 +695,7 @@ buildDistTableST !lens !off !n !counts !offs !syms !table = do
             sortLoop (i + 1)
   sortLoop 0
   let !rootSize = 1 `unsafeShiftL` distRootBits
-  zeroIntRange table distTblOff rootSize
+  when (not (valid && maxLen > 0 && finalSlots == 0)) $ zeroIntRange table distTblOff rootSize
   when valid $ do
     let !lim = min distRootBits maxLen
         fillRoot !len !first !index
@@ -1244,7 +1282,7 @@ readDynamicST !dat !sc !p0 !bb0 !bc0 =
                 decodeLens (n + k) 0 p (bb `unsafeShiftR` 7) (bc - 7)
       (!actualTotal, !p3, !bb3, !bc3) <- decodeLens 0 0 p2 bb2 bc2
       !litMax  <- buildLitTableST allLens 0 (min nlit actualTotal)
-                    (scLitCounts sc) offs (scLitSyms sc) (scTable sc)
+                    (scLitCounts sc) offs (scLitSyms sc) (scTable sc) (scShortLits sc)
       !distMax <- buildDistTableST allLens nlit (max 0 (actualTotal - nlit))
                     (scDistCounts sc) offs (scDistSyms sc) (scTable sc)
       pure (DynRes litMax distMax p3 bb3 bc3)
@@ -1292,7 +1330,7 @@ inflateFixed dat !startByte arr !base !size = do
                    forLoop 0 287 $ \i -> unsafeWrite (scAllLens sc) i (fixedLitLensU `unsafeAt` i)
                    forLoop 0 29  $ \i -> unsafeWrite (scAllLens sc) (288 + i) (fixedDistLensU `unsafeAt` i)
                    !litMax  <- buildLitTableST (scAllLens sc) 0 288
-                                 (scLitCounts sc) (scOffs sc) (scLitSyms sc) (scTable sc)
+                                 (scLitCounts sc) (scOffs sc) (scLitSyms sc) (scTable sc) (scShortLits sc)
                    !distMax <- buildDistTableST (scAllLens sc) 288 30
                                  (scDistCounts sc) (scOffs sc) (scDistSyms sc) (scTable sc)
                    BlockRes p' bb' bc' o' err <- huffBlockST dat arr base limit
