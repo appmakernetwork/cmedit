@@ -23,6 +23,7 @@ module Cmedit.Inflate
   , inflateDyn
   , inflateInto
   , inflateIntoSegs
+  , inflateIntoSegsW
     -- * Canonical Huffman tables (shared with JPEG)
   , Huff(..)
   , buildHuff
@@ -51,7 +52,7 @@ import qualified Data.ByteString.Internal as BI
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Array.Base (STUArray(..), unsafeRead, unsafeWrite, unsafeAt)
 import GHC.ByteOrder (ByteOrder(..), targetByteOrder)
-import GHC.Exts (Addr#, Int(I#), Int#, MutableByteArray#, State#, Word64#, copyAddrToByteArray#, copyMutableByteArray#, gtAddr#, indexWord64OffAddr#, isTrue#, minusAddr#, plusAddr#, readIntArray#, readWord64OffAddr#, readWord8Array#, readWord8ArrayAsWord16#, readWord8ArrayAsWord32#, readWord8ArrayAsWord64#, runRW#, setByteArray#, touch#, writeWord8Array#, writeWord8ArrayAsWord32#, writeWord8ArrayAsWord64#)
+import GHC.Exts (Addr#, Int(I#), Int#, MutableByteArray#, State#, Word64#, copyAddrToByteArray#, copyMutableByteArray#, gtAddr#, indexWord64OffAddr#, isTrue#, (<#), minusAddr#, plusAddr#, readIntArray#, readWord64OffAddr#, readWord8Array#, readWord8ArrayAsWord16#, readWord8ArrayAsWord32#, readWord8ArrayAsWord64#, runRW#, setByteArray#, touch#, writeWord8Array#, writeWord8ArrayAsWord32#, writeWord8ArrayAsWord64#)
 import GHC.ForeignPtr (ForeignPtr(..), ForeignPtrContents)
 import GHC.IO (IO(..))
 import GHC.ST (ST(..))
@@ -220,7 +221,7 @@ decodeSymSlow dat st (Huff counts syms maxLen) = go 1 0 0 0
 inflate :: BS.ByteString -> Int -> Int -> Either String (UArray Int Word8)
 inflate dat startByte outSize = runST $ do
   arr <- newArray (0, max 0 (outSize - 1)) 0 :: ST s (STUArray s Int Word8)
-  err <- inflateFixed (mkSegs [dat]) startByte arr 0 outSize
+  err <- inflateFixed 0 (mkSegs [dat]) [] startByte arr 0 outSize
   frozen <- freeze arr
   pure (maybe (Right frozen) Left err)
 
@@ -232,15 +233,60 @@ inflate dat startByte outSize = runST $ do
 inflateInto :: BS.ByteString -> Int -> STUArray s Int Word8 -> Int -> Int
             -> ST s (Maybe String)
 inflateInto dat startByte arr base outSize =
-  inflateFixed (mkSegs [dat]) startByte arr base outSize
+  inflateFixed 0 (mkSegs [dat]) [] startByte arr base outSize
 
 -- | 'inflateInto' over a list of contiguous byte slices, avoiding an upfront
 -- concatenation copy (e.g. multi-IDAT PNGs). Semantics are identical to
 -- @inflateInto (BS.concat chunks)@.
+--
+-- The list is consumed as a stream: the decoder holds a window of about
+-- 'streamWindow' bytes ahead of its read position and lets go of every slice
+-- behind it, so a lazily produced list (PNG IDAT payloads read from the file
+-- as the decode reaches them) is never resident as a whole.
 inflateIntoSegs :: [BS.ByteString] -> Int -> STUArray s Int Word8 -> Int -> Int
                 -> ST s (Maybe String)
-inflateIntoSegs chunks startByte arr base outSize =
-  inflateFixed (mkSegs chunks) startByte arr base outSize
+inflateIntoSegs = inflateIntoSegsW streamWindow
+
+-- | 'inflateIntoSegs' with the window size given (tests use small ones, so
+-- that blocks straddle windows).
+inflateIntoSegsW :: Int -> [BS.ByteString] -> Int -> STUArray s Int Word8 -> Int -> Int
+                 -> ST s (Maybe String)
+inflateIntoSegsW win chunks startByte arr base outSize =
+  let !w = max minWindow win
+      (segs, rest) = advanceWindow w (mkSegsAt 0 [] True) chunks 0 (startByte + w)
+  in inflateFixed w segs rest startByte arr base outSize
+
+-- Input held ahead of the reader. Large enough that the window is rebuilt a
+-- few times a megabyte and a block rarely has to be resumed; small next to
+-- the file it saves holding.
+streamWindow :: Int
+streamWindow = 1024 * 1024
+
+-- The least window: a block header plus its dynamic code tables (at most
+-- about 600 bytes) and the bit buffer's lookahead always fit in half of it.
+minWindow :: Int
+minWindow = 4096
+
+-- Slide a window forward: keep the slices that end after @lo@, then append
+-- from @rest@ until the window reaches @hi@ or the stream ends. The slices
+-- behind @lo@ are no longer referenced, which is what lets a lazily produced
+-- stream be collected as it is decoded.
+advanceWindow :: Int -> Segs -> [BS.ByteString] -> Int -> Int -> (Segs, [BS.ByteString])
+advanceWindow _ (Segs n tot starts arr _) rest lo hi =
+  let firstKept = head ([ j | j <- [0 .. n - 1], starts `unsafeAt` (j + 1) > lo ] ++ [n])
+      kept      = [ arr A.! j | j <- [firstKept .. n - 1] ]
+      base      = starts `unsafeAt` firstKept
+      grab !acc !end rs
+        | end >= hi = (reverse acc, rs)
+        | otherwise = case rs of
+            []       -> (reverse acc, [])
+            (b : bs) -> grab (b : acc) (end + BS.length b) bs
+      (added, rest') = grab [] tot rest
+  in (mkSegsAt base (kept ++ added) (not (null rest')), rest')
+
+-- The status a Huffman block returns when its window ran out mid-block.
+needInput :: String
+needInput = "\0need input"
 
 --------------------------------------------------------------------------------
 -- Fast known-size DEFLATE decoder ('inflateFixed')
@@ -266,27 +312,35 @@ le64Raw addr# fpc (I# pos#) =
 
 -- Non-empty input slices with cumulative byte offsets, padded with one
 -- trailing sentinel so @segStarts ! (k + 1)@ is always in bounds for @k <= n@.
-data Segs = Segs !Int !Int !(UArray Int Int) !(Array Int BS.ByteString)
+-- The last field says more input follows the last slice: the value is then a
+-- window onto a longer stream ('inflateIntoSegs'), and a refill that reaches
+-- its end stops short instead of supplying the zero padding that only the
+-- true end of the stream gets.
+data Segs = Segs !Int !Int !(UArray Int Int) !(Array Int BS.ByteString) !Bool
 
 {-# INLINE segTotal #-}
 segTotal :: Segs -> Int
-segTotal (Segs _ tot _ _) = tot
+segTotal (Segs _ tot _ _ _) = tot
 
 mkSegs :: [BS.ByteString] -> Segs
-mkSegs raw =
+mkSegs raw = mkSegsAt 0 raw False
+
+-- | Slices starting at stream offset @base@ (a window when @more@).
+mkSegsAt :: Int -> [BS.ByteString] -> Bool -> Segs
+mkSegsAt base raw more =
   let nonEmpty = filter (not . BS.null) raw
       !n       = length nonEmpty
-      starts   = scanl (\acc b -> acc + BS.length b) 0 nonEmpty
+      starts   = scanl (\acc b -> acc + BS.length b) base nonEmpty
       !tot     = last starts
       !sArr    = U.listArray (0, n + 1) (starts ++ [tot])
       !bArr    = A.listArray (0, n) (nonEmpty ++ [BS.empty])
-  in Segs n tot sArr bArr
+  in Segs n tot sArr bArr more
 
 -- Binary search for the segment containing byte @pos@ (0 if pos <= 0,
 -- @segCount@ if pos >= @segTotal@).
 {-# INLINE seekSeg #-}
 seekSeg :: Segs -> Int -> Int
-seekSeg (Segs !n !tot !starts _) !pos
+seekSeg (Segs !n !tot !starts _ _) !pos
   | pos <= 0   = 0
   | pos >= tot = n
   | otherwise  = go 0 n
@@ -301,7 +355,7 @@ seekSeg (Segs !n !tot !starts _) !pos
 -- whenever @k < n@ and @pos >= 0@).
 {-# INLINE advSeg #-}
 advSeg :: Segs -> Int -> Int -> Int
-advSeg (Segs !n _ !starts _) !k0 !pos = go k0
+advSeg (Segs !n _ !starts _ _) !k0 !pos = go k0
   where
     go !k
       | k < n && pos >= starts `unsafeAt` (k + 1) = go (k + 1)
@@ -309,7 +363,7 @@ advSeg (Segs !n _ !starts _) !k0 !pos = go k0
 
 {-# INLINE segByteAt #-}
 segByteAt :: Segs -> Int -> Int
-segByteAt segs@(Segs _ !tot !starts !arr) !idx
+segByteAt segs@(Segs _ !tot !starts !arr _) !idx
   | idx < 0 || idx >= tot = 0
   | otherwise =
       let !k  = seekSeg segs idx
@@ -318,7 +372,7 @@ segByteAt segs@(Segs _ !tot !starts !arr) !idx
 
 {-# NOINLINE copyStoredSegs #-}
 copyStoredSegs :: Segs -> Int -> Int -> STUArray s Int Word8 -> Int -> ST s ()
-copyStoredSegs segs@(Segs !n !tot !starts !arr) !srcStart !toCopy !(STUArray _ _ _ dst#) !dstOff
+copyStoredSegs segs@(Segs !n !tot !starts !arr _) !srcStart !toCopy !(STUArray _ _ _ dst#) !dstOff
   | toCopy <= 0 = pure ()
   | otherwise = go (seekSeg segs srcStart) srcStart dstOff toCopy
   where
@@ -351,7 +405,7 @@ copyStoredSegs segs@(Segs !n !tot !starts !arr) !srcStart !toCopy !(STUArray _ _
 -- Refill the 64-bit bit buffer to 56..63 valid bits from segmented input.
 {-# INLINE refillSeg #-}
 refillSeg :: Segs -> Int -> Int -> Word64 -> Int -> (# Int#, Int#, Word64#, Int# #)
-refillSeg segs@(Segs !n _ !starts !arr) !k !p !bb !bc
+refillSeg segs@(Segs !n _ !starts !arr _) !k !p !bb !bc
   | k < n
   , let !s0 = starts `unsafeAt` k
         !s1 = starts `unsafeAt` (k + 1)
@@ -370,7 +424,7 @@ refillSeg segs@(Segs !n _ !starts !arr) !k !p !bb !bc
 
 {-# OPAQUE refillSlowSeg #-}
 refillSlowSeg :: Segs -> Int# -> Int# -> Word64# -> Int# -> (# Int#, Int#, Word64#, Int# #)
-refillSlowSeg segs@(Segs !n _ !starts !arr) k0# p0# bb0# bc0# =
+refillSlowSeg segs@(Segs !n _ !starts !arr more) k0# p0# bb0# bc0# =
   go (I# k0#) (I# p0#) (W64# bb0#) (I# bc0#)
   where
     go !k !p !bb !bc
@@ -384,8 +438,10 @@ refillSlowSeg segs@(Segs !n _ !starts !arr) k0# p0# bb0# bc0# =
                  let !s0 = starts `unsafeAt` k1
                      !b  = fromIntegral (BSU.unsafeIndex (arr A.! k1) (p - s0)) :: Word64
                  in go k1 (p + 1) (bb .|. (b `unsafeShiftL` bc)) (bc + 8)
-               else
-                 go k1 (p + 1) bb (bc + 8)
+               else if more
+                 then case (k1, p, bb, bc) of   -- end of a window: stop short
+                   (I# k#, I# p#, W64# bb#, I# bc#) -> (# k#, p#, bb#, bc# #)
+                 else go k1 (p + 1) bb (bc + 8)
 
 -- 10-bit bit-reversal table for O(1) prefix-table construction.
 rev10 :: UArray Int Int
@@ -1152,7 +1208,7 @@ huffBlockST :: Segs -> STUArray s Int Word8 -> Int -> Int
             -> STUArray s Int Int -> STUArray s Int Int -> Int
             -> Int -> Int -> Word64 -> Int -> Int
             -> ST s BlockRes
-huffBlockST !segs@(Segs !nSeg _ !starts !segArr) !arr@(STUArray _ _ _ arr#) !base !limit
+huffBlockST !segs@(Segs !nSeg _ !starts !segArr _) !arr@(STUArray _ _ _ arr#) !base !limit
             !tbl
             !(STUArray _ _ _ litCnt#) !(STUArray _ _ _ litSym#) !(I# litMax#)
             !(STUArray _ _ _ distCnt#) !(STUArray _ _ _ distSym#) !(I# distMax#)
@@ -1185,7 +1241,10 @@ huffBlockST !segs@(Segs !nSeg _ !starts !segArr) !arr@(STUArray _ _ _ arr#) !bas
       | o >= limit = pure (BlockRes k p bb bc o Nothing)
       | otherwise =
           case refillSeg segs k p bb bc of
-            (# k1#, p1#, bb1#, bc1# #) -> decodeLitSlow (I# k1#) (I# p1#) (W64# bb1#) (I# bc1#) o
+            (# k1#, p1#, bb1#, bc1# #)
+              -- only a window's end leaves fewer than 56 bits: resume there
+              | isTrue# (bc1# <# 56#) -> pure (BlockRes (I# k1#) (I# p1#) (W64# bb1#) (I# bc1#) o (Just needInput))
+              | otherwise -> decodeLitSlow (I# k1#) (I# p1#) (W64# bb1#) (I# bc1#) o
     decodeLitSlow !k !p !bb !bc !o = do
       !e <- unsafeRead tbl (fromIntegral bb .&. litRootMask)
       if e < 0
@@ -1389,12 +1448,11 @@ readDynamicST !segs !sc !k0 !p0 !bb0 !bc0 =
       pure (DynRes litMax distMax k3 p3 bb3 bc3)
 
 {-# NOINLINE inflateFixed #-}
-inflateFixed :: Segs -> Int -> STUArray s Int Word8 -> Int -> Int
+inflateFixed :: Int -> Segs -> [BS.ByteString] -> Int -> STUArray s Int Word8 -> Int -> Int
              -> ST s (Maybe String)
-inflateFixed !segs !startByte arr !base !size = do
+inflateFixed !win !segs0 rest0 !startByte arr !base !size = do
   sc <- newInflateScratch
   let !limit   = base + size
-      !endBits = 8 * segTotal segs
       finish !o !err = do
         when (o < limit) $ do
           let !zEnd = min limit (o + 16)
@@ -1403,10 +1461,18 @@ inflateFixed !segs !startByte arr !base !size = do
                 | otherwise = unsafeWrite arr i 0 >> zeroTail (i + 1)
           zeroTail o
         pure err
-      blockLoop !k !p !bb !bc !o
-        | o >= limit || p * 8 - bc >= endBits = finish o Nothing
+      -- A window onto a longer stream (only 'inflateIntoSegs' makes one)
+      -- is moved on at a block boundary once less than half of it lies
+      -- ahead; until the stream's true end is in it, its end is never
+      -- taken for the end of the data.
+      slide !segs rest !lo !hi = advanceWindow win segs rest lo hi
+      blockLoop segs@(Segs _ _ _ _ more) rest !k !p !bb !bc !o
+        | more && segTotal segs - p < win `unsafeShiftR` 1 =
+            let (segs', rest') = slide segs rest (p - 16) (p + win)
+            in blockLoop segs' rest' (seekSeg segs' p) p bb bc o
+        | o >= limit || p * 8 - bc >= 8 * segTotal segs = finish o Nothing
         | bc < 3 = case refillSeg segs k p bb bc of
-            (# k'#, p'#, bb'#, bc'# #) -> blockLoop (I# k'#) (I# p'#) (W64# bb'#) (I# bc'#) o
+            (# k'#, p'#, bb'#, bc'# #) -> blockLoop segs rest (I# k'#) (I# p'#) (W64# bb'#) (I# bc'#) o
         | otherwise =
             let !bfinal = fromIntegral (bb .&. 1) :: Int
                 !btype  = fromIntegral ((bb `unsafeShiftR` 1) .&. 3) :: Int
@@ -1419,10 +1485,15 @@ inflateFixed !segs !startByte arr !base !size = do
                        !len         = segByteAt segs alignedByte .|. (segByteAt segs (alignedByte + 1) `unsafeShiftL` 8)
                        !srcStart    = alignedByte + 4
                        !toCopy      = min len (limit - o)
-                   copyStoredSegs segs srcStart toCopy arr o
+                       -- the whole payload in the window before copying it
+                       (segsS, restS)
+                         | more && srcStart + toCopy > segTotal segs =
+                             slide segs rest (alignedByte - 16) (srcStart + toCopy + win)
+                         | otherwise = (segs, rest)
+                   copyStoredSegs segsS srcStart toCopy arr o
                    if bfinal == 1 then finish (o + toCopy) Nothing
                    else let !nextP = srcStart + len
-                        in blockLoop (seekSeg segs nextP) nextP 0 0 (o + len)
+                        in blockLoop segsS restS (seekSeg segsS nextP) nextP 0 0 (o + len)
                  1 -> do
                    forLoop 0 287 $ \i -> unsafeWrite (scAllLens sc) i (fixedLitLensU `unsafeAt` i)
                    forLoop 0 29  $ \i -> unsafeWrite (scAllLens sc) (288 + i) (fixedDistLensU `unsafeAt` i)
@@ -1430,26 +1501,28 @@ inflateFixed !segs !startByte arr !base !size = do
                                  (scLitCounts sc) (scOffs sc) (scLitSyms sc) (scTable sc) (scShortLits sc)
                    !distMax <- buildDistTableST (scAllLens sc) 288 30
                                  (scDistCounts sc) (scOffs sc) (scDistSyms sc) (scTable sc)
-                   BlockRes k' p' bb' bc' o' err <- huffBlockST segs arr base limit
-                     (scTable sc)
-                     (scLitCounts sc) (scLitSyms sc) litMax
-                     (scDistCounts sc) (scDistSyms sc) distMax
-                     k p bb1 bc1 o
-                   case err of
-                     Just _  -> finish o' err
-                     Nothing -> if bfinal == 1 then finish o' Nothing else blockLoop k' p' bb' bc' o'
+                   huffBlock segs rest litMax distMax bfinal k p bb1 bc1 o
                  2 -> do
                    DynRes litMax distMax k2 p2 bb2 bc2 <- readDynamicST segs sc k p bb1 bc1
-                   BlockRes k' p' bb' bc' o' err <- huffBlockST segs arr base limit
-                     (scTable sc)
-                     (scLitCounts sc) (scLitSyms sc) litMax
-                     (scDistCounts sc) (scDistSyms sc) distMax
-                     k2 p2 bb2 bc2 o
-                   case err of
-                     Just _  -> finish o' err
-                     Nothing -> if bfinal == 1 then finish o' Nothing else blockLoop k' p' bb' bc' o'
+                   huffBlock segs rest litMax distMax bfinal k2 p2 bb2 bc2 o
                  _ -> finish o (Just "invalid DEFLATE block type")
-  blockLoop (seekSeg segs startByte) startByte 0 0 base
+      -- A Huffman block, resumed with the window moved on whenever it
+      -- stops at the window's end ('needInput'): the tables are still in
+      -- the scratch arrays, and nothing was decoded from bits it lacked.
+      huffBlock segs rest !litMax !distMax !bfinal !k !p !bb !bc !o = do
+        BlockRes k' p' bb' bc' o' err <- huffBlockST segs arr base limit
+          (scTable sc)
+          (scLitCounts sc) (scLitSyms sc) litMax
+          (scDistCounts sc) (scDistSyms sc) distMax
+          k p bb bc o
+        case err of
+          Just e
+            | e == needInput ->
+                let (segs', rest') = slide segs rest (p' - 16) (p' + win)
+                in huffBlock segs' rest' litMax distMax bfinal (seekSeg segs' p') p' bb' bc' o'
+            | otherwise -> finish o' err
+          Nothing -> if bfinal == 1 then finish o' Nothing else blockLoop segs rest k' p' bb' bc' o'
+  blockLoop segs0 rest0 (seekSeg segs0 startByte) startByte 0 0 base
 
 -- | Inflate a stream of unknown output size, stopping at @maxOut@ bytes.
 --
