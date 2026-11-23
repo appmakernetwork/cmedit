@@ -1255,7 +1255,32 @@ paethLanes a b c =
 
 pngPaeth1, pngPaeth2, pngPaeth3, pngPaeth4, pngPaeth6, pngPaeth8
   :: STUArray s Int Word8 -> Int -> Int -> Int -> ST s ()
-pngPaeth1 raw from end d = pngPaethWords 1 raw from end d
+pngPaeth1 raw from end d
+  | from >= end = pure ()
+  | otherwise = do
+      a0 <- unsafeRead raw (from - 1)
+      c0 <- unsafeRead raw (from - 1 + d)
+      go from (fromIntegral a0 :: Int) (fromIntegral c0 :: Int)
+  where
+    -- One byte per pixel: nothing for the lanes to share, so one scalar
+    -- chain, 'paethPredict' with its two comparisons as sign masks.
+    go !i !a !c
+      | i >= end = pure ()
+      | otherwise = do
+          x <- unsafeRead raw i
+          b0 <- unsafeRead raw (i + d)
+          let b = fromIntegral b0 :: Int
+              dd = a - b
+              dm = dd .&. (dd `unsafeShiftR` 63)
+              lo = b + dm; hi = a - dm
+              t = 3*c - a - b
+              m1 = (t - hi) `unsafeShiftR` 63      -- all ones unless hi <= t
+              m2 = (lo - t) `unsafeShiftR` 63      -- all ones unless t <= lo
+              inner = hi `xor` ((hi `xor` c) .&. m2)
+              p = lo `xor` ((lo `xor` inner) .&. m1)
+              r = (fromIntegral x + p) .&. 255
+          unsafeWrite raw i (fromIntegral r)
+          go (i + 1) r b
 pngPaeth2 raw from end d = pngPaethWords 2 raw from end d
 pngPaeth3 raw from end d = pngPaethWords 3 raw from end d
 pngPaeth4 raw from end d = pngPaethWords 4 raw from end d
