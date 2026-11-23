@@ -855,9 +855,29 @@ huffFastLoop cur0# endPtr# arr# !base !fastOutEnd !tbl !bb0 !bc0 !o0 =
               if finiteBitSize (0 :: Int) == 64
                 then writeU32LERaw arr# o (e `unsafeShiftR` 8)
                 else writeU8Raw arr# o (fromIntegral (e `unsafeShiftR` 8))
-              let !len = e .&. 15
-                  !cnt = (e `unsafeShiftR` 4) .&. 7
-              loop cur1# (bb1 `unsafeShiftR` len) (bc1 - len) (o + cnt)
+              let !len1 = e .&. 15
+                  !cnt1 = (e `unsafeShiftR` 4) .&. 7
+                  !bb2  = bb1 `unsafeShiftR` len1
+                  !bc2  = bc1 - len1
+                  !o2   = o + cnt1
+              !e2 <- unsafeRead tbl (fromIntegral bb2 .&. litRootMask)
+              if e2 < 0
+                then do
+                  if finiteBitSize (0 :: Int) == 64
+                    then writeU32LERaw arr# o2 (e2 `unsafeShiftR` 8)
+                    else writeU8Raw arr# o2 (fromIntegral (e2 `unsafeShiftR` 8))
+                  let !len2 = e2 .&. 15
+                      !cnt2 = (e2 `unsafeShiftR` 4) .&. 7
+                  loop cur1# (bb2 `unsafeShiftR` len2) (bc2 - len2) (o2 + cnt2)
+                else if e2 > 0 && e2 < 0x40000000
+                  then
+                    let !llen  = e2 .&. 15
+                        !lex   = (e2 `unsafeShiftR` 4) .&. 15
+                        !lmask = (e2 `unsafeShiftR` 8) .&. 31
+                        !bb3   = bb2 `unsafeShiftR` llen
+                        !mlen  = (e2 `unsafeShiftR` 16) + (fromIntegral bb3 .&. lmask)
+                    in decodeDist cur1# (bb3 `unsafeShiftR` lex) (bc2 - llen - lex) o2 mlen
+                  else loop cur1# bb2 bc2 o2
             else if e > 0 && e < 0x40000000
               then
                 let !llen  = e .&. 15
@@ -1004,7 +1024,7 @@ huffBlockST !dat@(BI.BS (ForeignPtr addr# fpc) !datLen) !arr@(STUArray _ _ _ arr
     !fastEnd    = datLen - 8
     !(I# fe#)   = fastEnd
     endPtr#     = plusAddr# addr# fe#
-    !fastOutEnd = limit - 270
+    !fastOutEnd = limit - 274
     driver !p !bb !bc !o
       | o >= limit = pure (BlockRes p bb bc o Nothing)
       | o < fastOutEnd && p >= 0 && p <= fastEnd = do
