@@ -1037,6 +1037,9 @@ decodePNG bs = do
      -- (never row y+1, by the argument above), so a row is converted only
      -- after the row below it has been unfiltered against it.
      zrow <- newBytes (rowBytes w + 8)
+     -- Eight-bit RGB and RGBA, not interlaced, go from the filtered row
+     -- straight to the output ('pngFuseRow').
+     let fused = inPlace && pngWordsOk && bd == 8 && (ct == 6 || (ct == 2 && isNothing rgbTrans))
      _ <- foldM (\off (x0,y0,dx,dy,pw,ph) ->
              if pw <= 0 || ph <= 0 then pure off else do
                let !rb = rowBytes pw
@@ -1045,11 +1048,21 @@ decodePNG bs = do
                    !ostep = dy*w*4
                    !st = 4*dx
                unfilterPngRow rawArr l0 bpp rb zrow 0 False
-               forLoop 1 (ph-1) $ \ry -> do
-                 let !l = l0 + ry*(1+rb)
-                 unfilterPngRow rawArr l bpp rb rawArr (l - rb) pngWordsOk
-                 conv rawArr (l - rb) (o0 + (ry-1)*ostep) st pw
-               conv rawArr (l0 + (ph-1)*(1+rb) + 1) (o0 + (ph-1)*ostep) st pw
+               if fused
+                 then do
+                   -- (inPlace: rawArr is a, and the pass is the image.)
+                   conv rawArr (l0 + 1) o0 st pw
+                   forLoop 1 (ph-1) $ \ry -> do
+                     let !l = l0 + ry*(1+rb)
+                     ft <- unsafeRead a l
+                     if bpp == 3 then pngFuseRow3 (fromIntegral ft) a (l + 1) (ry*ostep) pw
+                                 else pngFuseRow4 (fromIntegral ft) a (l + 1) (ry*ostep) pw
+                 else do
+                   forLoop 1 (ph-1) $ \ry -> do
+                     let !l = l0 + ry*(1+rb)
+                     unfilterPngRow rawArr l bpp rb rawArr (l - rb) pngWordsOk
+                     conv rawArr (l - rb) (o0 + (ry-1)*ostep) st pw
+                   conv rawArr (l0 + (ph-1)*(1+rb) + 1) (o0 + (ph-1)*ostep) st pw
                pure (off + ph*(1+rb)))
            0 passes
      a' <- if bufSize > outSize then shrinkBytes a outSize else pure a
@@ -1231,6 +1244,88 @@ pngPaeth8 raw from end d = pngPaethWords 8 raw from end d
 {-# NOINLINE pngPaeth4 #-}
 {-# NOINLINE pngPaeth6 #-}
 {-# NOINLINE pngPaeth8 #-}
+
+-- One row of 8-bit RGB (nb 3) or RGBA (nb 4), from its filtered bytes at i
+-- straight to its RGBA output at o, in the same buffer; the row above is
+-- read from the output, wd = 4w bytes back, so the row is touched once and
+-- never stored unfiltered. ft and nb are literals at every call. Writing
+-- pixel p never reaches a filtered byte not yet read: the output of p ends
+-- at o + 4(p+1), the filtered bytes of p+1 start at i + nb(p+1), and the
+-- first is no later at p+1 = 0 (the output row starts no later than the
+-- row's filter byte) and at p+1 = w (the in-place argument in 'decodePNG'),
+-- so everywhere between. Sub, Up and Average add byte lanes of whole pixel
+-- words ('swarAdd'); Paeth is 'paethLanes'. The pixel left of the first is
+-- zero, which is every filter's rule for it (Paeth of (0, b, 0) is b). An
+-- RGB pixel is loaded as four bytes, the fourth being the next pixel's
+-- first; so the row's last pixel, whose fourth byte may lie past the
+-- buffer, is 'pngLastPixel''s.
+{-# INLINE pngFuse #-}
+pngFuse :: Int -> Int -> STUArray s Int Word8 -> Int -> Int -> Int -> ST s ()
+pngFuse ft nb buf i0 o0 w = go i0 o0 0 0
+  where
+    !oLast = o0 + 4*(w - 1)
+    !wd = 4*w
+    spread v0 = let v1 = (v0 .|. (v0 `unsafeShiftL` 16)) .&. 0x0000ffff0000ffff
+                in (v1 .|. (v1 `unsafeShiftL` 8)) .&. 0x00ff00ff00ff00ff
+    squeeze v0 = let v1 = (v0 .|. (v0 `unsafeShiftR` 8)) .&. 0x0000ffff0000ffff
+                 in v1 .|. (v1 `unsafeShiftR` 16)
+    put o v = pngWr32 buf o (if nb == 3 then v .|. 0xff000000 else v)
+    go !i !o !a !c
+      | o >= oLast = pngLastPixel ft nb buf i o w
+      | otherwise = do
+          x <- pngRd32 buf i
+          case ft of
+            1 -> do let r = swarAdd x a
+                    put o r; go (i + nb) (o + 4) r 0
+            2 -> do b <- pngRd32 buf (o - wd)
+                    put o (swarAdd x b); go (i + nb) (o + 4) 0 0
+            3 -> do b <- pngRd32 buf (o - wd)
+                    let r = swarAdd x ((a .&. b) + (((a `xor` b) .&. 0xfefefefefefefefe) `unsafeShiftR` 1))
+                    put o r; go (i + nb) (o + 4) r 0
+            4 -> do b0 <- pngRd32 buf (o - wd)
+                    let b = spread b0
+                        r = (spread x + paethLanes a b c) .&. 0x00ff00ff00ff00ff
+                    put o (squeeze r); go (i + nb) (o + 4) r b
+            _ -> do put o x; go (i + nb) (o + 4) 0 0
+
+-- The last pixel of a 'pngFuse' row, a byte at a time.
+pngLastPixel :: Int -> Int -> STUArray s Int Word8 -> Int -> Int -> Int -> ST s ()
+pngLastPixel ft nb buf i o w = go 0
+  where
+    !wd = 4*w
+    rdI j = (fromIntegral :: Word8 -> Int) <$> unsafeRead buf j
+    go !ch
+      | ch >= nb = when (nb == 3) $ unsafeWrite buf (o + 3) 255
+      | otherwise = do
+          x <- rdI (i + ch)
+          b <- rdI (o - wd + ch)
+          a <- if w > 1 then rdI (o - 4 + ch) else pure 0
+          c <- if w > 1 then rdI (o - wd - 4 + ch) else pure 0
+          unsafeWrite buf (o + ch) (fromIntegral (x + paethPredict ft a b c))
+          go (ch + 1)
+
+-- (filter type, buffer, filtered bytes, output offset, width)
+pngFuseRow3, pngFuseRow4 :: Int -> STUArray s Int Word8 -> Int -> Int -> Int -> ST s ()
+pngFuseRow3 ft buf i o w = case ft of
+  1 -> pngFuse 1 3 buf i o w
+  2 -> pngFuse 2 3 buf i o w
+  3 -> pngFuse 3 3 buf i o w
+  4 -> pngFuse 4 3 buf i o w
+  _ -> pngFuse 0 3 buf i o w
+pngFuseRow4 ft buf i o w = case ft of
+  1 -> pngFuse 1 4 buf i o w
+  2 -> pngFuse 2 4 buf i o w
+  3 -> pngFuse 3 4 buf i o w
+  4 -> pngFuse 4 4 buf i o w
+  _ -> pngFuse 0 4 buf i o w
+{-# NOINLINE pngFuseRow3 #-}
+{-# NOINLINE pngFuseRow4 #-}
+
+-- Byte-wise addition of two words: no carry crosses a lane.
+{-# INLINE swarAdd #-}
+swarAdd :: Word64 -> Word64 -> Word64
+swarAdd x y = ((x .&. 0x7f7f7f7f7f7f7f7f) + (y .&. 0x7f7f7f7f7f7f7f7f))
+              `xor` ((x `xor` y) .&. 0x8080808080808080)
 
 -- The byte-at-a-time filter loops over raw[from, end), in place.
 pngSubBytes :: STUArray s Int Word8 -> Int -> Int -> Int -> ST s ()
