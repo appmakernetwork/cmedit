@@ -70,7 +70,7 @@ import Data.Bits
 import Data.Char (ord)
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.STRef
-import Data.Word (Word8, Word16, Word32, Word64)
+import Data.Word (Word8, Word16, Word32, Word64, byteSwap32)
 import Data.Int (Int16)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
@@ -5736,29 +5736,40 @@ renderImagePlaced mode cols rows (outW, outH, offX, offY) (cropX, cropY, cropW, 
               in (sr `div` n, sg `div` n, sb `div` n)
 
 -- | The mean RGBA of the source box @[x0,x1) x [y0,y1)@ (pixels outside
--- the image are not counted; an empty box is all zeros), for 'renderImage'.
--- Out of line with strict loops: as a local function of 'renderImagePlaced'
--- it boxed its accumulators, 1.1 GB of allocation and 100 ms for the cell
--- picture of a 4096x4096 image (67 bytes per source pixel).
+-- the image are not counted; an empty box is all zeros), shared by the cell
+-- picture ('renderImage') and the pixel overlay ('scaleRGBA'). Out of line
+-- with strict loops: as a local function of 'renderImagePlaced' it boxed its
+-- accumulators, 1.1 GB of allocation and 100 ms for the cell picture of a
+-- 4096x4096 image (67 bytes per source pixel). The box is clipped to the
+-- image once, rather than each pixel tested, and a pixel is one 32-bit
+-- load; the sums, and so the means, are exactly the per-byte ones.
 {-# NOINLINE boxMean #-}
 boxMean :: UArray Int Word8 -> Int -> Int -> Int -> Int -> Int -> Int -> (Int, Int, Int, Int)
-boxMean !pix !iw !ih !x0 !x1 !y0 !y1 = goY y0 0 0 0 0 0
+boxMean (UArray _ _ _ ba) !iw !ih !x0 !x1 !y0 !y1
+  | nx <= 0 || ny <= 0 = (0, 0, 0, 0)
+  | otherwise = goY ya 0 0 0 0
   where
-    goY !y !n !r !g !b !a
-      | y >= y1 = if n == 0 then (0, 0, 0, 0)
-                  else (r `div` n, g `div` n, b `div` n, a `div` n)
-      | y < 0 || y >= ih = goY (y + 1) n r g b a
-      | otherwise = goX x0 (y * iw * 4) y n r g b a
-    goX !x !row !y !n !r !g !b !a
-      | x >= x1 = goY (y + 1) n r g b a
-      | x < 0 || x >= iw = goX (x + 1) row y n r g b a
+    !xa = max 0 x0; !xb = min iw x1
+    !ya = max 0 y0; !yb = min ih y1
+    !nx = xb - xa; !ny = yb - ya
+    !n = nx * ny
+    goY !y !r !g !b !a
+      | y >= yb = let !r' = r `quot` n; !g' = g `quot` n; !b' = b `quot` n; !a' = a `quot` n
+                  in (r', g', b', a')
+      | otherwise = let !row = y * iw in goX (row + xa) (row + xb) y r g b a
+    goX !i !e !y !r !g !b !a
+      | i >= e = goY (y + 1) r g b a
       | otherwise =
-          let o = row + x * 4
-          in goX (x + 1) row y (n + 1)
-                 (r + fromIntegral (unsafeAt pix o))
-                 (g + fromIntegral (unsafeAt pix (o + 1)))
-                 (b + fromIntegral (unsafeAt pix (o + 2)))
-                 (a + fromIntegral (unsafeAt pix (o + 3)))
+          let !w = pixWord ba i
+          in goX (i + 1) e y (r + (w .&. 255)) (g + ((w `unsafeShiftR` 8) .&. 255))
+                 (b + ((w `unsafeShiftR` 16) .&. 255)) (a + (w `unsafeShiftR` 24))
+
+-- | Pixel @i@ of an RGBA buffer as one word, R in the low byte.
+{-# INLINE pixWord #-}
+pixWord :: ByteArray# -> Int -> Int
+pixWord ba (I# i) =
+  let w = W32# (indexWord32Array# ba i)
+  in fromIntegral (if targetByteOrder == LittleEndian then w else byteSwap32 w)
 
 -- | Area-average a source crop rectangle @(cropX, cropY, cropW, cropH)@ down
 -- to exactly @outW x outH@ raw RGBA bytes — the pixel payload for the
@@ -5784,11 +5795,12 @@ scaleRGBA img (cropX, cropY, cropW, cropH) outW0 outH0 =
                         let !x0 = unsafeAt xs0 sx
                             !x1 = unsafeAt xs1 sx
                             !d = (sy * outW + sx) * 4
-                        boxInto x0 x1 y0 y1 $ \r g b a -> do
-                          pokeByteOff ptr d r
-                          pokeByteOff ptr (d + 1) g
-                          pokeByteOff ptr (d + 2) b
-                          pokeByteOff ptr (d + 3) a
+                        case boxMean pix iw ih x0 x1 y0 y1 of
+                          (r, g, b, a) -> do
+                            pokeByteOff ptr d (fromIntegral r :: Word8)
+                            pokeByteOff ptr (d + 1) (fromIntegral g :: Word8)
+                            pokeByteOff ptr (d + 2) (fromIntegral b :: Word8)
+                            pokeByteOff ptr (d + 3) (fromIntegral a :: Word8)
                         col (sx + 1)
               col 0
               row (sy + 1)
@@ -5804,28 +5816,6 @@ scaleRGBA img (cropX, cropY, cropW, cropH) outW0 outH0 =
     xs1 = U.listArray (0, outW - 1)
             [ max (cropX + (sx * cw) `div` outW + 1) (cropX + ((sx + 1) * cw) `div` outW) | sx <- [0 .. outW - 1] ]
 
-    -- The mean of each channel over the source box (pixels outside the
-    -- image are not counted; an empty box is 0).
-    boxInto :: Int -> Int -> Int -> Int -> (Word8 -> Word8 -> Word8 -> Word8 -> IO ()) -> IO ()
-    boxInto !x0 !x1 !y0 !y1 k = goY y0 0 0 0 0 0
-      where
-        goY !y !n !r !g !b !a
-          | y >= y1 =
-              if n == 0 then k 0 0 0 0
-              else k (fromIntegral (r `div` n)) (fromIntegral (g `div` n))
-                     (fromIntegral (b `div` n)) (fromIntegral (a `div` n))
-          | y < 0 || y >= ih = goY (y + 1) n r g b a
-          | otherwise = goX x0 (y * iw * 4) y n r g b a
-        goX !x !base !y !n !r !g !b !a
-          | x >= x1 = goY (y + 1) n r g b a
-          | x < 0 || x >= iw = goX (x + 1) base y n r g b a
-          | otherwise =
-              let o = base + x * 4
-              in goX (x + 1) base y (n + 1)
-                     (r + fromIntegral (unsafeAt pix o) :: Int)
-                     (g + fromIntegral (unsafeAt pix (o + 1)))
-                     (b + fromIntegral (unsafeAt pix (o + 2)))
-                     (a + fromIntegral (unsafeAt pix (o + 3)))
 
 -- | Shrink an image by an integer factor @k@ per side, each output pixel the
 -- mean of its @k x k@ source box (clipped at the right and bottom edges, so
