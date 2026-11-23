@@ -1093,6 +1093,109 @@ main = do
   checkEq "inflate truncated stored block keeps zero padding"
     (U.elems <$> Inflate.inflate (BS.take 10 storedStream) 0 64)
     (Right ([0..4] ++ replicate 59 0))
+  -- Differential test: inflateIntoSegs must match inflateInto byte-for-byte
+  -- (error/Nothing result and every output byte, including guard bytes around
+  -- [base, base+outSize)) across random splits, 1-byte/empty chunks,
+  -- truncations, corrupt bit flips and fixed->stored backward alignment.
+  let runInflateSegs segs startByte base outSize = ST.runST $ do
+        arr <- STA.newArray (0, base + outSize + 15) 0xA5 :: ST.ST s (STA.STUArray s Int Word8)
+        err <- Inflate.inflateIntoSegs segs startByte arr base outSize
+        frozen <- STA.freeze arr
+        pure (err, U.elems (frozen :: U.UArray Int Word8))
+      runInflateFlat bs startByte base outSize = ST.runST $ do
+        arr <- STA.newArray (0, base + outSize + 15) 0xA5 :: ST.ST s (STA.STUArray s Int Word8)
+        err <- Inflate.inflateInto bs startByte arr base outSize
+        frozen <- STA.freeze arr
+        pure (err, U.elems (frozen :: U.UArray Int Word8))
+      splitPRNG :: Word64 -> BS.ByteString -> [BS.ByteString]
+      splitPRNG = go
+        where
+          go _ b | BS.null b = []
+          go seed b =
+            let s1 = seed * 6364136223846793005 + 1442695040888963407
+                r  = fromIntegral ((s1 `shiftR` 33) .&. 31) :: Int
+                sz | r == 0    = 0
+                   | r <= 6    = 1
+                   | r <= 12   = r - 5
+                   | r <= 16   = 8 + (r - 13)
+                   | otherwise = 12 + (r - 17) * 19
+                (h, t) = BS.splitAt sz b
+            in h : go s1 t
+      splitEvery k b
+        | BS.null b = []
+        | otherwise = let (h, t) = BS.splitAt k b in h : splitEvery k t
+      flipByteAt i b
+        | i < 0 || i >= BS.length b = b
+        | otherwise =
+            let (pre, rest) = BS.splitAt i b
+            in pre <> BS.singleton (BS.head rest `xor` 0x55) <> BS.tail rest
+      multiStoredStream = BS.pack ([0,10,0,245,255] ++ [1..10] ++ [1,12,0,243,255] ++ [20..31])
+      -- Non-final empty fixed block (bits 0..9: bfinal=0, btype=1, EOB=0000000)
+      -- followed by a final stored block (bits 10..12: bfinal=1, btype=0) so the
+      -- 64-bit bit buffer reads ahead past the stored header and must step back
+      -- across segment boundaries on byte alignment.
+      fixedThenStored = BS.pack ([0x02, 0x04, 12, 0, 243, 255] ++ [40..51])
+      diffStreams =
+        [ ("stored", storedStream, BS.length storedPayload)
+        , ("multi-stored", multiStoredStream, 22)
+        , ("fixed-then-stored", fixedThenStored, 12)
+        , ("long codes", deflateLongCodes, 15)
+        ] ++ [(label, bytes, BS.length inflatePayload) | (label, bytes) <- deflateRegressionStreams]
+      segDiffFailures =
+        [ label ++ " " ++ variant
+        | (label, raw, expectedLen) <- diffStreams
+        , let prefixed = BS.pack [0x78, 0x9c] <> raw
+              cases =
+                [ ("1-byte chunks", splitEvery 1 raw, 0, 0, expectedLen)
+                , ("7-byte chunks", splitEvery 7 raw, 0, 17, expectedLen)
+                , ("8-byte chunks", splitEvery 8 raw, 0, 0, expectedLen)
+                , ("empty interspersed", BS.empty : concatMap (\c -> [c, BS.empty]) (splitEvery 5 prefixed), 2, 13, expectedLen)
+                , ("prng-1", splitPRNG 1 raw, 0, 0, expectedLen)
+                , ("prng-2 start=2 base=31", splitPRNG 42 prefixed, 2, 31, expectedLen)
+                , ("prng-3 over-limit", splitPRNG 99 raw, 0, 7, expectedLen + 33)
+                , ("prng-4 short-limit", splitPRNG 123 raw, 0, 5, max 1 (expectedLen `div` 2))
+                ]
+                ++ [ ("trunc " ++ show t, splitPRNG (fromIntegral (1000 + t)) (BS.take t raw), 0, 9, expectedLen)
+                   | t <- [0, 1, 2, 7, 8, 9, BS.length raw `div` 3, BS.length raw - 1]
+                   , t <= BS.length raw ]
+                ++ [ ("corrupt @" ++ show pos, splitPRNG (fromIntegral (2000 + pos)) (flipByteAt pos raw), 0, 3, expectedLen)
+                   | pos <- [0, 1, 3, 7, 8, BS.length raw `div` 4, BS.length raw `div` 2, max 0 (BS.length raw - 2)]
+                   , pos < BS.length raw ]
+        , (variant, segs, startByte, base, outSize) <- cases
+        , runInflateSegs segs startByte base outSize /= runInflateFlat (BS.concat segs) startByte base outSize
+        ]
+  checkEq "inflateIntoSegs matches inflateInto across splits, truncations and corruptions"
+    segDiffFailures []
+  checkEq "fixed-then-stored decodes exact bytes across 1-byte segments"
+    (let (err, buf) = runInflateSegs (splitEvery 1 fixedThenStored) 0 0 12
+     in (err, take 12 buf))
+    (Nothing, [40..51])
+  -- Re-slice a PNG fixture's IDAT payload into 1-byte IDAT chunks so even the
+  -- 2-byte zlib header spans two IDAT chunks.
+  case pngRegressionFixtures of
+    ((label, pngBytes, expected) : _) -> do
+      let rechunkIDAT b = BS.take 8 b <> go 8
+            where
+              go pos
+                | pos + 8 > BS.length b = BS.drop pos b
+                | otherwise =
+                    let clen = sum [ fromIntegral (BS.index b (pos + i)) * (256 ^ (3 - i)) | i <- [0..3 :: Int] ]
+                        ctype = BS.take 4 (BS.drop (pos + 4) b)
+                        cdata = BS.take clen (BS.drop (pos + 8) b)
+                        next  = pos + 8 + clen + 4
+                    in if ctype == BS.pack (s "IDAT")
+                         then BS.concat
+                                [ BS.pack (be32b 1 ++ s "IDAT" ++ [w, 0, 0, 0, 0])
+                                | w <- BS.unpack cdata ]
+                              <> go next
+                         else BS.take (clen + 12) (BS.drop pos b) <> go next
+      case decodeImage (rechunkIDAT pngBytes) of
+        Left e -> check ("png 1-byte IDAT chunks (" ++ label ++ "): " ++ e) False
+        Right im -> do
+          let fp = foldl' (\h b -> (h `xor` fromIntegral b) * 1099511628211)
+                          (14695981039346656037 :: Word64) (U.elems (imgPix im))
+          checkEq ("png 1-byte IDAT chunks (" ++ label ++ ")") fp expected
+    [] -> pure ()
 
   -- Animated GIF: the full frame sequence, with sub-rectangle composition,
   -- transparency, disposal methods and the delay clamp.
