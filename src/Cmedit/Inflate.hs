@@ -22,6 +22,7 @@ module Cmedit.Inflate
     inflate
   , inflateDyn
   , inflateInto
+  , inflateIntoSegs
     -- * Canonical Huffman tables (shared with JPEG)
   , Huff(..)
   , buildHuff
@@ -50,7 +51,7 @@ import qualified Data.ByteString.Internal as BI
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Array.Base (STUArray(..), unsafeRead, unsafeWrite, unsafeAt)
 import GHC.ByteOrder (ByteOrder(..), targetByteOrder)
-import GHC.Exts (Addr#, Int(I#), Int#, MutableByteArray#, State#, Word64#, copyMutableByteArray#, gtAddr#, indexWord64OffAddr#, isTrue#, minusAddr#, plusAddr#, readIntArray#, readWord64OffAddr#, readWord8Array#, readWord8ArrayAsWord16#, readWord8ArrayAsWord32#, readWord8ArrayAsWord64#, runRW#, setByteArray#, touch#, writeWord8Array#, writeWord8ArrayAsWord32#, writeWord8ArrayAsWord64#)
+import GHC.Exts (Addr#, Int(I#), Int#, MutableByteArray#, State#, Word64#, copyAddrToByteArray#, copyMutableByteArray#, gtAddr#, indexWord64OffAddr#, isTrue#, minusAddr#, plusAddr#, readIntArray#, readWord64OffAddr#, readWord8Array#, readWord8ArrayAsWord16#, readWord8ArrayAsWord32#, readWord8ArrayAsWord64#, runRW#, setByteArray#, touch#, writeWord8Array#, writeWord8ArrayAsWord32#, writeWord8ArrayAsWord64#)
 import GHC.ForeignPtr (ForeignPtr(..), ForeignPtrContents)
 import GHC.IO (IO(..))
 import GHC.ST (ST(..))
@@ -219,7 +220,7 @@ decodeSymSlow dat st (Huff counts syms maxLen) = go 1 0 0 0
 inflate :: BS.ByteString -> Int -> Int -> Either String (UArray Int Word8)
 inflate dat startByte outSize = runST $ do
   arr <- newArray (0, max 0 (outSize - 1)) 0 :: ST s (STUArray s Int Word8)
-  err <- inflateFixed dat startByte arr 0 outSize
+  err <- inflateFixed (mkSegs [dat]) startByte arr 0 outSize
   frozen <- freeze arr
   pure (maybe (Right frozen) Left err)
 
@@ -231,7 +232,15 @@ inflate dat startByte outSize = runST $ do
 inflateInto :: BS.ByteString -> Int -> STUArray s Int Word8 -> Int -> Int
             -> ST s (Maybe String)
 inflateInto dat startByte arr base outSize =
-  inflateFixed dat startByte arr base outSize
+  inflateFixed (mkSegs [dat]) startByte arr base outSize
+
+-- | 'inflateInto' over a list of contiguous byte slices, avoiding an upfront
+-- concatenation copy (e.g. multi-IDAT PNGs). Semantics are identical to
+-- @inflateInto (BS.concat chunks)@.
+inflateIntoSegs :: [BS.ByteString] -> Int -> STUArray s Int Word8 -> Int -> Int
+                -> ST s (Maybe String)
+inflateIntoSegs chunks startByte arr base outSize =
+  inflateFixed (mkSegs chunks) startByte arr base outSize
 
 --------------------------------------------------------------------------------
 -- Fast known-size DEFLATE decoder ('inflateFixed')
@@ -255,30 +264,129 @@ le64Raw addr# fpc (I# pos#) =
        LittleEndian -> w
        BigEndian    -> byteSwap64 w
 
--- Refill the 64-bit bit buffer to 56..63 valid bits.
-{-# INLINE refill #-}
-refill :: BS.ByteString -> Int -> Word64 -> Int -> (# Int#, Word64#, Int# #)
-refill dat@(BI.BS (ForeignPtr addr# fpc) datLen) !p !bb !bc
-  | p >= 0 && p + 8 <= datLen =
-      let !w   = le64Raw addr# fpc p
-          !bb' = bb .|. (w `unsafeShiftL` bc)
-          !p'  = p + ((63 - bc) `unsafeShiftR` 3)
-          !bc' = bc .|. 56
-      in case (p', bb', bc') of (I# p#, W64# bb#, I# bc#) -> (# p#, bb#, bc# #)
-  | otherwise = case (p, bb, bc) of (I# p#, W64# bb#, I# bc#) -> refillSlow dat p# bb# bc#
+-- Non-empty input slices with cumulative byte offsets, padded with one
+-- trailing sentinel so @segStarts ! (k + 1)@ is always in bounds for @k <= n@.
+data Segs = Segs
+  { segCount  :: !Int
+  , segTotal  :: !Int
+  , segStarts :: !(UArray Int Int)
+  , segArr    :: !(Array Int BS.ByteString)
+  }
 
-{-# OPAQUE refillSlow #-}
-refillSlow :: BS.ByteString -> Int# -> Word64# -> Int# -> (# Int#, Word64#, Int# #)
-refillSlow dat p0# bb0# bc0# = go (I# p0#) (W64# bb0#) (I# bc0#)
+mkSegs :: [BS.ByteString] -> Segs
+mkSegs raw =
+  let nonEmpty = filter (not . BS.null) raw
+      !n       = length nonEmpty
+      starts   = scanl (\acc b -> acc + BS.length b) 0 nonEmpty
+      !tot     = last starts
+      !sArr    = U.listArray (0, n + 1) (starts ++ [tot])
+      !bArr    = A.listArray (0, n) (nonEmpty ++ [BS.empty])
+  in Segs n tot sArr bArr
+
+-- Binary search for the segment containing byte @pos@ (0 if pos <= 0,
+-- @segCount@ if pos >= @segTotal@).
+{-# INLINE seekSeg #-}
+seekSeg :: Segs -> Int -> Int
+seekSeg (Segs !n !tot !starts _) !pos
+  | pos <= 0   = 0
+  | pos >= tot = n
+  | otherwise  = go 0 n
   where
-    !datLen = BS.length dat
-    go !p !bb !bc
-      | bc >= 56 = case (p, bb, bc) of (I# p#, W64# bb#, I# bc#) -> (# p#, bb#, bc# #)
-      | p >= 0 && p < datLen =
-          let !b = fromIntegral (BSU.unsafeIndex dat p) :: Word64
-          in go (p + 1) (bb .|. (b `unsafeShiftL` bc)) (bc + 8)
+    go !lo !hi
+      | lo + 1 >= hi = lo
       | otherwise =
-          go (p + 1) bb (bc + 8)
+          let !mid = (lo + hi) `unsafeShiftR` 1
+          in if starts `unsafeAt` mid <= pos then go mid hi else go lo mid
+
+-- Advance segment index forward to contain @pos@ (assumes @pos >= starts ! k@
+-- whenever @k < n@ and @pos >= 0@).
+{-# INLINE advSeg #-}
+advSeg :: Segs -> Int -> Int -> Int
+advSeg (Segs !n _ !starts _) !k0 !pos = go k0
+  where
+    go !k
+      | k < n && pos >= starts `unsafeAt` (k + 1) = go (k + 1)
+      | otherwise = k
+
+{-# INLINE segByteAt #-}
+segByteAt :: Segs -> Int -> Int
+segByteAt segs@(Segs _ !tot !starts !arr) !idx
+  | idx < 0 || idx >= tot = 0
+  | otherwise =
+      let !k  = seekSeg segs idx
+          !s0 = starts `unsafeAt` k
+      in fromIntegral (BSU.unsafeIndex (arr A.! k) (idx - s0))
+
+{-# NOINLINE copyStoredSegs #-}
+copyStoredSegs :: Segs -> Int -> Int -> STUArray s Int Word8 -> Int -> ST s ()
+copyStoredSegs segs@(Segs !n !tot !starts !arr) !srcStart !toCopy !(STUArray _ _ _ dst#) !dstOff
+  | toCopy <= 0 = pure ()
+  | otherwise = go (seekSeg segs srcStart) srcStart dstOff toCopy
+  where
+    go !k !pos !o !remN
+      | remN <= 0 = pure ()
+      | pos < 0 = do
+          let !z = min remN (negate pos)
+          zeroOut o z
+          go 0 0 (o + z) (remN - z)
+      | pos >= tot || k >= n = zeroOut o remN
+      | otherwise =
+          let !s0 = starts `unsafeAt` k
+              !s1 = starts `unsafeAt` (k + 1)
+              !avail = s1 - pos
+              !chunk = min remN avail
+          in if chunk <= 0
+               then go (k + 1) pos o remN
+               else case arr A.! k of
+                 BI.BS (ForeignPtr addr# fpc) _ -> do
+                   copyFromAddr addr# fpc (pos - s0) o chunk
+                   go (k + 1) (pos + chunk) (o + chunk) (remN - chunk)
+    zeroOut (I# off#) (I# len#) = ST $ \s# ->
+      case setByteArray# dst# off# len# 0# s# of s1# -> (# s1#, () #)
+    copyFromAddr addr# fpc (I# sOff#) (I# dOff#) (I# len#) = do
+      ST $ \s# ->
+        case copyAddrToByteArray# (plusAddr# addr# sOff#) dst# dOff# len# s# of
+          s1# -> (# s1#, () #)
+      unsafeIOToST (IO $ \s# -> case touch# fpc s# of s1# -> (# s1#, () #))
+
+-- Refill the 64-bit bit buffer to 56..63 valid bits from segmented input.
+{-# INLINE refillSeg #-}
+refillSeg :: Segs -> Int -> Int -> Word64 -> Int -> (# Int#, Int#, Word64#, Int# #)
+refillSeg segs@(Segs !n _ !starts !arr) !k !p !bb !bc
+  | k < n
+  , let !s0 = starts `unsafeAt` k
+        !s1 = starts `unsafeAt` (k + 1)
+  , p >= s0 && p + 8 <= s1 =
+      case arr A.! k of
+        BI.BS (ForeignPtr addr# fpc) _ ->
+          let !w   = le64Raw addr# fpc (p - s0)
+              !bb' = bb .|. (w `unsafeShiftL` bc)
+              !p'  = p + ((63 - bc) `unsafeShiftR` 3)
+              !bc' = bc .|. 56
+          in case (k, p', bb', bc') of
+               (I# k#, I# p#, W64# bb#, I# bc#) -> (# k#, p#, bb#, bc# #)
+  | otherwise =
+      case (k, p, bb, bc) of
+        (I# k#, I# p#, W64# bb#, I# bc#) -> refillSlowSeg segs k# p# bb# bc#
+
+{-# OPAQUE refillSlowSeg #-}
+refillSlowSeg :: Segs -> Int# -> Int# -> Word64# -> Int# -> (# Int#, Int#, Word64#, Int# #)
+refillSlowSeg segs@(Segs !n _ !starts !arr) k0# p0# bb0# bc0# =
+  go (I# k0#) (I# p0#) (W64# bb0#) (I# bc0#)
+  where
+    go !k !p !bb !bc
+      | bc >= 56 = case (k, p, bb, bc) of
+          (I# k#, I# p#, W64# bb#, I# bc#) -> (# k#, p#, bb#, bc# #)
+      | p < 0 = go k (p + 1) bb (bc + 8)
+      | otherwise =
+          let !k1 = advSeg segs k p
+          in if k1 < n
+               then
+                 let !s0 = starts `unsafeAt` k1
+                     !b  = fromIntegral (BSU.unsafeIndex (arr A.! k1) (p - s0)) :: Word64
+                 in go k1 (p + 1) (bb .|. (b `unsafeShiftL` bc)) (bc + 8)
+               else
+                 go k1 (p + 1) bb (bc + 8)
 
 -- 10-bit bit-reversal table for O(1) prefix-table construction.
 rev10 :: UArray Int Int
@@ -808,7 +916,7 @@ decodeSymSlowM bb0# bc0# cnts# syms# maxLen# s0# = go 1 0 0 0 (W64# bb0#) (I# bc
                                case (bb', bc') of (W64# b#, I# c#) -> (# s2#, sym#, b#, c# #)
                       else go (len + 1) (code1 `unsafeShiftL` 1) ((first + cnt) `unsafeShiftL` 1) (index + cnt) bb' bc' s1#
 
-data BlockRes = BlockRes !Int !Word64 !Int !Int !(Maybe String)
+data BlockRes = BlockRes !Int !Int !Word64 !Int !Int !(Maybe String)
 data FastRes  = FastRes  !Int Addr# !Word64 !Int !Int
 
 {-# INLINE le64Ptr #-}
@@ -1044,44 +1152,47 @@ huffFastLoop cur0# endPtr# arr# !base !fastOutEnd !tbl !bb0 !bc0 !o0 =
               copy8 cur# bb bc end (o - d) prepEnd
 
 {-# NOINLINE huffBlockST #-}
-huffBlockST :: BS.ByteString -> STUArray s Int Word8 -> Int -> Int
+huffBlockST :: Segs -> STUArray s Int Word8 -> Int -> Int
             -> STUArray s Int Int
             -> STUArray s Int Int -> STUArray s Int Int -> Int
             -> STUArray s Int Int -> STUArray s Int Int -> Int
-            -> Int -> Word64 -> Int -> Int
+            -> Int -> Int -> Word64 -> Int -> Int
             -> ST s BlockRes
-huffBlockST !dat@(BI.BS (ForeignPtr addr# fpc) !datLen) !arr@(STUArray _ _ _ arr#) !base !limit
+huffBlockST !segs@(Segs !nSeg _ !starts !segArr) !arr@(STUArray _ _ _ arr#) !base !limit
             !tbl
             !(STUArray _ _ _ litCnt#) !(STUArray _ _ _ litSym#) !(I# litMax#)
             !(STUArray _ _ _ distCnt#) !(STUArray _ _ _ distSym#) !(I# distMax#)
-            !p0 !bb0 !bc0 !o0 = do
-  !res <- driver p0 bb0 bc0 o0
-  unsafeIOToST (IO $ \s# -> case touch# fpc s# of s1# -> (# s1#, () #))
-  pure res
+            !k0 !p0 !bb0 !bc0 !o0 =
+  driver k0 p0 bb0 bc0 o0
   where
-    !fastEnd    = datLen - 8
-    !(I# fe#)   = fastEnd
-    endPtr#     = plusAddr# addr# fe#
     !fastOutEnd = limit - 274
-    driver !p !bb !bc !o
-      | o >= limit = pure (BlockRes p bb bc o Nothing)
-      | o < fastOutEnd && p >= 0 && p <= fastEnd = do
-          let !(I# p#) = p
-          FastRes st cur1# bb1 bc1 o1 <- huffFastLoop (plusAddr# addr# p#) endPtr# arr# base fastOutEnd tbl bb bc o
-          let !p1 = I# (minusAddr# cur1# addr#)
+    driver !k !p !bb !bc !o
+      | o >= limit = pure (BlockRes k p bb bc o Nothing)
+      | o < fastOutEnd && k < nSeg
+      , let !s0 = starts `unsafeAt` k
+            !s1 = starts `unsafeAt` (k + 1)
+      , p >= s0 && p <= s1 - 8 = do
+          let !(BI.BS (ForeignPtr segAddr# segFpc) _) = segArr A.! k
+              !(I# pOff#) = p - s0
+              !(I# eOff#) = s1 - s0 - 8
+          FastRes st cur1# bb1 bc1 o1 <-
+            huffFastLoop (plusAddr# segAddr# pOff#) (plusAddr# segAddr# eOff#)
+                         arr# base fastOutEnd tbl bb bc o
+          unsafeIOToST (IO $ \s# -> case touch# segFpc s# of s1# -> (# s1#, () #))
+          let !p1 = s0 + I# (minusAddr# cur1# segAddr#)
           case st of
-            0 -> pure (BlockRes p1 bb1 bc1 o1 Nothing)
-            2 -> pure (BlockRes p1 bb1 bc1 o1 (Just "invalid length code"))
-            3 -> pure (BlockRes p1 bb1 bc1 o1 (Just "invalid distance code"))
-            1 -> slowStep p1 bb1 bc1 o1
-            _ -> walkDist p1 bb1 bc1 o1 (st - 4)
-      | otherwise = slowStep p bb bc o
-    slowStep !p !bb !bc !o
-      | o >= limit = pure (BlockRes p bb bc o Nothing)
+            0 -> pure (BlockRes k p1 bb1 bc1 o1 Nothing)
+            2 -> pure (BlockRes k p1 bb1 bc1 o1 (Just "invalid length code"))
+            3 -> pure (BlockRes k p1 bb1 bc1 o1 (Just "invalid distance code"))
+            1 -> slowStep k p1 bb1 bc1 o1
+            _ -> walkDist k p1 bb1 bc1 o1 (st - 4)
+      | otherwise = slowStep k p bb bc o
+    slowStep !k !p !bb !bc !o
+      | o >= limit = pure (BlockRes k p bb bc o Nothing)
       | otherwise =
-          case refill dat p bb bc of
-            (# p1#, bb1#, bc1# #) -> decodeLitSlow (I# p1#) (W64# bb1#) (I# bc1#) o
-    decodeLitSlow !p !bb !bc !o = do
+          case refillSeg segs k p bb bc of
+            (# k1#, p1#, bb1#, bc1# #) -> decodeLitSlow (I# k1#) (I# p1#) (W64# bb1#) (I# bc1#) o
+    decodeLitSlow !k !p !bb !bc !o = do
       !e <- unsafeRead tbl (fromIntegral bb .&. litRootMask)
       if e < 0
         then do
@@ -1092,7 +1203,7 @@ huffBlockST !dat@(BI.BS (ForeignPtr addr# fpc) !datLen) !arr@(STUArray _ _ _ arr
                 | j >= nwr  = pure ()
                 | otherwise = unsafeWrite arr (o + j) (fromIntegral v) >> writeBytes (j + 1) (v `unsafeShiftR` 8)
           writeBytes 0 (e `unsafeShiftR` 8)
-          driver p (bb `unsafeShiftR` len) (bc - len) (o + cnt)
+          driver k p (bb `unsafeShiftR` len) (bc - len) (o + cnt)
         else if e > 0 && e < 0x40000000
           then
             let !llen  = e .&. 15
@@ -1100,10 +1211,10 @@ huffBlockST !dat@(BI.BS (ForeignPtr addr# fpc) !datLen) !arr@(STUArray _ _ _ arr
                 !lmask = (e `unsafeShiftR` 8) .&. 31
                 !bb1   = bb `unsafeShiftR` llen
                 !mlen  = (e `unsafeShiftR` 16) + (fromIntegral bb1 .&. lmask)
-            in decodeDistSlow p (bb1 `unsafeShiftR` lex) (bc - llen - lex) o mlen
+            in decodeDistSlow k p (bb1 `unsafeShiftR` lex) (bc - llen - lex) o mlen
           else if e >= 0x40000000
             then if e < 0x50000000
-              then let !len = e .&. 15 in pure (BlockRes p (bb `unsafeShiftR` len) (bc - len) o Nothing)
+              then let !len = e .&. 15 in pure (BlockRes k p (bb `unsafeShiftR` len) (bc - len) o Nothing)
               else if e < 0x60000000
                 then do
                   let !bb1    = bb `unsafeShiftR` litRootBits
@@ -1115,7 +1226,7 @@ huffBlockST !dat@(BI.BS (ForeignPtr addr# fpc) !datLen) !arr@(STUArray _ _ _ arr
                     then do
                       unsafeWrite arr o (fromIntegral (se `unsafeShiftR` 8))
                       let !len = se .&. 15
-                      driver p (bb1 `unsafeShiftR` len) (bc1 - len) (o + 1)
+                      driver k p (bb1 `unsafeShiftR` len) (bc1 - len) (o + 1)
                     else if se > 0 && se < 0x40000000
                       then
                         let !llen  = se .&. 15
@@ -1123,37 +1234,37 @@ huffBlockST !dat@(BI.BS (ForeignPtr addr# fpc) !datLen) !arr@(STUArray _ _ _ arr
                             !lmask = (se `unsafeShiftR` 8) .&. 31
                             !bb2   = bb1 `unsafeShiftR` llen
                             !mlen  = (se `unsafeShiftR` 16) + (fromIntegral bb2 .&. lmask)
-                        in decodeDistSlow p (bb2 `unsafeShiftR` lex) (bc1 - llen - lex) o mlen
+                        in decodeDistSlow k p (bb2 `unsafeShiftR` lex) (bc1 - llen - lex) o mlen
                       else if se >= 0x40000000
                         then if se < 0x50000000
-                          then let !len = se .&. 15 in pure (BlockRes p (bb1 `unsafeShiftR` len) (bc1 - len) o Nothing)
-                          else let !len = se .&. 15 in pure (BlockRes p (bb1 `unsafeShiftR` len) (bc1 - len) o (Just "invalid length code"))
-                        else walkLit p bb bc o
-                else let !len = e .&. 15 in pure (BlockRes p (bb `unsafeShiftR` len) (bc - len) o (Just "invalid length code"))
-            else walkLit p bb bc o
-    walkLit !p !bb !bc !o =
+                          then let !len = se .&. 15 in pure (BlockRes k p (bb1 `unsafeShiftR` len) (bc1 - len) o Nothing)
+                          else let !len = se .&. 15 in pure (BlockRes k p (bb1 `unsafeShiftR` len) (bc1 - len) o (Just "invalid length code"))
+                        else walkLit k p bb bc o
+                else let !len = e .&. 15 in pure (BlockRes k p (bb `unsafeShiftR` len) (bc - len) o (Just "invalid length code"))
+            else walkLit k p bb bc o
+    walkLit !k !p !bb !bc !o =
       case (bb, bc) of
         (W64# bb#, I# bc#) -> ST $ \s# ->
           case decodeSymSlowM bb# bc# litCnt# litSym# litMax# s# of
             (# s1#, sym#, bb2#, bc2# #) ->
-              case handleSymWalk p (W64# bb2#) (I# bc2#) o (I# sym#) of
+              case handleSymWalk k p (W64# bb2#) (I# bc2#) o (I# sym#) of
                 ST f -> f s1#
-    handleSymWalk !p !bb !bc !o !sym
-      | sym < 0    = pure (BlockRes p bb bc o (Just "invalid Huffman code"))
+    handleSymWalk !k !p !bb !bc !o !sym
+      | sym < 0    = pure (BlockRes k p bb bc o (Just "invalid Huffman code"))
       | sym < 256  = do
           unsafeWrite arr o (fromIntegral sym)
-          driver p bb bc (o + 1)
-      | sym == 256 = pure (BlockRes p bb bc o Nothing)
+          driver k p bb bc (o + 1)
+      | sym == 256 = pure (BlockRes k p bb bc o Nothing)
       | otherwise  =
           let !li = sym - 257
           in if li >= nLenCodes
-               then pure (BlockRes p bb bc o (Just "invalid length code"))
+               then pure (BlockRes k p bb bc o (Just "invalid length code"))
                else
                  let !lex   = lenExtra `unsafeAt` li
                      !extra = fromIntegral bb .&. ((1 `unsafeShiftL` lex) - 1)
                      !mlen  = lenBase `unsafeAt` li + extra
-                 in decodeDistSlow p (bb `unsafeShiftR` lex) (bc - lex) o mlen
-    decodeDistSlow !p !bb !bc !o !mlen = do
+                 in decodeDistSlow k p (bb `unsafeShiftR` lex) (bc - lex) o mlen
+    decodeDistSlow !k !p !bb !bc !o !mlen = do
       !de <- unsafeRead tbl (distTblOff + (fromIntegral bb .&. distRootMask))
       if de > 0
         then
@@ -1162,7 +1273,7 @@ huffBlockST !dat@(BI.BS (ForeignPtr addr# fpc) !datLen) !arr@(STUArray _ _ _ arr
               !bb1   = bb `unsafeShiftR` dlen
               !dmask = if finiteBitSize (0 :: Int) == 64 then de `unsafeShiftR` 32 else (1 `unsafeShiftL` dex) - 1
               !d     = ((de `unsafeShiftR` 16) .&. 0x7FFF) + (fromIntegral bb1 .&. dmask)
-          in doCopySlow p (bb1 `unsafeShiftR` dex) (bc - dlen - dex) o mlen d
+          in doCopySlow k p (bb1 `unsafeShiftR` dex) (bc - dlen - dex) o mlen d
         else if de < 0
           then if (de .&. 0x40000000) == 0
             then do
@@ -1178,41 +1289,41 @@ huffBlockST !dat@(BI.BS (ForeignPtr addr# fpc) !datLen) !arr@(STUArray _ _ _ arr
                       !bb2   = bb1 `unsafeShiftR` dlen
                       !dmask = if finiteBitSize (0 :: Int) == 64 then sde `unsafeShiftR` 32 else (1 `unsafeShiftL` dex) - 1
                       !d     = ((sde `unsafeShiftR` 16) .&. 0x7FFF) + (fromIntegral bb2 .&. dmask)
-                  in doCopySlow p (bb2 `unsafeShiftR` dex) (bc1 - dlen - dex) o mlen d
+                  in doCopySlow k p (bb2 `unsafeShiftR` dex) (bc1 - dlen - dex) o mlen d
                 else if sde < 0
-                  then let !dlen = sde .&. 15 in pure (BlockRes p (bb1 `unsafeShiftR` dlen) (bc1 - dlen) o (Just "invalid distance code"))
-                  else walkDist p bb bc o mlen
-            else let !dlen = de .&. 15 in pure (BlockRes p (bb `unsafeShiftR` dlen) (bc - dlen) o (Just "invalid distance code"))
-          else walkDist p bb bc o mlen
-    walkDist !p !bb !bc !o !mlen =
+                  then let !dlen = sde .&. 15 in pure (BlockRes k p (bb1 `unsafeShiftR` dlen) (bc1 - dlen) o (Just "invalid distance code"))
+                  else walkDist k p bb bc o mlen
+            else let !dlen = de .&. 15 in pure (BlockRes k p (bb `unsafeShiftR` dlen) (bc - dlen) o (Just "invalid distance code"))
+          else walkDist k p bb bc o mlen
+    walkDist !k !p !bb !bc !o !mlen =
       case (bb, bc) of
         (W64# bb#, I# bc#) -> ST $ \s# ->
           case decodeSymSlowM bb# bc# distCnt# distSym# distMax# s# of
             (# s1#, dsym#, bb3#, bc3# #) ->
-              case handleDistWalk p (W64# bb3#) (I# bc3#) o mlen (I# dsym#) of
+              case handleDistWalk k p (W64# bb3#) (I# bc3#) o mlen (I# dsym#) of
                 ST f -> f s1#
-    handleDistWalk !p !bb !bc !o !mlen !dsym
-      | dsym < 0 || dsym >= nDistCodes = pure (BlockRes p bb bc o (Just "invalid distance code"))
+    handleDistWalk !k !p !bb !bc !o !mlen !dsym
+      | dsym < 0 || dsym >= nDistCodes = pure (BlockRes k p bb bc o (Just "invalid distance code"))
       | otherwise =
           let !dex = distExtra `unsafeAt` dsym
               !d   = distBase `unsafeAt` dsym + (fromIntegral bb .&. ((1 `unsafeShiftL` dex) - 1))
-          in doCopySlow p (bb `unsafeShiftR` dex) (bc - dex) o mlen d
-    doCopySlow !p !bb !bc !o !mlen !d = do
+          in doCopySlow k p (bb `unsafeShiftR` dex) (bc - dex) o mlen d
+    doCopySlow !k !p !bb !bc !o !mlen !d = do
       let !end = min limit (o + mlen) - 1
       if o - d >= base
         then copyMatch arr o d (end - o + 1)
         else forLoop o end $ \i -> do
                v <- if i - d >= base then unsafeRead arr (i - d) else pure 0
                unsafeWrite arr i v
-      driver p bb bc (o + mlen)
+      driver k p bb bc (o + mlen)
 
-data DynRes = DynRes !Int !Int !Int !Word64 !Int
+data DynRes = DynRes !Int !Int !Int !Int !Word64 !Int
 
 {-# NOINLINE readDynamicST #-}
-readDynamicST :: BS.ByteString -> InflateScratch s -> Int -> Word64 -> Int -> ST s DynRes
-readDynamicST !dat !sc !p0 !bb0 !bc0 =
-  case refill dat p0 bb0 bc0 of
-    (# p1#, bb1#, bc1# #) -> do
+readDynamicST :: Segs -> InflateScratch s -> Int -> Int -> Word64 -> Int -> ST s DynRes
+readDynamicST !segs !sc !k0 !p0 !bb0 !bc0 =
+  case refillSeg segs k0 p0 bb0 bc0 of
+    (# k1#, p1#, bb1#, bc1# #) -> do
       let !bb1   = W64# bb1#
           !hlit  = fromIntegral (bb1 .&. 31) :: Int
           !hdist = fromIntegral ((bb1 `unsafeShiftR` 5) .&. 31) :: Int
@@ -1227,15 +1338,15 @@ readDynamicST !dat !sc !p0 !bb0 !bc0 =
           !allLens = scAllLens sc
           !offs   = scOffs sc
       zeroIntArr clLens 19
-      let readCL !i !p !bb !bc
-            | i >= nclen = pure (p, bb, bc)
-            | bc < 3 = case refill dat p bb bc of
-                (# p'#, bb'#, bc'# #) -> readCL i (I# p'#) (W64# bb'#) (I# bc'#)
+      let readCL !i !k !p !bb !bc
+            | i >= nclen = pure (k, p, bb, bc)
+            | bc < 3 = case refillSeg segs k p bb bc of
+                (# k'#, p'#, bb'#, bc'# #) -> readCL i (I# k'#) (I# p'#) (W64# bb'#) (I# bc'#)
             | otherwise = do
                 let !v = fromIntegral (bb .&. 7) :: Int
                 unsafeWrite clLens (clOrderU `unsafeAt` i) v
-                readCL (i + 1) p (bb `unsafeShiftR` 3) (bc - 3)
-      (!p2, !bb2, !bc2) <- readCL 0 (I# p1#) (bb1 `unsafeShiftR` 14) (I# bc1# - 14)
+                readCL (i + 1) k p (bb `unsafeShiftR` 3) (bc - 3)
+      (!k2, !p2, !bb2, !bc2) <- readCL 0 (I# k1#) (I# p1#) (bb1 `unsafeShiftR` 14) (I# bc1# - 14)
       !clMeta <- buildClTableST clLens clCnt offs clSym clTbl
       let !clMax   = clMeta `unsafeShiftR` 1
           !clValid = clMeta .&. 1
@@ -1243,58 +1354,57 @@ readDynamicST !dat !sc !p0 !bb0 !bc0 =
           !(STUArray _ _ _ clCnt#) = clCnt
           !(STUArray _ _ _ clSym#) = clSym
           !(I# clMax#) = clMax
-          fillVal !start !k !val = go 0
-            where go !j | j >= k    = pure ()
+          fillVal !start !cnt !val = go 0
+            where go !j | j >= cnt  = pure ()
                         | otherwise = unsafeWrite allLens (start + j) val >> go (j + 1)
-          decodeLens !n !prev !p !bb !bc
-            | n >= total = pure (n, p, bb, bc)
-            | bc < 22 = case refill dat p bb bc of
-                (# p'#, bb'#, bc'# #) -> decodeLens n prev (I# p'#) (W64# bb'#) (I# bc'#)
+          decodeLens !n !prev !k !p !bb !bc
+            | n >= total = pure (n, k, p, bb, bc)
+            | bc < 22 = case refillSeg segs k p bb bc of
+                (# k'#, p'#, bb'#, bc'# #) -> decodeLens n prev (I# k'#) (I# p'#) (W64# bb'#) (I# bc'#)
             | clValid == 1 = do
                 !e32 <- unsafeRead clTbl (fromIntegral bb .&. 127)
                 let !e   = fromIntegral e32 :: Int
                     !len = e .&. 15
                 if len == 0
-                  then pure (n, p, bb `unsafeShiftR` clMax, bc - clMax)
-                  else step n prev (e `unsafeShiftR` 4) p (bb `unsafeShiftR` len) (bc - len)
+                  then pure (n, k, p, bb `unsafeShiftR` clMax, bc - clMax)
+                  else step n prev (e `unsafeShiftR` 4) k p (bb `unsafeShiftR` len) (bc - len)
             | otherwise = case (bb, bc) of
                 (W64# bb#, I# bc#) -> ST $ \s# ->
                   case decodeSymSlowM bb# bc# clCnt# clSym# clMax# s# of
                     (# s1#, sSym#, bb'#, bc'# #) ->
-                      case step n prev (I# sSym#) p (W64# bb'#) (I# bc'#) of
+                      case step n prev (I# sSym#) k p (W64# bb'#) (I# bc'#) of
                         ST f -> f s1#
-          step !n !prev !s !p !bb !bc
-            | s < 0  = pure (n, p, bb, bc)
+          step !n !prev !s !k !p !bb !bc
+            | s < 0  = pure (n, k, p, bb, bc)
             | s < 16 = do
                 unsafeWrite allLens n s
-                decodeLens (n + 1) s p bb bc
+                decodeLens (n + 1) s k p bb bc
             | s == 16 = do
-                let !k = fromIntegral (bb .&. 3) + 3
-                fillVal n k prev
-                decodeLens (n + k) prev p (bb `unsafeShiftR` 2) (bc - 2)
+                let !cnt = fromIntegral (bb .&. 3) + 3
+                fillVal n cnt prev
+                decodeLens (n + cnt) prev k p (bb `unsafeShiftR` 2) (bc - 2)
             | s == 17 = do
-                let !k = fromIntegral (bb .&. 7) + 3
-                fillVal n k 0
-                decodeLens (n + k) 0 p (bb `unsafeShiftR` 3) (bc - 3)
+                let !cnt = fromIntegral (bb .&. 7) + 3
+                fillVal n cnt 0
+                decodeLens (n + cnt) 0 k p (bb `unsafeShiftR` 3) (bc - 3)
             | otherwise = do
-                let !k = fromIntegral (bb .&. 127) + 11
-                fillVal n k 0
-                decodeLens (n + k) 0 p (bb `unsafeShiftR` 7) (bc - 7)
-      (!actualTotal, !p3, !bb3, !bc3) <- decodeLens 0 0 p2 bb2 bc2
+                let !cnt = fromIntegral (bb .&. 127) + 11
+                fillVal n cnt 0
+                decodeLens (n + cnt) 0 k p (bb `unsafeShiftR` 7) (bc - 7)
+      (!actualTotal, !k3, !p3, !bb3, !bc3) <- decodeLens 0 0 k2 p2 bb2 bc2
       !litMax  <- buildLitTableST allLens 0 (min nlit actualTotal)
                     (scLitCounts sc) offs (scLitSyms sc) (scTable sc) (scShortLits sc)
       !distMax <- buildDistTableST allLens nlit (max 0 (actualTotal - nlit))
                     (scDistCounts sc) offs (scDistSyms sc) (scTable sc)
-      pure (DynRes litMax distMax p3 bb3 bc3)
+      pure (DynRes litMax distMax k3 p3 bb3 bc3)
 
 {-# NOINLINE inflateFixed #-}
-inflateFixed :: BS.ByteString -> Int -> STUArray s Int Word8 -> Int -> Int
+inflateFixed :: Segs -> Int -> STUArray s Int Word8 -> Int -> Int
              -> ST s (Maybe String)
-inflateFixed dat !startByte arr !base !size = do
+inflateFixed !segs !startByte arr !base !size = do
   sc <- newInflateScratch
   let !limit   = base + size
-      !datLen  = BS.length dat
-      !endBits = 8 * datLen
+      !endBits = 8 * segTotal segs
       finish !o !err = do
         when (o < limit) $ do
           let !zEnd = min limit (o + 16)
@@ -1303,10 +1413,10 @@ inflateFixed dat !startByte arr !base !size = do
                 | otherwise = unsafeWrite arr i 0 >> zeroTail (i + 1)
           zeroTail o
         pure err
-      blockLoop !p !bb !bc !o
+      blockLoop !k !p !bb !bc !o
         | o >= limit || p * 8 - bc >= endBits = finish o Nothing
-        | bc < 3 = case refill dat p bb bc of
-            (# p'#, bb'#, bc'# #) -> blockLoop (I# p'#) (W64# bb'#) (I# bc'#) o
+        | bc < 3 = case refillSeg segs k p bb bc of
+            (# k'#, p'#, bb'#, bc'# #) -> blockLoop (I# k'#) (I# p'#) (W64# bb'#) (I# bc'#) o
         | otherwise =
             let !bfinal = fromIntegral (bb .&. 1) :: Int
                 !btype  = fromIntegral ((bb `unsafeShiftR` 1) .&. 3) :: Int
@@ -1316,16 +1426,13 @@ inflateFixed dat !startByte arr !base !size = do
                  0 -> do
                    let !curBitPos   = p * 8 - bc1
                        !alignedByte = ((curBitPos + 7) .&. complement 7) `unsafeShiftR` 3
-                       byteAt !idx  = if idx >= 0 && idx < datLen then fromIntegral (BSU.unsafeIndex dat idx) else 0 :: Int
-                       !len         = byteAt alignedByte .|. (byteAt (alignedByte + 1) `unsafeShiftL` 8)
+                       !len         = segByteAt segs alignedByte .|. (segByteAt segs (alignedByte + 1) `unsafeShiftL` 8)
                        !srcStart    = alignedByte + 4
                        !toCopy      = min len (limit - o)
-                   forLoop 0 (toCopy - 1) $ \i -> do
-                     let !pos = srcStart + i
-                         !v   = if pos >= 0 && pos < datLen then BSU.unsafeIndex dat pos else 0
-                     unsafeWrite arr (o + i) v
+                   copyStoredSegs segs srcStart toCopy arr o
                    if bfinal == 1 then finish (o + toCopy) Nothing
-                   else blockLoop (srcStart + len) 0 0 (o + len)
+                   else let !nextP = srcStart + len
+                        in blockLoop (seekSeg segs nextP) nextP 0 0 (o + len)
                  1 -> do
                    forLoop 0 287 $ \i -> unsafeWrite (scAllLens sc) i (fixedLitLensU `unsafeAt` i)
                    forLoop 0 29  $ \i -> unsafeWrite (scAllLens sc) (288 + i) (fixedDistLensU `unsafeAt` i)
@@ -1333,26 +1440,26 @@ inflateFixed dat !startByte arr !base !size = do
                                  (scLitCounts sc) (scOffs sc) (scLitSyms sc) (scTable sc) (scShortLits sc)
                    !distMax <- buildDistTableST (scAllLens sc) 288 30
                                  (scDistCounts sc) (scOffs sc) (scDistSyms sc) (scTable sc)
-                   BlockRes p' bb' bc' o' err <- huffBlockST dat arr base limit
+                   BlockRes k' p' bb' bc' o' err <- huffBlockST segs arr base limit
                      (scTable sc)
                      (scLitCounts sc) (scLitSyms sc) litMax
                      (scDistCounts sc) (scDistSyms sc) distMax
-                     p bb1 bc1 o
+                     k p bb1 bc1 o
                    case err of
                      Just _  -> finish o' err
-                     Nothing -> if bfinal == 1 then finish o' Nothing else blockLoop p' bb' bc' o'
+                     Nothing -> if bfinal == 1 then finish o' Nothing else blockLoop k' p' bb' bc' o'
                  2 -> do
-                   DynRes litMax distMax p2 bb2 bc2 <- readDynamicST dat sc p bb1 bc1
-                   BlockRes p' bb' bc' o' err <- huffBlockST dat arr base limit
+                   DynRes litMax distMax k2 p2 bb2 bc2 <- readDynamicST segs sc k p bb1 bc1
+                   BlockRes k' p' bb' bc' o' err <- huffBlockST segs arr base limit
                      (scTable sc)
                      (scLitCounts sc) (scLitSyms sc) litMax
                      (scDistCounts sc) (scDistSyms sc) distMax
-                     p2 bb2 bc2 o
+                     k2 p2 bb2 bc2 o
                    case err of
                      Just _  -> finish o' err
-                     Nothing -> if bfinal == 1 then finish o' Nothing else blockLoop p' bb' bc' o'
+                     Nothing -> if bfinal == 1 then finish o' Nothing else blockLoop k' p' bb' bc' o'
                  _ -> finish o (Just "invalid DEFLATE block type")
-  blockLoop startByte 0 0 base
+  blockLoop (seekSeg segs startByte) startByte 0 0 base
 
 -- | Inflate a stream of unknown output size, stopping at @maxOut@ bytes.
 --

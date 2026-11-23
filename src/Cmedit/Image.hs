@@ -71,7 +71,7 @@ import qualified Data.ByteString.Internal as BI
 import Foreign.Storable (pokeByteOff)
 import GHC.ByteOrder (ByteOrder(..), targetByteOrder)
 
-import Cmedit.Inflate (Huff(..), buildHuff, inflateInto, InflateHuff(..), buildInflateHuffN, decodeSymSlow)
+import Cmedit.Inflate (Huff(..), buildHuff, inflateIntoSegs, InflateHuff(..), buildInflateHuffN, decodeSymSlow)
 import Cmedit.Types (Cell(..), Style(..), Color(..), attrNone)
 
 ------------------------------------------------------------------------------
@@ -892,14 +892,14 @@ lzwSlowEmit prefix suffix stack root count sink c outPos = do
 decodePNG :: BS.ByteString -> Either String Image
 decodePNG bs = do
   when' (BS.length bs < 8 || BS.take 8 bs /= pngSig) "not a PNG file"
-  (ihdr, plte, trns, idat) <- pngChunks bs 8 Nothing BS.empty BS.empty []
+  (ihdr, plte, trns, idats) <- pngChunks bs 8 Nothing BS.empty BS.empty []
   let (w,h,bd,ct,interlace) = ihdr
   checkDims w h
   chans <- pngChannels ct
   unless (validDepth ct bd) $
     Left ("unsupported PNG bit depth " ++ show bd ++ " for colour type " ++ show ct)
   when (ct == 3 && BS.null plte) $ Left "PNG palette image without PLTE"
-  when' (BS.null idat) "PNG has no image data"
+  when' (null idats) "PNG has no image data"
   let bitsPP   = chans * bd
       bpp      = max 1 ((bitsPP + 7) `div` 8)
       rowBytes pw = (bitsPP * pw + 7) `div` 8
@@ -908,8 +908,13 @@ decodePNG bs = do
       rawSize  = sum [ ph * (1 + rowBytes pw)
                      | (_,_,_,_,pw,ph) <- passes, pw > 0, ph > 0 ]
   -- Validate the zlib header (CM=8 deflate, FCHECK), then inflate.
-  let zlibOk = BS.length idat >= 2 && (at idat 0 .&. 0x0f) == 8
-               && ((at idat 0 * 256 + at idat 1) `mod` 31) == 0
+  -- Join at most two bytes when the first IDAT chunk is a single byte.
+  let (z0, z1, hasZlibHdr) = case idats of
+        (c:_) | BS.length c >= 2 -> (at c 0, at c 1, True)
+        (c1:c2:_)                -> (at c1 0, at c2 0, True)
+        _                        -> (0, 0, False)
+      zlibOk = hasZlibHdr && (z0 .&. 0x0f) == 8
+               && ((z0 * 256 + z1) `mod` 31) == 0
   unless zlibOk $ Left "corrupt PNG (bad zlib header)"
   let -- Eight-bit samples already have the output range; avoid a division
       -- for every colour/alpha component in the common RGB/RGBA path.
@@ -953,7 +958,7 @@ decodePNG bs = do
    a <- newBytes bufSize
    (rawArr, base) <- if inPlace then pure (a, bufSize - rawSize)
                                  else do r <- newBytes rawSize; pure (r, 0)
-   ierr <- inflateInto idat 2 rawArr base rawSize   -- skip the 2-byte zlib header
+   ierr <- inflateIntoSegs idats 2 rawArr base rawSize   -- skip the 2-byte zlib header
    case ierr of
     Just e -> pure (Left e)
     Nothing -> do
@@ -1534,10 +1539,10 @@ adam7Passes w h =
   | (x0,y0,dx,dy) <- [(0,0,8,8),(4,0,8,8),(0,4,4,8),(2,0,4,4),(0,2,2,4),(1,0,2,2),(0,1,1,2)] ]
   where ceilDiv a b = if a <= 0 then 0 else (a + b - 1) `div` b
 
--- Walk PNG chunks, accumulating IHDR fields, PLTE, tRNS and concatenated IDAT.
+-- Walk PNG chunks, accumulating IHDR fields, PLTE, tRNS and non-empty IDAT slices.
 pngChunks :: BS.ByteString -> Int
           -> Maybe (Int,Int,Int,Int,Int) -> BS.ByteString -> BS.ByteString -> [BS.ByteString]
-          -> Either String ((Int,Int,Int,Int,Int), BS.ByteString, BS.ByteString, BS.ByteString)
+          -> Either String ((Int,Int,Int,Int,Int), BS.ByteString, BS.ByteString, [BS.ByteString])
 pngChunks bs pos mihdr plte trns idats
   | pos + 8 > BS.length bs = finish
   | otherwise =
@@ -1562,7 +1567,7 @@ pngChunks bs pos mihdr plte trns idats
     finish = finishWith
     finishWith = case mihdr of
       Nothing -> Left "PNG missing IHDR"
-      Just ih -> Right (ih, plte, trns, BS.concat (reverse idats))
+      Just ih -> Right (ih, plte, trns, filter (not . BS.null) (reverse idats))
 
 ------------------------------------------------------------------------------
 -- DEFLATE lives in "Cmedit.Inflate" (a leaf module), which PNG shares with the
