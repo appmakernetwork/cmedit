@@ -1404,7 +1404,14 @@ in `README.md`; the cross-cutting structure that matters when editing:
   frames), noise row bands that regenerate their halos from the RNG rather
   than reading a neighbour's output, and lossless pass groups
   (`passGroupsPar`), plus the JPEG decoder's reconstruction bands (see the
-  image-view bullet). Two traps from that work: a job's result must be built
+  image-view bullet) and PNG's row unfiltering (non-interlaced images of
+  1 MB or more: independent runs of rows, cut at None/Sub rows by
+  `pngParJobs`, or `pngWaveJob`'s chunked wavefront when every row reads
+  the one above; both unfilter in place, so an interrupted stage answers
+  `pngParRetry` and `decodePNG` decodes again sequentially, while
+  `App.streamPng`, whose payloads were reads it cannot replay, gives the
+  file to the whole-file read; `docs/plans/bench/PngKill.hs` and
+  `PngStreamKill.hs` are its kill tests). Two traps from that work: a job's result must be built
   *inside* the job, not memoised in a pass-long array (that retained every
   group's output, +305 MiB on a 4096² lossless image), and peak RSS here
   follows the GC schedule, not the allocation total (reusing EPF scratch

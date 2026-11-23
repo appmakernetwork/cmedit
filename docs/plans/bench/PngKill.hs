@@ -1,5 +1,7 @@
--- Kill test: interrupt a decode at many points, check no worker survives,
--- then force the same thunk again and compare with an undisturbed decode.
+-- Kill test for a decoder's parallel stages: interrupt a decode at N evenly
+-- spaced points, check no worker thread survives, then force the same thunk
+-- again and compare with an undisturbed decode. Build like ImageDecode.hs
+-- (threaded, -N4).   PngKill N FILE...
 module Main where
 import Control.Concurrent
 import Control.Exception
