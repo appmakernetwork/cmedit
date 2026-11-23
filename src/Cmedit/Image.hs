@@ -49,6 +49,7 @@ module Cmedit.Image
   , reduceImage
   ) where
 
+import Control.Concurrent (yield)
 import Control.Monad (when, unless, forM, forM_, foldM)
 import Cmedit.Jxl (isJxl, decodeJxl)
 import Cmedit.JxlPar (parOrderedResumable, parWorkers)
@@ -59,7 +60,7 @@ import qualified Data.Array as A
 import Data.Array.ST (STArray, STUArray, newArray, readArray, writeArray, runSTUArray)
 import Data.Array.MArray (freeze, thaw)
 import Data.Array.Base (STUArray(..), UArray(..), unsafeRead, unsafeWrite, unsafeAt, unsafeNewArray_)
-import GHC.Exts (Int(I#), Int#, Word(W#), Word#, ByteArray#, MutableByteArray#, shrinkMutableByteArray#, copyMutableByteArray#, setByteArray#, (*#), indexWord32Array#, readWord8ArrayAsWord32#, readWord8ArrayAsWord64#, writeWord8ArrayAsWord16#, writeWord8ArrayAsWord32#, writeWord8ArrayAsWord64#)
+import GHC.Exts (Int(I#), Int#, Word(W#), Word#, ByteArray#, MutableByteArray#, shrinkMutableByteArray#, copyMutableByteArray#, atomicReadIntArray#, atomicWriteIntArray#, setByteArray#, (*#), indexWord32Array#, readWord8ArrayAsWord32#, readWord8ArrayAsWord64#, writeWord8ArrayAsWord16#, writeWord8ArrayAsWord32#, writeWord8ArrayAsWord64#)
 import GHC.Word (Word16(W16#), Word32(W32#), Word64(W64#))
 import GHC.ST (ST(..))
 import Data.Array.Unsafe (castSTUArray, unsafeFreeze)
@@ -1139,7 +1140,24 @@ decodePNGParts allowPar (ihdr, plte, trns, idats) = do
                                    in unfilterPngRow rawArr l bpp rb rawArr (l - rb) pngWordsOk
                jobs <- if inPlace && pngWordsOk && nw > 1 && ph >= 64 && ph*rb >= 0x100000
                          then pngParJobs rawArr l0 rb ph (4*nw) else pure []
-               if not (null jobs)
+               waveOk <- if null jobs && inPlace && pngWordsOk && nw > 1 && ph >= 64
+                              && ph*rb >= 0x100000
+                           then pngMostlyDependent rawArr l0 rb ph else pure False
+               if waveOk
+                 then do
+                   -- No such runs: every row needs the one above. The rows
+                   -- are dealt round robin to the workers, and a worker
+                   -- takes a row a chunk at a time, each chunk only once
+                   -- the row above has got past it ('pngWaveJob'). What a
+                   -- chunk reads is then complete, whatever the schedule.
+                   prog <- newArray (0, ph - 1) 0 :: ST s (STUArray s Int Int)
+                   ok <- unsafeIOToST $ parOrderedResumable nw nw nw
+                           (\k -> unsafeSTToIO (pngWaveJob rawArr l0 bpp rb ph zrow prog nw k))
+                           (\_ _ -> pure True)
+                   if ok then forLoop 0 (ph-1) $ \ry ->
+                                conv rawArr (l0 + ry*(1+rb) + 1) (o0 + ry*ostep) st pw
+                         else writeSTRef interrupted True
+                 else if not (null jobs)
                  then do
                    -- Runs of rows that begin with a row no filter ties to
                    -- the one above it, each unfiltered where it lies by one
@@ -1184,21 +1202,29 @@ decodePNGParts allowPar (ihdr, plte, trns, idats) = do
 -- with left = upper-left = 0 is always the byte above) takes the byte above.
 -- Reads of the inflated stream are unchecked: it is exactly as long as the
 -- passes' rows, which is what 'inflate' was asked for.
-{-# NOINLINE unfilterPngRow #-}
 unfilterPngRow :: STUArray s Int Word8 -> Int -> Int -> Int
                -> STUArray s Int Word8 -> Int -> Bool -> ST s ()
-unfilterPngRow raw lineOff bpp rb prev prevOff wordsOk = do
+unfilterPngRow raw lineOff bpp rb prev prevOff wordsOk =
+  unfilterPngRange raw lineOff bpp rb prev prevOff wordsOk 0 rb
+
+-- Bytes [p, q) of a row ('unfilterPngRow' is the whole of it), given that
+-- the bytes before p are done; p and q are whole pixels, or q the row's end.
+{-# NOINLINE unfilterPngRange #-}
+unfilterPngRange :: STUArray s Int Word8 -> Int -> Int -> Int
+                 -> STUArray s Int Word8 -> Int -> Bool -> Int -> Int -> ST s ()
+unfilterPngRange raw lineOff bpp rb prev prevOff wordsOk p q = do
   ftype <- unsafeRead raw lineOff
   let !lead = min bpp rb
       !rowOff = lineOff + 1
-      !end = rowOff + rb
+      !end = rowOff + q
+      !from = rowOff + max p lead
       -- d: from a row position to the same byte of the row above.
       !d = prevOff - rowOff
   case ftype of
-    1 -> if wordsOk then pngSubWords bpp raw (rowOff + lead) end
-                    else pngSubBytes raw (rowOff + lead) end bpp
-    2 -> if wordsOk then pngUpWords raw rowOff end d
-                    else pngUpBytes raw rowOff end prev d
+    1 -> if wordsOk then pngSubWords bpp raw from end
+                    else pngSubBytes raw from end bpp
+    2 -> if wordsOk then pngUpWords raw (rowOff + p) end d
+                    else pngUpBytes raw (rowOff + p) end prev d
     3 -> do
       let goLead !i | i >= rowOff + lead = pure ()
                     | otherwise = do
@@ -1206,12 +1232,11 @@ unfilterPngRow raw lineOff bpp rb prev prevOff wordsOk = do
                         b <- unsafeRead prev (i + d)
                         unsafeWrite raw i (v + (b `shiftR` 1))
                         goLead (i + 1)
-      goLead rowOff
-      if wordsOk then pngAvgWords bpp raw (rowOff + lead) end d
-                 else pngAvgBytes raw (rowOff + lead) end bpp prev d
+      when (p == 0) $ goLead rowOff
+      if wordsOk then pngAvgWords bpp raw from end d
+                 else pngAvgBytes raw from end bpp prev d
     4 -> do
-      pngUpBytes raw rowOff (rowOff + lead) prev d
-      let from = rowOff + lead
+      when (p == 0) $ pngUpBytes raw rowOff (rowOff + lead) prev d
       if not wordsOk then pngPaethBytes raw from end bpp prev d else
         case bpp of
           1 -> pngPaeth1 raw from end d
@@ -1642,6 +1667,57 @@ pngParJobs raw l0 rb ph njobs = go 1 0 1 0 0 []
           if not needsAbove && y*njobs >= k*ph
             then go (y + 1) y (y*njobs `quot` ph + 1) dep (max big (y - s)) ((s, y) : acc)
             else go (y + 1) s k (if needsAbove then dep + 1 else dep) big acc
+
+-- Whether at least half of a pass's rows read the row above.
+pngMostlyDependent :: STUArray s Int Word8 -> Int -> Int -> Int -> ST s Bool
+pngMostlyDependent raw l0 rb ph = go 0 (0 :: Int)
+  where go !y !dep | y >= ph = pure (2*dep >= ph)
+                   | otherwise = do
+                       ft <- unsafeRead raw (l0 + y*(1+rb))
+                       go (y + 1) (if ft >= 2 && ft <= 4 then dep + 1 else dep)
+
+-- Worker k of nw: rows k, k + nw, ... of a pass, unfiltered in place. A row
+-- is taken in chunks of whole pixels; before a chunk ending at byte q, the
+-- worker waits until the row above has finished its bytes up to q, which is
+-- everything the chunk reads of it (prog holds each row's finished bytes,
+-- read and written with full barriers, so the bytes are visible before the
+-- count is). A row's own bytes are written by its worker alone. The wait
+-- spins, then yields, which is also where a kill reaches a waiting worker.
+pngWaveJob :: STUArray s Int Word8 -> Int -> Int -> Int -> Int
+           -> STUArray s Int Word8 -> STUArray s Int Int -> Int -> Int -> ST s ()
+pngWaveJob raw !l0 !bpp !rb !ph zrow prog !nw !k = rows k
+  where
+    !chunk = bpp * 1024
+    rows !y
+      | y >= ph = pure ()
+      | otherwise = chunks y 0 >> rows (y + nw)
+    chunks !y !p
+      | p >= rb = pure ()
+      | otherwise = do
+          let !q = min rb (p + chunk)
+              !l = l0 + y*(1+rb)
+          if y == 0
+            then unfilterPngRange raw l bpp rb zrow 0 False p q
+            else do
+              waitFor (y - 1) q (0 :: Int)
+              unfilterPngRange raw l bpp rb raw (l - rb) True p q
+          atomicWriteInt prog y q
+          chunks y q
+    waitFor !r !q !n = do
+      v <- atomicReadInt prog r
+      if v >= q then pure ()
+        else if n >= 200 then unsafeIOToST yield >> waitFor r q 0
+        else waitFor r q (n + 1)
+
+atomicReadInt :: STUArray s Int Int -> Int -> ST s Int
+atomicReadInt (STUArray _ _ _ m) (I# i) = ST $ \s -> case atomicReadIntArray# m i s of
+  (# s', v #) -> (# s', I# v #)
+{-# INLINE atomicReadInt #-}
+
+atomicWriteInt :: STUArray s Int Int -> Int -> Int -> ST s ()
+atomicWriteInt (STUArray _ _ _ m) (I# i) (I# v) =
+  ST $ \s -> case atomicWriteIntArray# m i v s of s' -> (# s', () #)
+{-# INLINE atomicWriteInt #-}
 
 -- A row of 8-bit RGB to opaque RGBA, a pixel per word. The fourth byte
 -- loaded is the next pixel's first, so the last pixel goes a byte at a
