@@ -260,7 +260,7 @@ inflateIntoSegsW win chunks startByte arr base outSize =
 -- few times a megabyte and a block rarely has to be resumed; small next to
 -- the file it saves holding.
 streamWindow :: Int
-streamWindow = 1024 * 1024
+streamWindow = 256 * 1024
 
 -- The least window: a block header plus its dynamic code tables (at most
 -- about 600 bytes) and the bit buffer's lookahead always fit in half of it.

@@ -10,6 +10,8 @@ module Cmedit.App
   , abbreviateHome
   , detectLinters
   , asyncThresholdFor
+  , streamPng
+  , LoadOutcome(..)
   ) where
 
 import Control.Concurrent (ThreadId, forkIO, getNumCapabilities, killThread, myThreadId)
@@ -70,7 +72,9 @@ import Cmedit.Definition (DefReq(..))
 import qualified Cmedit.Definition as D
 import Cmedit.Editor
 import Cmedit.Gfx
-import Cmedit.Image (Image, imgW, imgH, sniffImage, decodeFrames, decodeJPEGScaled, jpegDims, jpegFitScale, scaleRGBA, jpegCostHint)
+import Cmedit.Image (Image, imgW, imgH, sniffImage, decodeFrames, decodeJPEGScaled, jpegDims, jpegFitScale, scaleRGBA, jpegCostHint, decodePNGParts)
+import System.IO.Unsafe (unsafeInterleaveIO)
+import Data.Bits (shiftL, (.|.))
 import Cmedit.Jobs (JobTable, newJobTable, startJobIn, cancelJobIn)
 import Cmedit.FontProvider (FontProvider, newFontProvider, startFontDiscovery, providerFiles, facesForQueries, fontFor)
 import qualified Cmedit.PdfRender as PR
@@ -2786,7 +2790,8 @@ classifyFileWith :: Bool -> FilePath -> IO LoadOutcome
 classifyFileWith pagedOK path = do
   exists <- doesFileExist path
   regular <- if exists then isRegularFile path else pure True
-  hdr4 <- if exists && regular then readHead path 4 else pure Nothing
+  hdr8 <- if exists && regular then readHead path 8 else pure Nothing
+  let hdr4 = BS.take 4 <$> hdr8
   if not exists
     then pure (OutText path emptyLoadResult)  -- new file
     -- A pipe or a device (`cmedit <(git diff)`, /dev/zero) passes for a file
@@ -2829,10 +2834,170 @@ classifyFileWith pagedOK path = do
                 Left err -> OutError (takeFileName path ++ ": " ++ err)
                 Right pg -> OutPaged pg
         _ -> do
-          ebs <- try (BS.readFile path) :: IO (Either SomeException BS.ByteString)
-          case ebs of
-            Left e   -> pure (OutError (show e))
-            Right bs -> classifyBytes False path bs
+          -- A PNG is decoded straight off the handle when it can be, so
+          -- the file is never resident beside its picture; any doubt about
+          -- that read falls back to reading the whole file, as always.
+          streamed <- if maybe False ((== Just "PNG") . sniffImage) hdr8
+                           && maybe False (>= pngStreamBytes) msz
+                        then streamPng path else pure Nothing
+          case streamed of
+            Just o -> pure o
+            Nothing -> do
+              ebs <- try (BS.readFile path) :: IO (Either SomeException BS.ByteString)
+              case ebs of
+                Left e   -> pure (OutError (show e))
+                Right bs -> classifyBytes False path bs
+
+-- | Open a regular file that starts with the PNG signature without ever
+-- holding all of it: the 'LoadOutcome' 'classifyBytes' would give for its
+-- bytes, or Nothing when this read cannot vouch for that (the caller then
+-- reads the whole file the ordinary way, which settles every such case
+-- exactly as before). The point is the peak: the file used to be resident
+-- for the whole decode beside the picture it expands into (21 MB beside
+-- 67 MB for a 4096x4096 photo).
+--
+-- One sequential pass, in 'pngReadBlock' reads. The chunks before the first
+-- IDAT are walked eagerly (IHDR, PLTE and tRNS are all a decoder needs
+-- before the image data); from there the walk continues lazily, as the
+-- decoder pulls IDAT payloads, which arrive as slices of the reads and are
+-- consumed as a stream ('decodePNGParts', 'Cmedit.Inflate.inflateIntoSegs'),
+-- so each read is collected once the decoder is past it. The decode is
+-- forced here, while the handle is open: pure code never meets a read.
+--
+-- The walk follows 'Cmedit.Image.pngChunks' (where it stops, which chunks
+-- count). Its answer differs from that one only if IHDR, PLTE or tRNS
+-- appears after the first IDAT (a later one wins there) or no IHDR precedes
+-- it; after the decode the rest of the chunk table is walked, by headers, to
+-- rule that out. That, a read that fails or comes up short, or a file whose
+-- size or mtime moved while it was read, makes the attempt Nothing.
+streamPng :: FilePath -> IO (Maybe LoadOutcome)
+streamPng path = do
+  r <- try (withBinaryFile path ReadMode go) :: IO (Either SomeException (Maybe LoadOutcome))
+  pure (either (const Nothing) id r)
+  where
+    go h = do
+      size <- fromIntegral <$> hFileSize h
+      mt0 <- fileMtime path
+      bad <- newIORef False          -- a read failed or came up short
+      late <- newIORef False         -- IHDR/PLTE/tRNS after the first IDAT
+      cur <- newIORef (0 :: Int, BS.empty)
+      let -- The read holding byte o (sequential reads, so mostly the current one).
+          blockAt o = do
+            (b0, b) <- readIORef cur
+            if o >= b0 && o < b0 + BS.length b then pure (b0, b) else do
+              let want = min pngReadBlock (size - o)
+              hSeek h AbsoluteSeek (fromIntegral o)
+              b' <- BS.hGet h want
+              when (BS.length b' < want) (writeIORef bad True)
+              writeIORef cur (o, b')
+              pure (o, b')
+          -- n bytes from o, short only if a read was (and then marked bad).
+          bytes o n
+            | n <= 0 = pure BS.empty
+            | otherwise = do
+                (b0, b) <- blockAt o
+                let avail = b0 + BS.length b - o
+                    piece = BS.take n (BS.drop (o - b0) b)
+                if avail <= 0 then pure BS.empty
+                  else if n <= avail then pure piece
+                  else (piece <>) <$> bytes (o + avail) (n - avail)
+          header pos = do
+            hdr <- bytes pos 8
+            pure (be32At hdr 0, BS.unpack (BS.take 4 (BS.drop 4 hdr)))
+          -- Up to the first IDAT, eagerly.
+          prefix pos ihdr plte trns
+            | pos + 8 > size = pure (Nothing, ihdr, plte, trns)
+            | otherwise = do
+                (clen, ctype) <- header pos
+                let dstart = pos + 8; next = dstart + clen + 4
+                if dstart + clen > size then pure (Nothing, ihdr, plte, trns)
+                  else case map (toEnum . fromIntegral) ctype :: String of
+                    "IHDR" -> do
+                      c <- bytes dstart (min clen 13)
+                      prefix next (Just (be32At c 0, be32At c 4, byteAt c 8, byteAt c 9, byteAt c 12)) plte trns
+                    "PLTE" -> bytes dstart clen >>= \c -> prefix next ihdr (BS.copy c) trns
+                    "tRNS" -> bytes dstart clen >>= \c -> prefix next ihdr plte (BS.copy c)
+                    "IDAT" -> pure (Just pos, ihdr, plte, trns)
+                    "IEND" -> pure (Nothing, ihdr, plte, trns)
+                    _      -> prefix next ihdr plte trns
+      walkPos <- newIORef (Nothing :: Maybe Int)   -- where the lazy walk stands
+      let -- From the first IDAT on, lazily: the payload slices of every IDAT.
+          chunks pos = unsafeInterleaveIO (step pos)
+          step pos
+            | pos + 8 > size = writeIORef walkPos Nothing >> pure []
+            | otherwise = do
+                (clen, ctype) <- header pos
+                let dstart = pos + 8; next = dstart + clen + 4
+                if dstart + clen > size then writeIORef walkPos Nothing >> pure []
+                  else case map (toEnum . fromIntegral) ctype :: String of
+                    "IDAT" -> writeIORef walkPos (Just next) >> payload dstart clen next
+                    "IEND" -> writeIORef walkPos Nothing >> pure []
+                    t | t `elem` ["IHDR", "PLTE", "tRNS"] ->
+                          writeIORef late True >> writeIORef walkPos Nothing >> pure []
+                      | otherwise -> step next
+          payload o n next
+            | n <= 0 = step next
+            | otherwise = do
+                (b0, b) <- blockAt o
+                let avail = b0 + BS.length b - o
+                    m = min n avail
+                if avail <= 0 then writeIORef bad True >> pure [] else do
+                  rest <- unsafeInterleaveIO (payload (o + m) (n - m) next)
+                  pure (BS.take m (BS.drop (o - b0) b) : rest)
+          -- After the decode: the chunk headers the decoder never pulled.
+          tailWalk pos budget
+            | pos + 8 > size = pure ()
+            | budget <= (0 :: Int) = writeIORef bad True
+            | otherwise = do
+                hSeek h AbsoluteSeek (fromIntegral pos)
+                hdr <- BS.hGet h 8
+                if BS.length hdr < 8 then writeIORef bad True else do
+                  let clen = be32At hdr 0
+                      next = pos + 8 + clen + 4
+                  if pos + 8 + clen > size then pure () else
+                    case map (toEnum . fromIntegral) (BS.unpack (BS.take 4 (BS.drop 4 hdr))) :: String of
+                      "IEND" -> pure ()
+                      t | t `elem` ["IHDR", "PLTE", "tRNS"] -> writeIORef late True
+                        | otherwise -> tailWalk next (budget - 1)
+      (firstIdat, mihdr, plte, trns) <- prefix 8 Nothing BS.empty BS.empty
+      result <- case (firstIdat, mihdr) of
+        (_, Nothing) -> pure Nothing            -- an IHDR may yet follow: not ours to say
+        (Nothing, Just ih) -> Just <$> force (decodePNGParts (ih, plte, trns, []))
+        (Just p0, Just ih) -> do
+          idats <- chunks p0
+          d <- force (decodePNGParts (ih, plte, trns, idats))
+          writeIORef cur (0, BS.empty)
+          readIORef walkPos >>= maybe (pure ()) (\p -> tailWalk p 100000)
+          pure (Just d)
+      failed <- (||) <$> readIORef bad <*> readIORef late
+      size1 <- hFileSize h
+      mt1 <- fileMtime path
+      pure $ case result of
+        Just d | not failed, fromIntegral size1 == size, mt1 == mt0 -> Just $ case d of
+          Left err  -> OutError (takeFileName path ++ ": " ++ err)
+          Right img -> OutImage path (fullDecode [(img, 0)]) { dcMtime = mt1, dcStream = False }
+        _ -> Nothing
+    force d = case d of
+      Left err -> evaluate (length err) >> pure d
+      Right img -> evaluate (imgW img) >> pure d
+    byteAt c i = if i >= 0 && i < BS.length c then fromIntegral (BS.index c i) else 0 :: Int
+    be32At c i = (byteAt c i `shiftL` 24) .|. (byteAt c (i + 1) `shiftL` 16)
+                 .|. (byteAt c (i + 2) `shiftL` 8) .|. byteAt c (i + 3)
+
+-- | The size from which a PNG is read as a stream ('streamPng'). Below it the
+-- whole-file read costs less than what streaming leaves resident beside the
+-- picture (the reads still alive at a collection, about 5-9 MB, plus about
+-- 1 MB that does not depend on the file), measured: a 15 MB file peaks 6 MB
+-- lower streamed, a 21 MB one 12 MB lower, and files under 4 MB 1-3 MB
+-- higher.
+pngStreamBytes :: Integer
+pngStreamBytes = 8 * 1024 * 1024
+
+-- | 'streamPng''s read size: what the decoder holds of the file at a time is
+-- about this plus its window ('Cmedit.Inflate.streamWindow'); small enough
+-- that the reads still alive at a collection (and so promoted) stay small.
+pngReadBlock :: Int
+pngReadBlock = 128 * 1024
 
 -- | Classify a file's bytes, already read: an image, a PDF, a refused binary,
 -- or text. @forceRO@ marks the text read-only whatever the path's permissions

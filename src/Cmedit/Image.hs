@@ -34,6 +34,7 @@ module Cmedit.Image
   , jpegCostHint
   , maxPixels
   , decodeFrames
+  , decodePNGParts
   , decodeGIFFrames
   , sniffImage
   , renderImage
@@ -892,7 +893,15 @@ lzwSlowEmit prefix suffix stack root count sink c outPos = do
 decodePNG :: BS.ByteString -> Either String Image
 decodePNG bs = do
   when' (BS.length bs < 8 || BS.take 8 bs /= pngSig) "not a PNG file"
-  (ihdr, plte, trns, idats) <- pngChunks bs 8 Nothing BS.empty BS.empty []
+  pngChunks bs 8 Nothing BS.empty BS.empty [] >>= decodePNGParts
+
+-- | 'decodePNG' from a file's chunks, already walked: IHDR's fields, PLTE,
+-- tRNS and the IDAT payloads in order. The payloads are consumed as a
+-- stream (see 'inflateIntoSegs'), so a lazily read list of them is never
+-- resident as a whole; the editor reads a PNG that way (@Cmedit.App.streamPng@).
+decodePNGParts :: ((Int,Int,Int,Int,Int), BS.ByteString, BS.ByteString, [BS.ByteString])
+               -> Either String Image
+decodePNGParts (ihdr, plte, trns, idats) = do
   let (w,h,bd,ct,interlace) = ihdr
   checkDims w h
   chans <- pngChannels ct
