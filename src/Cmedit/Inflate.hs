@@ -45,17 +45,17 @@ import qualified Data.Array.Unboxed as U
 import Data.Bits
 import Data.STRef
 import Data.Int (Int32)
-import Data.Word (Word8, Word32, Word64, byteSwap32, byteSwap64)
+import Data.Word (Word8, Word16, Word32, Word64, byteSwap32, byteSwap64)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BI
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Array.Base (STUArray(..), unsafeRead, unsafeWrite, unsafeAt)
 import GHC.ByteOrder (ByteOrder(..), targetByteOrder)
-import GHC.Exts (Addr#, Int(I#), Int#, MutableByteArray#, State#, Word64#, copyMutableByteArray#, indexWord64OffAddr#, plusAddr#, readIntArray#, readWord64OffAddr#, runRW#, setByteArray#, touch#, writeWord8ArrayAsWord32#)
+import GHC.Exts (Addr#, Int(I#), Int#, MutableByteArray#, State#, Word64#, copyMutableByteArray#, indexWord64OffAddr#, plusAddr#, readIntArray#, readWord64OffAddr#, readWord8Array#, readWord8ArrayAsWord16#, readWord8ArrayAsWord32#, readWord8ArrayAsWord64#, runRW#, setByteArray#, touch#, writeWord8Array#, writeWord8ArrayAsWord32#, writeWord8ArrayAsWord64#)
 import GHC.ForeignPtr (ForeignPtr(..), ForeignPtrContents)
 import GHC.IO (IO(..))
 import GHC.ST (ST(..))
-import GHC.Word (Word32(W32#), Word64(W64#))
+import GHC.Word (Word8(W8#), Word16(W16#), Word32(W32#), Word64(W64#))
 
 -- Canonical Huffman table built from per-symbol code lengths.
 -- Boxed arrays here, deliberately, and measured: switching these two tables to
@@ -790,9 +790,29 @@ le64Addr addr# (I# pos#) =
        LittleEndian -> w
        BigEndian    -> byteSwap64 w
 
-{-# INLINE writeU32LE #-}
-writeU32LE :: STUArray s Int Word8 -> Int -> Int -> ST s ()
-writeU32LE (STUArray _ _ _ mba#) (I# off#) !v =
+{-# INLINE readU8Raw #-}
+readU8Raw :: MutableByteArray# s -> Int -> ST s Word8
+readU8Raw mba# (I# off#) = ST $ \s# ->
+  case readWord8Array# mba# off# s# of (# s1#, w# #) -> (# s1#, W8# w# #)
+
+{-# INLINE writeU8Raw #-}
+writeU8Raw :: MutableByteArray# s -> Int -> Word8 -> ST s ()
+writeU8Raw mba# (I# off#) (W8# w#) = ST $ \s# ->
+  case writeWord8Array# mba# off# w# s# of s1# -> (# s1#, () #)
+
+{-# INLINE readU16Raw #-}
+readU16Raw :: MutableByteArray# s -> Int -> ST s Word16
+readU16Raw mba# (I# off#) = ST $ \s# ->
+  case readWord8ArrayAsWord16# mba# off# s# of (# s1#, w# #) -> (# s1#, W16# w# #)
+
+{-# INLINE readU32Raw #-}
+readU32Raw :: MutableByteArray# s -> Int -> ST s Word32
+readU32Raw mba# (I# off#) = ST $ \s# ->
+  case readWord8ArrayAsWord32# mba# off# s# of (# s1#, w# #) -> (# s1#, W32# w# #)
+
+{-# INLINE writeU32LERaw #-}
+writeU32LERaw :: MutableByteArray# s -> Int -> Int -> ST s ()
+writeU32LERaw mba# (I# off#) !v =
   let !w32 = case targetByteOrder of
                LittleEndian -> fromIntegral v :: Word32
                BigEndian    -> byteSwap32 (fromIntegral v)
@@ -800,21 +820,33 @@ writeU32LE (STUArray _ _ _ mba#) (I# off#) !v =
        W32# w# -> ST $ \s# ->
          case writeWord8ArrayAsWord32# mba# off# w# s# of s1# -> (# s1#, () #)
 
+{-# INLINE readU64Raw #-}
+readU64Raw :: MutableByteArray# s -> Int -> ST s Word64
+readU64Raw mba# (I# off#) = ST $ \s# ->
+  case readWord8ArrayAsWord64# mba# off# s# of (# s1#, w# #) -> (# s1#, W64# w# #)
+
+{-# INLINE writeU64Raw #-}
+writeU64Raw :: MutableByteArray# s -> Int -> Word64 -> ST s ()
+writeU64Raw mba# (I# off#) (W64# w#) = ST $ \s# ->
+  case writeWord8ArrayAsWord64# mba# off# w# s# of s1# -> (# s1#, () #)
+
 -- Leaf fast loop for combined 2-level Huffman tables.
--- Keeps ZERO slow-path arrays or ByteString pointers live, so GHC's register
--- allocator avoids per-iteration stack spills. Exits with a status code:
+-- Takes raw MutableByteArray# for output and makes ZERO out-of-line calls
+-- (including inline 64-bit word match copies), so GHC keeps the entire loop
+-- register-resident with no STG stack spills. Exits with a status code:
 --   0 = EOB
 --   1 = boundary or slow path needed (caller handles one symbol or tail)
 --   2 = invalid length code
 --   3 = invalid distance code
+--   >= 4 = slow distance walk needed with mlen = st - 4
 {-# NOINLINE huffFastLoop #-}
 huffFastLoop
   :: Addr# -> Int
-  -> STUArray s Int Word8 -> Int -> Int
+  -> MutableByteArray# s -> Int -> Int
   -> STUArray s Int Int -> STUArray s Int Int32
   -> Int -> Word64 -> Int -> Int
   -> ST s FastRes
-huffFastLoop addr# !fastEnd !arr !base !fastOutEnd !litTbl !distTbl !p0 !bb0 !bc0 !o0 =
+huffFastLoop addr# !fastEnd arr# !base !fastOutEnd !litTbl !distTbl !p0 !bb0 !bc0 !o0 =
   loop p0 bb0 bc0 o0
   where
     ret !st !p !bb !bc !o = pure (FastRes st p bb bc o)
@@ -829,8 +861,8 @@ huffFastLoop addr# !fastEnd !arr !base !fastOutEnd !litTbl !distTbl !p0 !bb0 !bc
           if e < 0
             then do
               if finiteBitSize (0 :: Int) == 64
-                then writeU32LE arr o (e `unsafeShiftR` 8)
-                else unsafeWrite arr o (fromIntegral (e `unsafeShiftR` 8))
+                then writeU32LERaw arr# o (e `unsafeShiftR` 8)
+                else writeU8Raw arr# o (fromIntegral (e `unsafeShiftR` 8))
               let !len = e .&. 15
                   !cnt = (e `unsafeShiftR` 4) .&. 7
               loop p1 (bb1 `unsafeShiftR` len) (bc1 - len) (o + cnt)
@@ -854,7 +886,7 @@ huffFastLoop addr# !fastEnd !arr !base !fastOutEnd !litTbl !distTbl !p0 !bb0 !bc
                       !se <- unsafeRead litTbl (subOff + (fromIntegral bb2 .&. subMsk))
                       if se < 0
                         then do
-                          unsafeWrite arr o (fromIntegral (se `unsafeShiftR` 8))
+                          writeU8Raw arr# o (fromIntegral (se `unsafeShiftR` 8))
                           let !len = se .&. 15
                           loop p1 (bb2 `unsafeShiftR` len) (bc2 - len) (o + 1)
                         else if se > 0 && se < 0x40000000
@@ -903,15 +935,63 @@ huffFastLoop addr# !fastEnd !arr !base !fastOutEnd !litTbl !distTbl !p0 !bb0 !bc
                   else ret (4 + mlen) p bb bc o
             else let !dlen = de .&. 15 in ret 3 p (bb `unsafeShiftR` dlen) (bc - dlen) o
           else ret (4 + mlen) p bb bc o
+    -- Word-sized (64-bit) sloppy match copies; safe because fastOutEnd = limit - 270
+    -- guarantees o + mlen + 7 < limit. Any trailing sloppy bytes on truncated/corrupt
+    -- streams are zeroed at inflateFixed exit.
+    copy8 !p !bb !bc !end !src !dst
+      | dst >= end = loop p bb bc end
+      | otherwise = do
+          !w <- readU64Raw arr# src
+          writeU64Raw arr# dst w
+          copy8 p bb bc end (src + 8) (dst + 8)
+    fill8 !p !bb !bc !end !dst !w
+      | dst >= end = loop p bb bc end
+      | otherwise = do
+          writeU64Raw arr# dst w
+          fill8 p bb bc end (dst + 8) w
     doCopy !p !bb !bc !o !mlen !d
       | o - d < base = do
-          forLoop o (o + mlen - 1) $ \i -> do
-            v <- if i - d >= base then unsafeRead arr (i - d) else pure 0
-            unsafeWrite arr i v
-          loop p bb bc (o + mlen)
+          let !end = o + mlen
+              zLoop !i
+                | i >= end  = loop p bb bc end
+                | otherwise = do
+                    !v <- if i - d >= base then readU8Raw arr# (i - d) else pure 0
+                    writeU8Raw arr# i v
+                    zLoop (i + 1)
+          zLoop o
+      | d >= 8 = do
+          !w0 <- readU64Raw arr# (o - d)
+          writeU64Raw arr# o w0
+          let !end = o + mlen
+          if mlen <= 8
+            then loop p bb bc end
+            else copy8 p bb bc end (o - d + 8) (o + 8)
+      | d == 1 = do
+          !b <- readU8Raw arr# (o - 1)
+          fill8 p bb bc (o + mlen) o (fromIntegral b * (0x0101010101010101 :: Word64))
+      | d == 4 = do
+          !w32 <- readU32Raw arr# (o - 4)
+          let !w64 = fromIntegral w32 :: Word64
+          fill8 p bb bc (o + mlen) o (w64 .|. (w64 `unsafeShiftL` 32))
+      | d == 2 = do
+          !w16 <- readU16Raw arr# (o - 2)
+          fill8 p bb bc (o + mlen) o (fromIntegral w16 * (0x0001000100010001 :: Word64))
       | otherwise = do
-          copyMatch arr o d mlen
-          loop p bb bc (o + mlen)
+          let !end = o + mlen
+          if mlen <= 16
+            then do
+              let bLoop !i
+                    | i >= end  = loop p bb bc end
+                    | otherwise = readU8Raw arr# (i - d) >>= writeU8Raw arr# i >> bLoop (i + 1)
+              bLoop o
+            else do
+              let !d' = if d == 3 then 9 else d + d
+                  !prepEnd = o + d' - d
+                  prep !i
+                    | i >= prepEnd = pure ()
+                    | otherwise    = readU8Raw arr# (i - d) >>= writeU8Raw arr# i >> prep (i + 1)
+              prep o
+              copy8 p bb bc end (o - d) prepEnd
 
 {-# NOINLINE huffBlockST #-}
 huffBlockST :: BS.ByteString -> STUArray s Int Word8 -> Int -> Int
@@ -919,7 +999,7 @@ huffBlockST :: BS.ByteString -> STUArray s Int Word8 -> Int -> Int
             -> STUArray s Int Int32 -> STUArray s Int Int -> STUArray s Int Int -> Int
             -> Int -> Word64 -> Int -> Int
             -> ST s BlockRes
-huffBlockST !dat@(BI.BS (ForeignPtr addr# fpc) !datLen) !arr !base !limit
+huffBlockST !dat@(BI.BS (ForeignPtr addr# fpc) !datLen) !arr@(STUArray _ _ _ arr#) !base !limit
             !litTbl !(STUArray _ _ _ litCnt#) !(STUArray _ _ _ litSym#) !(I# litMax#)
             !distTbl !(STUArray _ _ _ distCnt#) !(STUArray _ _ _ distSym#) !(I# distMax#)
             !p0 !bb0 !bc0 !o0 = do
@@ -928,11 +1008,11 @@ huffBlockST !dat@(BI.BS (ForeignPtr addr# fpc) !datLen) !arr !base !limit
   pure res
   where
     !fastEnd    = datLen - 8
-    !fastOutEnd = limit - 262
+    !fastOutEnd = limit - 270
     driver !p !bb !bc !o
       | o >= limit = pure (BlockRes p bb bc o Nothing)
       | o < fastOutEnd && p >= 0 && p <= fastEnd = do
-          FastRes st p1 bb1 bc1 o1 <- huffFastLoop addr# fastEnd arr base fastOutEnd litTbl distTbl p bb bc o
+          FastRes st p1 bb1 bc1 o1 <- huffFastLoop addr# fastEnd arr# base fastOutEnd litTbl distTbl p bb bc o
           case st of
             0 -> pure (BlockRes p1 bb1 bc1 o1 Nothing)
             2 -> pure (BlockRes p1 bb1 bc1 o1 (Just "invalid length code"))
@@ -1159,8 +1239,16 @@ inflateFixed dat !startByte arr !base !size = do
   let !limit   = base + size
       !datLen  = BS.length dat
       !endBits = 8 * datLen
+      finish !o !err = do
+        when (o < limit) $ do
+          let !zEnd = min limit (o + 16)
+              zeroTail !i
+                | i >= zEnd = pure ()
+                | otherwise = unsafeWrite arr i 0 >> zeroTail (i + 1)
+          zeroTail o
+        pure err
       blockLoop !p !bb !bc !o
-        | o >= limit || p * 8 - bc >= endBits = pure Nothing
+        | o >= limit || p * 8 - bc >= endBits = finish o Nothing
         | bc < 3 = case refill dat p bb bc of
             (# p'#, bb'#, bc'# #) -> blockLoop (I# p'#) (W64# bb'#) (I# bc'#) o
         | otherwise =
@@ -1180,7 +1268,7 @@ inflateFixed dat !startByte arr !base !size = do
                      let !pos = srcStart + i
                          !v   = if pos >= 0 && pos < datLen then BSU.unsafeIndex dat pos else 0
                      unsafeWrite arr (o + i) v
-                   if bfinal == 1 then pure Nothing
+                   if bfinal == 1 then finish (o + toCopy) Nothing
                    else blockLoop (srcStart + len) 0 0 (o + len)
                  1 -> do
                    forLoop 0 287 $ \i -> unsafeWrite (scAllLens sc) i (fixedLitLensU `unsafeAt` i)
@@ -1194,8 +1282,8 @@ inflateFixed dat !startByte arr !base !size = do
                      (scDistTable sc) (scDistCounts sc) (scDistSyms sc) distMax
                      p bb1 bc1 o
                    case err of
-                     Just _  -> pure err
-                     Nothing -> if bfinal == 1 then pure Nothing else blockLoop p' bb' bc' o'
+                     Just _  -> finish o' err
+                     Nothing -> if bfinal == 1 then finish o' Nothing else blockLoop p' bb' bc' o'
                  2 -> do
                    DynRes litMax distMax p2 bb2 bc2 <- readDynamicST dat sc p bb1 bc1
                    BlockRes p' bb' bc' o' err <- huffBlockST dat arr base limit
@@ -1203,9 +1291,9 @@ inflateFixed dat !startByte arr !base !size = do
                      (scDistTable sc) (scDistCounts sc) (scDistSyms sc) distMax
                      p2 bb2 bc2 o
                    case err of
-                     Just _  -> pure err
-                     Nothing -> if bfinal == 1 then pure Nothing else blockLoop p' bb' bc' o'
-                 _ -> pure (Just "invalid DEFLATE block type")
+                     Just _  -> finish o' err
+                     Nothing -> if bfinal == 1 then finish o' Nothing else blockLoop p' bb' bc' o'
+                 _ -> finish o (Just "invalid DEFLATE block type")
   blockLoop startByte 0 0 base
 
 -- | Inflate a stream of unknown output size, stopping at @maxOut@ bytes.
