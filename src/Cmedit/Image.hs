@@ -922,12 +922,17 @@ decodePNG bs = do
       grayTrans  = if ct == 0 && BS.length trns >= 2 then Just (be16 trns 0) else Nothing
       rgbTrans   = if ct == 2 && BS.length trns >= 6
                      then Just (be16 trns 0, be16 trns 2, be16 trns 4) else Nothing
-      -- The palette as RGBA quads, so a palette pixel is one indexed read
-      -- per channel (sub-byte depths index the same table).
-      palQuads = U.listArray (0, 1023)
-                   [ fromIntegral v | i <- [0 .. 255]
-                   , let (r,g,b) = palAt i
-                   , v <- [r, g, b, palAlpha i] ] :: UArray Int Word8
+      -- The palette as RGBA words in memory order, so a palette pixel is one
+      -- indexed read and one write (sub-byte depths index the same table).
+      palWords = U.listArray (0, 255)
+                   [ if le then pack al b g r else pack r g b al
+                   | i <- [0 .. 255]
+                   , let (r,g,b) = palAt i; al = palAlpha i ] :: UArray Int Word32
+      pack b3 b2 b1 b0 = fromIntegral (((b3*256 + b2)*256 + b1)*256 + b0)
+      le = targetByteOrder == LittleEndian
+      -- An opaque gray pixel as one word.
+      grayOpaque g = if le then 0xff000000 .|. (g * 0x010101)
+                           else (g * 0x01010100) .|. 0xff :: Word64
       outSize = w*h*4
       -- A non-interlaced image is decoded in place: one buffer of
       -- max outSize rawSize bytes, the stream inflated into its tail, each
@@ -975,9 +980,7 @@ decodePNG bs = do
            (0, 8) | Nothing <- grayTrans ->
                      \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
                        g <- unsafeRead recon (ro + px)
-                       let o = o0 + px*st
-                       unsafeWrite a o g; unsafeWrite a (o + 1) g; unsafeWrite a (o + 2) g
-                       unsafeWrite a (o + 3) 255
+                       pngWr32 a (o0 + px*st) (grayOpaque (fromIntegral g))
            (4, 8) -> \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
                        g <- unsafeRead recon (ro + 2*px)
                        al <- unsafeRead recon (ro + 2*px + 1)
@@ -1018,11 +1021,7 @@ decodePNG bs = do
                        unsafeWrite a (o+3) al
            (3, _) -> \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
                        idx <- rawSampleU recon ro bd px
-                       let q = 4*idx; o = o0 + px*st
-                       unsafeWrite a o       (palQuads `unsafeAt` q)
-                       unsafeWrite a (o + 1) (palQuads `unsafeAt` (q + 1))
-                       unsafeWrite a (o + 2) (palQuads `unsafeAt` (q + 2))
-                       unsafeWrite a (o + 3) (palQuads `unsafeAt` (q + 3))
+                       pngWr32 a (o0 + px*st) (fromIntegral (palWords `unsafeAt` idx))
            _ -> \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
                   (r,g,b,al) <- pngPixel recon ro bd ct chans scale palAt palAlpha
                                          grayTrans rgbTrans px
