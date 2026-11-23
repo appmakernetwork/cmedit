@@ -948,6 +948,18 @@ decodePNGParts (ihdr, plte, trns, idats) = do
                    , let (r,g,b) = palAt i; al = palAlpha i ] :: UArray Int Word32
       pack b3 b2 b1 b0 = fromIntegral (((b3*256 + b2)*256 + b1)*256 + b0)
       le = targetByteOrder == LittleEndian
+      grayWords = U.listArray (0, 255)
+                    [ if le then pack al g g g else pack g g g al
+                    | i <- [0 .. 255]
+                    , let g = if bd < 8 && i < (1 `shiftL` bd) then scale i else 0
+                          al = if grayTrans == Just i then 0 else 255 ] :: UArray Int Word32
+      -- A pixel as one word, its bytes r, g, b, a in memory.
+      rgbaWord :: Word8 -> Word8 -> Word8 -> Word8 -> Word64
+      rgbaWord r g b al
+        | le = fromIntegral r .|. (fromIntegral g `unsafeShiftL` 8)
+               .|. (fromIntegral b `unsafeShiftL` 16) .|. (fromIntegral al `unsafeShiftL` 24)
+        | otherwise = fromIntegral al .|. (fromIntegral b `unsafeShiftL` 8)
+               .|. (fromIntegral g `unsafeShiftL` 16) .|. (fromIntegral r `unsafeShiftL` 24)
       -- An opaque gray pixel as one word.
       grayOpaque g = if le then 0xff000000 .|. (g * 0x010101)
                            else (g * 0x01010100) .|. 0xff :: Word64
@@ -990,11 +1002,11 @@ decodePNGParts (ihdr, plte, trns, idats) = do
                        unsafeRead recon (i + 3) >>= unsafeWrite a (o + 3)
            (2, 8) | Nothing <- rgbTrans ->
                      \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
-                       let i = ro + 3*px; o = o0 + px*st
-                       unsafeRead recon i       >>= unsafeWrite a o
-                       unsafeRead recon (i + 1) >>= unsafeWrite a (o + 1)
-                       unsafeRead recon (i + 2) >>= unsafeWrite a (o + 2)
-                       unsafeWrite a (o + 3) 255
+                       let i = ro + 3*px
+                       r <- unsafeRead recon i
+                       g <- unsafeRead recon (i + 1)
+                       b <- unsafeRead recon (i + 2)
+                       pngWr32 a (o0 + px*st) (rgbaWord r g b 255)
            (0, 8) | Nothing <- grayTrans ->
                      \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
                        g <- unsafeRead recon (ro + px)
@@ -1002,15 +1014,11 @@ decodePNGParts (ihdr, plte, trns, idats) = do
            (4, 8) -> \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
                        g <- unsafeRead recon (ro + 2*px)
                        al <- unsafeRead recon (ro + 2*px + 1)
-                       let o = o0 + px*st
-                       unsafeWrite a o g; unsafeWrite a (o + 1) g; unsafeWrite a (o + 2) g
-                       unsafeWrite a (o + 3) al
+                       pngWr32 a (o0 + px*st) (rgbaWord g g g al)
            (0, 16) | Nothing <- grayTrans ->
                      \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
                        g <- s16 recon (ro + 2*px)
-                       let o = o0 + px*st
-                       unsafeWrite a o g; unsafeWrite a (o + 1) g; unsafeWrite a (o + 2) g
-                       unsafeWrite a (o + 3) 255
+                       pngWr32 a (o0 + px*st) (grayOpaque (fromIntegral g))
            (2, 16) | Nothing <- rgbTrans ->
                      \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
                        let i = ro + 6*px; o = o0 + px*st
@@ -1027,9 +1035,12 @@ decodePNGParts (ihdr, plte, trns, idats) = do
            (4, 16) -> \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
                        g <- s16 recon (ro + 4*px)
                        al <- s16 recon (ro + 4*px + 2)
-                       let o = o0 + px*st
-                       unsafeWrite a o g; unsafeWrite a (o + 1) g; unsafeWrite a (o + 2) g
-                       unsafeWrite a (o + 3) al
+                       pngWr32 a (o0 + px*st) (rgbaWord g g g al)
+           -- Sub-byte gray is a palette of its own (gray level and tRNS).
+           (0, _) | bd < 8 && pngWordsOk -> \recon ro o0 st n -> case bd of
+                       1 -> pngPalRow1 grayWords recon ro a o0 st n
+                       2 -> pngPalRow2 grayWords recon ro a o0 st n
+                       _ -> pngPalRow4 grayWords recon ro a o0 st n
            (0, _) | bd <= 8 -> \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
                        v <- rawSampleU recon ro bd px
                        let g = fromIntegral (scale v)
