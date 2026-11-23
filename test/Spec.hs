@@ -6,7 +6,7 @@ module Main (main) where
 import Control.Monad (forM, when, replicateM, forM_, unless, void, join)
 import Text.Read (readMaybe)
 import Data.Maybe (fromMaybe, isJust)
-import Data.Bits (shiftR, (.&.), xor)
+import Data.Bits (shiftR, (.&.), xor, shiftL)
 import Data.Foldable (toList)
 import Data.IORef
 import Data.Word (Word8, Word64)
@@ -86,7 +86,7 @@ import qualified Cmedit.Epub as Epub
 import qualified Cmedit.Xlsx as Xlsx
 import qualified Cmedit.Formula as Fm
 import qualified Cmedit.Odf as Odf
-import Cmedit.App (convertPath, abbreviateHome, detectLinters, asyncThresholdFor)
+import Cmedit.App (convertPath, abbreviateHome, detectLinters, asyncThresholdFor, streamPng, LoadOutcome(..))
 import Cmedit.Rtf (RtfDoc(..))
 import Cmedit.Pdf (PdfDoc(..))
 import qualified Cmedit.Pdf as Pdf
@@ -1170,6 +1170,98 @@ main = do
     (let (err, buf) = runInflateSegs (splitEvery 1 fixedThenStored) 0 0 12
      in (err, take 12 buf))
     (Nothing, [40..51])
+  -- The stream window (inflateIntoSegsW): inputs many windows long, so a
+  -- Huffman block straddles windows (and is resumed at each edge) and stored
+  -- blocks are windowed before they are copied. Any window must give the
+  -- contiguous decode, byte for byte, corrupt and truncated input included.
+  let runInflateSegsW w segs startByte base outSize = ST.runST $ do
+        arr <- STA.newArray (0, base + outSize + 15) 0xA5 :: ST.ST s (STA.STUArray s Int Word8)
+        err <- Inflate.inflateIntoSegsW w segs startByte arr base outSize
+        frozen <- STA.freeze arr
+        pure (err, U.elems (frozen :: U.UArray Int Word8))
+      -- DEFLATE bits: header fields LSB first, Huffman codes MSB first.
+      lsb n v = [ (v `shiftR` i) .&. 1 | i <- [0 .. n - 1] ] :: [Int]
+      msb n c = [ (c `shiftR` i) .&. 1 | i <- [n - 1, n - 2 .. 0] ] :: [Int]
+      packBits [] = []
+      packBits bs = let (h, t) = splitAt 8 bs
+                    in fromIntegral (sum [ b `shiftL` i | (i, b) <- zip [0 ..] h ]) : packBits t
+      fixedLit v | v < 144 = msb 8 (0x30 + v)
+                 | otherwise = msb 9 (0x190 + v - 144)
+      fixedBlock final lits = lsb 1 final ++ lsb 2 1 ++ concatMap fixedLit lits ++ msb 7 0
+      storedBlock final payload =  -- byte-aligned by the caller
+        lsb 1 final ++ lsb 2 0 ++ replicate 5 0
+          ++ concatMap (lsb 8) [n .&. 255, n `shiftR` 8, (65535 - n) .&. 255, (65535 - n) `shiftR` 8]
+          ++ concatMap (lsb 8) payload
+        where n = length payload
+      lits :: Int -> Int -> [Int]
+      lits k seed = take k (map (\x -> (x `shiftR` 7) .&. 255) (iterate (\x -> (x * 1103515245 + 12345) .&. 0x7fffffff) seed))
+      bigFixed = BS.pack (packBits (fixedBlock 1 (lits 60000 7)))
+      multiFixed = BS.pack (packBits (concat [ fixedBlock (if i == 3 then 1 else 0) (lits (9000 + 4000 * i) i) | i <- [0 .. 3 :: Int] ]))
+      bigStored = BS.pack (packBits (concat [ storedBlock (if i == 2 then 1 else 0) (lits 30000 (i + 50)) | i <- [0 .. 2 :: Int] ]))
+      windowFailures =
+        [ label ++ " " ++ variant ++ " w=" ++ show w
+        | (label, raw, outLen) <- [ ("fixed 60k", bigFixed, 60000), ("fixed x4", multiFixed, 60000)
+                                  , ("stored 3x30k", bigStored, 90000) ]
+        , w <- [4096, 5000, 12345]
+        , let cases = [ ("1000-byte slices", splitEvery 1000 raw, outLen)
+                      , ("prng slices", splitPRNG 5 raw, outLen)
+                      , ("one slice", [raw], outLen)
+                      , ("short limit", splitEvery 777 raw, outLen `div` 3)
+                      , ("truncated", splitEvery 999 (BS.take (BS.length raw * 2 `div` 3) raw), outLen)
+                      , ("corrupt", splitEvery 1500 (flipByteAt (BS.length raw `div` 2) raw), outLen) ]
+        , (variant, segs, size) <- cases
+        , runInflateSegsW w segs 0 5 size /= runInflateFlat (BS.concat segs) 0 5 size
+        ]
+  checkEq "inflateIntoSegsW: every window size decodes as the contiguous stream" windowFailures []
+  checkEq "fixed 60k literals decode through 4 KB windows"
+    (let (err, buf) = runInflateSegsW 4096 (splitEvery 3000 bigFixed) 0 0 60000
+     in (err, take 60000 buf == map fromIntegral (lits 60000 7)))
+    (Nothing, True)
+  -- streamPng: the outcome the whole-file read gives, or Nothing (it then
+  -- falls back to that read). A palette, a transparency chunk or a header
+  -- after the image data changes what the whole-file walk decides, so those
+  -- must fall back rather than be decoded from the chunks seen first.
+  do
+    tmp <- getTemporaryDirectory
+    let path = tmp </> "cmedit-spec-streampng.png"
+        chunkB t d = be32b (length d) ++ map (fromIntegral . fromEnum) t ++ d ++ [0,0,0,0]
+        sigB = [137,80,78,71,13,10,26,10]
+        w = 37; h = 23
+        pixels = [ (fromIntegral (x * 7), fromIntegral (y * 11), fromIntegral (x * y)) | y <- [0 .. h - 1], x <- [0 .. w - 1] ]
+        rgb = mkPNG w h pixels
+        -- the same picture as a palette image (index = x), stored zlib
+        palScan = concat [ 0 : [ fromIntegral x | x <- [0 .. w - 1] ] | _ <- [0 .. h - 1 :: Int] ]
+        palZ = [0x78, 0x01, 0x01] ++ le16b (length palScan) ++ le16b (0xFFFF - length palScan) ++ palScan ++ [0,0,0,0]
+        palIhdr = chunkB "IHDR" (be32b w ++ be32b h ++ [8,3,0,0,0])
+        plte = chunkB "PLTE" (concat [ [fromIntegral (i * 5), 200, fromIntegral (255 - i)] | i <- [0 .. 255 :: Int] ])
+        -- the image data split over many IDAT chunks, an ancillary chunk among them
+        idats = concat [ chunkB "IDAT" c | c <- chunksOf 50 palZ ]
+        chunksOf k xs = if null xs then [] else take k xs : chunksOf k (drop k xs)
+        iend = chunkB "IEND" []
+        ordinary = BS.pack (sigB ++ palIhdr ++ plte ++ take 300 idats ++ chunkB "tEXt" [65,0,66] ++ drop 300 idats ++ iend)
+        latePlte = BS.pack (sigB ++ palIhdr ++ idats ++ plte ++ iend)
+        lateIhdr = BS.pack (sigB ++ plte ++ idats ++ palIhdr ++ iend)
+        truncated = BS.take (BS.length ordinary - 400) ordinary
+        whole bs = case decodeImage bs of
+          Left e -> Left e
+          Right i -> Right (imgW i, imgH i, imgPix i)
+        streamed bs = do
+          BS.writeFile path bs
+          mo <- streamPng path
+          pure $ case mo of
+            Nothing -> Nothing
+            Just (OutImage _ dc) -> let i = fst (head (dcFrames dc)) in Just (Right (imgW i, imgH i, imgPix i))
+            Just (OutError e) -> Just (Left (drop 2 (dropWhile (/= ':') e)))
+            Just _ -> Just (Left "another outcome")
+    forM_ [("rgb", rgb), ("palette, IDATs split, tEXt between", ordinary), ("truncated mid-IDAT", truncated)] $ \(label, bs) -> do
+      r <- streamed bs
+      checkEq ("streamPng matches the whole-file decode: " ++ label) r (Just (whole bs))
+    rLate <- streamed latePlte
+    checkEq "streamPng falls back when PLTE follows the image data" rLate Nothing
+    check "the whole-file read decodes a late PLTE (the case the fallback keeps)" (isRight (whole latePlte))
+    rIhdr <- streamed lateIhdr
+    checkEq "streamPng falls back when no IHDR precedes the image data" rIhdr Nothing
+    removeFile path
   -- Re-slice a PNG fixture's IDAT payload into 1-byte IDAT chunks so even the
   -- 2-byte zlib header spans two IDAT chunks.
   case pngRegressionFixtures of
