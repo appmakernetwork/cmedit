@@ -1019,6 +1019,10 @@ decodePNG bs = do
                            o = o0 + px*st
                        unsafeWrite a o g; unsafeWrite a (o+1) g; unsafeWrite a (o+2) g
                        unsafeWrite a (o+3) al
+           (3, _) | bd < 8 && pngWordsOk -> \recon ro o0 st n -> case bd of
+                       1 -> pngPalRow1 palWords recon ro a o0 st n
+                       2 -> pngPalRow2 palWords recon ro a o0 st n
+                       _ -> pngPalRow4 palWords recon ro a o0 st n
            (3, _) -> \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
                        idx <- rawSampleU recon ro bd px
                        pngWr32 a (o0 + px*st) (fromIntegral (palWords `unsafeAt` idx))
@@ -1325,6 +1329,57 @@ pngFuseRow4 ft buf i o w = case ft of
 swarAdd :: Word64 -> Word64 -> Word64
 swarAdd x y = ((x .&. 0x7f7f7f7f7f7f7f7f) + (y .&. 0x7f7f7f7f7f7f7f7f))
               `xor` ((x `xor` y) .&. 0x8080808080808080)
+
+-- A row of palette indices at 1, 2 or 4 bits (bd, a literal at every call)
+-- to RGBA: one read per packed byte and one table word per pixel, rather
+-- than a byte read, a shift and a mask per pixel. The pixels of the last,
+-- partly used byte are the tail loop's. In place this keeps the argument in
+-- 'decodePNG': a byte's pixels end, in the output, no later than its last
+-- pixel alone did.
+{-# INLINE pngPalRow #-}
+pngPalRow :: Int -> UArray Int Word32 -> STUArray s Int Word8 -> Int
+          -> STUArray s Int Word8 -> Int -> Int -> Int -> ST s ()
+pngPalRow bd pal src ro out o0 st n = go 0 o0
+  where
+    !ppb = 8 `quot` bd
+    !full = n `quot` ppb
+    !m = (1 `unsafeShiftL` bd) - 1 :: Int
+    put o idx = pngWr32 out o (fromIntegral (pal `unsafeAt` idx))
+    go !j !o
+      | j >= full = tailPx (full * ppb) o
+      | otherwise = do
+          v <- (fromIntegral :: Word8 -> Int) <$> unsafeRead src (ro + j)
+          case bd of
+            4 -> do put o (v `unsafeShiftR` 4); put (o + st) (v .&. 15)
+            2 -> do put o (v `unsafeShiftR` 6)
+                    put (o + st) ((v `unsafeShiftR` 4) .&. 3)
+                    put (o + 2*st) ((v `unsafeShiftR` 2) .&. 3)
+                    put (o + 3*st) (v .&. 3)
+            _ -> do put o (v `unsafeShiftR` 7)
+                    put (o + st) ((v `unsafeShiftR` 6) .&. 1)
+                    put (o + 2*st) ((v `unsafeShiftR` 5) .&. 1)
+                    put (o + 3*st) ((v `unsafeShiftR` 4) .&. 1)
+                    put (o + 4*st) ((v `unsafeShiftR` 3) .&. 1)
+                    put (o + 5*st) ((v `unsafeShiftR` 2) .&. 1)
+                    put (o + 6*st) ((v `unsafeShiftR` 1) .&. 1)
+                    put (o + 7*st) (v .&. 1)
+          go (j + 1) (o + ppb*st)
+    tailPx !px !o
+      | px >= n = pure ()
+      | otherwise = do
+          v <- (fromIntegral :: Word8 -> Int) <$> unsafeRead src (ro + (px*bd) `unsafeShiftR` 3)
+          put o ((v `unsafeShiftR` (8 - bd - ((px*bd) .&. 7))) .&. m)
+          tailPx (px + 1) (o + st)
+
+pngPalRow1, pngPalRow2, pngPalRow4
+  :: UArray Int Word32 -> STUArray s Int Word8 -> Int
+  -> STUArray s Int Word8 -> Int -> Int -> Int -> ST s ()
+pngPalRow1 pal src ro out o0 st n = pngPalRow 1 pal src ro out o0 st n
+pngPalRow2 pal src ro out o0 st n = pngPalRow 2 pal src ro out o0 st n
+pngPalRow4 pal src ro out o0 st n = pngPalRow 4 pal src ro out o0 st n
+{-# NOINLINE pngPalRow1 #-}
+{-# NOINLINE pngPalRow2 #-}
+{-# NOINLINE pngPalRow4 #-}
 
 -- The byte-at-a-time filter loops over raw[from, end), in place.
 pngSubBytes :: STUArray s Int Word8 -> Int -> Int -> Int -> ST s ()
