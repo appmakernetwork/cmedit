@@ -2964,6 +2964,9 @@ streamPng path = do
         (_, Nothing) -> pure Nothing            -- an IHDR may yet follow: not ours to say
         (Nothing, Just ih) -> Just <$> force (decodePNGParts (ih, plte, trns, []))
         (Just p0, Just ih) -> do
+          -- The walk stands at the first IDAT until the decoder pulls
+          -- something (it may reject the picture without reading any).
+          writeIORef walkPos (Just p0)
           idats <- chunks p0
           d <- force (decodePNGParts (ih, plte, trns, idats))
           writeIORef cur (0, BS.empty)
