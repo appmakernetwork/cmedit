@@ -1349,12 +1349,32 @@ pngFuseRow3 ft buf i o w = case ft of
   _ -> pngFuse 0 3 buf i o w
 pngFuseRow4 ft buf i o w = case ft of
   1 -> pngFuse 1 4 buf i o w
-  2 -> pngFuse 2 4 buf i o w
+  2 -> pngUpRow4 buf i o w
   3 -> pngFuse 3 4 buf i o w
   4 -> pngFuse 4 4 buf i o w
-  _ -> pngFuse 0 4 buf i o w
+  _ -> copyBytesU8 buf i buf o (4*w)     -- None: the row is its output
 {-# NOINLINE pngFuseRow3 #-}
 {-# NOINLINE pngFuseRow4 #-}
+
+-- An RGBA row under Up, two pixels at a time: no pixel depends on its
+-- neighbour, and filtered and output bytes are the same four per pixel.
+-- (Each word is read before the write that may overlap it.)
+pngUpRow4 :: STUArray s Int Word8 -> Int -> Int -> Int -> ST s ()
+pngUpRow4 buf !i0 !o0 !w = go i0 o0
+  where
+    !wd = 4*w
+    !oEnd = o0 + wd
+    go !i !o
+      | o + 8 <= oEnd = do
+          x <- pngRd64 buf i
+          b <- pngRd64 buf (o - wd)
+          pngWr64 buf o (swarAdd x b)
+          go (i + 8) (o + 8)
+      | o < oEnd = do
+          x <- pngRd32 buf i
+          b <- pngRd32 buf (o - wd)
+          pngWr32 buf o (swarAdd x b)
+      | otherwise = pure ()
 
 -- Byte-wise addition of two words: no carry crosses a lane.
 {-# INLINE swarAdd #-}
