@@ -968,7 +968,7 @@ decodePNGParts (ihdr, plte, trns, idats) = do
       inPlace = interlace /= 1
       bufSize = if inPlace then max outSize rawSize else outSize
   px <- runST $ do
-   a <- newBytes bufSize
+   a <- newBytesZeroedFrom bufSize (if inPlace then bufSize - rawSize else bufSize)
    (rawArr, base) <- if inPlace then pure (a, bufSize - rawSize)
                                  else do r <- newBytes rawSize; pure (r, 0)
    ierr <- inflateIntoSegs idats 2 rawArr base rawSize   -- skip the 2-byte zlib header
@@ -4287,6 +4287,17 @@ vlEntropyInto bs st errR level0 w h out = do
                       next pos x y
   err0 <- readSTRef errR
   when (err0 == Nothing) $ loop 0 0 0
+
+-- A byte buffer zeroed only from index z on. PNG's output buffer: every
+-- pixel is written by the row converters, so only the part the stream is
+-- inflated into (which a short stream leaves zero-padded) needs clearing.
+-- Zeroing the rest cost a pass over the whole image before decoding began.
+newBytesZeroedFrom :: Int -> Int -> ST s (STUArray s Int Word8)
+newBytesZeroedFrom n z = do
+  arr@(STUArray _ _ _ marr) <- unsafeNewArray_ (0, max 0 (n - 1))
+  let !(I# z#) = z; !(I# len#) = max 0 (n - z)
+  ST $ \s -> case setByteArray# marr z# len# 0# s of s' -> (# s', () #)
+  pure arr
 
 newBytes :: Int -> ST s (STUArray s Int Word8)
 newBytes n = newArray (0, max 0 (n - 1)) 0
