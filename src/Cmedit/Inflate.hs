@@ -1687,22 +1687,24 @@ inflateStep (InflateStream !win !arrRef !capRef !base !limit !strictTrunc !sc !p
     PhaseStored segs rest bfinal srcPos remLen o         -> storedLoop segs rest bfinal srcPos remLen o
     PhaseHuff segs rest bfinal litMax distMax k p bb bc o -> huffLoop segs rest bfinal litMax distMax k p bb bc o
 
--- | Inflate a stream of unknown output size, stopping at @maxOut@ bytes.
---
--- The bound is not a nicety: a compressed stream names no expanded size, so a
--- hostile or corrupt one could otherwise ask for unbounded memory — the same
--- reasoning as "Cmedit.Pager"'s per-line cap. Hitting it truncates rather than
--- failing, since a partial content stream still renders most of a page.
--- Allocate an uninitialized byte buffer for 'inflateDyn'. Safe because every
--- output byte in @[0 .. n - 1]@ is written before any back-reference or final
--- copy can read it, and 'inflateDyn' never returns bytes past @n@. Avoids
--- zero-filling and faulting in unused tail pages when @cap0 > actualOutput@.
+-- An uninitialised byte buffer for 'inflateDyn', which avoids zero-filling
+-- (and faulting in) the unused tail of a buffer sized ahead of its output.
+-- Sound because the decoder never reads a byte it has not written: a match
+-- reaching before the start of the output and a stored block running past
+-- the end of the input both write explicit zeros, as the zeroed buffer
+-- used to supply, and only the @n@ bytes written are ever returned.
 {-# INLINE newRawByteBuf #-}
 newRawByteBuf :: Int -> ST s (STUArray s Int Word8)
 newRawByteBuf !cap@(I# cap#) = ST $ \s# ->
   case newByteArray# cap# s# of
     (# s1#, mba# #) -> (# s1#, STUArray 0 (cap - 1) cap mba# #)
 
+-- | Inflate a stream of unknown output size, stopping at @maxOut@ bytes.
+--
+-- The bound is not a nicety: a compressed stream names no expanded size, so a
+-- hostile or corrupt one could otherwise ask for unbounded memory — the same
+-- reasoning as "Cmedit.Pager"'s per-line cap. Hitting it truncates rather than
+-- failing, since a partial content stream still renders most of a page.
 inflateDyn :: BS.ByteString -> Int -> Int -> Either String BS.ByteString
 inflateDyn dat startByte maxOut
   | maxOut <= 0 = Right BS.empty

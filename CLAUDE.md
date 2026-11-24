@@ -1096,7 +1096,11 @@ in `README.md`; the cross-cutting structure that matters when editing:
   same into a caller's buffer at an offset, which is how PNG inflates into the
   tail of its own output image and decodes in place; `inflateDyn`, which grows
   its buffer, for PDF content streams, which declare only their *compressed*
-  length; `Huff`/`buildHuff` and the prefix-table decoder are shared with
+  length, and for ZIP members and `.svgz`; it runs the same resumable fast
+  loop (`inflateStep`), pausing 258 bytes short of its buffer's end and
+  carrying on in one twice the size, and is held to the original decoder's
+  exact `Either` on every input, truncated and corrupt ones included, by
+  `docs/plans/bench/inflatedyn_fuzz.sh`; `Huff`/`buildHuff` and the prefix-table decoder are shared with
   VP8L). The result is an RGBA `Image`, and
   `renderImage` area-averages it down to a grid of half-block (`▀`, fg=top
   pixel / bg=bottom pixel, 24-bit colour) or ASCII-ramp `Cell`s.
