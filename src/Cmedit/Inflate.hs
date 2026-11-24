@@ -15,8 +15,7 @@
 -- one pre-sized buffer and hands back the unboxed array the unfilter pass
 -- wants. PDF does not — a compressed stream declares its /compressed/ length
 -- and nothing else — so 'inflateDyn' grows its buffer geometrically and
--- returns a 'BS.ByteString'. Both share one decoder ('inflateWith'); only the
--- sink differs.
+-- returns a 'BS.ByteString'. Both share the same fast table-driven decoder.
 --
 -- 'Huff' and 'buildHuff' live here rather than in a decoder because JPEG's
 -- scan reader builds the same canonical-Huffman tables from its own DHT
@@ -51,7 +50,7 @@ import Data.Array (Array)
 import qualified Data.Array as A
 import Data.Array.ST (STUArray, newArray, readArray, writeArray, runSTUArray)
 import Data.Array.MArray (freeze)
-import Data.Array.Unboxed (UArray, (!))
+import Data.Array.Unboxed (UArray)
 import qualified Data.Array.Unboxed as U
 import Data.Bits
 import Data.STRef
@@ -61,7 +60,7 @@ import qualified Data.ByteString.Internal as BI
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Array.Base (STUArray(..), unsafeRead, unsafeWrite, unsafeAt)
 import GHC.ByteOrder (ByteOrder(..), targetByteOrder)
-import GHC.Exts (Addr#, Int(I#), Int#, MutableByteArray#, State#, Word64#, Ptr(..), copyAddrToByteArray#, copyMutableByteArray#, copyMutableByteArrayToAddr#, gtAddr#, indexWord64OffAddr#, isTrue#, (<#), minusAddr#, plusAddr#, readIntArray#, readWord64OffAddr#, readWord8Array#, readWord8ArrayAsWord16#, readWord8ArrayAsWord32#, readWord8ArrayAsWord64#, runRW#, setByteArray#, touch#, writeWord8Array#, writeWord8ArrayAsWord32#, writeWord8ArrayAsWord64#)
+import GHC.Exts (Addr#, Int(I#), Int#, MutableByteArray#, State#, Word64#, Ptr(..), RealWorld, copyAddrToByteArray#, copyMutableByteArray#, copyMutableByteArrayToAddr#, gtAddr#, indexWord64OffAddr#, isTrue#, (<#), minusAddr#, plusAddr#, readIntArray#, readWord64OffAddr#, readWord8Array#, readWord8ArrayAsWord16#, readWord8ArrayAsWord32#, readWord8ArrayAsWord64#, runRW#, setByteArray#, touch#, writeWord8Array#, writeWord8ArrayAsWord32#, writeWord8ArrayAsWord64#)
 import GHC.ForeignPtr (ForeignPtr(..), ForeignPtrContents)
 import GHC.IO (IO(..), unsafeDupablePerformIO)
 import GHC.ST (ST(..))
@@ -150,26 +149,9 @@ buildInflateHuffN bits lens =
         pure t
   in InflateHuff hf table
 
--- Slots of the inflate reader's unboxed state array.
-iBit, iOut :: Int
-iBit = 0   -- bit position in the compressed stream
-iOut = 1   -- next output byte index
-
--- Inline the bit operations into their callers: a local ST action otherwise
--- allocates at every bit boundary in this shared PNG/PDF/archive decoder.
--- 24 bits of the stream from byte @i@, LSB first, zero past the end: the
--- unchecked read is every read but the last few of a stream. 24 is enough
--- for every caller, which needs at most 16 bits past a sub-byte offset of
--- up to 7 (23 bits); a fourth byte measured 4% slower. A future caller
--- wanting more than 17 bits needs a wider window.
-{-# INLINE peek24I #-}
-peek24I :: BS.ByteString -> Int -> Int
-peek24I dat i
-  | i >= 0 && i + 2 < BS.length dat =
-      u i .|. (u (i+1) `shiftL` 8) .|. (u (i+2) `shiftL` 16)
-  | otherwise = b i .|. (b (i+1) `shiftL` 8) .|. (b (i+2) `shiftL` 16)
-  where u j = fromIntegral (BSU.unsafeIndex dat j)
-        b j = if j >= 0 && j < BS.length dat then u j else 0
+-- Bit-position slot of the state array used by 'decodeSymSlow' (WebP lossless).
+iBit :: Int
+iBit = 0
 
 {-# INLINE getBitI #-}
 getBitI :: BS.ByteString -> STUArray s Int Int -> ST s Int
@@ -180,34 +162,6 @@ getBitI dat st = do
       b    = (byte `shiftR` (p .&. 7)) .&. 1
   unsafeWrite st iBit (p+1)
   pure b
-
--- All callers request at most 16 bits, which with the sub-byte offset fit
--- in one 24-bit window; past the end the window is zero-padded, exactly as
--- reading byte by byte was.
-{-# INLINE getBitsI #-}
-getBitsI :: BS.ByteString -> STUArray s Int Int -> Int -> ST s Int
-getBitsI dat st n = do
-  p <- unsafeRead st iBit
-  let !v | n <= 0 = 0
-         | otherwise = (peek24I dat (p `shiftR` 3) `shiftR` (p .&. 7)) .&. ((1 `shiftL` n) - 1)
-  unsafeWrite st iBit (p + max 0 n)
-  pure v
-
-{-# INLINE decodeSymI #-}
-decodeSymI :: BS.ByteString -> STUArray s Int Int -> InflateHuff -> ST s Int
-decodeSymI dat st (InflateHuff hf table) = do
-  p <- unsafeRead st iBit
-  let prefix = (peek24I dat (p `shiftR` 3) `shiftR` (p .&. 7)) .&. ((1 `shiftL` inflateBits) - 1)
-      entry = table `unsafeAt` prefix
-      len = entry .&. 15
-  if len == 0 then decodeSymSlowI dat st hf
-  else unsafeWrite st iBit (p+len) >> pure (entry `shiftR` 4)
-
--- The canonical walk, out of line: codes longer than the table are rare,
--- and inlined it was copied into every symbol read.
-{-# NOINLINE decodeSymSlowI #-}
-decodeSymSlowI :: BS.ByteString -> STUArray s Int Int -> Huff -> ST s Int
-decodeSymSlowI = decodeSymSlow
 
 {-# INLINE decodeSymSlow #-}
 decodeSymSlow :: BS.ByteString -> STUArray s Int Int -> Huff -> ST s Int
@@ -1218,20 +1172,21 @@ huffFastLoop cur0# endPtr# arr# !base !fastOutEnd !tbl !bb0 !bc0 !o0 =
               copy8 cur# bb bc end (o - d) prepEnd
 
 {-# NOINLINE huffBlockST #-}
-huffBlockST :: Segs -> STUArray s Int Word8 -> Int -> Int -> Int
+huffBlockST :: Segs -> STUArray s Int Word8 -> Int -> Int -> Int -> Int -> Bool
             -> STUArray s Int Int
             -> STUArray s Int Int -> STUArray s Int Int -> Int
             -> STUArray s Int Int -> STUArray s Int Int -> Int
             -> Int -> Int -> Word64 -> Int -> Int
             -> ST s BlockRes
-huffBlockST !segs@(Segs !nSeg _ !starts !segArr _) !arr@(STUArray _ _ _ arr#) !base !limit !stopAt
+huffBlockST !segs@(Segs !nSeg _ !starts !segArr _) !arr@(STUArray _ _ _ arr#) !base !limit !bufCap !stopAt !strictTrunc
             !tbl
             !(STUArray _ _ _ litCnt#) !(STUArray _ _ _ litSym#) !(I# litMax#)
             !(STUArray _ _ _ distCnt#) !(STUArray _ _ _ distSym#) !(I# distMax#)
             !k0 !p0 !bb0 !bc0 !o0 =
   driver k0 p0 bb0 bc0 o0
   where
-    !fastOutEnd = min stopAt (limit - 274)
+    !fastOutEnd = min stopAt (bufCap - 274)
+    !endBits    = 8 * segTotal segs
     driver !k !p !bb !bc !o
       | o >= limit  = pure (BlockRes k p bb bc o BlockDone)
       | o >= stopAt = pure (BlockRes k p bb bc o BlockNeedOutput)
@@ -1259,6 +1214,8 @@ huffBlockST !segs@(Segs !nSeg _ !starts !segArr _) !arr@(STUArray _ _ _ arr#) !b
     slowStep !k !p !bb !bc !o
       | o >= limit  = pure (BlockRes k p bb bc o BlockDone)
       | o >= stopAt = pure (BlockRes k p bb bc o BlockNeedOutput)
+      | strictTrunc && p * 8 - bc > endBits =
+          pure (BlockRes k p bb bc o (BlockError "truncated DEFLATE stream"))
       | otherwise =
           case refillSeg segs k p bb bc of
             (# k1#, p1#, bb1#, bc1# #)
@@ -1271,12 +1228,18 @@ huffBlockST !segs@(Segs !nSeg _ !starts !segArr _) !arr@(STUArray _ _ _ arr#) !b
         then do
           let !len = e .&. 15
               !cnt = (e `unsafeShiftR` 4) .&. 7
-              !nwr = min cnt (limit - o)
-              writeBytes !j !v
-                | j >= nwr  = pure ()
-                | otherwise = unsafeWrite arr (o + j) (fromIntegral v) >> writeBytes (j + 1) (v `unsafeShiftR` 8)
-          writeBytes 0 (e `unsafeShiftR` 8)
-          driver k p (bb `unsafeShiftR` len) (bc - len) (o + cnt)
+          -- In strictTrunc mode (inflateDyn), a packed multi-literal entry whose
+          -- combined bits cross endBits could emit extra symbols from zero padding;
+          -- fall back to single-symbol decoding for the final ~2 bytes of input.
+          if strictTrunc && cnt > 1 && p * 8 - bc + len > endBits
+            then walkLit k p bb bc o
+            else do
+              let !nwr = min cnt (limit - o)
+                  writeBytes !j !v
+                    | j >= nwr  = pure ()
+                    | otherwise = unsafeWrite arr (o + j) (fromIntegral v) >> writeBytes (j + 1) (v `unsafeShiftR` 8)
+              writeBytes 0 (e `unsafeShiftR` 8)
+              driver k p (bb `unsafeShiftR` len) (bc - len) (o + cnt)
         else if e > 0 && e < 0x40000000
           then
             let !llen  = e .&. 15
@@ -1530,7 +1493,7 @@ inflateFixed !win !segs0 rest0 !startByte arr !base !size = do
       -- stops at the window's end ('BlockNeedInput'): the tables are still
       -- in the scratch arrays, and nothing was decoded from bits it lacked.
       huffBlock segs rest !litMax !distMax !bfinal !k !p !bb !bc !o = do
-        BlockRes k' p' bb' bc' o' stop <- huffBlockST segs arr base limit limit
+        BlockRes k' p' bb' bc' o' stop <- huffBlockST segs arr base limit limit limit False
           (scTable sc)
           (scLitCounts sc) (scLitSyms sc) litMax
           (scDistCounts sc) (scDistSyms sc) distMax
@@ -1565,7 +1528,14 @@ data InflatePhase
 -- downstream passes can consume completed rows while lazily-read input
 -- slices are released behind the read cursor.
 data InflateStream s = InflateStream
-  !Int !(STUArray s Int Word8) !Int !Int !(InflateScratch s) !(STRef s InflatePhase)
+  !Int
+  !(STRef s (STUArray s Int Word8))
+  !(STRef s Int)
+  !Int
+  !Int
+  !Bool
+  !(InflateScratch s)
+  !(STRef s InflatePhase)
 
 -- | Create a resumable fixed-size DEFLATE stream over a lazily-consumed list
 -- of byte slices using the default 'streamWindow'.
@@ -1585,21 +1555,41 @@ newInflateStreamW win chunks startByte arr base outSize = do
                 (s0, r0) = advanceWindow w' (mkSegsAt 0 [] True) chunks 0 (startByte + w')
             in (w', s0, r0)
       !limit = base + max 0 outSize
-  sc  <- newInflateScratch
-  ref <- newSTRef (PhaseBlock segs0 rest0 (seekSeg segs0 startByte) startByte 0 0 base)
-  pure (InflateStream w arr base limit sc ref)
+  arrRef <- newSTRef arr
+  capRef <- newSTRef limit
+  sc     <- newInflateScratch
+  ref    <- newSTRef (PhaseBlock segs0 rest0 (seekSeg segs0 startByte) startByte 0 0 base)
+  pure (InflateStream w arrRef capRef base limit False sc ref)
+
+newInflateDynStream :: BS.ByteString -> Int -> STUArray s Int Word8 -> Int -> Int
+                    -> ST s (InflateStream s)
+newInflateDynStream dat startByte arr cap0 maxOut = do
+  let !segs0 = mkSegs [dat]
+      !limit = max 0 maxOut
+  arrRef <- newSTRef arr
+  capRef <- newSTRef cap0
+  sc     <- newInflateScratch
+  ref    <- newSTRef (PhaseBlock segs0 [] (seekSeg segs0 startByte) startByte 0 0 0)
+  pure (InflateStream 0 arrRef capRef 0 limit True sc ref)
+
+swapInflateStreamBuf :: InflateStream s -> STUArray s Int Word8 -> Int -> ST s ()
+swapInflateStreamBuf (InflateStream _ arrRef capRef _ _ _ _ _) !newArr !newCap = do
+  writeSTRef arrRef newArr
+  writeSTRef capRef newCap
 
 -- | Advance a resumable DEFLATE stream until at least @targetBytes@ bytes
 -- (relative to @base@) have been finalized, or until the stream ends / hits
 -- a hard error. Input window slides happen transparently inside the call.
 {-# NOINLINE inflateStep #-}
 inflateStep :: InflateStream s -> Int -> ST s InflateStepRes
-inflateStep (InflateStream !win !arr !base !limit !sc !phaseRef) !targetBytes = do
+inflateStep (InflateStream !win !arrRef !capRef !base !limit !strictTrunc !sc !phaseRef) !targetBytes = do
+  arr    <- readSTRef arrRef
+  bufCap <- readSTRef capRef
   let !stopAt = min limit (base + max 0 targetBytes)
       slide !segs rest !lo !hi = advanceWindow win segs rest lo hi
       finish !o !err = do
-        when (o < limit) $ do
-          let !zEnd = min limit (o + 16)
+        when (not strictTrunc && o < bufCap) $ do
+          let !zEnd = min bufCap (o + 16)
               zeroTail !i
                 | i >= zEnd = pure ()
                 | otherwise = unsafeWrite arr i 0 >> zeroTail (i + 1)
@@ -1639,7 +1629,7 @@ inflateStep (InflateStream !win !arr !base !limit !sc !phaseRef) !targetBytes = 
             writeSTRef phaseRef (PhaseHuff segs rest bfinal litMax distMax k p bb bc o)
             pure (InflatePaused (o - base))
         | otherwise = do
-            BlockRes k' p' bb' bc' o' stop <- huffBlockST segs arr base limit stopAt
+            BlockRes k' p' bb' bc' o' stop <- huffBlockST segs arr base limit bufCap stopAt strictTrunc
               (scTable sc)
               (scLitCounts sc) (scLitSyms sc) litMax
               (scDistCounts sc) (scDistSyms sc) distMax
@@ -1704,226 +1694,46 @@ inflateStep (InflateStream !win !arr !base !limit !sc !phaseRef) !targetBytes = 
 -- reasoning as "Cmedit.Pager"'s per-line cap. Hitting it truncates rather than
 -- failing, since a partial content stream still renders most of a page.
 inflateDyn :: BS.ByteString -> Int -> Int -> Either String BS.ByteString
-inflateDyn dat startByte maxOut = unsafeDupablePerformIO $ do
-  (arrRef, n, err) <- stToIO $ inflateWith dat startByte maxOut True 0 Nothing
-  out <- if n <= 0
-           then pure BS.empty
-           else do
-             STUArray _ _ _ mba# <- stToIO (readSTRef arrRef)
-             BI.create n $ \(Ptr dst#) -> IO $ \s# ->
-               let !(I# n#) = n
-               in case copyMutableByteArrayToAddr# mba# 0# dst# n# s# of
-                    s1# -> (# s1#, () #)
-  -- A truncated-but-decodable stream is worth what it produced, so the bytes
-  -- come back even alongside an error; the caller decides (see 'Cmedit.Pdf').
-  pure $ case err of
-    Just e | BS.null out -> Left e
-    _                    -> Right out
-
--- The decoder proper. @limit@ bounds the output either way; @grow@ says
--- whether the buffer starts small and doubles (unknown size) or is allocated
--- once at full size and silently drops any overflow (known size, PNG's case,
--- where a stream longer than the image is corrupt anyway).
---
--- Returns the buffer, the number of bytes written, and any hard error.
---
--- With a caller's buffer the output occupies indices [base, base+size): the
--- output position, @limit@ and the capacity are all absolute, and only the
--- known-size mode supports it (growing always starts at 0 in a fresh buffer).
-inflateWith
-  :: BS.ByteString -> Int -> Int -> Bool -> Int -> Maybe (STUArray s Int Word8)
-  -> ST s (STRef s (STUArray s Int Word8), Int, Maybe String)
-inflateWith dat startByte size grow base given = do
-  let limit = base + size
-      cap0 | grow      = min limit (max 4096 (4 * BS.length dat))
-           | otherwise = limit
-  arr0   <- case given of
-              Just g  -> pure g
-              Nothing -> newArray (0, max 0 (cap0 - 1)) 0 :: ST s (STUArray s Int Word8)
-  arrRef <- newSTRef arr0
-  capRef <- newSTRef (max 1 cap0)
-  -- Bit position and output position share one unboxed array: they are read
-  -- and written on every bit and every output byte respectively, and an
-  -- 'STRef Int' allocates a fresh box on each write.
-  st     <- newArray (0, 1) 0 :: ST s (STUArray s Int Int)
-  writeArray st iBit (startByte * 8)
-  writeArray st iOut base
-  doneRef <- newSTRef False
-  errRef  <- newSTRef (Nothing :: Maybe String)
-  let fail' msg = writeSTRef errRef (Just msg) >> writeSTRef doneRef True
-      -- Double the buffer, copying what is already in it. Geometric, so the
-      -- copying costs O(n) over the whole stream.
-      growTo !need = do
-        cap <- readSTRef capRef
-        when (need > cap) $ do
-          let cap' = min limit (max need (cap * 2))
-          old <- readSTRef arrRef
-          new <- newArray (0, max 0 (cap' - 1)) 0
-          n <- readArray st iOut
-          forLoop 0 (min n cap - 1) $ \i -> readArray old i >>= writeArray new i
-          writeSTRef arrRef new
-          writeSTRef capRef cap'
-      putByte !w = do
-        !o <- unsafeRead st iOut
-        cap <- readSTRef capRef
-        when (grow && o >= cap && o < limit) (growTo (o + 1))
-        cap' <- readSTRef capRef
-        when (o < cap') $ do
-          a <- readSTRef arrRef
-          unsafeWrite a o w
-        unsafeWrite st iOut (o+1)
-      copyBack !dist !len = do
-        o <- unsafeRead st iOut
-        cap <- readSTRef capRef
-        when (grow && o+len > cap && o < limit) (growTo (min limit (o+len)))
-        cap' <- readSTRef capRef
-        a <- readSTRef arrRef
-        -- Copy forwards: overlapping matches must see bytes just written.
-        -- Capacity checks and mutable sink lookup happen once per match, and
-        -- so does the source check: only a distance reaching before the
-        -- start of the output (corrupt) needs it per byte.
-        let end = min cap' (o+len) - 1
-        if o - dist >= base
-          then forLoop o end $ \i -> unsafeRead a (i-dist) >>= unsafeWrite a i
-          else forLoop o end $ \i -> do
-                 v <- if i-dist >= base then unsafeRead a (i-dist) else pure 0
-                 unsafeWrite a i v
-        unsafeWrite st iOut (o+len)
-      -- Known-size mode: the buffer and its capacity never change, so the
-      -- block loop writes straight into it (the general loop below reads
-      -- both through STRefs on every byte, for the growing case). Same
-      -- bounds as 'putByte'/'copyBack': here the capacity is the limit.
-      huffBlockFixed lit dist = loop
-        where cap = max 1 limit
-              loop = do
-                o <- unsafeRead st iOut
-                if o >= limit then pure () else do
-                  sym <- decodeSymI dat st lit
-                  if sym < 0 then fail' "invalid Huffman code"
-                  else if sym < 256 then do
-                    unsafeWrite arr0 o (fromIntegral sym)
-                    unsafeWrite st iOut (o+1)
-                    loop
-                  else if sym == 256 then pure ()
-                  else do
-                    let li = sym - 257
-                    if li >= nLenCodes then fail' "invalid length code" else do
-                      extra <- getBitsI dat st (lenExtra `unsafeAt` li)
-                      let len = lenBase `unsafeAt` li + extra
-                      dsym <- decodeSymI dat st dist
-                      if dsym < 0 || dsym >= nDistCodes then fail' "invalid distance code" else do
-                        dextra <- getBitsI dat st (distExtra `unsafeAt` dsym)
-                        let d = distBase `unsafeAt` dsym + dextra
-                            end = min cap (o+len) - 1
-                        if o - d >= base
-                          then copyMatch arr0 o d (end-o+1)
-                          else forLoop o end $ \i -> do
-                                 v <- if i-d >= base then unsafeRead arr0 (i-d) else pure 0
-                                 unsafeWrite arr0 i v
-                        unsafeWrite st iOut (o+len)
-                        loop
-      huffBlock lit dist
-        | not grow = huffBlockFixed lit dist
-        | otherwise = loop
-        -- Unknown output size: the input is the only thing that can end a
-        -- truncated stream. Past it the reader supplies zero bits, which
-        -- decode as symbols for ever, so a stream cut mid-block used to
-        -- "inflate" to the full cap (64 MiB of garbage per PDF stream, each
-        -- then parsed). Stop at the last real bit and keep what came out.
-        -- (The known-size loop keeps its zero-padding tolerance: its output
-        -- is bounded by a size the file declared.)
-        where endBits = 8 * BS.length dat
-              loop = do
-                o <- unsafeRead st iOut
-                p <- unsafeRead st iBit
-                if o >= limit then pure ()
-                else if p > endBits then fail' "truncated DEFLATE stream" else do
-                  sym <- decodeSymI dat st lit
-                  if sym < 0 then fail' "invalid Huffman code"
-                  else if sym < 256 then putByte (fromIntegral sym) >> loop
-                  else if sym == 256 then pure ()
-                  else do
-                    let li = sym - 257
-                    if li >= nLenCodes then fail' "invalid length code" else do
-                      extra <- getBitsI dat st (lenExtra ! li)
-                      let len = lenBase ! li + extra
-                      dsym <- decodeSymI dat st dist
-                      if dsym < 0 || dsym >= nDistCodes then fail' "invalid distance code" else do
-                        dextra <- getBitsI dat st (distExtra ! dsym)
-                        let d = distBase ! dsym + dextra
-                        copyBack d len
-                        loop
-      storedBlock = do
-        p <- readArray st iBit
-        writeArray st iBit ((p + 7) .&. complement 7)   -- align to byte
-        len <- getBitsI dat st 16
-        _nlen <- getBitsI dat st 16
-        bytePos <- (`shiftR` 3) <$> readArray st iBit
-        o <- readArray st iOut
-        cap <- readSTRef capRef
-        when (grow && o+len > cap && o < limit) (growTo (min limit (o+len)))
-        cap' <- readSTRef capRef
-        a <- readSTRef arrRef
-        -- Stored blocks are already byte-aligned. Copy their bytes directly,
-        -- retaining the reader's zero padding when the input is truncated.
-        forLoop 0 (min len (cap'-o) - 1) $ \i -> do
-          let pos = bytePos+i
-              v = if pos >= 0 && pos < BS.length dat then BS.index dat pos else 0
-          writeArray a (o+i) v
-        writeArray st iBit ((bytePos+len)*8)
-        writeArray st iOut (o+len)
-      readDynamic = do
-        hlit  <- getBitsI dat st 5
-        hdist <- getBitsI dat st 5
-        hclen <- getBitsI dat st 4
-        let nlit = hlit + 257; ndist = hdist + 1; nclen = hclen + 4
-        clRaw <- mapM (const (getBitsI dat st 3)) [1..nclen]
-        let clLens = A.elems (A.accumArray (\_ x -> x) 0 (0,18)
-                       (zip (take nclen clOrder) clRaw)) :: [Int]
-            clHuff = buildInflateHuff clLens
-        allLens <- decodeLens clHuff (nlit + ndist)
-        let (litLens, distLens) = splitAt nlit allLens
-        pure (buildInflateHuff litLens, buildInflateHuff distLens)
-      decodeLens clHuff total = reverse <$> go [] 0
-        where go acc n
-                | n >= total = pure acc
-                | otherwise = do
-                    s <- decodeSymI dat st clHuff
-                    if s < 0 then pure acc
-                    else if s < 16 then go (s:acc) (n+1)
-                    else if s == 16 then do
-                      r <- getBitsI dat st 2
-                      let prev = case acc of (p:_) -> p; [] -> 0
-                          k = r + 3
-                      go (replicate k prev ++ acc) (n+k)
-                    else if s == 17 then do
-                      r <- getBitsI dat st 3; let k = r + 3 in go (replicate k 0 ++ acc) (n+k)
-                    else do
-                      r <- getBitsI dat st 7; let k = r + 11 in go (replicate k 0 ++ acc) (n+k)
-      -- A block never starts in the zero padding past the end of the
-      -- data: there a header reads as a non-final stored block of length 0,
-      -- forever, and a stream truncated at a block boundary used to spin
-      -- here without end. Every other path makes output progress, so this
-      -- changes nothing for any input that ever finished.
-      blockLoop = do
-        done <- readSTRef doneRef
-        o <- readArray st iOut
-        p <- readArray st iBit
-        if done || o >= limit || p >= 8 * BS.length dat then pure () else do
-          bfinal <- getBitI dat st
-          btype  <- getBitsI dat st 2
-          case btype of
-            0 -> storedBlock
-            1 -> huffBlock fixedLit fixedDist
-            2 -> do (lit,dist) <- readDynamic; huffBlock lit dist
-            _ -> fail' "invalid DEFLATE block type"
-          err <- readSTRef errRef
-          if bfinal == 1 || err /= Nothing then pure () else blockLoop
-  blockLoop
-  err <- readSTRef errRef
-  written <- readArray st iOut
-  cap <- readSTRef capRef
-  pure (arrRef, max 0 (min cap written - base), err)
+inflateDyn dat startByte maxOut
+  | maxOut <= 0 = Right BS.empty
+  | otherwise = unsafeDupablePerformIO $ do
+      let !cap0 = min maxOut (max 4096 (4 * BS.length dat))
+      arr0 <- stToIO (newArray (0, cap0 - 1) 0 :: ST RealWorld (STUArray RealWorld Int Word8))
+      st   <- stToIO (newInflateDynStream dat startByte arr0 cap0 maxOut)
+      let go !curArr !curCap = do
+            -- While curCap < maxOut, leave 258 bytes of headroom so a max-length
+            -- match starting before stopAt stays inside curArr; swap to a doubled
+            -- buffer when inflateStep pauses at stopAt.
+            let !target = if curCap < maxOut then curCap - 258 else maxOut
+            res <- stToIO (inflateStep st target)
+            case res of
+              InflateDone n err -> pure (curArr, n, err)
+              InflatePaused n -> do
+                let !newCap = if curCap >= maxOut `unsafeShiftR` 1
+                                then maxOut
+                                else max (n + 274) (curCap * 2)
+                newArr <- stToIO $ do
+                  na@(STUArray _ _ _ dst#) <- newArray (0, newCap - 1) 0
+                  let !(STUArray _ _ _ src#) = curArr
+                      !(I# n#) = n
+                  when (n > 0) $ ST $ \s# ->
+                    case copyMutableByteArray# src# 0# dst# 0# n# s# of
+                      s1# -> (# s1#, () #)
+                  swapInflateStreamBuf st na newCap
+                  pure na
+                go newArr newCap
+      (STUArray _ _ _ mba#, n, err) <- go arr0 cap0
+      out <- if n <= 0
+               then pure BS.empty
+               else BI.create n $ \(Ptr dst#) -> IO $ \s# ->
+                 let !(I# n#) = n
+                 in case copyMutableByteArrayToAddr# mba# 0# dst# n# s# of
+                      s1# -> (# s1#, () #)
+      -- A truncated-but-decodable stream is worth what it produced, so the bytes
+      -- come back even alongside an error; the caller decides (see 'Cmedit.Pdf').
+      pure $ case err of
+        Just e | BS.null out -> Left e
+        _                    -> Right out
 
 -- | A strict counted loop; @forM_ [lo..hi]@ builds a list and a closure per
 -- element, which is real allocation in a per-byte loop.
@@ -1932,14 +1742,6 @@ forLoop lo hi act = go lo
   where go !i | i > hi = pure ()
               | otherwise = act i >> go (i + 1)
 {-# INLINE forLoop #-}
-
--- Fixed Huffman tables (RFC 1951 §3.2.6).
-fixedLit :: InflateHuff
-fixedLit = buildInflateHuff ([8 | _ <- [0..143 :: Int]] ++ [9 | _ <- [144..255 :: Int]]
-                   ++ [7 | _ <- [256..279 :: Int]] ++ [8 | _ <- [280..287 :: Int]])
-
-fixedDist :: InflateHuff
-fixedDist = buildInflateHuff (replicate 30 5)
 
 clOrder :: [Int]
 clOrder = [16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15]
