@@ -50,8 +50,8 @@ module Cmedit.Image
   ) where
 
 import Control.Concurrent (yield)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar)
-import Control.Monad (when, unless, forM, forM_, foldM)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryTakeMVar)
+import Control.Monad (when, unless, void, forM, forM_, foldM)
 import Cmedit.Jxl (isJxl, decodeJxl)
 import Cmedit.JxlPar (parOrderedResumable, parWorkers)
 import Control.Monad.ST.Unsafe (unsafeIOToST, unsafeSTToIO)
@@ -79,7 +79,7 @@ import qualified Data.ByteString.Internal as BI
 import Foreign.Storable (pokeByteOff)
 import GHC.ByteOrder (ByteOrder(..), targetByteOrder)
 
-import Cmedit.Inflate (Huff(..), buildHuff, inflateIntoSegs, InflateHuff(..), buildInflateHuffN, decodeSymSlow)
+import Cmedit.Inflate (Huff(..), buildHuff, inflateIntoSegs, InflateStepRes(..), newInflateStream, inflateStep, InflateHuff(..), buildInflateHuffN, decodeSymSlow)
 import Cmedit.Types (Cell(..), Style(..), Color(..), attrNone)
 
 ------------------------------------------------------------------------------
@@ -920,8 +920,10 @@ pngParRetry = "\0PNG parallel stage interrupted"
 -- stream (see 'inflateIntoSegs'), so a lazily read list of them is never
 -- resident as a whole; the editor reads a PNG that way (@Cmedit.App.streamPng@).
 --
--- @allowPar@ permits unfiltering rows on several capabilities ('pngParJobs',
--- 'pngWaveJob'); with it the answer may be @Left pngParRetry@, which is not
+-- @allowPar@ pipelines resumable inflate ('inflateStep'), wavefront
+-- unfiltering ('pngWavePipeJob') and row conversion across capabilities
+-- (falling back to 'pngParJobs' / 'pngWaveJob' when the compressed stream
+-- is small); with it the answer may be @Left pngParRetry@, which is not
 -- an error to show but a request to call again with 'False'.
 decodePNGParts :: Bool
                -> ((Int,Int,Int,Int,Int), BS.ByteString, BS.ByteString, [BS.ByteString])
@@ -1004,10 +1006,16 @@ decodePNGParts allowPar (ihdr, plte, trns, idats) = do
    a <- newBytesZeroedFrom bufSize (if inPlace then bufSize - rawSize else bufSize)
    (rawArr, base) <- if inPlace then pure (a, bufSize - rawSize)
                                  else do r <- newBytes rawSize; pure (r, 0)
-   ierr <- inflateIntoSegs idats 2 rawArr base rawSize   -- skip the 2-byte zlib header
-   case ierr of
-    Just e -> pure (Left e)
-    Nothing -> do
+   nwAll <- if allowPar then unsafeIOToST parWorkers else pure 1
+   let nw = min 4 nwAll
+       !rb0 = rowBytes w
+       -- Only pipeline when the compressed stream is large enough for inflate
+       -- to dominate (at least 192 KiB, fitting inside streamPng's first
+       -- 256 KiB read); tiny compressed streams like flat screenshots finish
+       -- inflate in ~1 ms and are faster through 4-worker pngParJobs.
+       pipeOk = inPlace && pngWordsOk && nw > 1 && h >= 64
+                && rawSize >= 0x100000 && hasAtLeastBytes 196608 idats
+   do
      -- One row converter per image, chosen once: (recon row offset, output
      -- byte offset of the row's first pixel, output stride per pixel, pixels).
      -- The common layouts get their own loops; anything else takes the
@@ -1015,60 +1023,60 @@ decodePNGParts allowPar (ihdr, plte, trns, idats) = do
      let conv = case (ct, bd) of
            -- RGBA8 rows are already the output's bytes: one block copy,
            -- unless Adam7 scatters the pixels (stride > 4).
-           (6, 8) -> \recon ro o0 st n -> if st == 4 then copyBytesU8 recon ro a o0 (4*n) else forLoop 0 (n-1) $ \px -> do
+           (6, 8) -> \recon !ro !o0 !st !n -> if st == 4 then copyBytesU8 recon ro a o0 (4*n) else forLoop 0 (n-1) $ \px -> do
                        let i = ro + 4*px; o = o0 + px*st
                        unsafeRead recon i       >>= unsafeWrite a o
                        unsafeRead recon (i + 1) >>= unsafeWrite a (o + 1)
                        unsafeRead recon (i + 2) >>= unsafeWrite a (o + 2)
                        unsafeRead recon (i + 3) >>= unsafeWrite a (o + 3)
            (2, 8) | Nothing <- rgbTrans ->
-                     \recon ro o0 st n -> if st == 4 && pngWordsOk then pngRgbRow recon ro a o0 n else forLoop 0 (n-1) $ \px -> do
+                     \recon !ro !o0 !st !n -> if st == 4 && pngWordsOk then pngRgbRow recon ro a o0 n else forLoop 0 (n-1) $ \px -> do
                        let i = ro + 3*px
                        r <- unsafeRead recon i
                        g <- unsafeRead recon (i + 1)
                        b <- unsafeRead recon (i + 2)
                        pngWr32 a (o0 + px*st) (rgbaWord r g b 255)
            (0, 8) | Nothing <- grayTrans ->
-                     \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
+                     \recon !ro !o0 !st !n -> forLoop 0 (n-1) $ \px -> do
                        g <- unsafeRead recon (ro + px)
                        pngWr32 a (o0 + px*st) (grayOpaque (fromIntegral g))
-           (4, 8) -> \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
+           (4, 8) -> \recon !ro !o0 !st !n -> forLoop 0 (n-1) $ \px -> do
                        g <- unsafeRead recon (ro + 2*px)
                        al <- unsafeRead recon (ro + 2*px + 1)
                        pngWr32 a (o0 + px*st) (rgbaWord g g g al)
            (0, 16) | Nothing <- grayTrans ->
-                     \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
+                     \recon !ro !o0 !st !n -> forLoop 0 (n-1) $ \px -> do
                        g <- s16 recon (ro + 2*px)
                        pngWr32 a (o0 + px*st) (grayOpaque (fromIntegral g))
            (2, 16) | Nothing <- rgbTrans ->
-                     \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
+                     \recon !ro !o0 !st !n -> forLoop 0 (n-1) $ \px -> do
                        let i = ro + 6*px; o = o0 + px*st
                        s16 recon i       >>= unsafeWrite a o
                        s16 recon (i + 2) >>= unsafeWrite a (o + 1)
                        s16 recon (i + 4) >>= unsafeWrite a (o + 2)
                        unsafeWrite a (o + 3) 255
-           (6, 16) -> \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
+           (6, 16) -> \recon !ro !o0 !st !n -> forLoop 0 (n-1) $ \px -> do
                        let i = ro + 8*px; o = o0 + px*st
                        s16 recon i       >>= unsafeWrite a o
                        s16 recon (i + 2) >>= unsafeWrite a (o + 1)
                        s16 recon (i + 4) >>= unsafeWrite a (o + 2)
                        s16 recon (i + 6) >>= unsafeWrite a (o + 3)
-           (4, 16) -> \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
+           (4, 16) -> \recon !ro !o0 !st !n -> forLoop 0 (n-1) $ \px -> do
                        g <- s16 recon (ro + 4*px)
                        al <- s16 recon (ro + 4*px + 2)
                        pngWr32 a (o0 + px*st) (rgbaWord g g g al)
            -- Sub-byte gray is a palette of its own (gray level and tRNS).
-           (0, _) | bd < 8 && pngWordsOk -> \recon ro o0 st n -> case bd of
+           (0, _) | bd < 8 && pngWordsOk -> \recon !ro !o0 !st !n -> case bd of
                        1 -> pngPalRow1 grayWords recon ro a o0 st n
                        2 -> pngPalRow2 grayWords recon ro a o0 st n
                        _ -> pngPalRow4 grayWords recon ro a o0 st n
            -- The tRNS colour-key layouts: alpha is 0 where the samples as
            -- stored equal the key, as in 'pngPixel'.
-           (0, 8) -> \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
+           (0, 8) -> \recon !ro !o0 !st !n -> forLoop 0 (n-1) $ \px -> do
                        g <- unsafeRead recon (ro + px)
                        pngWr32 a (o0 + px*st) (fromIntegral (grayWords `unsafeAt` fromIntegral g))
            (0, 16) | Just t <- grayTrans ->
-                     \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
+                     \recon !ro !o0 !st !n -> forLoop 0 (n-1) $ \px -> do
                        let i = ro + 2*px
                        hi <- unsafeRead recon i
                        lo <- unsafeRead recon (i + 1)
@@ -1076,7 +1084,7 @@ decodePNGParts allowPar (ihdr, plte, trns, idats) = do
                            al = if fromIntegral hi * 256 + fromIntegral lo == t then 0 else 255
                        pngWr32 a (o0 + px*st) (rgbaWord g g g al)
            (2, 8) | Just (tr, tg, tb) <- rgbTrans ->
-                     \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
+                     \recon !ro !o0 !st !n -> forLoop 0 (n-1) $ \px -> do
                        let i = ro + 3*px
                        r <- unsafeRead recon i
                        g <- unsafeRead recon (i + 1)
@@ -1085,7 +1093,7 @@ decodePNGParts allowPar (ihdr, plte, trns, idats) = do
                                    && fromIntegral b == tb then 0 else 255
                        pngWr32 a (o0 + px*st) (rgbaWord r g b al)
            (2, 16) | Just (tr, tg, tb) <- rgbTrans ->
-                     \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
+                     \recon !ro !o0 !st !n -> forLoop 0 (n-1) $ \px -> do
                        let i = ro + 6*px
                            raw16 j = do hi <- unsafeRead recon j
                                         lo <- unsafeRead recon (j + 1)
@@ -1094,21 +1102,21 @@ decodePNGParts allowPar (ihdr, plte, trns, idats) = do
                        r <- s16 recon i; g <- s16 recon (i + 2); b <- s16 recon (i + 4)
                        let al = if rv == tr && gv == tg && bv == tb then 0 else 255
                        pngWr32 a (o0 + px*st) (rgbaWord r g b al)
-           (0, _) | bd <= 8 -> \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
+           (0, _) | bd <= 8 -> \recon !ro !o0 !st !n -> forLoop 0 (n-1) $ \px -> do
                        v <- rawSampleU recon ro bd px
                        let g = fromIntegral (scale v)
                            al = if grayTrans == Just v then 0 else 255
                            o = o0 + px*st
                        unsafeWrite a o g; unsafeWrite a (o+1) g; unsafeWrite a (o+2) g
                        unsafeWrite a (o+3) al
-           (3, _) | bd < 8 && pngWordsOk -> \recon ro o0 st n -> case bd of
+           (3, _) | bd < 8 && pngWordsOk -> \recon !ro !o0 !st !n -> case bd of
                        1 -> pngPalRow1 palWords recon ro a o0 st n
                        2 -> pngPalRow2 palWords recon ro a o0 st n
                        _ -> pngPalRow4 palWords recon ro a o0 st n
-           (3, _) -> \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
+           (3, _) -> \recon !ro !o0 !st !n -> forLoop 0 (n-1) $ \px -> do
                        idx <- rawSampleU recon ro bd px
                        pngWr32 a (o0 + px*st) (fromIntegral (palWords `unsafeAt` idx))
-           _ -> \recon ro o0 st n -> forLoop 0 (n-1) $ \px -> do
+           _ -> \recon !ro !o0 !st !n -> forLoop 0 (n-1) $ \px -> do
                   (r,g,b,al) <- pngPixel recon ro bd ct chans scale palAt palAlpha
                                          grayTrans rgbTrans px
                   let o = o0 + px*st
@@ -1125,77 +1133,190 @@ decodePNGParts allowPar (ihdr, plte, trns, idats) = do
      -- Eight-bit RGB and RGBA, not interlaced, go from the filtered row
      -- straight to the output ('pngFuseRow').
      let fused = inPlace && pngWordsOk && bd == 8 && (ct == 6 || (ct == 2 && isNothing rgbTrans))
-     nwAll <- if allowPar then unsafeIOToST parWorkers else pure 1
-     let nw = min 4 nwAll
-     interrupted <- newSTRef False
-     _ <- foldM (\off (x0,y0,dx,dy,pw,ph) ->
-             if pw <= 0 || ph <= 0 then pure off else do
-               let !rb = rowBytes pw
-                   !l0 = base + off
-                   !o0 = (y0*w + x0)*4
-                   !ostep = dy*w*4
-                   !st = 4*dx
-                   unfilterRow ry
-                     | ry == 0 = unfilterPngRow rawArr l0 bpp rb zrow 0 False
-                     | otherwise = let !l = l0 + ry*(1+rb)
-                                   in unfilterPngRow rawArr l bpp rb rawArr (l - rb) pngWordsOk
-               jobs <- if inPlace && pngWordsOk && nw > 1 && ph >= 64 && ph*rb >= 0x100000
-                         then pngParJobs rawArr l0 rb ph (4*nw) else pure []
-               waveOk <- if null jobs && inPlace && pngWordsOk && nw > 1 && ph >= 64
-                              && ph*rb >= 0x100000
-                           then pngMostlyDependent rawArr l0 rb ph else pure False
-               if waveOk
-                 then do
-                   -- No such runs: every row needs the one above. The rows
-                   -- are dealt round robin to the workers, and a worker
-                   -- takes a row a chunk at a time, each chunk only once
-                   -- the row above has got past it ('pngWaveJob'). What a
-                   -- chunk reads is then complete, whatever the schedule.
-                   prog <- newArray (0, ph - 1) 0 :: ST s (STUArray s Int Int)
-                   rowDone <- unsafeIOToST (listArray (0, ph - 1) <$> mapM (const newEmptyMVar) [1 .. ph])
-                   ok <- unsafeIOToST $ parOrderedResumable nw nw nw
-                           (\k -> unsafeSTToIO (pngWaveJob rawArr l0 bpp rb ph zrow prog rowDone nw k))
-                           (\_ _ -> pure True)
-                   if ok then forLoop 0 (ph-1) $ \ry ->
-                                conv rawArr (l0 + ry*(1+rb) + 1) (o0 + ry*ostep) st pw
-                         else writeSTRef interrupted True
-                 else if not (null jobs)
-                 then do
-                   -- Runs of rows that begin with a row no filter ties to
-                   -- the one above it, each unfiltered where it lies by one
-                   -- worker: a job reads and writes its own rows only, so
-                   -- the result does not depend on the schedule. The rows
-                   -- are converted afterwards, in order, as the in-place
-                   -- argument requires.
-                   let jobArr = listArray (0, length jobs - 1) jobs :: Array Int (Int, Int)
-                       job j = let (r0, r1) = jobArr A.! j in forLoop r0 (r1 - 1) unfilterRow
-                   ok <- unsafeIOToST $ parOrderedResumable nw nw (length jobs)
-                           (\j -> unsafeSTToIO (job j)) (\_ _ -> pure True)
-                   if ok then forLoop 0 (ph-1) $ \ry ->
-                                conv rawArr (l0 + ry*(1+rb) + 1) (o0 + ry*ostep) st pw
-                         else writeSTRef interrupted True
-                 else if fused
-                 then do
-                   -- (inPlace: rawArr is a, and the pass is the image.)
-                   unfilterRow 0
-                   conv rawArr (l0 + 1) o0 st pw
-                   forLoop 1 (ph-1) $ \ry -> do
-                     let !l = l0 + ry*(1+rb)
-                     ft <- unsafeRead a l
-                     if bpp == 3 then pngFuseRow3 (fromIntegral ft) a (l + 1) (ry*ostep) pw
-                                 else pngFuseRow4 (fromIntegral ft) a (l + 1) (ry*ostep) pw
-                 else do
-                   unfilterRow 0
-                   forLoop 1 (ph-1) $ \ry -> do
-                     unfilterRow ry
-                     conv rawArr (l0 + (ry-1)*(1+rb) + 1) (o0 + (ry-1)*ostep) st pw
-                   conv rawArr (l0 + (ph-1)*(1+rb) + 1) (o0 + (ph-1)*ostep) st pw
-               pure (off + ph*(1+rb)))
-           0 passes
-     stopped <- readSTRef interrupted
-     if stopped then pure (Left pngParRetry) else do
-       a' <- if bufSize > outSize then shrinkBytes a outSize else pure a
-       Right <$> unsafeFreeze a'
+     if pipeOk
+       then do
+         -- Pipelined parallel decode: resumable inflate produces raw scanlines
+         -- in 128 KiB bands into the buffer tail, releasing each row once
+         -- DEFLATE's 32 KiB lookback window has moved past it. On 3+
+         -- capabilities the calling thread runs inflate (in consume 0) so all
+         -- input/stream allocation stays on the caller's capability under -qm,
+         -- while nw - 2 workers run the chunked wavefront ('pngWavePipeJob')
+         -- and 1 worker converts completed rows in order while warm in cache.
+         -- Every wait uses 'pngAwait' (spin/yield, then MVar block) so workers
+         -- never starve when capabilities outnumber usable cores.
+         let !stride       = 1 + rb0
+             !ostep        = w * 4
+             !bandBytes    = 131072
+             !windowMargin = 32832
+             !nWave        = if nw == 2 then 0 else nw - 2
+             !nInfWake     = if nw == 2 then 1 else nWave
+             !nWaiters     = if nw == 2 then 1 else nWave + 1
+         stream  <- newInflateStream idats 2 a base rawSize
+         meta    <- newArray (0, 0) 0 :: ST s (STUArray s Int Int)
+         waiting <- newArray (0, nWaiters * 8 - 1) 0 :: ST s (STUArray s Int Int)
+         wakes   <- unsafeIOToST (listArray (0, nWaiters - 1) <$> mapM (const newEmptyMVar) [1 .. nWaiters])
+         errRef  <- newSTRef Nothing
+         let wakeIf !tag !w = do
+               wt <- atomicReadInt waiting (w * 8)
+               when (wt == tag) $ unsafeIOToST (void (tryPutMVar (wakes A.! w) ()))
+             wakeAny !w = do
+               wt <- atomicReadInt waiting (w * 8)
+               when (wt /= 0) $ unsafeIOToST (void (tryPutMVar (wakes A.! w) ()))
+             signalInflate = forLoop 0 (nInfWake - 1) (wakeIf 1)
+             signalAll     = forLoop 0 (nWaiters - 1) wakeAny
+             inflateJob = go 0 0
+               where
+                 go !prod !pub = do
+                   res <- inflateStep stream (prod + bandBytes)
+                   case res of
+                     InflatePaused !p -> do
+                       let !safe = max pub ((p - windowMargin) `quot` stride)
+                       when (safe > pub) $ do
+                         atomicWriteInt meta 0 safe
+                         signalInflate
+                       go p safe
+                     InflateDone _ Nothing -> do
+                       atomicWriteInt meta 0 h
+                       signalInflate
+                     InflateDone _ (Just e) -> do
+                       writeSTRef errRef (Just e)
+                       atomicWriteInt meta 0 (-1)
+                       signalAll
+         ok <- if nw == 2
+           then do
+             let !wake0 = wakes A.! 0
+                 seqConsumer = do
+                   pat0 <- pngWaitSafe meta waiting 0 wake0 0 pngAwaitMax
+                   when (pat0 >= 0) $ do
+                     unfilterPngRow a base bpp rb0 zrow 0 False
+                     if fused
+                       then do
+                         conv a (base + 1) 0 4 w
+                         let go !ry !pat
+                               | ry >= h = pure ()
+                               | otherwise = do
+                                   pat1 <- pngWaitSafe meta waiting 0 wake0 ry pat
+                                   when (pat1 >= 0) $ do
+                                     let !l = base + ry * stride
+                                     ft <- unsafeRead a l
+                                     if bpp == 3
+                                       then pngFuseRow3 (fromIntegral ft) a (l + 1) (ry * ostep) w
+                                       else pngFuseRow4 (fromIntegral ft) a (l + 1) (ry * ostep) w
+                                     go (ry + 1) (if ry .&. 63 == 63 then pngAwaitMax else pat1)
+                         go 1 pat0
+                       else do
+                         let go !ry !pat
+                               | ry >= h = conv a (base + (h - 1) * stride + 1) ((h - 1) * ostep) 4 w
+                               | otherwise = do
+                                   pat1 <- pngWaitSafe meta waiting 0 wake0 ry pat
+                                   when (pat1 >= 0) $ do
+                                     let !l = base + ry * stride
+                                     unfilterPngRow a l bpp rb0 a (l - rb0) True
+                                     conv a (l - rb0) ((ry - 1) * ostep) 4 w
+                                     go (ry + 1) (if ry .&. 63 == 63 then pngAwaitMax else pat1)
+                         go 1 pat0
+             unsafeIOToST $ parOrderedResumable 2 2 2
+               (\k -> unsafeSTToIO (if k == 0 then inflateJob else seqConsumer))
+               (\_ _ -> pure True)
+           else do
+             prog <- newArray (0, h - 1) 0 :: ST s (STUArray s Int Int)
+             let !convWake = wakes A.! nWave
+                 convJob = go 0 pngAwaitMax
+                   where
+                     go !y !pat
+                       | y >= h = pure ()
+                       | otherwise = do
+                           pat1 <- pngWaitProg prog meta waiting nWave convWake y rb0 pat
+                           when (pat1 >= 0) $ do
+                             pat2 <- if y + 1 < h
+                                       then pngWaitProg prog meta waiting nWave convWake (y + 1) rb0 pat1
+                                       else pure pat1
+                             when (pat2 >= 0) $ do
+                               conv a (base + y * stride + 1) (y * ostep) 4 w
+                               go (y + 1) (if y .&. 63 == 63 then pngAwaitMax else pat2)
+                 -- Job 0 is a no-op so consume 0 runs inflateJob immediately on
+                 -- the calling thread (keeping stream/inflate allocations on the
+                 -- caller's capability); the nw - 1 workers run the wavefront
+                 -- (jobs 1..nWave) and the in-order converter (job nw - 1).
+                 job k
+                   | k == 0     = pure ()
+                   | k <= nWave = pngWavePipeJob a base bpp rb0 h zrow prog meta waiting
+                                    wakes nWave (k - 1)
+                   | otherwise  = convJob
+             unsafeIOToST $ parOrderedResumable (nw - 1) nw nw
+               (\k -> unsafeSTToIO (job k))
+               (\k _ -> if k == 0 then True <$ unsafeSTToIO inflateJob else pure True)
+         if not ok
+           then pure (Left pngParRetry)
+           else do
+             ierr <- readSTRef errRef
+             case ierr of
+               Just e  -> pure (Left e)
+               Nothing -> do
+                 a' <- if bufSize > outSize then shrinkBytes a outSize else pure a
+                 Right <$> unsafeFreeze a'
+       else do
+         ierr <- inflateIntoSegs idats 2 rawArr base rawSize   -- skip the 2-byte zlib header
+         case ierr of
+           Just e -> pure (Left e)
+           Nothing -> do
+             interrupted <- newSTRef False
+             _ <- foldM (\off (x0,y0,dx,dy,pw,ph) ->
+                     if pw <= 0 || ph <= 0 then pure off else do
+                       let !rb = rowBytes pw
+                           !l0 = base + off
+                           !o0 = (y0*w + x0)*4
+                           !ostep = dy*w*4
+                           !st = 4*dx
+                           unfilterRow ry
+                             | ry == 0 = unfilterPngRow rawArr l0 bpp rb zrow 0 False
+                             | otherwise = let !l = l0 + ry*(1+rb)
+                                           in unfilterPngRow rawArr l bpp rb rawArr (l - rb) pngWordsOk
+                       jobs <- if inPlace && pngWordsOk && nw > 1 && ph >= 64 && ph*rb >= 0x100000
+                                 then pngParJobs rawArr l0 rb ph (4*nw) else pure []
+                       waveOk <- if null jobs && inPlace && pngWordsOk && nw > 1 && ph >= 64
+                                      && ph*rb >= 0x100000
+                                   then pngMostlyDependent rawArr l0 rb ph else pure False
+                       if waveOk
+                         then do
+                           prog <- newArray (0, ph - 1) 0 :: ST s (STUArray s Int Int)
+                           rowDone <- unsafeIOToST (listArray (0, ph - 1) <$> mapM (const newEmptyMVar) [1 .. ph])
+                           ok <- unsafeIOToST $ parOrderedResumable nw nw nw
+                                   (\k -> unsafeSTToIO (pngWaveJob rawArr l0 bpp rb ph zrow prog rowDone nw k))
+                                   (\_ _ -> pure True)
+                           if ok then forLoop 0 (ph-1) $ \ry ->
+                                        conv rawArr (l0 + ry*(1+rb) + 1) (o0 + ry*ostep) st pw
+                                 else writeSTRef interrupted True
+                         else if not (null jobs)
+                         then do
+                           let jobArr = listArray (0, length jobs - 1) jobs :: Array Int (Int, Int)
+                               job j = let (r0, r1) = jobArr A.! j in forLoop r0 (r1 - 1) unfilterRow
+                           ok <- unsafeIOToST $ parOrderedResumable nw nw (length jobs)
+                                   (\j -> unsafeSTToIO (job j)) (\_ _ -> pure True)
+                           if ok then forLoop 0 (ph-1) $ \ry ->
+                                        conv rawArr (l0 + ry*(1+rb) + 1) (o0 + ry*ostep) st pw
+                                 else writeSTRef interrupted True
+                         else if fused
+                         then do
+                           unfilterRow 0
+                           conv rawArr (l0 + 1) o0 st pw
+                           forLoop 1 (ph-1) $ \ry -> do
+                             let !l = l0 + ry*(1+rb)
+                             ft <- unsafeRead a l
+                             if bpp == 3 then pngFuseRow3 (fromIntegral ft) a (l + 1) (ry*ostep) pw
+                                         else pngFuseRow4 (fromIntegral ft) a (l + 1) (ry*ostep) pw
+                         else do
+                           unfilterRow 0
+                           forLoop 1 (ph-1) $ \ry -> do
+                             unfilterRow ry
+                             conv rawArr (l0 + (ry-1)*(1+rb) + 1) (o0 + (ry-1)*ostep) st pw
+                           conv rawArr (l0 + (ph-1)*(1+rb) + 1) (o0 + (ph-1)*ostep) st pw
+                       pure (off + ph*(1+rb)))
+                   0 passes
+             stopped <- readSTRef interrupted
+             if stopped then pure (Left pngParRetry) else do
+               a' <- if bufSize > outSize then shrinkBytes a outSize else pure a
+               Right <$> unsafeFreeze a'
   pure (Image w h "PNG" px)
 
 -- Unfilter one row where it lies. Dispatch once per row and read only the
@@ -1756,6 +1877,157 @@ pngAwait ready block !pat = do
 
 pngAwaitMax :: Int
 pngAwaitMax = 512
+
+-- Whether a lazy chunk list has at least @n@ bytes, forcing only as many
+-- prefix chunks as needed to tell.
+hasAtLeastBytes :: Int -> [BS.ByteString] -> Bool
+hasAtLeastBytes !n _ | n <= 0 = True
+hasAtLeastBytes _ []          = False
+hasAtLeastBytes !n (c:cs)     = hasAtLeastBytes (n - BS.length c) cs
+
+-- Cold blocking helper for 'pngWaitSafe': publishes waiting[w*8] = 1 (waiting
+-- on inflate) under a full barrier before re-checking meta[0], then blocks on
+-- wake until meta[0] > y or meta[0] < 0.
+{-# NOINLINE pngBlockSafe #-}
+pngBlockSafe :: STUArray s Int Int -> STUArray s Int Int
+             -> Int -> MVar () -> Int -> ST s ()
+pngBlockSafe meta waiting !w wake !y = go
+  where
+    !slot = w * 8
+    go = do
+      _ <- unsafeIOToST (tryTakeMVar wake)
+      atomicWriteInt waiting slot 1
+      s <- atomicReadInt meta 0
+      if s > y || s < 0
+        then atomicWriteInt waiting slot 0
+        else do
+          unsafeIOToST (takeMVar wake)
+          atomicWriteInt waiting slot 0
+          s2 <- atomicReadInt meta 0
+          unless (s2 > y || s2 < 0) go
+
+-- Cold blocking helper for 'pngWaitProg': publishes waiting[w*8] = 2 (waiting
+-- on row progress) under a full barrier before re-checking prog[r] and meta[0].
+{-# NOINLINE pngBlockProg #-}
+pngBlockProg :: STUArray s Int Int -> STUArray s Int Int -> STUArray s Int Int
+             -> Int -> MVar () -> Int -> Int -> ST s ()
+pngBlockProg prog meta waiting !w wake !r !q = go
+  where
+    !slot = w * 8
+    go = do
+      _ <- unsafeIOToST (tryTakeMVar wake)
+      atomicWriteInt waiting slot 2
+      v <- atomicReadInt prog r
+      done <- if v >= q then pure True else (< 0) <$> atomicReadInt meta 0
+      if done
+        then atomicWriteInt waiting slot 0
+        else do
+          unsafeIOToST (takeMVar wake)
+          atomicWriteInt waiting slot 0
+          v2 <- atomicReadInt prog r
+          done2 <- if v2 >= q then pure True else (< 0) <$> atomicReadInt meta 0
+          unless done2 go
+
+-- Wait until inflate has released row y (meta[0] > y) or failed (meta[0] < 0),
+-- using 'pngAwait' so a worker gives up its core on a core-constrained machine.
+-- Returns updated patience (>= 1) on success, or -1 if inflate failed.
+pngWaitSafe :: STUArray s Int Int -> STUArray s Int Int
+            -> Int -> MVar () -> Int -> Int -> ST s Int
+pngWaitSafe meta waiting !w wake !y !pat = do
+  s0 <- atomicReadInt meta 0
+  if s0 > y then pure pat
+    else if s0 < 0 then pure (-1)
+    else do
+      pat' <- pngAwait
+                (do s <- atomicReadInt meta 0
+                    pure (s > y || s < 0))
+                (unsafeSTToIO (pngBlockSafe meta waiting w wake y))
+                pat
+      s1 <- atomicReadInt meta 0
+      pure (if s1 > y then pat' else -1)
+{-# INLINE pngWaitSafe #-}
+
+-- Wait until row r has unfiltered at least q bytes (prog[r] >= q), or inflate
+-- failed (meta[0] < 0). Returns updated patience (>= 1) on success, or -1 on
+-- abort.
+pngWaitProg :: STUArray s Int Int -> STUArray s Int Int -> STUArray s Int Int
+            -> Int -> MVar () -> Int -> Int -> Int -> ST s Int
+pngWaitProg prog meta waiting !w wake !r !q !pat = do
+  v0 <- atomicReadInt prog r
+  if v0 >= q then pure pat
+    else do
+      pat' <- pngAwait
+                (do v <- atomicReadInt prog r
+                    if v >= q then pure True
+                      else (< 0) <$> atomicReadInt meta 0)
+                (unsafeSTToIO (pngBlockProg prog meta waiting w wake r q))
+                pat
+      v1 <- atomicReadInt prog r
+      pure (if v1 >= q then pat' else -1)
+{-# INLINE pngWaitProg #-}
+
+-- Pipelined wavefront unfilter worker k of nWave: rows k, k + nWave, ...
+-- Waits for inflate to release row y past the 32 KiB lookback window, then
+-- unfilters in place and wakes the next wave worker and converter if either
+-- is blocked on this row.
+{-# NOINLINE pngWavePipeJob #-}
+pngWavePipeJob :: STUArray s Int Word8 -> Int -> Int -> Int -> Int
+               -> STUArray s Int Word8 -> STUArray s Int Int -> STUArray s Int Int
+               -> STUArray s Int Int -> Array Int (MVar ()) -> Int -> Int -> ST s ()
+pngWavePipeJob raw !l0 !bpp !rb !ph zrow prog meta waiting wakes !nWave !k = rows k pngAwaitMax
+  where
+    !stride   = 1 + rb
+    !chunk    = bpp * 1024
+    !wake     = wakes A.! k
+    !nextK    = if k + 1 == nWave then 0 else k + 1
+    !nextWake = wakes A.! nextK
+    !convWake = wakes A.! nWave
+    restorePat !y !p = if (y `quot` nWave) .&. 63 == 63 then pngAwaitMax else p
+    signalRowDone = do
+      when (nWave > 1) $ do
+        wt <- atomicReadInt waiting (nextK * 8)
+        when (wt == 2) $ unsafeIOToST (void (tryPutMVar nextWake ()))
+      wtc <- atomicReadInt waiting (nWave * 8)
+      when (wtc == 2) $ unsafeIOToST (void (tryPutMVar convWake ()))
+    rows !y !pat
+      | y >= ph = pure ()
+      | otherwise = do
+          pat1 <- pngWaitSafe meta waiting k wake y pat
+          when (pat1 >= 0) $ do
+            let !l = l0 + y * stride
+            ft <- unsafeRead raw l
+            if ft == 0 || ft > 4
+              then do
+                atomicWriteInt prog y rb
+                signalRowDone
+                rows (y + nWave) (restorePat y pat1)
+              else if y == 0 || ft == 1
+              then do
+                let !wOk = y > 0
+                    goInd !p
+                      | p >= rb = pure ()
+                      | otherwise = do
+                          let !q = min rb (p + chunk)
+                          unfilterPngRange raw l bpp rb zrow 0 wOk p q
+                          atomicWriteInt prog y q
+                          goInd q
+                goInd 0
+                signalRowDone
+                rows (y + nWave) (restorePat y pat1)
+              else do
+                let goDep !p !patC
+                      | p >= rb = pure patC
+                      | otherwise = do
+                          let !q = min rb (p + chunk)
+                          patC' <- pngWaitProg prog meta waiting k wake (y - 1) q patC
+                          if patC' < 0 then pure (-1) else do
+                            unfilterPngRange raw l bpp rb raw (l - rb) True p q
+                            atomicWriteInt prog y q
+                            goDep q patC'
+                pat2 <- goDep 0 pat1
+                when (pat2 >= 0) $ do
+                  signalRowDone
+                  rows (y + nWave) (restorePat y pat2)
 
 atomicReadInt :: STUArray s Int Int -> Int -> ST s Int
 atomicReadInt (STUArray _ _ _ m) (I# i) = ST $ \s -> case atomicReadIntArray# m i s of

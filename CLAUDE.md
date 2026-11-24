@@ -1404,10 +1404,13 @@ in `README.md`; the cross-cutting structure that matters when editing:
   frames), noise row bands that regenerate their halos from the RNG rather
   than reading a neighbour's output, and lossless pass groups
   (`passGroupsPar`), plus the JPEG decoder's reconstruction bands (see the
-  image-view bullet) and PNG's row unfiltering (non-interlaced images of
-  1 MB or more: independent runs of rows, cut at None/Sub rows by
-  `pngParJobs`, or `pngWaveJob`'s chunked wavefront when every row reads
-  the one above; both unfilter in place, so an interrupted stage answers
+  image-view bullet) and PNG decoding (non-interlaced images of 1 MB or
+  more raw: when compressed IDAT is >= 192 KiB, `inflateStep` runs on the
+  calling thread in 128 KiB bands overlapped with `pngWavePipeJob`
+  wavefront unfiltering and in-order RGBA conversion using `pngAwait` with
+  O(nw) per-waiter MVars; below 192 KiB compressed, one-shot inflate feeds
+  `pngParJobs` or `pngWaveJob`; all parallel paths unfilter in place, so
+  an interrupted stage answers
   `pngParRetry` and `decodePNG` decodes again sequentially, while
   `App.streamPng`, whose payloads were reads it cannot replay, gives the
   file to the whole-file read; `docs/plans/bench/PngKill.hs` and
