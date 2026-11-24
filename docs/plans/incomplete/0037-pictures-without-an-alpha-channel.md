@@ -158,8 +158,9 @@ emits RGB into a scene.
 ### 3.4 The in-place PNG decode
 
 PNG inflates its raw rows into the tail of the output buffer and converts
-forwards (0036 §2). For RGB output the raw image (`h × (1 + 3w)` bytes) is
-*larger* than the output (`3wh`), the `rawSize > outSize` case the
+forwards (0036, round 1; mechanism (2) in `CLAUDE.md`). For RGB output the
+raw image (`h × (1 + 3w)` bytes) is *larger* than the output (`3wh`), the
+`rawSize > outSize` case the
 converter already supports for sub-byte and palette images. So the buffer
 is allocated at `rawSize`, converted forwards from offset 0, and shrunk by
 `h` bytes at the end. The parallel unfilter and the pipeline only see
