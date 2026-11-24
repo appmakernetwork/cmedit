@@ -37,6 +37,9 @@ main = do
     ref <- evaluate (hashImg (decodeImage bs))
     t1 <- getMonotonicTimeNSec
     let durUs = fromIntegral (t1 - t0) `div` 1000 :: Int
+    -- Let the reference decode's workers finish exiting before counting:
+    -- a joined worker is still a live thread until it is next scheduled.
+    threadDelay 100000
     base <- live
     bad <- fmap sum $ forM [0 .. n - 1] $ \k -> do
       copy <- evaluate (BS.copy bs)
@@ -53,7 +56,7 @@ main = do
                         if v /= base && i < (300 :: Int) then threadDelay 1000 >> settle (i + 1) else pure v
       l <- settle 0
       h <- evaluate (hashImg r)
-      l2 <- live
+      l2 <- settle 0
       when (l /= base || l2 /= base) $ putStrLn ("  threads leaked at k=" ++ show k ++ ": " ++ show (base, l, l2))
       when (h /= ref) $ putStrLn ("  hash differs at k=" ++ show k)
       pure (if l /= base || l2 /= base || h /= ref then 1 else 0 :: Int)
