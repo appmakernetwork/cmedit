@@ -60,7 +60,7 @@ import qualified Data.ByteString.Internal as BI
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Array.Base (STUArray(..), unsafeRead, unsafeWrite, unsafeAt)
 import GHC.ByteOrder (ByteOrder(..), targetByteOrder)
-import GHC.Exts (Addr#, Int(I#), Int#, MutableByteArray#, State#, Word64#, Ptr(..), RealWorld, copyAddrToByteArray#, copyMutableByteArray#, copyMutableByteArrayToAddr#, gtAddr#, indexWord64OffAddr#, isTrue#, (<#), minusAddr#, plusAddr#, readIntArray#, readWord64OffAddr#, readWord8Array#, readWord8ArrayAsWord16#, readWord8ArrayAsWord32#, readWord8ArrayAsWord64#, runRW#, setByteArray#, touch#, writeWord8Array#, writeWord8ArrayAsWord32#, writeWord8ArrayAsWord64#)
+import GHC.Exts (Addr#, Int(I#), Int#, MutableByteArray#, State#, Word64#, Ptr(..), copyAddrToByteArray#, copyMutableByteArray#, copyMutableByteArrayToAddr#, gtAddr#, indexWord64OffAddr#, isTrue#, (<#), minusAddr#, newByteArray#, plusAddr#, readIntArray#, readWord64OffAddr#, readWord8Array#, readWord8ArrayAsWord16#, readWord8ArrayAsWord32#, readWord8ArrayAsWord64#, runRW#, setByteArray#, touch#, writeWord8Array#, writeWord8ArrayAsWord32#, writeWord8ArrayAsWord64#)
 import GHC.ForeignPtr (ForeignPtr(..), ForeignPtrContents)
 import GHC.IO (IO(..), unsafeDupablePerformIO)
 import GHC.ST (ST(..))
@@ -1693,12 +1693,22 @@ inflateStep (InflateStream !win !arrRef !capRef !base !limit !strictTrunc !sc !p
 -- hostile or corrupt one could otherwise ask for unbounded memory — the same
 -- reasoning as "Cmedit.Pager"'s per-line cap. Hitting it truncates rather than
 -- failing, since a partial content stream still renders most of a page.
+-- Allocate an uninitialized byte buffer for 'inflateDyn'. Safe because every
+-- output byte in @[0 .. n - 1]@ is written before any back-reference or final
+-- copy can read it, and 'inflateDyn' never returns bytes past @n@. Avoids
+-- zero-filling and faulting in unused tail pages when @cap0 > actualOutput@.
+{-# INLINE newRawByteBuf #-}
+newRawByteBuf :: Int -> ST s (STUArray s Int Word8)
+newRawByteBuf !cap@(I# cap#) = ST $ \s# ->
+  case newByteArray# cap# s# of
+    (# s1#, mba# #) -> (# s1#, STUArray 0 (cap - 1) cap mba# #)
+
 inflateDyn :: BS.ByteString -> Int -> Int -> Either String BS.ByteString
 inflateDyn dat startByte maxOut
   | maxOut <= 0 = Right BS.empty
   | otherwise = unsafeDupablePerformIO $ do
       let !cap0 = min maxOut (max 4096 (4 * BS.length dat))
-      arr0 <- stToIO (newArray (0, cap0 - 1) 0 :: ST RealWorld (STUArray RealWorld Int Word8))
+      arr0 <- stToIO (newRawByteBuf cap0)
       st   <- stToIO (newInflateDynStream dat startByte arr0 cap0 maxOut)
       let go !curArr !curCap = do
             -- While curCap < maxOut, leave 258 bytes of headroom so a max-length
@@ -1713,7 +1723,7 @@ inflateDyn dat startByte maxOut
                                 then maxOut
                                 else max (n + 274) (curCap * 2)
                 newArr <- stToIO $ do
-                  na@(STUArray _ _ _ dst#) <- newArray (0, newCap - 1) 0
+                  na@(STUArray _ _ _ dst#) <- newRawByteBuf newCap
                   let !(STUArray _ _ _ src#) = curArr
                       !(I# n#) = n
                   when (n > 0) $ ST $ \s# ->
