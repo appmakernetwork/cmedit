@@ -36,6 +36,7 @@ import GHC.Float (castFloatToWord32)
 import System.Exit (exitFailure, exitSuccess)
 import GHC.Clock (getMonotonicTime)
 import System.Timeout (timeout)
+import qualified Cmedit.FontProvider as FP
 import GHC.Stats (getRTSStats, getRTSStatsEnabled, gc, gcdetails_live_bytes)
 import System.Mem (performMajorGC)
 import qualified Data.ByteString as BS
@@ -1262,6 +1263,51 @@ main = do
     rIhdr <- streamed lateIhdr
     checkEq "streamPng falls back when no IHDR precedes the image data" rIhdr Nothing
     removeFile path
+  -- Font discovery is started by whoever first wants it (the first
+  -- providerFiles, or a thread after the delay) on a thread of its own, so
+  -- neither a killed claimer nor a caller's timeout can cut it short.
+  do
+    fp1 <- FP.newFontProvider
+    done1 <- newIORef False
+    FP.startDiscoveryWith 60000000 fp1 (pure ["a.ttf"]) (writeIORef done1 True)
+    r1 <- FP.providerFiles 1000000 fp1
+    d1 <- readIORef done1
+    checkEq "font discovery: the first providerFiles runs the walk" (r1, d1) (Just ["a.ttf"], True)
+    fp2 <- FP.newFontProvider
+    gate <- newEmptyMVar :: IO (MVar ())
+    walks <- newIORef (0 :: Int)
+    FP.startDiscoveryWith 60000000 fp2
+      (atomicModifyIORef' walks (\n -> (n + 1, ())) >> readMVar gate >> pure ["b.ttf"]) (pure ())
+    started <- newEmptyMVar
+    t <- forkIO (putMVar started () >> void (FP.providerFiles 60000000 fp2))
+    takeMVar started
+    let waitWalk = do n <- readIORef walks; unless (n >= 1) (threadDelay 1000 >> waitWalk)
+    waitWalk
+    killThread t
+    putMVar gate ()
+    r2 <- FP.providerFiles 2000000 fp2
+    n2 <- readIORef walks
+    checkEq "font discovery: killing the claimer does not stop the walk" (r2, n2) (Just ["b.ttf"], 1)
+    fp3 <- FP.newFontProvider
+    done3 <- newIORef False
+    FP.startDiscoveryWith 10000 fp3 (pure ["c.ttf"]) (writeIORef done3 True)
+    threadDelay 300000
+    d3 <- readIORef done3          -- nobody asked: only the delayed thread can have run it
+    checkEq "font discovery: the delayed thread runs the walk when nobody asks" d3 True
+    fp4 <- FP.newFontProvider
+    walks4 <- newIORef (0 :: Int)
+    dones4 <- newIORef (0 :: Int)
+    FP.startDiscoveryWith 60000000 fp4
+      (atomicModifyIORef' walks4 (\n -> (n + 1, ())) >> threadDelay 300000 >> pure ["d.ttf"])
+      (atomicModifyIORef' dones4 (\n -> (n + 1, ())))
+    r4a <- FP.providerFiles 50000 fp4     -- times out mid-walk
+    r4b <- FP.providerFiles 50000 fp4     -- and so does the next caller
+    r4c <- FP.providerFiles 3000000 fp4   -- the walk was never restarted
+    threadDelay 50000
+    w4 <- readIORef walks4
+    d4 <- readIORef dones4
+    checkEq "font discovery: a walk slower than the caller's timeout completes once, onDone once"
+      (r4a, r4b, r4c, w4, d4) (Nothing, Nothing, Just ["d.ttf"], 1, 1)
   -- Re-slice a PNG fixture's IDAT payload into 1-byte IDAT chunks so even the
   -- 2-byte zlib header spans two IDAT chunks.
   case pngRegressionFixtures of

@@ -50,6 +50,7 @@ module Cmedit.FontProvider
   , FontProvider
   , newFontProvider
   , startFontDiscovery
+  , startDiscoveryWith
   , providerFiles
   , fontFor
   , facesForQueries
@@ -57,9 +58,9 @@ module Cmedit.FontProvider
   , trySync
   ) where
 
-import Cmedit.Jobs (forkBackground)
+import Control.Concurrent (forkIO, forkOnWithUnmask, myThreadId, threadCapability, threadDelay)
 import Control.Concurrent.MVar
-import Control.Exception (SomeException, SomeAsyncException, evaluate, fromException, throwIO, try)
+import Control.Exception (SomeException, SomeAsyncException, evaluate, fromException, mask_, throwIO, try)
 import Control.Monad (forM)
 import qualified Data.ByteString as BS
 import Data.Char (toLower)
@@ -188,36 +189,77 @@ cacheFailed p c
 ------------------------------------------------------------------------------
 -- The provider
 
--- | Discovered files (empty until discovery finishes) and the face cache.
+-- | Discovered files (empty until discovery finishes), the discovery walk
+-- while nobody has run it yet, and the face cache.
 data FontProvider = FontProvider
   { fpFiles :: !(MVar [FilePath])
+  , fpWalk  :: !(MVar (IO ()))
   , fpCache :: !(MVar FontCache)
   }
 
 newFontProvider :: IO FontProvider
-newFontProvider = FontProvider <$> newEmptyMVar <*> newMVar emptyFontCache
+newFontProvider = FontProvider <$> newEmptyMVar <*> newEmptyMVar <*> newMVar emptyFontCache
 
--- | Walk the system font directories on a background thread. The list is
--- published exactly once, even if the walk throws (as an empty list then).
+-- | Arrange for the system font directories to be walked. The list is
+-- published exactly once, even if the walk throws (as an empty list then),
+-- and @onDone@ runs after it.
+--
+-- The walk is not started now but by whoever first wants it: the first
+-- 'providerFiles' (a picture parse that needs fonts), or else a thread that
+-- waits 'discoveryDelayUs' first. Either way the claimant forks it onto its
+-- own capability and does not run it itself, so no caller's timeout and no
+-- superseded parse being killed can cut it short: once started it runs to
+-- completion. The capability is the point. The walk allocates about 12 MB in
+-- 7 ms; started on a capability of its own at startup it left a whole
+-- allocation area of fresh pages resident (5 MB on the peak of opening a
+-- picture), and started on the UI thread's at startup it took CPU from the
+-- first frame. Forked from a parse it allocates where the parse is
+-- allocating anyway; after the delay, on the UI thread's capability (the
+-- editor runs with @-qm@, so threads stay where they are forked), whose pages
+-- are already touched, with the first frame long out.
 startFontDiscovery :: FontProvider -> IO () -> IO ()
-startFontDiscovery fp onDone = do
-  _ <- forkBackground $ do
-    r <- trySync (do home <- either (const "") id <$> trySync getHomeDirectory
-                     env <- forM fontEnvVars (\k -> fmap ((,) k) <$> lookupEnv k)
-                     discoverFontFiles (fontDirectories hostOS [ kv | Just kv <- env ] home))
+startFontDiscovery fp = startDiscoveryWith discoveryDelayUs fp
+  (do home <- either (const "") id <$> trySync getHomeDirectory
+      env <- forM fontEnvVars (\k -> fmap ((,) k) <$> lookupEnv k)
+      discoverFontFiles (fontDirectories hostOS [ kv | Just kv <- env ] home))
+
+-- | 'startFontDiscovery' with the delay and the walk given (tests).
+startDiscoveryWith :: Int -> FontProvider -> IO [FilePath] -> IO () -> IO ()
+startDiscoveryWith delay fp discover onDone = do
+  putMVar (fpWalk fp) $ do
+    r <- trySync discover
     _ <- tryPutMVar (fpFiles fp) (either (const []) id r)
     -- Tell the driver: a parse that gave up waiting for the walk drew its
     -- text without fonts, and can now be redone with them.
     _ <- trySync onDone
     pure ()
+  _ <- forkIO (threadDelay delay >> claimDiscovery fp)
   pure ()
+
+-- | How long after startup the font walk waits for a parse to want it.
+discoveryDelayUs :: Int
+discoveryDelayUs = 500000
+
+-- | Start the discovery walk, if nobody has: on a thread of its own, on the
+-- caller's capability. Taking the walk and forking it are one step with
+-- respect to asynchronous exceptions (a parse superseded between the two
+-- would otherwise lose the walk for good); the walk itself runs unmasked.
+claimDiscovery :: FontProvider -> IO ()
+claimDiscovery fp = do
+  (cap, _) <- threadCapability =<< myThreadId
+  mask_ $ do
+    m <- tryTakeMVar (fpWalk fp)
+    case m of
+      Nothing   -> pure ()
+      Just walk -> () <$ forkOnWithUnmask cap (\unmask -> unmask walk)
 
 -- | The discovered files, waiting at most this many microseconds for the
 -- walk to finish; 'Nothing' when it has not (as opposed to @Just []@: the walk
 -- finished and found no fonts at all). The distinction is what lets a
--- picture drawn without its fonts be redrawn once they turn up.
+-- picture drawn without its fonts be redrawn once they turn up. Starts the
+-- walk if nothing has yet ('claimDiscovery'); the wait never stops it.
 providerFiles :: Int -> FontProvider -> IO (Maybe [FilePath])
-providerFiles us fp = timeout us (readMVar (fpFiles fp))
+providerFiles us fp = claimDiscovery fp >> timeout us (readMVar (fpFiles fp))
 
 -- | 'try' that lets asynchronous exceptions through: a job killed because a
 -- newer one superseded it must die, and must not mistake its own death for a
