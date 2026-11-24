@@ -1411,7 +1411,10 @@ in `README.md`; the cross-cutting structure that matters when editing:
   `pngParRetry` and `decodePNG` decodes again sequentially, while
   `App.streamPng`, whose payloads were reads it cannot replay, gives the
   file to the whole-file read; `docs/plans/bench/PngKill.hs` and
-  `PngStreamKill.hs` are its kill tests). Two traps from that work: a job's result must be built
+  `PngStreamKill.hs` are its kill tests). A worker that waits for another
+  spins, then **blocks** (`pngAwait`): `yield` gives a core to no one when
+  the capability has no other thread, and a spin-only wait took 90 s for one
+  picture with four capabilities on one core. Two traps from that work: a job's result must be built
   *inside* the job, not memoised in a pass-long array (that retained every
   group's output, +305 MiB on a 4096² lossless image), and peak RSS here
   follows the GC schedule, not the allocation total (reusing EPF scratch

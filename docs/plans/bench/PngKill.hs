@@ -50,7 +50,7 @@ main = do
                         unless (st == ThreadFinished || st == ThreadDied) (yield >> waitDead)
       waitDead
       let settle i = do v <- live
-                        if v /= base && i < (2000 :: Int) then yield >> settle (i + 1) else pure v
+                        if v /= base && i < (300 :: Int) then threadDelay 1000 >> settle (i + 1) else pure v
       l <- settle 0
       h <- evaluate (hashImg r)
       l2 <- live

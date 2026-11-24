@@ -50,6 +50,7 @@ module Cmedit.Image
   ) where
 
 import Control.Concurrent (yield)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar)
 import Control.Monad (when, unless, forM, forM_, foldM)
 import Cmedit.Jxl (isJxl, decodeJxl)
 import Cmedit.JxlPar (parOrderedResumable, parWorkers)
@@ -1151,8 +1152,9 @@ decodePNGParts allowPar (ihdr, plte, trns, idats) = do
                    -- the row above has got past it ('pngWaveJob'). What a
                    -- chunk reads is then complete, whatever the schedule.
                    prog <- newArray (0, ph - 1) 0 :: ST s (STUArray s Int Int)
+                   rowDone <- unsafeIOToST (listArray (0, ph - 1) <$> mapM (const newEmptyMVar) [1 .. ph])
                    ok <- unsafeIOToST $ parOrderedResumable nw nw nw
-                           (\k -> unsafeSTToIO (pngWaveJob rawArr l0 bpp rb ph zrow prog nw k))
+                           (\k -> unsafeSTToIO (pngWaveJob rawArr l0 bpp rb ph zrow prog rowDone nw k))
                            (\_ _ -> pure True)
                    if ok then forLoop 0 (ph-1) $ \ry ->
                                 conv rawArr (l0 + ry*(1+rb) + 1) (o0 + ry*ostep) st pw
@@ -1682,32 +1684,78 @@ pngMostlyDependent raw l0 rb ph = go 0 (0 :: Int)
 -- everything the chunk reads of it (prog holds each row's finished bytes,
 -- read and written with full barriers, so the bytes are visible before the
 -- count is). A row's own bytes are written by its worker alone. The wait
--- spins, then yields, which is also where a kill reaches a waiting worker.
+-- is 'pngAwait'; rowDone holds an MVar per row, filled when the row is
+-- finished, for a waiter that has given up spinning.
 pngWaveJob :: STUArray s Int Word8 -> Int -> Int -> Int -> Int
-           -> STUArray s Int Word8 -> STUArray s Int Int -> Int -> Int -> ST s ()
-pngWaveJob raw !l0 !bpp !rb !ph zrow prog !nw !k = rows k
+           -> STUArray s Int Word8 -> STUArray s Int Int -> Array Int (MVar ())
+           -> Int -> Int -> ST s ()
+pngWaveJob raw !l0 !bpp !rb !ph zrow prog rowDone !nw !k = rows k pngAwaitMax
   where
     !chunk = bpp * 1024
-    rows !y
+    -- pat: this worker's patience ('pngAwait'), restored now and then so a
+    -- passing shortage of cores does not cost the rest of the picture.
+    rows !y !pat
       | y >= ph = pure ()
-      | otherwise = chunks y 0 >> rows (y + nw)
-    chunks !y !p
-      | p >= rb = pure ()
+      | otherwise = do
+          pat' <- chunks y 0 pat
+          unsafeIOToST (putMVar (rowDone A.! y) ())
+          rows (y + nw) (if (y `quot` nw) .&. 63 == 63 then pngAwaitMax else pat')
+    chunks !y !p !pat
+      | p >= rb = pure pat
       | otherwise = do
           let !q = min rb (p + chunk)
               !l = l0 + y*(1+rb)
-          if y == 0
-            then unfilterPngRange raw l bpp rb zrow 0 False p q
+          pat' <- if y == 0
+            then pat <$ unfilterPngRange raw l bpp rb zrow 0 False p q
             else do
-              waitFor (y - 1) q (0 :: Int)
+              pat1 <- pngAwait ((>= q) <$> atomicReadInt prog (y - 1))
+                               (readMVar (rowDone A.! (y - 1))) pat
               unfilterPngRange raw l bpp rb raw (l - rb) True p q
+              pure pat1
           atomicWriteInt prog y q
-          chunks y q
-    waitFor !r !q !n = do
-      v <- atomicReadInt prog r
-      if v >= q then pure ()
-        else if n >= 200 then unsafeIOToST yield >> waitFor r q 0
-        else waitFor r q (n + 1)
+          chunks y q pat'
+
+-- Wait for another worker: until @ready@ answers True, which it certainly
+-- does once @block@ returns (here: the row above is finished, announced
+-- through its MVar). The wait escalates. It spins first, because what it
+-- waits for is usually a fraction of a chunk away (microseconds) and
+-- blocking costs more than that; between rounds it yields, which lets a
+-- worker sharing this capability run. But 'yield' hands over only to
+-- another Haskell thread on the same capability: with none there this OS
+-- thread keeps its core, and if the worker it waits for has no core of its
+-- own (more capabilities than the process may use: an affinity mask, a
+-- busy machine) that worker does not move until the kernel preempts us, a
+-- timeslice per chunk. Measured, a 4096x4096 picture took 90 s on one core
+-- with four capabilities. So after @pat@ rounds it blocks, which gives the
+-- core away and is woken by the worker itself rather than by a timer
+-- (sleeping in steps of 30 us and up still took 3 s for that picture: a
+-- poll per chunk).
+--
+-- The patience adapts, and the answer is the next wait's. It has to be
+-- long while the workers all run: a worker just woken takes tens of
+-- microseconds to publish its first chunk, and a waiter that gave up
+-- sooner would block for the whole row, as would the one behind it, and
+-- the stage would run one row at a time for good (measured: 143 ms became
+-- 226 ms with a fixed short patience). It has to be short when they do
+-- not, since every round spent spinning is then a round the awaited worker
+-- cannot have. So a wait that had to block halves it, and one that
+-- spinning settled doubles it, up to 'pngAwaitMax'.
+-- The yields and the block are also where a kill reaches a waiting worker.
+{-# INLINE pngAwait #-}
+pngAwait :: ST s Bool -> IO () -> Int -> ST s Int
+pngAwait ready block !pat = do
+  ok0 <- ready
+  if ok0 then pure pat else spin (1 :: Int) (0 :: Int)
+  where
+    spin !n !rounds = do
+      ok <- ready
+      if ok then pure (min pngAwaitMax (2 * pat))
+        else if n < 200 then spin (n + 1) rounds
+        else if rounds < pat then unsafeIOToST yield >> spin 0 (rounds + 1)
+        else max 1 (pat `quot` 2) <$ unsafeIOToST block
+
+pngAwaitMax :: Int
+pngAwaitMax = 512
 
 atomicReadInt :: STUArray s Int Int -> Int -> ST s Int
 atomicReadInt (STUArray _ _ _ m) (I# i) = ST $ \s -> case atomicReadIntArray# m i s of
