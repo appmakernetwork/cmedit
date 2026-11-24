@@ -1111,7 +1111,47 @@ in `README.md`; the cross-cutting structure that matters when editing:
   build) and `docs/plans/bench/ImageFuzz.hs` (diff corrupt-input outcomes);
   `imgbench.sh build-threaded` builds the editor's runtime (`-threaded -N4`),
   and the bench reports wall-clock time, because CPU time stops meaning
-  anything once a decoder runs in parallel.
+  anything once a decoder runs in parallel. **`Inflate.hs` and `Image.hs`
+  are compiled with `-fproc-alignment=64`** (a pragma in each): their hot
+  loops measured up to 12% apart between builds that differed only in
+  unrelated code, from where the linker placed them, so a candidate is only
+  ever compared against an aligned build. The decoder bench cannot see the
+  editor's memory effects (nursery placement, render allocation); judge
+  those with `docs/plans/bench/pty_png.py BIN RUNS FILE...` (first-picture
+  time and `VmHWM` in the real editor, kitty and no-reply terminals).
+  **PNG decodes in place, from slices, in parallel and from a stream**
+  (plan 0036; 2.8 s → 0.41 s over the 16-file corpus, peaks −13%, and in
+  the editor 4–5× faster to first picture with 16–18% lower peaks). Four
+  mechanisms, each with a rule:
+  **(1) No copy of the compressed data.** `pngChunks` returns the IDAT
+  payloads as slices of the file (only the two zlib header bytes are
+  joined) and `Inflate.inflateIntoSegs` reads them as segments: the fast
+  loop runs while 8 bytes remain in the current segment and `refillSeg`
+  crosses a boundary with the same bit semantics and end-of-input zero
+  padding as one contiguous input.
+  **(2) In place.** The raw rows are inflated into the *tail* of the RGBA
+  output buffer, unfiltered there, and converted forwards; conversion of
+  row y writes strictly below raw row y+1, which is what makes both
+  `outSize >= rawSize` and the reverse safe. Nothing outside the inflated
+  region is zeroed.
+  **(3) In parallel** (non-interlaced, at least 1 MB raw). With 192 KiB or
+  more of compressed data, `inflateStep` runs on the *calling* thread in
+  128 KiB bands and releases rows that end at least 32 832 bytes behind it
+  (the DEFLATE window plus margin), while `pngWavePipeJob` workers unfilter
+  them as a wavefront and one worker converts rows in order; below that,
+  one-shot inflate feeds `pngParJobs` (runs of rows whose filter needs no
+  row above) or `pngWaveJob`. All of them unfilter in place, so a killed
+  decode cannot be resumed: the resumed thunk answers `pngParRetry` and
+  `decodePNG` decodes again sequentially. Inflate stays on the caller on
+  purpose: run on a worker its stream and window landed in another
+  capability's nursery (+1–2 MB on every editor peak).
+  **(4) From a stream.** `App.streamPng` opens a regular PNG of 8 MiB or
+  more straight off the handle in 128 KiB reads, lazily feeding IDAT
+  slices to a windowed inflate (about 256 KB of input live), and forces
+  the decode in IO while the handle is open, so the file's bytes never sit
+  in the peak. Any doubt (chunk order, a read error, the file changing,
+  `pngParRetry`) falls back to the whole-file read, and its `try` is
+  `trySync`, so a killed load dies instead of starting a second decode.
   **JPEG output is bit-exact with libjpeg-turbo** (2.1's default decode, as
   Pillow ships it: the accurate integer IDCT, "fancy" triangle-filter chroma
   upsampling, its table colour conversion and its three-component rule: JFIF
@@ -1403,21 +1443,25 @@ in `README.md`; the cross-cutting structure that matters when editing:
   512-pixel tiles with 8-pixel halos (`filterBands`, only for large noisy
   frames), noise row bands that regenerate their halos from the RNG rather
   than reading a neighbour's output, and lossless pass groups
-  (`passGroupsPar`), plus the JPEG decoder's reconstruction bands (see the
-  image-view bullet) and PNG decoding (non-interlaced images of 1 MB or
-  more raw: when compressed IDAT is >= 192 KiB, `inflateStep` runs on the
-  calling thread in 128 KiB bands overlapped with `pngWavePipeJob`
-  wavefront unfiltering and in-order RGBA conversion using `pngAwait` with
-  O(nw) per-waiter MVars; below 192 KiB compressed, one-shot inflate feeds
-  `pngParJobs` or `pngWaveJob`; all parallel paths unfilter in place, so
-  an interrupted stage answers
-  `pngParRetry` and `decodePNG` decodes again sequentially, while
-  `App.streamPng`, whose payloads were reads it cannot replay, gives the
-  file to the whole-file read; `docs/plans/bench/PngKill.hs` and
-  `PngStreamKill.hs` are its kill tests). A worker that waits for another
-  spins, then **blocks** (`pngAwait`): `yield` gives a core to no one when
-  the capability has no other thread, and a spin-only wait took 90 s for one
-  picture with four capabilities on one core. Two traps from that work: a job's result must be built
+  (`passGroupsPar`), plus the JPEG decoder's reconstruction bands and the
+  PNG pipeline (both in the image-view bullet; PNG's kill tests are
+  `docs/plans/bench/PngKill.hs` and `PngStreamKill.hs`).
+  **Workers are placed, and the editor runs with `-qm`** (Makefile
+  `RTSOPTS`): `parOrdered` forks its workers with `forkOn` on the
+  capabilities after the caller's (`workerCap`), and `Cmedit.Jobs` puts
+  background jobs round-robin on the capabilities other than the UI
+  thread's (`backgroundCap`). The two only work together: a thread that
+  allocates on a capability nothing else uses leaves that capability's
+  nursery resident (4–5 MB on a picture's peak), automatic migration
+  spreads threads over every nursery, and `-qm` without placement would
+  leave every worker on its caller's capability and run the stage
+  sequentially. **A worker that waits for another spins, then blocks**
+  (`Image.pngAwait`: spin, `yield` for an adaptive number of rounds, then
+  an `MVar` the awaited worker fills). Never spin-and-`yield` only:
+  `yield` hands over only to another Haskell thread on the same
+  capability, so with none there the OS thread keeps its core while the
+  worker it waits for has none (a 4096² PNG took 90 s with four
+  capabilities on one core; a timer back-off still took 3 s). Two traps from that work: a job's result must be built
   *inside* the job, not memoised in a pass-long array (that retained every
   group's output, +305 MiB on a 4096² lossless image), and peak RSS here
   follows the GC schedule, not the allocation total (reusing EPF scratch
@@ -1554,11 +1598,19 @@ in `README.md`; the cross-cutting structure that matters when editing:
   cancellable; the walker's worker pool is bracketed, the journal never
   supersedes itself, and a replace's handler still posts its completion. A budget-truncated raster says so
   (`vecTruncatedNote`; "(truncated)" in the status bar).
-  **Fonts** are discovered once on a startup thread (`startFontDiscovery`:
+  **Fonts** are discovered once, but not at startup (`startFontDiscovery`:
   `FontSys.fontDirectories` for the host OS, a bounded walk that follows
   symlinked directories once each by canonical path and charges its entry
-  budget before stat-ing a listing; it posts `SMFontsReady` when done) and
-  loaded on demand, inside jobs only,
+  budget before stat-ing a listing; it posts `SMFontsReady` when done). The
+  first `providerFiles` (a parse that needs fonts) or, failing that, a
+  thread 500 ms in claims the walk and forks it with `forkOn` on its *own*
+  capability, under `mask_` so a claimer killed between taking and forking
+  cannot lose it; the walk runs to completion whatever happens to the
+  claimer, and callers only wait on the published list. Started at startup
+  on a capability of its own, its 12 MB of allocation left that
+  capability's whole nursery resident (4–5 MB on every picture's peak);
+  started on the UI thread's at startup, it took CPU from the first frame.
+  Faces are loaded on demand, inside jobs only,
   through a bounded LRU cache (12 faces, 96 MB; files that failed to parse
   are remembered). The API the PDF page view should reuse is `fontFor ::
   FontProvider -> [FilePath] -> FontRequest -> IO (Maybe (Int, Font))` (a
