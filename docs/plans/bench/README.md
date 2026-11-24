@@ -72,6 +72,15 @@ it writes the interlaced PNG itself, because Pillow silently ignores
 `interlace=1`, and a corpus that only *claims* an interlaced file leaves the
 Adam7 path unmeasured.
 
+`gen_png_sets.py [OUT=/tmp]` writes three deterministic PNG sets the photo
+corpus does not cover: `fable-extra` (312 edge files: every colour type and
+depth at tiny sizes, random filters, tRNS), `fable-par` (33 files that reach
+the parallel unfilter in each of its modes) and `fable-big` (11 large files
+for the sub-byte, gray+alpha, 16-bit and colour-key converters). Its header
+says how to make the baseline hash list a candidate is diffed against.
+`PngKill.hs` and `PngStreamKill.hs` are the kill tests for PNG's parallel
+stages (in memory, and through the streamed open).
+
 `ImageFuzz.hs` (build like `ImageDecode.hs`, ideally with `-fno-omit-yields`
 so its timeout can interrupt a non-allocating loop) decodes N seeded mutants
 of each input (byte overwrites, truncations, both) and prints one line per
