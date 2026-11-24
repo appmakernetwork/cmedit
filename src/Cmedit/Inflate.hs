@@ -45,7 +45,7 @@ module Cmedit.Inflate
   ) where
 
 import Control.Monad (when)
-import Control.Monad.ST (ST, runST)
+import Control.Monad.ST (ST, runST, stToIO)
 import Control.Monad.ST.Unsafe (unsafeIOToST)
 import Data.Array (Array)
 import qualified Data.Array as A
@@ -61,9 +61,9 @@ import qualified Data.ByteString.Internal as BI
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Array.Base (STUArray(..), unsafeRead, unsafeWrite, unsafeAt)
 import GHC.ByteOrder (ByteOrder(..), targetByteOrder)
-import GHC.Exts (Addr#, Int(I#), Int#, MutableByteArray#, State#, Word64#, copyAddrToByteArray#, copyMutableByteArray#, gtAddr#, indexWord64OffAddr#, isTrue#, (<#), minusAddr#, plusAddr#, readIntArray#, readWord64OffAddr#, readWord8Array#, readWord8ArrayAsWord16#, readWord8ArrayAsWord32#, readWord8ArrayAsWord64#, runRW#, setByteArray#, touch#, writeWord8Array#, writeWord8ArrayAsWord32#, writeWord8ArrayAsWord64#)
+import GHC.Exts (Addr#, Int(I#), Int#, MutableByteArray#, State#, Word64#, Ptr(..), copyAddrToByteArray#, copyMutableByteArray#, copyMutableByteArrayToAddr#, gtAddr#, indexWord64OffAddr#, isTrue#, (<#), minusAddr#, plusAddr#, readIntArray#, readWord64OffAddr#, readWord8Array#, readWord8ArrayAsWord16#, readWord8ArrayAsWord32#, readWord8ArrayAsWord64#, runRW#, setByteArray#, touch#, writeWord8Array#, writeWord8ArrayAsWord32#, writeWord8ArrayAsWord64#)
 import GHC.ForeignPtr (ForeignPtr(..), ForeignPtrContents)
-import GHC.IO (IO(..))
+import GHC.IO (IO(..), unsafeDupablePerformIO)
 import GHC.ST (ST(..))
 import GHC.Word (Word8(W8#), Word16(W16#), Word32(W32#), Word64(W64#))
 
@@ -1704,12 +1704,16 @@ inflateStep (InflateStream !win !arr !base !limit !sc !phaseRef) !targetBytes = 
 -- reasoning as "Cmedit.Pager"'s per-line cap. Hitting it truncates rather than
 -- failing, since a partial content stream still renders most of a page.
 inflateDyn :: BS.ByteString -> Int -> Int -> Either String BS.ByteString
-inflateDyn dat startByte maxOut = runST $ do
-  (arrRef, n, err) <- inflateWith dat startByte maxOut True 0 Nothing
-  arr <- readSTRef arrRef
-  frozen <- freeze arr
-  let ua = frozen :: UArray Int Word8
-      out = fst (BS.unfoldrN n (\i -> Just (ua ! i, i + 1)) 0)
+inflateDyn dat startByte maxOut = unsafeDupablePerformIO $ do
+  (arrRef, n, err) <- stToIO $ inflateWith dat startByte maxOut True 0 Nothing
+  out <- if n <= 0
+           then pure BS.empty
+           else do
+             STUArray _ _ _ mba# <- stToIO (readSTRef arrRef)
+             BI.create n $ \(Ptr dst#) -> IO $ \s# ->
+               let !(I# n#) = n
+               in case copyMutableByteArrayToAddr# mba# 0# dst# n# s# of
+                    s1# -> (# s1#, () #)
   -- A truncated-but-decodable stream is worth what it produced, so the bytes
   -- come back even alongside an error; the caller decides (see 'Cmedit.Pdf').
   pure $ case err of
