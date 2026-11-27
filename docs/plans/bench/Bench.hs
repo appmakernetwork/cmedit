@@ -16,13 +16,11 @@ import System.Mem (performMajorGC)
 
 import Cmedit.Editor
 import qualified Cmedit.Image as Img
-import Cmedit.Editor
-import qualified Cmedit.Image as ImgState
 import Cmedit.TextBuffer
 import Cmedit.Types
 import Cmedit.Syntax
 import Cmedit.Render
-import Cmedit.ConfigFile (defaultConfig)
+import Cmedit.ConfigFile (Config(..), defaultConfig, ThemeName(..))
 import qualified Data.ByteString as BS
 import qualified Cmedit.Csv as Csv
 import qualified Cmedit.Search as S
@@ -243,6 +241,168 @@ benchType path lineLen nlines = do
               go e1 (Just s) (acc + n) (i + 1)
     n <- go ed Nothing 0 1
     putStrLn ("    (" ++ show (n `div` 100) ++ " bytes/frame emitted)")
+
+-- Plan 0042: distinct-line corpus so GHC cannot share work across rows.
+distinctDoc :: Int -> Int -> T.Text
+distinctDoc nlines lineLen =
+  T.unlines [ T.pack (take lineLen (cycle ("var a" ++ show i ++ " = beta + 12; foo(bar, baz); ")))
+            | i <- [1 .. nlines] ]
+
+-- Plan 0042: steady-state driver cycle using renderEditorCached, threading
+-- RenderCache alongside prev Screen exactly as App.renderNow does.
+benchTypeCached :: ThemeName -> String -> Int -> Int -> IO ()
+benchTypeCached theme path lineLen nlines = do
+  let txt = distinctDoc nlines lineLen
+      ed0 = setLoaded path (emptyLoadResult { lrBuffer = fromText txt })
+                      (newEditor (50, 200) defaultConfig { cfgTheme = theme })
+  ed <- forceEd ed0
+  let tag = if theme == ThemeDark then "" else " [" ++ show theme ++ "]"
+  timed ("  " ++ path ++ " " ++ show nlines ++ "x" ++ show lineLen ++ tag
+         ++ ": 100 keystrokes, CACHED driver cycle") $ do
+    let go !e !rc !prev !acc i
+          | i > (100 :: Int) = pure acc
+          | otherwise = do
+              let e1 = refreshHighlight (fst (update (KChar 'q') e))
+                  !(s, !rc1) = renderEditorCached rc e1
+                  !n = frameBytes prev s
+              go e1 rc1 (Just s) (acc + n) (i + 1)
+    n <- go ed emptyRenderCache Nothing 0 1
+    putStrLn ("    (" ++ show (n `div` 100) ++ " bytes/frame emitted)")
+
+benchFrameCached :: String -> Int -> Int -> IO ()
+benchFrameCached path lineLen nlines = do
+  let txt = distinctDoc nlines lineLen
+      ed0 = setLoaded path (emptyLoadResult { lrBuffer = fromText txt })
+                      (newEditor (50, 200) defaultConfig)
+  ed <- forceEd ed0
+  timed ("  " ++ path ++ " " ++ show nlines ++ "x" ++ show lineLen
+         ++ ": 100 scrolling frames, CACHED (render+diff+emit)") $ do
+    let go !e !rc !prev !acc i
+          | i > (100 :: Int) = pure acc
+          | otherwise = do
+              let e1 = refreshHighlight (e { edTop = i })
+                  !(s, !rc1) = renderEditorCached rc e1
+                  !n = frameBytes prev s
+              go e1 rc1 (Just s) (acc + n) (i + 1)
+    n <- go ed emptyRenderCache Nothing 0 1
+    putStrLn ("    (" ++ show (n `div` 100) ++ " bytes/frame)")
+
+-- All-miss worst-case overhead checks: cached vs uncached when every row misses
+-- on every frame (horizontal scroll, live-Find typing, PageDown, ThemeGraphite).
+benchAllMiss :: IO ()
+benchAllMiss = do
+  let txt = distinctDoc 5000 600
+      edDark = setLoaded "/tmp/b.js" (emptyLoadResult { lrBuffer = fromText txt })
+                         (newEditor (50, 200) defaultConfig)
+      edGraph = setLoaded "/tmp/b.js" (emptyLoadResult { lrBuffer = fromText txt })
+                          (newEditor (50, 200) defaultConfig { cfgTheme = ThemeGraphite })
+  edD <- forceEd edDark
+  edG <- forceEd edGraph
+  let runPair lbl step ed0 = do
+        timed ("  " ++ lbl ++ " [uncached]") $ do
+          let go !e !prev i | i > (100 :: Int) = pure ()
+                            | otherwise =
+                                let e1 = refreshHighlight (step i e)
+                                    s  = renderEditor e1
+                                    !_ = frameBytes prev s
+                                in go e1 (Just s) (i + 1)
+          go ed0 Nothing 1
+        timed ("  " ++ lbl ++ " [cached]  ") $ do
+          let go !e !rc !prev i | i > (100 :: Int) = pure ()
+                                | otherwise =
+                                    let e1 = refreshHighlight (step i e)
+                                        !(s, !rc1) = renderEditorCached rc e1
+                                        !_ = frameBytes prev s
+                                    in go e1 rc1 (Just s) (i + 1)
+          go ed0 emptyRenderCache Nothing 1
+  runPair "h-scroll (edLeft++) .js 600" (\i e -> e { edLeft = i }) edD
+  runPair "PageDown (no wrap)  .js 600" (\_ e -> fst (update (KPageDown noMods) e)) edD
+  runPair "PageDown Graphite   .js 600" (\_ e -> fst (update (KPageDown noMods) e)) edG
+  let edFind = fst (update (KCtrlChar 'f') edD)
+  runPair "live-Find typing    .js 600" (\i e -> fst (update (if even i then KChar 'a' else KBackspace) e)) edFind
+
+benchWrapCached :: IO ()
+benchWrapCached = forM_ [(120::Int), 600, 3000] $ \len -> forM_ [False, True] $ \wrap -> do
+  let txt = distinctDoc 5000 len
+      ed0 = (setLoaded "/tmp/b.txt" (emptyLoadResult { lrBuffer = fromText txt })
+                       (newEditor (50, 200) defaultConfig)) { edWordWrap = wrap }
+  ed <- forceEd ed0
+  timed ("  wrap=" ++ show wrap ++ " lines of " ++ show len
+         ++ ": 100 keystrokes, CACHED cycle") $ do
+    let go !e !rc !prev !acc i
+          | i > (100 :: Int) = pure acc
+          | otherwise =
+              let e1 = refreshHighlight (fst (update (KChar 'q') e))
+                  !(s, !rc1) = renderEditorCached rc e1
+                  !n = frameBytes prev s
+              in go e1 rc1 (Just s) (acc + n) (i + 1)
+    _ <- go ed emptyRenderCache Nothing (0::Int) 1
+    pure ()
+  timed ("  wrap=" ++ show wrap ++ " lines of " ++ show len ++ ": 100 PageDowns, CACHED") $ do
+    let go !e !rc i
+          | i > (100 :: Int) = pure e
+          | otherwise =
+              let e1 = refreshHighlight (fst (update (KPageDown noMods) e))
+                  !(s, !rc1) = renderEditorCached rc e1
+                  !_ = frameBytes Nothing s
+              in go e1 rc1 (i+1)
+    _ <- (go ed emptyRenderCache 1 >>= forceEd); pure ()
+
+benchCachedAll :: IO ()
+benchCachedAll = do
+  putStrLn "=== CACHED TYPE (Plan 0042, distinct lines) ==="
+  benchTypeCached ThemeDark "/tmp/b.js" 120 5000
+  benchTypeCached ThemeDark "/tmp/b.js" 600 5000
+  benchTypeCached ThemeDark "/tmp/b.js" 3000 5000
+  benchTypeCached ThemeDark "/tmp/b.txt" 120 5000
+  benchTypeCached ThemeDark "/tmp/b.txt" 3000 5000
+  benchTypeCached ThemeDark "/tmp/b.js" 120 200000
+  benchTypeCached ThemeGraphite "/tmp/b.js" 600 5000
+  putStrLn "=== CACHED SCROLL (1 line/frame, distinct lines) ==="
+  benchFrameCached "/tmp/b.js" 120 5000
+  benchFrameCached "/tmp/b.js" 600 5000
+  benchFrameCached "/tmp/b.js" 3000 5000
+  benchFrameCached "/tmp/b.txt" 120 5000
+  benchFrameCached "/tmp/b.txt" 3000 5000
+  benchFrameCached "/tmp/b.js" 120 200000
+  putStrLn "=== ALL-MISS WORST-CASE OVERHEAD (cached vs uncached) ==="
+  benchAllMiss
+  putStrLn "=== CACHED WRAP (distinct lines) ==="
+  benchWrapCached
+
+-- The like-for-like baseline for 'benchFrameCached': the same distinct-line
+-- corpus and the same threaded editor (so the HlCache carries across frames,
+-- as in App.renderNow), through the uncached 'renderEditor'. 'benchFrame'
+-- restarts from one editor every frame and so re-lexes the whole viewport;
+-- comparing the cached scroll against it credits the row cache with work the
+-- HlCache already saves.
+benchFrameThreaded :: String -> Int -> Int -> IO ()
+benchFrameThreaded path lineLen nlines = do
+  let txt = distinctDoc nlines lineLen
+      ed0 = setLoaded path (emptyLoadResult { lrBuffer = fromText txt })
+                      (newEditor (50, 200) defaultConfig)
+  ed <- forceEd ed0
+  timed ("  " ++ path ++ " " ++ show nlines ++ "x" ++ show lineLen
+         ++ ": 100 scrolling frames, UNCACHED threaded (render+diff+emit)") $ do
+    let go !e !prev !acc i
+          | i > (100 :: Int) = pure acc
+          | otherwise = do
+              let e1 = refreshHighlight (e { edTop = i })
+                  s = renderEditor e1
+                  !n = frameBytes prev s
+              go e1 (Just s) (acc + n) (i + 1)
+    n <- go ed Nothing 0 1
+    putStrLn ("    (" ++ show (n `div` 100) ++ " bytes/frame)")
+
+benchScrollBaseline :: IO ()
+benchScrollBaseline = do
+  putStrLn "=== UNCACHED SCROLL, editor threaded (1 line/frame, distinct lines) ==="
+  benchFrameThreaded "/tmp/b.js" 120 5000
+  benchFrameThreaded "/tmp/b.js" 600 5000
+  benchFrameThreaded "/tmp/b.js" 3000 5000
+  benchFrameThreaded "/tmp/b.txt" 120 5000
+  benchFrameThreaded "/tmp/b.txt" 3000 5000
+  benchFrameThreaded "/tmp/b.js" 120 200000
 
 benchTypes :: IO ()
 benchTypes = do
@@ -709,6 +869,8 @@ main = do
     ["lex2"]    -> benchLex2
     ["frame"]   -> benchFrames
     ["type"]    -> benchTypes
+    ["scroll"]  -> benchScrollBaseline
+    ["cached"]  -> benchCachedAll
     ["decomp"]  -> benchDecomps
     ["io", f]   -> benchIO f
     ["share", f] -> benchShare f
@@ -720,4 +882,4 @@ main = do
     ["search", f] -> benchSearch f
     ["explorer"] -> benchExplorer
     ["gfx", f]  -> benchGfx f
-    _           -> putStrLn "usage: bench (undo N|lex|sync|render)"
+    _           -> putStrLn "usage: bench (undo N|lex|sync|render|type|frame|wrap|cached)"

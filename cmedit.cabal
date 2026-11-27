@@ -158,6 +158,7 @@ test-suite cmedit-test
                       PdfViewSpec
                       PdfRenderSpec
                       GfxTransportSpec
+                      RenderCacheSpec
     build-depends:    base, cmedit, bytestring, directory, text, containers, time
     if !os(windows)
         build-depends: unix

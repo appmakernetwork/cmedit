@@ -5,7 +5,10 @@
 module Cmedit.Render
   ( Screen(..)
   , ScrollHint(..)
+  , RenderCache
+  , emptyRenderCache
   , renderEditor
+  , renderEditorCached
   , renderFrame
   , scrollPlan
   , refreshHighlight
@@ -20,22 +23,28 @@ module Cmedit.Render
   , FileKind(..)
   , fileKind
   , expandLineCells   -- exposed for the diagnostics-overlay unit test
+  , expandLineCellsFrom
+  , expandLineCellsDirect
   ) where
 
 import Control.Monad (forM_, when)
 import Control.Monad.ST (ST, runST)
 import Data.Bits ((.|.))
-import Data.Array (Array, (!), listArray)
-import Data.Array.MArray (freeze, newArray, readArray, writeArray)
+import Data.Array (Array, (!), bounds, listArray)
+import Data.Array.Base (unsafeAt, unsafeWrite)
+import Data.Array.MArray (newArray, readArray, writeArray)
+import Data.Array.Unsafe (unsafeFreeze)
 import Data.Array.ST (STArray)
 import Data.ByteString.Builder (Builder, charUtf8, stringUtf8, intDec, string7)
+import qualified Data.IntMap.Strict as IntMap
 import qualified Data.Map.Strict as Map
 import Data.Char (toLower)
 import Data.List (find, foldl')
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Cmedit.VecView (VecDoc(..))
 import Data.Text (Text)
 import qualified Data.Text as T
+import Data.Text.Unsafe (Iter(..), iter, lengthWord8)
 
 import Cmedit.About (aboutFrameCells)
 import Cmedit.HelpCard (helpFrameCells)
@@ -69,7 +78,7 @@ import Cmedit.Syntax
 import Cmedit.TextBuffer
 import Cmedit.Types
 import Cmedit.Image (Image(..), ImgMode(..), renderImage)
-import Cmedit.Width (charWidth, colToDisplay, controlCaret, dropCellsEnd, fitCells, inputWindow, isCombining, strCells, takeCells, textCells, isControlChar, isInvisibleFormat, windowStart)
+import Cmedit.Width (cellAdvance, charWidth, colToDisplay, controlCaret, dropCellsEnd, fitCells, inputWindow, isCombining, strCells, takeCells, textCells, isControlChar, isInvisibleFormat, windowStart)
 
 -- | A rendered frame: a flat row-major grid plus the desired cursor position.
 -- 'scrHint' describes where this frame's scrollable band sat, so the diff can
@@ -816,29 +825,157 @@ type Surf s = STArray s Int Cell
 newSurf :: Int -> ST s (Surf s)
 newSurf n = newArray (0, max 0 (n - 1)) blankCell
 
+-- Pointer-equality fast path: a True result proves equality in O(1); a False
+-- result always falls back to structural (==) (or an equivalent full
+-- computation, as in 'remapRangeInPlace') because GC can move objects or GHC
+-- can rebox headers under -O2. Never let a False ptrEq change semantics.
+sameText :: Text -> Text -> Bool
+sameText !a !b = ptrEq a b || a == b
+{-# INLINE sameText #-}
+
+sameToks :: [TokRun] -> [TokRun] -> Bool
+sameToks !a !b = ptrEq a b || a == b
+{-# INLINE sameToks #-}
+
+sameCell :: Cell -> Cell -> Bool
+sameCell !a !b = ptrEq a b || a == b
+{-# INLINE sameCell #-}
+
+isExactColor :: Color -> Bool
+isExactColor ColorRGB{} = True
+isExactColor Color256{} = True
+isExactColor _          = False
+{-# INLINE isExactColor #-}
+
+-- Apply a theme remap function in place over [0 .. len - 1].
+--
+-- Theme remap contract (verified in RenderCacheSpec): every built-in theme
+-- remap must (1) pass cells whose fg and bg are both ColorRGB/Color256 through
+-- unchanged, (2) be idempotent (f . f == f) across all styles, and (3) map
+-- every text-area style (tokens, gutter, selection, whitespace, find-match,
+-- bracket, blankCell) to exact ColorRGB/Color256 fg and bg so pre-remapped
+-- cached rows bypass the per-frame remap pass in O(1) with zero allocation.
+remapRangeInPlace :: (Style -> Style) -> Cell -> STArray s Int Cell -> Int -> ST s ()
+remapRangeInPlace f !remappedBlank arr !len = go 0
+  where
+    go !i
+      | i >= len  = pure ()
+      | otherwise = do
+          !cell <- readArray arr i
+          if ptrEq cell blankCell
+            then writeArray arr i remappedBlank
+            else let !st = cellStyle cell
+                 in if isExactColor (styleFg st) && isExactColor (styleBg st)
+                      then pure ()
+                      else let !st' = f st
+                           in when (st' /= st) $ do
+                                let !cell' = cell { cellStyle = st' }
+                                writeArray arr i cell'
+          go (i + 1)
+
+-- | Pure, driver-owned row cache for the plain-text and word-wrapped views
+-- (plan 0042). Stores pre-remap, pre-overlay row slices covering only the
+-- buffer lines visible in the most recent frame, so memory is strictly
+-- O(screen) and closed buffers are never pinned.
+data RenderCache = RenderCache
+  { rcDocId     :: !Int
+  , rcCols      :: !Int
+  , rcRows      :: !Int
+  , rcTheme     :: !ThemeName
+  , rcLang      :: !(Maybe Lang)
+  , rcTextGeom  :: !(Int, Int, Int, Int, Int) -- ^ (loTextTop, loContentLeft, loTextLeft, loTextWidth, loGutter)
+  , rcTabWidth  :: !Int
+  , rcShowWs    :: !Bool
+  , rcWordWrap  :: !Bool
+  , rcHasHBar   :: !Bool
+  , rcLeft      :: !Int
+  , rcFindKey   :: !(Maybe (Text, Bool, Bool))
+  , rcRowsCache :: !(IntMap.IntMap CachedRow)
+  , rcWrapCache :: !(IntMap.IntMap CachedWrapRow)
+  }
+
+data CachedRow = CachedRow
+  { crLine      :: !Text
+  , crToks      :: ![TokRun]
+  , crCurLine   :: !Bool
+  , crSel       :: !(Maybe (Int, Int, Bool))
+  , crBrackets  :: ![Int]
+  , crDiags     :: ![Diag]
+  , crLineWidth :: !Int
+  , crCells     :: !(Array Int Cell)
+  }
+
+data CachedWrapRow = CachedWrapRow
+  { cwrLine     :: !Text
+  , cwrToks     :: ![TokRun]
+  , cwrCurLine  :: !Bool
+  , cwrSel      :: !(Maybe (Int, Int, Bool))
+  , cwrBrackets :: ![Int]
+  , cwrDiags    :: ![Diag]
+  , cwrComplete :: !Bool
+  , cwrRows     :: ![Array Int Cell]
+  }
+
+-- | Empty cache with no retained row slices or buffer references.
+emptyRenderCache :: RenderCache
+emptyRenderCache = RenderCache
+  { rcDocId     = -1
+  , rcCols      = 0
+  , rcRows      = 0
+  , rcTheme     = ThemeDark
+  , rcLang      = Nothing
+  , rcTextGeom  = (0, 0, 0, 0, 0)
+  , rcTabWidth  = 4
+  , rcShowWs    = False
+  , rcWordWrap  = False
+  , rcHasHBar   = False
+  , rcLeft      = 0
+  , rcFindKey   = Nothing
+  , rcRowsCache = IntMap.empty
+  , rcWrapCache = IntMap.empty
+  }
+
+-- | Uncached direct render (also serves as the oracle for 'renderEditorCached').
 renderEditor :: Editor -> Screen
-renderEditor ed = runST $ do
+renderEditor ed = fst (renderEditorCore Nothing ed)
+
+-- | Render with row-level caching across consecutive frames of the plain-text
+-- and word-wrapped views. Output is bit-for-bit identical to 'renderEditor';
+-- switching to a non-text view or another file drops the previous viewport's
+-- cached rows immediately so closed buffers are never retained.
+renderEditorCached :: RenderCache -> Editor -> (Screen, RenderCache)
+renderEditorCached rc ed = renderEditorCore (Just rc) ed
+
+renderEditorCore :: Maybe RenderCache -> Editor -> (Screen, RenderCache)
+renderEditorCore mrc ed = runST $ do
   let lo = computeLayout ed
       rows = loRows lo
       cols = loCols lo
-      th = themeFor (resolvedTheme ed)
+      thName = resolvedTheme ed
+      th = themeFor thName
   arr <- newSurf (rows * cols)
-  if searchViewActive ed
-    then maybe (pure ()) (\ss -> drawSearch th ss lo arr) (edSearch ed)
-    else case edImage ed of
-      Just idoc -> drawImage ed idoc lo arr
-      Nothing   -> case edPager ed of
-        Just pg -> drawPager th ed pg lo arr
-        Nothing -> case edRtf ed of
-          Just rd -> drawRtf th ed rd lo arr
-          Nothing -> case edPdf ed of
-            -- the page view is the PDF view's other mode: its picture is
-            -- drawn by the image view's code ('activePicture')
-            Just _ | pageViewOn ed, Just pic <- activePicture ed -> drawImage ed pic lo arr
-            Just pd -> drawPdf th ed pd lo arr
-            Nothing -> maybe (drawTextArea th ed lo arr) (\v -> drawCsvTable th ed v lo arr) (edCsv ed)
+  (mWidest, rc') <-
+    if searchViewActive ed
+      then maybe (pure ()) (\ss -> drawSearch th ss lo arr) (edSearch ed) >> pure (Nothing, emptyRenderCache)
+      else case edImage ed of
+        Just idoc -> drawImage ed idoc lo arr >> pure (Nothing, emptyRenderCache)
+        Nothing   -> case edPager ed of
+          Just pg -> drawPager th ed pg lo arr >> pure (Nothing, emptyRenderCache)
+          Nothing -> case edRtf ed of
+            Just rd -> drawRtf th ed rd lo arr >> pure (Nothing, emptyRenderCache)
+            Nothing -> case edPdf ed of
+              -- the page view is the PDF view's other mode: its picture is
+              -- drawn by the image view's code ('activePicture')
+              Just _ | pageViewOn ed, Just pic <- activePicture ed ->
+                drawImage ed pic lo arr >> pure (Nothing, emptyRenderCache)
+              Just pd -> drawPdf th ed pd lo arr >> pure (Nothing, emptyRenderCache)
+              Nothing -> case edCsv ed of
+                Just v  -> drawCsvTable th ed v lo arr >> pure (Nothing, emptyRenderCache)
+                Nothing -> case mrc of
+                  Nothing -> drawTextArea th ed lo arr >> pure (Nothing, emptyRenderCache)
+                  Just rc -> drawTextAreaCached rc thName th ed lo arr
   maybe (pure ()) (drawVScroll th arr cols rows) (scrollBarInfo ed)
-  maybe (pure ()) (drawHScroll th arr cols rows ed lo) (loHBarRow lo)
+  maybe (pure ()) (drawHScrollWith th arr cols rows ed lo mWidest) (loHBarRow lo)
   when (isJust (edExplorer ed)) $ drawExplorer th ed lo arr
   when (edShowMenu ed)   $ drawMenuBar th ed lo arr
   when (edShowStatus ed) $ drawStatus th ed lo arr
@@ -851,15 +988,17 @@ renderEditor ed = runST $ do
   when (edFocus ed == FEdit) $ maybe (pure ()) (\cp -> drawComplete th ed cp arr) (edComplete ed)
   maybe (pure ()) (\ld -> drawLoading th ed lo ld arr) (edLoading ed)
   -- Forced-background themes remap every cell onto their palette (see
-  -- 'thRemap'); dark/light skip this entirely.
+  -- 'thRemap'); dark/light skip this entirely. Share the single remapped
+  -- blankCell and skip writes when the style is already remapped.
   case thRemap th of
     Nothing -> pure ()
-    Just f  -> forM_ [0 .. rows * cols - 1] $ \i -> do
-      cell <- readArray arr i
-      writeArray arr i cell { cellStyle = f (cellStyle cell) }
+    Just f  -> do
+      let !remappedBlank = blankCell { cellStyle = f (cellStyle blankCell) }
+      remapRangeInPlace f remappedBlank arr (rows * cols)
   sanitizeGrid arr cols rows
-  frozen <- freeze arr
-  pure (Screen cols rows frozen (computeCursor ed lo) (scrollHintFor ed lo))
+  frozen <- unsafeFreeze arr
+  let !scr = Screen cols rows frozen (computeCursor ed lo) (scrollHintFor ed lo)
+  rc' `seq` pure (scr, rc')
 
 -- | The last pass over a frame, and the one place two grid invariants are
 -- /enforced/ rather than hoped for, because the emitter prints whatever a
@@ -1064,8 +1203,8 @@ drawVScroll th arr cols rows (x, top, h, total, win) = do
 -- a proportional thumb overlaid when the content actually overflows. The
 -- sidebar/gutter cells to the left of the region are blanked with the default
 -- background so the row reads as chrome, not document content.
-drawHScroll :: Theme -> Surf s -> Int -> Int -> Editor -> Layout -> Int -> ST s ()
-drawHScroll th arr cols rows ed lo r = do
+drawHScrollWith :: Theme -> Surf s -> Int -> Int -> Editor -> Layout -> Maybe Int -> Int -> ST s ()
+drawHScrollWith th arr cols rows ed lo mWidest r = do
   let x0 = case edCsv ed of
              -- CSV pins the row-number gutter, so the track spans only the
              -- scrollable column region (see 'hScrollBarInfo').
@@ -1080,8 +1219,12 @@ drawHScroll th arr cols rows ed lo r = do
   -- the vertical bar is enabled, or uses the full width when it is not.
   forM_ [x0 .. cols - 1] $ \c -> putCell arr cols rows r c (Cell '\x2500' (thScrollbar th))
   -- Thumb overlay when content overflows (track width plays the vertical bar's
-  -- track height in 'scrollThumb').
-  case hScrollBarInfo ed of
+  -- track height in 'scrollThumb'). When 'drawTextAreaCached' already tracked
+  -- the widest visible line, reuse it instead of re-folding every visible line.
+  let info = case mWidest of
+        Just widest | isNothing (edCsv ed) -> hScrollBarInfoFor ed lo widest
+        _                                  -> hScrollBarInfo ed
+  case info of
     Just (_, tx0, trackWidth, totalWidth, offset) ->
       let (tt, tl) = scrollThumb trackWidth totalWidth offset
       in forM_ [0 .. tl - 1] $ \i ->
@@ -1096,6 +1239,35 @@ fillRect arr cols rows r0 c0 h w st =
 ------------------------------------------------------------------------------
 -- Text area
 
+-- | Copy a pre-built row slice covering @[cl .. cl + sliceW - 1]@ straight
+-- into @arr@ at screen row @sr@. Bounds are validated once outside the loop.
+copyRowSlice :: Surf s -> Int -> Int -> Int -> Int -> Array Int Cell -> ST s ()
+copyRowSlice arr !cols !rows !sr !cl src =
+  when (sr >= 0 && sr < rows && cl >= 0 && cl < cols) $ do
+    let !(loB, hiB) = bounds src
+        !n = if loB == 0 && hiB >= 0 then min (hiB + 1) (cols - cl) else 0
+        !dstBase = sr * cols + cl
+    go dstBase n 0
+  where
+    go !base !n !k
+      | k >= n    = pure ()
+      | otherwise = do
+          let !cell = unsafeAt src k
+          unsafeWrite arr (base + k) cell
+          go base n (k + 1)
+
+-- | Write pure ASCII digits (e.g. a gutter line number) into a 0-based row
+-- slice of length @sliceW@.
+drawAsciiIntoRow :: STArray s Int Cell -> Int -> Int -> Style -> String -> ST s ()
+drawAsciiIntoRow rowArr !sliceW !c0 !st = go c0
+  where
+    go _  [] = pure ()
+    go !c (ch : cs)
+      | c >= sliceW = pure ()
+      | c < 0       = go (c + 1) cs
+      | otherwise   = writeArray rowArr c (Cell ch st) >> go (c + 1) cs
+
+-- | Uncached direct-write text area renderer.
 drawTextArea :: Theme -> Editor -> Layout -> Surf s -> ST s ()
 drawTextArea th ed lo arr
   | edWordWrap ed = drawTextAreaWrapped th ed lo arr
@@ -1106,45 +1278,208 @@ drawTextArea th ed lo arr
           n = lineCount buf
           sel = getSelection ed
           tabw = tabWidthOf ed
+          showWS = edShowWhitespace ed
           gut = loGutter lo
           cl = loContentLeft lo
+          tl = loTextLeft lo
           tw = loTextWidth lo
           left = edLeft ed
-          hlmap = visibleHighlight ed (loTextHeight lo)
+          mhl = visibleHighlightCache ed (loTextHeight lo)
           dmap = visibleDiags ed (loTextHeight lo)
+          noDiags = Map.null dmap
           brs = bracketPair ed
+          noBrs = null brs
+          noFind = isNothing (liveFindTerm ed)
+          dEnd = left + max 0 (min tw (cols - tl))
       forM_ [0 .. loTextHeight lo - 1] $ \row -> do
         let bl = edTop ed + row
             sr = loTextTop lo + row
-            diagsOnLine = Map.findWithDefault [] bl dmap
-        when (bl < n) $ do
+        when (bl < n && sr >= 0 && sr < rows) $ do
+          let diagsOnLine = if noDiags then [] else Map.findWithDefault [] bl dmap
           -- gutter / line number
           when (gut > 0) $ do
             let numStr = show (bl + 1)
                 pad = gut - 1 - length numStr
                 gstyle = gutterStyleFor th ed diagsOnLine bl
             drawStr arr cols rows sr (cl + max 0 pad) gstyle numStr
-          -- line content: expand cells only from just before the horizontal
-          -- scroll offset, so a view deep into a huge single line stays cheap.
-          let line = getLine' bl buf
-              msel = lineSelInterval sel bl (T.length line)
-              (selRange, selEOL) = case msel of
-                                     Just (s, e, eol) -> (Just (s, e), eol)
-                                     Nothing          -> (Nothing, False)
-              baseAt = mkBaseAt th (Map.findWithDefault [] bl hlmap)
-              (startCol, startDisp) = windowStart tabw left line
-              overlays = [ (s, e, thFindMatch th) | (s, e) <- liveMatchSpans ed line ]
-                         ++ [ (bc, bc + 1, thBracket th) | Pos brl bc <- brs, brl == bl ]
-              diagOver = diagOverFor th diagsOnLine line
-              cells = expandLineCellsFrom tabw (edShowWhitespace ed)
-                        baseAt (thSelection th) (thWhitespace th)
-                        selRange selEOL overlays diagOver
-                        (urlLinksIn startCol (startCol + tw + 8) line)
-                        startCol startDisp (T.drop startCol line)
-              visible = takeWhile (\(d, _) -> d < left + tw)
-                          (dropWhile (\(d, _) -> d < left) cells)
-          forM_ visible $ \(d, cell) ->
-            putCell arr cols rows sr (loTextLeft lo + (d - left)) cell
+          -- line content: expand directly into arr for [left .. dEnd)
+          when (tl >= 0 && tl < cols && dEnd > left) $ do
+            let line = getLine' bl buf
+                msel = lineSelInterval sel bl (T.length line)
+                (selRange, selEOL) = case msel of
+                                       Just (s, e, eol) -> (Just (s, e), eol)
+                                       Nothing          -> (Nothing, False)
+                toks = tokRunsFor mhl bl
+                baseSty = if null toks then BsConst (thText th) else BsRuns th toks
+                (startCol, startDisp) = windowStart tabw left line
+                findOv = if noFind then [] else [ (s, e, thFindMatch th) | (s, e) <- liveMatchSpans ed line ]
+                brOv   = if noBrs  then [] else [ (bc, bc + 1, thBracket th) | Pos brl bc <- brs, brl == bl ]
+                overlays = findOv ++ brOv
+                diagOver = if null diagsOnLine then [] else diagOverFor th diagsOnLine line
+                links = urlLinksIn startCol (startCol + tw + 8) line
+                subLine = if startCol == 0 then line else T.drop startCol line
+            expandLineCellsInto arr (sr * cols + tl) left dEnd
+              tabw showWS baseSty (thSelection th) (thWhitespace th)
+              selRange selEOL overlays diagOver links startCol startDisp subLine
+
+-- | Cached text area renderer (handles both non-wrapped and word-wrapped
+-- modes). Returns @(mWidest, nextRenderCache)@ where @mWidest@ is the widest
+-- visible display width when in non-wrapped mode with a horizontal scrollbar.
+drawTextAreaCached
+  :: RenderCache -> ThemeName -> Theme -> Editor -> Layout -> Surf s
+  -> ST s (Maybe Int, RenderCache)
+drawTextAreaCached rc thName th ed lo arr = do
+  let docId  = edDocId ed
+      cols   = loCols lo
+      rows   = loRows lo
+      lang   = langForPath (edPath ed)
+      geom   = (loTextTop lo, loContentLeft lo, loTextLeft lo, loTextWidth lo, loGutter lo)
+      tabw   = tabWidthOf ed
+      showWS = edShowWhitespace ed
+      wrap   = edWordWrap ed
+      hasHB  = isJust (loHBarRow lo)
+      left   = if wrap then 0 else edLeft ed
+      fKey   = liveFindTerm ed
+      valid  = rcDocId rc == docId
+            && rcCols rc == cols
+            && rcRows rc == rows
+            && rcTheme rc == thName
+            && rcLang rc == lang
+            && rcTextGeom rc == geom
+            && rcTabWidth rc == tabw
+            && rcShowWs rc == showWS
+            && rcWordWrap rc == wrap
+            && rcHasHBar rc == hasHB
+            && rcLeft rc == left
+            && rcFindKey rc == fKey
+      baseRc = RenderCache
+        { rcDocId     = docId
+        , rcCols      = cols
+        , rcRows      = rows
+        , rcTheme     = thName
+        , rcLang      = lang
+        , rcTextGeom  = geom
+        , rcTabWidth  = tabw
+        , rcShowWs    = showWS
+        , rcWordWrap  = wrap
+        , rcHasHBar   = hasHB
+        , rcLeft      = left
+        , rcFindKey   = fKey
+        , rcRowsCache = IntMap.empty
+        , rcWrapCache = IntMap.empty
+        }
+  if wrap
+    then do
+      let prevWrap = if valid then rcWrapCache rc else IntMap.empty
+      nextWrap <- drawTextAreaWrappedCached prevWrap th ed lo arr
+      let !rc' = baseRc { rcWrapCache = nextWrap }
+      pure (Nothing, rc')
+    else do
+      let prevRows = if valid then rcRowsCache rc else IntMap.empty
+      (widest, nextRows) <- drawTextAreaPlainCached prevRows hasHB th ed lo arr
+      let !rc' = baseRc { rcRowsCache = nextRows }
+      pure (if hasHB then Just widest else Nothing, rc')
+
+drawTextAreaPlainCached
+  :: IntMap.IntMap CachedRow -> Bool -> Theme -> Editor -> Layout -> Surf s
+  -> ST s (Int, IntMap.IntMap CachedRow)
+drawTextAreaPlainCached prevRows hasHB th ed lo arr = do
+  let cols    = loCols lo
+      rows    = loRows lo
+      buf     = edBuffer ed
+      n       = lineCount buf
+      sel     = getSelection ed
+      tabw    = tabWidthOf ed
+      showWS  = edShowWhitespace ed
+      gut     = loGutter lo
+      cl      = loContentLeft lo
+      tl      = loTextLeft lo
+      tw      = loTextWidth lo
+      left    = edLeft ed
+      th'     = loTextHeight lo
+      curLine = posLine (edCursor ed)
+      mhl     = visibleHighlightCache ed th'
+      dmap    = visibleDiags ed th'
+      noDiags = Map.null dmap
+      brs     = bracketPair ed
+      noBrs   = null brs
+      noFind  = isNothing (liveFindTerm ed)
+      sliceW  = max 0 (min cols (tl + tw) - cl)
+      textOff = tl - cl
+      dEnd    = left + max 0 (sliceW - textOff)
+      go !row !widest !acc
+        | row >= th' = pure (widest, acc)
+        | otherwise  = do
+            let !bl = edTop ed + row
+                !sr = loTextTop lo + row
+            if bl >= n
+              then pure (widest, acc)
+              else do
+                let line        = getLine' bl buf
+                    toks        = tokRunsFor mhl bl
+                    isCur       = bl == curLine
+                    msel        = lineSelInterval sel bl (T.length line)
+                    brsOnLine   = if noBrs then [] else [ bc | Pos brl bc <- brs, brl == bl ]
+                    diagsOnLine = if noDiags then [] else Map.findWithDefault [] bl dmap
+                cr <- case IntMap.lookup bl prevRows of
+                  Just old
+                    | crCurLine old == isCur
+                    , crSel old == msel
+                    , crBrackets old == brsOnLine
+                    , crDiags old == diagsOnLine
+                    , sameText (crLine old) line
+                    , sameToks (crToks old) toks ->
+                        -- If the match went through (==) rather than ptrEq (e.g.
+                        -- Revert/reload into a fresh buffer), re-anchor crLine/crToks
+                        -- to the current buffer so the old decoded file can be GC'd.
+                        if ptrEq (crLine old) line && ptrEq (crToks old) toks
+                          then pure old
+                          else let !cr' = old { crLine = line, crToks = toks } in pure cr'
+                  _ -> do
+                    rowArr <- newArray (0, max 0 (sliceW - 1)) blankCell
+                    when (sliceW > 0) $ do
+                      when (gut > 0) $ do
+                        let numStr = show (bl + 1)
+                            pad    = gut - 1 - length numStr
+                            gstyle = gutterStyleFor th ed diagsOnLine bl
+                        drawAsciiIntoRow rowArr sliceW (max 0 pad) gstyle numStr
+                      when (textOff >= 0 && dEnd > left) $ do
+                        let (selRange, selEOL) = case msel of
+                              Just (s, e, eol) -> (Just (s, e), eol)
+                              Nothing          -> (Nothing, False)
+                            baseSty = if null toks then BsConst (thText th) else BsRuns th toks
+                            (startCol, startDisp) = windowStart tabw left line
+                            findOv = if noFind then [] else [ (s, e, thFindMatch th) | (s, e) <- liveMatchSpans ed line ]
+                            brOv   = if null brsOnLine then [] else [ (bc, bc + 1, thBracket th) | bc <- brsOnLine ]
+                            overlays = findOv ++ brOv
+                            diagOver = if null diagsOnLine then [] else diagOverFor th diagsOnLine line
+                            links = urlLinksIn startCol (startCol + tw + 8) line
+                            subLine = if startCol == 0 then line else T.drop startCol line
+                        expandLineCellsInto rowArr textOff left dEnd
+                          tabw showWS baseSty (thSelection th) (thWhitespace th)
+                          selRange selEOL overlays diagOver links startCol startDisp subLine
+                    case thRemap th of
+                      Nothing -> pure ()
+                      Just f  -> do
+                        let !remappedBlank = blankCell { cellStyle = f (cellStyle blankCell) }
+                        remapRangeInPlace f remappedBlank rowArr sliceW
+                    frozenRow <- unsafeFreeze rowArr
+                    let !lw = if hasHB then lineDispWidth tabw line else 0
+                    pure CachedRow
+                      { crLine      = line
+                      , crToks      = toks
+                      , crCurLine   = isCur
+                      , crSel       = msel
+                      , crBrackets  = brsOnLine
+                      , crDiags     = diagsOnLine
+                      , crLineWidth = lw
+                      , crCells     = frozenRow
+                      }
+                when (sliceW > 0) $ copyRowSlice arr cols rows sr cl (crCells cr)
+                let !widest' = if hasHB then max widest (crLineWidth cr) else widest
+                    !acc'    = IntMap.insert bl cr acc
+                go (row + 1) widest' acc'
+  go 0 0 IntMap.empty
 
 -- | The paged read-only view of a file too large to load.
 --
@@ -1184,19 +1519,21 @@ drawPager th ed pg lo arr = do
                        Just lang | T.length line <= maxHlLine ->
                          fst (lexLineRuns lang initialState line)
                        _ -> []
-              baseAt0 = mkBaseAt th toks
               -- The cursor line is reverse-highlighted: with no editable
               -- cursor to place, the line itself is the position indicator.
-              baseAt = if bl == pgCursor pg then const (thSelection th) else baseAt0
+              baseSty
+                | bl == pgCursor pg = BsConst (thSelection th)
+                | null toks         = BsConst (thText th)
+                | otherwise         = BsRuns th toks
               (startCol, startDisp) = windowStart tabw left line
-              cells = expandLineCellsFrom tabw (edShowWhitespace ed)
-                        baseAt (thSelection th) (thWhitespace th)
-                        Nothing False [] [] (urlLinksIn startCol (startCol + tw + 8) line)
-                        startCol startDisp (T.drop startCol line)
-              visible = takeWhile (\(d, _) -> d < left + tw)
-                          (dropWhile (\(d, _) -> d < left) cells)
-          forM_ visible $ \(d, cell) ->
-            putCell arr cols rows sr (loTextLeft lo + (d - left)) cell
+              tl = loTextLeft lo
+              dEnd = left + max 0 (min tw (cols - tl))
+              subLine = if startCol == 0 then line else T.drop startCol line
+          when (sr >= 0 && sr < rows && tl >= 0 && tl < cols && dEnd > left) $
+            expandLineCellsInto arr (sr * cols + tl) left dEnd
+              tabw (edShowWhitespace ed) baseSty (thSelection th) (thWhitespace th)
+              Nothing False [] [] (urlLinksIn startCol (startCol + tw + 8) line)
+              startCol startDisp subLine
 
 -- | The formatted RTF view: a word-processor document drawn as text.
 --
@@ -1230,15 +1567,16 @@ drawRtf th ed rd lo arr = do
                 (selRange, selEOL) = case lineSelInterval sel li (T.length (rlText l)) of
                   Just (a, b, eol) -> (Just (a, b), eol)
                   Nothing          -> (Nothing, False)
-                cells  = expandLineCells tabw False baseAt (thSelection th) (thWhitespace th)
-                           selRange selEOL [] []
-                           (urlLinksIn 0 (T.length (rlText l)) (rlText l))
-                           (rlText l)
                 -- The layout's leading pad is indent plus alignment; clip
                 -- anything that a narrow window pushes past the right edge.
                 x0 = loTextLeft lo + rlPad l
-            forM_ (takeWhile (\(d, _) -> rlPad l + d < loTextWidth lo) cells) $ \(d, cell) ->
-              putCell arr cols rows sr (x0 + d) cell
+                dEnd = min (loTextWidth lo - rlPad l) (cols - x0)
+            when (sr >= 0 && sr < rows && x0 >= 0 && x0 < cols && dEnd > 0) $
+              expandLineCellsInto arr (sr * cols + x0) 0 dEnd
+                tabw False (BsFunc baseAt) (thSelection th) (thWhitespace th)
+                selRange selEOL [] []
+                (urlLinksIn 0 (T.length (rlText l)) (rlText l))
+                0 0 (rlText l)
 
 -- A per-character base-style lookup over a laid-out RTF line's formatting
 -- runs — the formatted view's answer to 'mkBaseAt'. Runs are few per line and
@@ -1315,13 +1653,14 @@ drawPdf th ed pd lo arr = do
                   Just (a, b, eol) -> (Just (a, b), eol)
                   Nothing          -> (Nothing, False)
                 overlays = [ (a, b, thFindMatch th) | (a, b) <- liveMatchSpans ed (plText l) ]
-                cells  = expandLineCells tabw False baseAt (thSelection th) (thWhitespace th)
-                           selRange selEOL overlays []
-                           (urlLinksIn 0 (T.length (plText l)) (plText l))
-                           (plText l)
                 x0 = loTextLeft lo + plPad l
-            forM_ (takeWhile (\(d, _) -> plPad l + d < loTextWidth lo) cells) $ \(d, cell) ->
-              putCell arr cols rows sr (x0 + d) cell
+                dEnd = min (loTextWidth lo - plPad l) (cols - x0)
+            when (sr >= 0 && sr < rows && x0 >= 0 && x0 < cols && dEnd > 0) $
+              expandLineCellsInto arr (sr * cols + x0) 0 dEnd
+                tabw False (BsFunc baseAt) (thSelection th) (thWhitespace th)
+                selRange selEOL overlays []
+                (urlLinksIn 0 (T.length (plText l)) (plText l))
+                0 0 (plText l)
 
 -- A per-character base-style lookup over a laid-out PDF line's formatting
 -- runs; 'rtfBaseAt' for the PDF view, and linear for the same reason.
@@ -1351,17 +1690,31 @@ isDarkTheme t = t `notElem` [ThemeLight, ThemeCherryBlossom, ThemeFlashbang]
 -- Word-wrapped text rendering: each buffer line occupies one or more visual
 -- rows. Tab stops and selection styling are taken from the full line so they
 -- stay consistent with the cursor math in "Cmedit.Editor".
+-- Advance display column across a slice of text, matching 'colToDisplay'.
+advanceDisp :: Int -> Int -> Text -> Int
+advanceDisp tabw = T.foldl' step
+  where
+    step !disp c
+      | c == '\t' = disp + (tabw - disp `mod` tabw)
+      | otherwise = disp + cellAdvance disp c
+
+-- Uncached direct-write word-wrapped text area renderer.
 drawTextAreaWrapped :: Theme -> Editor -> Layout -> Surf s -> ST s ()
 drawTextAreaWrapped th ed lo arr = loop (edTop ed) 0
   where
     cols = loCols lo; rows = loRows lo
     buf = edBuffer ed; n = lineCount buf
     sel = getSelection ed; tabw = tabWidthOf ed
-    gut = loGutter lo; cl = loContentLeft lo; th' = loTextHeight lo
-    hlmap = visibleHighlight ed (loTextHeight lo)
-    dmap = visibleDiags ed (loTextHeight lo)
+    showWS = edShowWhitespace ed
+    gut = loGutter lo; cl = loContentLeft lo; tl = loTextLeft lo; th' = loTextHeight lo
+    mhl = visibleHighlightCache ed th'
+    dmap = visibleDiags ed th'
+    noDiags = Map.null dmap
     brs = bracketPair ed
-    loop li vrow
+    noBrs = null brs
+    noFind = isNothing (liveFindTerm ed)
+    maxColsText = max 0 (cols - tl)
+    loop !li !vrow
       | vrow >= th' || li >= n = pure ()
       | otherwise = do
           let line = getLine' li buf
@@ -1370,34 +1723,148 @@ drawTextAreaWrapped th ed lo arr = loop (edTop ed) 0
               (selRange, eolFlag) = case msel of
                                       Just (s, e, eol) -> (Just (s, e), eol)
                                       Nothing          -> (Nothing, False)
-              baseAt = mkBaseAt th (Map.findWithDefault [] li hlmap)
-              overlays = [ (s, e, thFindMatch th) | (s, e) <- liveMatchSpans ed line ]
-                         ++ [ (bc, bc + 1, thBracket th) | Pos brl bc <- brs, brl == li ]
-              diagOver = diagOverFor th (Map.findWithDefault [] li dmap) line
-              cells = expandLineCells tabw (edShowWhitespace ed)
-                        baseAt (thSelection th) (thWhitespace th)
-                        selRange False overlays diagOver
-                        (urlLinksIn 0 (T.length line) line) line
-          vrow' <- drawSegs li line cells eolFlag segs 0 vrow
+              toks = tokRunsFor mhl li
+              baseSty = if null toks then BsConst (thText th) else BsRuns th toks
+              diagsOnLine = if noDiags then [] else Map.findWithDefault [] li dmap
+              findOv = if noFind then [] else [ (s, e, thFindMatch th) | (s, e) <- liveMatchSpans ed line ]
+              brOv   = if noBrs  then [] else [ (bc, bc + 1, thBracket th) | Pos brl bc <- brs, brl == li ]
+              overlays = findOv ++ brOv
+              diagOver = if null diagsOnLine then [] else diagOverFor th diagsOnLine line
+              links = urlLinksIn 0 (T.length line) line
+          vrow' <- drawSegs li baseSty selRange eolFlag overlays diagOver links diagsOnLine line 0 segs 0 vrow
           loop (li + 1) vrow'
-    drawSegs _ _ _ _ [] _ vrow = pure vrow
-    drawSegs li line cells eolFlag ((s, e) : rest) si vrow
+    drawSegs _ _ _ _ _ _ _ _ _ _ [] _ !vrow = pure vrow
+    drawSegs li baseSty selRange eolFlag overlays diagOver links diagsOnLine curTxt !ds ((s, e) : rest) !si !vrow
       | vrow >= th' = pure vrow
       | otherwise = do
           let sr = loTextTop lo + vrow
-              ds = colToDisplay tabw s line
-              de = colToDisplay tabw e line
-              isLast = null rest
-          when (gut > 0 && si == 0) $ do
-            let numStr = show (li + 1)
-                pad = gut - 1 - length numStr
-                gstyle = gutterStyleFor th ed (Map.findWithDefault [] li dmap) li
-            drawStr arr cols rows sr (cl + max 0 pad) gstyle numStr
-          forM_ [ (d - ds, cell) | (d, cell) <- cells, d >= ds, d < de ] $ \(off, cell) ->
-            putCell arr cols rows sr (loTextLeft lo + off) cell
-          when (isLast && eolFlag) $
-            putCell arr cols rows sr (loTextLeft lo + (de - ds)) (Cell ' ' (thSelection th))
-          drawSegs li line cells eolFlag rest (si + 1) (vrow + 1)
+              (segTxt, nextTxt) = T.splitAt (e - s) curTxt
+              !de = advanceDisp tabw ds segTxt
+              !isLast = null rest
+          when (sr >= 0 && sr < rows) $ do
+            when (gut > 0 && si == 0) $ do
+              let numStr = show (li + 1)
+                  pad = gut - 1 - length numStr
+                  gstyle = gutterStyleFor th ed diagsOnLine li
+              drawStr arr cols rows sr (cl + max 0 pad) gstyle numStr
+            let !dEnd = min de (ds + maxColsText)
+            when (tl >= 0 && tl < cols && dEnd > ds) $
+              expandLineCellsInto arr (sr * cols + tl) ds dEnd
+                tabw showWS baseSty (thSelection th) (thWhitespace th)
+                selRange False overlays diagOver links s ds curTxt
+            when (isLast && eolFlag) $
+              putCell arr cols rows sr (tl + (de - ds)) (Cell ' ' (thSelection th))
+          drawSegs li baseSty selRange eolFlag overlays diagOver links diagsOnLine nextTxt de rest (si + 1) (vrow + 1)
+
+-- | Cached word-wrapped text area renderer (Phase 2). Caches the pre-remap
+-- visual row slices per buffer line; lines clipped at the bottom of the screen
+-- record @cwrComplete = False@ so scrolling down rebuilds the newly exposed
+-- trailing segments.
+drawTextAreaWrappedCached
+  :: IntMap.IntMap CachedWrapRow -> Theme -> Editor -> Layout -> Surf s
+  -> ST s (IntMap.IntMap CachedWrapRow)
+drawTextAreaWrappedCached prevWrap th ed lo arr = loop (edTop ed) 0 IntMap.empty
+  where
+    cols    = loCols lo; rows = loRows lo
+    buf     = edBuffer ed; n = lineCount buf
+    sel     = getSelection ed; tabw = tabWidthOf ed
+    showWS  = edShowWhitespace ed
+    gut     = loGutter lo; cl = loContentLeft lo; tl = loTextLeft lo; th' = loTextHeight lo
+    curLine = posLine (edCursor ed)
+    mhl     = visibleHighlightCache ed th'
+    dmap    = visibleDiags ed th'
+    noDiags = Map.null dmap
+    brs     = bracketPair ed
+    noBrs   = null brs
+    noFind  = isNothing (liveFindTerm ed)
+    sliceW  = max 0 (cols - cl)
+    textOff = tl - cl
+    maxColsText = max 0 (sliceW - textOff)
+    loop !li !vrow !acc
+      | vrow >= th' || li >= n = pure acc
+      | otherwise = do
+          let line        = getLine' li buf
+              toks        = tokRunsFor mhl li
+              isCur       = li == curLine
+              msel        = lineSelInterval sel li (T.length line)
+              brsOnLine   = if noBrs then [] else [ bc | Pos brl bc <- brs, brl == li ]
+              diagsOnLine = if noDiags then [] else Map.findWithDefault [] li dmap
+              needRows    = th' - vrow
+          cwr <- case IntMap.lookup li prevWrap of
+            Just old
+              | cwrCurLine old == isCur
+              , cwrSel old == msel
+              , cwrBrackets old == brsOnLine
+              , cwrDiags old == diagsOnLine
+              , cwrComplete old || length (cwrRows old) >= needRows
+              , sameText (cwrLine old) line
+              , sameToks (cwrToks old) toks ->
+                  if ptrEq (cwrLine old) line && ptrEq (cwrToks old) toks
+                    then pure old
+                    else let !cwr' = old { cwrLine = line, cwrToks = toks } in pure cwr'
+            _ -> do
+              let segs = lineSegs ed li
+                  (selRange, eolFlag) = case msel of
+                                          Just (s, e, eol) -> (Just (s, e), eol)
+                                          Nothing          -> (Nothing, False)
+                  baseSty = if null toks then BsConst (thText th) else BsRuns th toks
+                  findOv = if noFind then [] else [ (s, e, thFindMatch th) | (s, e) <- liveMatchSpans ed line ]
+                  brOv   = if null brsOnLine then [] else [ (bc, bc + 1, thBracket th) | bc <- brsOnLine ]
+                  overlays = findOv ++ brOv
+                  diagOver = if null diagsOnLine then [] else diagOverFor th diagsOnLine line
+                  links = urlLinksIn 0 (T.length line) line
+              (builtRows, isComplete) <-
+                buildWrapRows li baseSty selRange eolFlag overlays diagOver links diagsOnLine
+                              line 0 segs 0 needRows []
+              pure CachedWrapRow
+                { cwrLine     = line
+                , cwrToks     = toks
+                , cwrCurLine  = isCur
+                , cwrSel      = msel
+                , cwrBrackets = brsOnLine
+                , cwrDiags    = diagsOnLine
+                , cwrComplete = isComplete
+                , cwrRows     = builtRows
+                }
+          vrow' <- blitRows vrow (cwrRows cwr)
+          loop (li + 1) vrow' (IntMap.insert li cwr acc)
+    blitRows !vrow [] = pure vrow
+    blitRows !vrow (rArr : rest)
+      | vrow >= th' = pure vrow
+      | otherwise   = do
+          when (sliceW > 0) $ copyRowSlice arr cols rows (loTextTop lo + vrow) cl rArr
+          blitRows (vrow + 1) rest
+    buildWrapRows _ _ _ _ _ _ _ _ _ _ [] _ _ revAcc = pure (reverse revAcc, True)
+    buildWrapRows _ _ _ _ _ _ _ _ _ _ _ _ !remRows revAcc
+      | remRows <= 0 = pure (reverse revAcc, False)
+    buildWrapRows li baseSty selRange eolFlag overlays diagOver links diagsOnLine curTxt !ds ((s, e) : rest) !si !remRows revAcc = do
+      let (segTxt, nextTxt) = T.splitAt (e - s) curTxt
+          !de     = advanceDisp tabw ds segTxt
+          !isLast = null rest
+      rowArr <- newArray (0, max 0 (sliceW - 1)) blankCell
+      when (sliceW > 0) $ do
+        when (gut > 0 && si == 0) $ do
+          let numStr = show (li + 1)
+              pad    = gut - 1 - length numStr
+              gstyle = gutterStyleFor th ed diagsOnLine li
+          drawAsciiIntoRow rowArr sliceW (max 0 pad) gstyle numStr
+        let !dEnd = min de (ds + maxColsText)
+        when (textOff >= 0 && dEnd > ds) $
+          expandLineCellsInto rowArr textOff ds dEnd
+            tabw showWS baseSty (thSelection th) (thWhitespace th)
+            selRange False overlays diagOver links s ds curTxt
+        when (isLast && eolFlag) $ do
+          let !off = textOff + (de - ds)
+          when (off >= 0 && off < sliceW) $
+            writeArray rowArr off (Cell ' ' (thSelection th))
+      case thRemap th of
+        Nothing -> pure ()
+        Just f  -> do
+          let !remappedBlank = blankCell { cellStyle = f (cellStyle blankCell) }
+          remapRangeInPlace f remappedBlank rowArr sliceW
+      frozenRow <- unsafeFreeze rowArr
+      buildWrapRows li baseSty selRange eolFlag overlays diagOver links diagsOnLine
+                    nextTxt de rest (si + 1) (remRows - 1) (frozenRow : revAcc)
 
 -- Selection columns for a given buffer line: (startCol, endCol, includesEOL).
 lineSelInterval :: Maybe (Pos, Pos) -> Int -> Int -> Maybe (Int, Int, Bool)
@@ -1409,9 +1876,244 @@ lineSelInterval (Just (Pos sl sc, Pos el ec)) bl len
   | bl == el           = Just (0, ec, False)
   | otherwise          = Just (0, len, True)
 
+-- | Source of per-character base styles for 'expandLineCellsInto'.
+data BaseStyle
+  = BsConst !Style         -- ^ Plain text / uniform style (zero lookup cost).
+  | BsRuns  !Theme ![TokRun] -- ^ Streaming syntax token runs (O(1) amortized, zero Array).
+  | BsFunc  !(Int -> Style)  -- ^ Arbitrary function (RTF / PDF formatted runs).
+
+-- | Direct-write equivalent of 'expandLineCellsFrom': walks @line@ using
+-- 'Data.Text.Unsafe.iter' without unpacking to @[Char]@ or building an
+-- intermediate @[(Int, Cell)]@ list, writing visible cells for display columns
+-- @[dMin .. dEnd)@ directly into @arr@ at @rowBase + (d - dMin)@. Stops
+-- immediately once @dcol >= dEnd@.
+expandLineCellsInto
+  :: STArray s Int Cell
+  -> Int -> Int -> Int
+  -> Int -> Bool -> BaseStyle -> Style -> Style
+  -> Maybe (Int, Int) -> Bool -> [(Int, Int, Style)] -> [(Int, Int, Color)]
+  -> [(Int, Int, Text)]
+  -> Int -> Int -> Text -> ST s ()
+expandLineCellsInto arr !rowBase !dMin !dEnd tabw showWS baseSrc selSty wsSty msel selEOL overlays diagOver links i0 d0 line = do
+  let !byteLen = lengthWord8 line
+      !noSel   = isNothing msel
+      !noOv    = null overlays
+      !noDiag  = null diagOver
+      !noLinks = null links
+      (rEnd0, rSty0, runs0) = case baseSrc of
+        BsConst sty      -> (maxBound, sty, [])
+        BsRuns th runs   -> advanceRuns th i0 0 (thText th) runs
+        BsFunc _         -> (maxBound, defaultStyle, [])
+  go 0 d0 i0 rEnd0 rSty0 runs0 byteLen noSel noOv noDiag noLinks
+  where
+    advanceRuns th !i !rEnd !rSty rs
+      | i < rEnd  = (rEnd, rSty, rs)
+      | otherwise = case rs of
+          []                   -> (maxBound, thText th, [])
+          (TokRun n tok : rs') ->
+            let !rEnd' = rEnd + n
+            in if i < rEnd'
+                 then (rEnd', tokStyle th tok, rs')
+                 else advanceRuns th i rEnd' rSty rs'
+
+    inSel !i = case msel of
+      Just (s, e) -> i >= s && i < e
+      Nothing     -> False
+
+    overlayAt !i = findOv overlays
+      where
+        findOv [] = Nothing
+        findOv ((s, e, sty) : rest)
+          | i >= s && i < e = Just sty
+          | otherwise       = findOv rest
+
+    diagTint !i !s = findDg diagOver
+      where
+        findDg [] = s
+        findDg ((s0, e0, col) : rest)
+          | i >= s0 && i < e0 = s { styleAttr = styleAttr s .|. attrUndercurl, styleUl = col }
+          | otherwise         = findDg rest
+
+    lnkAt !noLinks !i
+      | noLinks   = Nothing
+      | otherwise = findLn links
+      where
+        findLn [] = Nothing
+        findLn ((s, e, u) : rest)
+          | i >= s && i < e = Just u
+          | otherwise       = findLn rest
+
+    resolveBase !i !rEnd !rSty rs = case baseSrc of
+      BsConst sty -> (rEnd, rSty, rs, sty)
+      BsFunc f    -> (rEnd, rSty, rs, f i)
+      BsRuns th _ ->
+        if i < rEnd
+          then (rEnd, rSty, rs, rSty)
+          else let !(rEnd', rSty', rs') = advanceRuns th i rEnd rSty rs
+               in (rEnd', rSty', rs', rSty')
+
+    styFor !noSel !noOv !noDiag !i !bSty =
+      let !baseS
+            | not noSel && inSel i = selSty
+            | not noOv, Just ov <- overlayAt i = ov
+            | otherwise = bSty
+      in if noDiag then baseS else diagTint i baseS
+
+    wsFor !noSel !noDiag !i =
+      let !baseS = if not noSel && inSel i then selSty else wsSty
+      in if noDiag then baseS else diagTint i baseS
+
+    emitAt !d !cell =
+      when (d >= dMin && d < dEnd) $
+        writeArray arr (rowBase + (d - dMin)) cell
+
+    collectMarks !byteLen !offAcc !cntAcc revMarks
+      | offAcc >= byteLen = (offAcc, cntAcc, reverse revMarks)
+      | otherwise =
+          let !(Iter mc md) = iter line offAcc
+          in if isCombining mc
+               then collectMarks byteLen (offAcc + md) (cntAcc + 1)
+                      (if cntAcc < maxComb then mc : revMarks else revMarks)
+               else (offAcc, cntAcc, reverse revMarks)
+
+    go !off !dcol !i !rEnd !rSty rs !byteLen !noSel !noOv !noDiag !noLinks
+      | dcol >= dEnd = pure ()
+      | off >= byteLen =
+          when (selEOL && dcol >= dMin) $
+            writeArray arr (rowBase + (dcol - dMin)) (Cell ' ' selSty)
+      | otherwise =
+          let !(Iter c delta) = iter line off
+              !off1 = off + delta
+          in if c >= ' ' && c < '\DEL'
+               then
+                 -- Fast path for printable ASCII: width is always 1; only peek
+                 -- for a following combining mark (>= U+0300).
+                 if off1 < byteLen && let !(Iter m _) = iter line off1 in m >= '\x300' && isCombining m
+                   then do
+                     let !(Iter m md) = iter line off1
+                         !(off2, nMarks, marks) = collectMarks byteLen (off1 + md) 1 [m]
+                         !c' = if showWS && c == ' ' then '\183' else c
+                         !(rEnd', rSty', rs', bSty) = resolveBase i rEnd rSty rs
+                     when (dcol >= dMin) $ do
+                       let !s = styFor noSel noOv noDiag i bSty
+                           !lnk = lnkAt noLinks i
+                       writeArray arr (rowBase + (dcol - dMin))
+                         (CellC c' s lnk (T.pack marks))
+                     go off2 (dcol + 1) (i + 1 + nMarks) rEnd' rSty' rs' byteLen noSel noOv noDiag noLinks
+                   else do
+                     if dcol >= dMin
+                       then do
+                         let !c' = if showWS && c == ' ' then '\183' else c
+                             !(rEnd', rSty', rs', bSty) = resolveBase i rEnd rSty rs
+                             !s = styFor noSel noOv noDiag i bSty
+                             !cell = if noLinks then Cell c' s else CellL c' s (lnkAt False i)
+                         writeArray arr (rowBase + (dcol - dMin)) cell
+                         go off1 (dcol + 1) (i + 1) rEnd' rSty' rs' byteLen noSel noOv noDiag noLinks
+                       else
+                         go off1 (dcol + 1) (i + 1) rEnd rSty rs byteLen noSel noOv noDiag noLinks
+               else if c == '\t'
+                 then do
+                   let !w = tabw - dcol `mod` tabw
+                   if dcol + w > dMin
+                     then do
+                       let !(rEnd', rSty', rs', bSty) = resolveBase i rEnd rSty rs
+                           !s = styFor noSel noOv noDiag i bSty
+                           !lnk = lnkAt noLinks i
+                           !spCell = CellL ' ' s lnk
+                       if showWS
+                         then do
+                           emitAt dcol (CellL '\8594' (wsFor noSel noDiag i) lnk)
+                           let fillTab !k
+                                 | k >= w    = pure ()
+                                 | otherwise = emitAt (dcol + k) spCell >> fillTab (k + 1)
+                           fillTab 1
+                         else do
+                           let fillTab !k
+                                 | k >= w    = pure ()
+                                 | otherwise = emitAt (dcol + k) spCell >> fillTab (k + 1)
+                           fillTab 0
+                       go off1 (dcol + w) (i + 1) rEnd' rSty' rs' byteLen noSel noOv noDiag noLinks
+                     else
+                       go off1 (dcol + w) (i + 1) rEnd rSty rs byteLen noSel noOv noDiag noLinks
+                 else if isControlChar c
+                   then do
+                     if dcol + 2 > dMin
+                       then do
+                         let !(rEnd', rSty', rs', bSty) = resolveBase i rEnd rSty rs
+                             !s = styFor noSel noOv noDiag i bSty
+                             !lnk = lnkAt noLinks i
+                             cc = take 2 (controlCaret c ++ "  ")
+                         emitAt dcol       (CellL (cc !! 0) s lnk)
+                         emitAt (dcol + 1) (CellL (cc !! 1) s lnk)
+                         go off1 (dcol + 2) (i + 1) rEnd' rSty' rs' byteLen noSel noOv noDiag noLinks
+                       else
+                         go off1 (dcol + 2) (i + 1) rEnd rSty rs byteLen noSel noOv noDiag noLinks
+                   else if c >= '\x300' && isCombining c
+                     then if dcol == 0
+                       then do
+                         let !(off2, totalUsed, marks) = collectMarks byteLen off1 1 [c]
+                             !(rEnd', rSty', rs', bSty) = resolveBase i rEnd rSty rs
+                         when (dcol >= dMin) $ do
+                           let !s = styFor noSel noOv noDiag i bSty
+                               !lnk = lnkAt noLinks i
+                           writeArray arr (rowBase + (dcol - dMin))
+                             (CellC ' ' s lnk (T.pack marks))
+                         go off2 1 (i + totalUsed) rEnd' rSty' rs' byteLen noSel noOv noDiag noLinks
+                       else
+                         go off1 dcol (i + 1) rEnd rSty rs byteLen noSel noOv noDiag noLinks
+                     else do
+                       -- Non-ASCII base glyph (possibly wide, possibly followed by combining marks).
+                       let !w = max 1 (charWidth c)
+                           (off2, used, marks) =
+                             if off1 < byteLen
+                               then let !(Iter m md) = iter line off1
+                                    in if m >= '\x300' && isCombining m
+                                         then let !(o2, nM, ms) = collectMarks byteLen (off1 + md) 1 [m]
+                                              in (o2, 1 + nM, ms)
+                                         else (off1, 1, [])
+                               else (off1, 1, [])
+                       if dcol + w > dMin
+                         then do
+                           let !(rEnd', rSty', rs', bSty) = resolveBase i rEnd rSty rs
+                               !s = styFor noSel noOv noDiag i bSty
+                               !lnk = lnkAt noLinks i
+                               !hd = if null marks then CellL c s lnk else CellC c s lnk (T.pack marks)
+                           emitAt dcol hd
+                           when (w > 1) $ do
+                             let !cont = CellL contChar s lnk
+                                 fillCont !k
+                                   | k >= w    = pure ()
+                                   | otherwise = emitAt (dcol + k) cont >> fillCont (k + 1)
+                             fillCont 1
+                           go off2 (dcol + w) (i + used) rEnd' rSty' rs' byteLen noSel noOv noDiag noLinks
+                         else
+                           go off2 (dcol + w) (i + used) rEnd rSty rs byteLen noSel noOv noDiag noLinks
+
 -- Expand a line into (displayColumn, Cell) pairs, applying selection styling,
 -- find-match highlights and whitespace markers, with wide glyphs followed by
 -- continuation cells.
+-- | Pure wrapper around 'expandLineCellsInto' exposed for randomized
+-- differential tests against 'expandLineCellsFrom'. Returns the cell grid for
+-- display columns @[dMin .. dEnd - 1]@ initialized to 'blankCell'.
+expandLineCellsDirect
+  :: Theme -> Int -> Int -> Int -> Bool -> Either (Int -> Style) [TokRun]
+  -> Style -> Style -> Maybe (Int, Int) -> Bool
+  -> [(Int, Int, Style)] -> [(Int, Int, Color)] -> [(Int, Int, Text)]
+  -> Int -> Int -> Text -> [Cell]
+expandLineCellsDirect th dMin dEnd tabw showWS baseSpec selSty wsSty msel selEOL overlays diagOver links i0 d0 line
+  | dEnd <= dMin = []
+  | otherwise = runST $ do
+      let !w = dEnd - dMin
+      arr <- newArray (0, w - 1) blankCell
+      let baseSrc = case baseSpec of
+            Left f     -> BsFunc f
+            Right []   -> BsConst (thText th)
+            Right runs -> BsRuns th runs
+      expandLineCellsInto arr 0 dMin dEnd tabw showWS baseSrc selSty wsSty
+                          msel selEOL overlays diagOver links i0 d0 line
+      frozen <- unsafeFreeze arr
+      pure [ frozen ! k | k <- [0 .. w - 1] ]
+
 expandLineCells
   :: Int -> Bool -> (Int -> Style) -> Style -> Style
   -> Maybe (Int, Int) -> Bool -> [(Int, Int, Style)] -> [(Int, Int, Color)]
@@ -1503,10 +2205,12 @@ expandLineCellsFrom tabw showWS baseAt selSty wsSty msel selEOL overlays diagOve
 -- the gutter tint (scanning all of @edDiags@ per visible row was
 -- O(rows × diags) twice over — this is the 'visibleHighlight' discipline).
 visibleDiags :: Editor -> Int -> Map.Map Int [Diag]
-visibleDiags ed count =
-  Map.fromListWith (flip (++))
-    [ (dgLine d, [d]) | d <- edDiags ed
-    , dgLine d >= top, dgLine d < top + count ]
+visibleDiags ed count
+  | null (edDiags ed) = Map.empty
+  | otherwise =
+      Map.fromListWith (flip (++))
+        [ (dgLine d, [d]) | d <- edDiags ed
+        , dgLine d >= top, dgLine d < top + count ]
   where top = edTop ed
 
 -- | The diagnostic underline spans for one buffer line, given that line's
@@ -1567,46 +2271,19 @@ urlWindowLine = 2000
 tokStyle :: Theme -> Tok -> Style
 tokStyle = thTokens
 
--- A per-character base-style lookup over compact token runs. The small boxed
--- array contains cumulative exclusive ends, typically tens of entries rather
--- than one entry per source character; lookup is logarithmic in run count.
-mkBaseAt :: Theme -> [TokRun] -> (Int -> Style)
-mkBaseAt th runs
-  | null runs = const (thText th)
-  | otherwise =
-      let entries = snd (foldl' add (0, []) runs)
-          add (!off, acc) (TokRun n tok) =
-            let end = off + n in (end, (end, tok) : acc)
-          ordered = reverse entries
-          nRuns = length ordered
-          total = case ordered of [] -> 0; _ -> fst (last ordered)
-          arr = listArray (0, nRuns - 1) ordered :: Array Int (Int, Tok)
-          findRun i = search 0 (nRuns - 1)
-            where
-              search lo hi
-                | lo >= hi = snd (arr ! lo)
-                | otherwise =
-                    let mid = (lo + hi) `div` 2
-                    in if i < fst (arr ! mid) then search lo mid else search (mid + 1) hi
-      in \i -> if i >= 0 && i < total then tokStyle th (findRun i) else thText th
+-- The refreshed highlight cache for the visible region (avoids materialising
+-- an intermediate Map of visible token runs every frame).
+visibleHighlightCache :: Editor -> Int -> Maybe HlCache
+visibleHighlightCache ed count = case langForPath (edPath ed) of
+  Just lang ->
+    let buf   = edBuffer ed
+        lastL = min (lineCount buf - 1) (edTop ed + count - 1)
+    in Just (refreshHlCacheFor lang (bufLines buf) (edDocSeq ed) (edTop ed) lastL (edHlCache ed))
+  Nothing -> Nothing
 
--- Tokenise lines [top .. top+count) for highlighting. Line-start lexer states
--- come from the 'HlCache' (refreshed here if the editor's copy is stale), so
--- multi-line constructs are correct from the top of the file — there is no
--- look-back cap — while each frame only lexes the visible window.
-highlightMap :: Lang -> Editor -> Int -> Int -> Map.Map Int [TokRun]
-highlightMap lang ed top count =
-  let buf   = edBuffer ed
-      lns   = bufLines buf
-      lastL = min (lineCount buf - 1) (top + count - 1)
-      cache = refreshHlCacheFor lang lns (edDocSeq ed) top lastL (edHlCache ed)
-  in Map.fromAscList [ (li, hlTokenRuns cache li) | li <- [max 0 top .. lastL] ]
-
--- The highlight map for the visible region (empty when no language applies).
-visibleHighlight :: Editor -> Int -> Map.Map Int [TokRun]
-visibleHighlight ed count = case langForPath (edPath ed) of
-  Just lang -> highlightMap lang ed (edTop ed) count
-  Nothing   -> Map.empty
+tokRunsFor :: Maybe HlCache -> Int -> [TokRun]
+tokRunsFor Nothing  _  = []
+tokRunsFor (Just c) li = hlTokenRuns c li
 
 -- | Bring the editor's highlight-state cache up to date for the current
 -- viewport so the render that follows finds it fresh. The driver calls this
@@ -2877,13 +3554,31 @@ shiftScreen p top hgt delta =
   in p { scrCells = listArray (0, w * scrH p - 1)
                       [ cellFor i | i <- [0 .. w * scrH p - 1] ] }
 
+-- O(1) proof that @scrCells s@ covers @[0 .. scrW s * scrH s - 1]@ so
+-- 'unsafeAt' is guaranteed in-bounds (hand-crafted screens that violate the
+-- invariant fall back to bounds-checked '(!)').
+screenCovers :: Screen -> Bool
+screenCovers s =
+  let !w = scrW s; !h = scrH s
+  in w <= 0 || h <= 0 || let !(loB, hiB) = bounds (scrCells s) in loB == 0 && hiB >= w * h - 1
+{-# INLINE screenCovers #-}
+
 -- How many cells inside the band differ between two same-size screens.
 bandDiffCells :: Screen -> Screen -> Int -> Int -> Int
 bandDiffCells a b top hgt =
   let w = scrW a
-      lo = top * w
+      lo = max 0 (top * w)
       hi = min (scrW a * scrH a) ((top + hgt) * w) - 1
-  in length [ () | i <- [lo .. hi], scrCells a ! i /= scrCells b ! i ]
+      ca = scrCells a
+      cb = scrCells b
+      !fast = screenCovers a && screenCovers b
+      go !acc !i
+        | i > hi = acc
+        | otherwise =
+            let !x = if fast then unsafeAt ca i else ca ! i
+                !y = if fast then unsafeAt cb i else cb ! i
+            in if sameCell x y then go acc (i + 1) else go (acc + 1) (i + 1)
+  in go 0 lo
 
 -- Repositioning the cursor costs ~8 bytes plus an SGR re-sync, while
 -- re-emitting an unchanged cell costs a few, so runs of changed cells
@@ -2920,19 +3615,29 @@ cellPre caps cell es =
 -- the whole frame (the terminal keeps it across cursor moves), so a cursor
 -- move or single-character edit costs a handful of bytes instead of full rows.
 diffRows :: RenderCaps -> Screen -> Screen -> (Builder, EmitState)
-diffRows caps p cur = foldl step (mempty, emitState0) [0 .. scrH cur - 1]
+diffRows caps p cur = foldl' step (mempty, emitState0) [0 .. scrH cur - 1]
   where
-    step (acc, es) r =
-      let (b, es') = drawSpans caps cur r (rowSpans p cur r) es
-      in (acc <> b, es')
+    step (!acc, !es) r =
+      case rowSpans p cur r of
+        []    -> (acc, es)
+        spans -> let (b, es') = drawSpans caps cur r spans es
+                 in (acc <> b, es')
 
 -- The changed column spans of a row, bridging small unchanged gaps and
 -- widening over wide-glyph continuation sentinels so glyphs repaint whole.
 rowSpans :: Screen -> Screen -> Int -> [(Int, Int)]
 rowSpans p cur r = go 0
   where
-    w = scrW cur
-    changed c = cellAt p w r c /= cellAt cur w r c
+    !w = scrW cur
+    !base = r * w
+    !cp = scrCells p
+    !cc = scrCells cur
+    !fast = screenCovers p && screenCovers cur
+    changed !c =
+      let !idx = base + c
+          !x = if fast then unsafeAt cp idx else cp ! idx
+          !y = if fast then unsafeAt cc idx else cc ! idx
+      in not (sameCell x y)
     go c
       | c >= w = []
       | not (changed c) = go (c + 1)

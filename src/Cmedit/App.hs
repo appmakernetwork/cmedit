@@ -206,6 +206,7 @@ runTui cfg cfgWarns files readOnly statsOnExit restoreFlag = do
     gfxProbeRef  <- newIORef Nothing
     gfxProbedRef <- newIORef False
     gfxTmpRef    <- newIORef (0, 0, Seq.empty)
+    renderCacheRef <- newIORef emptyRenderCache
     lintGen   <- newTVarIO 0
     lintFpRef <- newIORef (lintFingerprint ed0Px)
     lintAvRef <- newIORef (edLintAvail ed0Px)
@@ -222,7 +223,7 @@ runTui cfg cfgWarns files readOnly statsOnExit restoreFlag = do
     vecDrv <- newVecDrv
     imgDecRef <- newIORef Nothing
     let drv = Drv loadQ searchQ searchGen defGen dirMtimes focused recentsRef sessionRef quickGen
-                  capsRef pointerRef themeRef gfxRef gfxProbeRef gfxProbedRef gfxTmpRef
+                  capsRef pointerRef themeRef gfxRef gfxProbeRef gfxProbedRef gfxTmpRef renderCacheRef
                   lintGen lintFpRef lintAvRef lintRunRef
                   lintLastRef journalDir journalsRef journalFpRef journalWarnRef
                   journalLastRef journalRunRef journalGate stats jobsRef vecDrv imgDecRef
@@ -934,6 +935,8 @@ data Drv = Drv
       --   @(nextBatchId, totalBytes, entries)@ where each entry is
       --   @(batchId, kind, name, byteLen)@. Unlinked on exit; older batches
       --   evict once the ring exceeds 256 entries or 64 MiB.
+  , drvRenderCache :: !(IORef RenderCache)
+      -- ^ Pure viewport row cache threaded across consecutive frames (plan 0042).
   , drvLintGen   :: !(TVar Int)       -- ^ id of the newest lint pass; a stale runner's result is dropped.
   , drvLintFp    :: !(IORef LintFp)   -- ^ Last-seen lint fingerprint; the debounce arms when it changes.
   , drvLintAvail :: !(IORef LintAvail) -- ^ Driver copy of detected linters (the runner reads it; the editor's copy drives the pure side).
@@ -4369,9 +4372,11 @@ renderNow drv editorRef prevRef titleRef = do
   caps <- readIORef (drvCaps drv)
   -- Refresh the highlight-state cache and keep the refreshed editor, so the
   -- lexer states computed for this frame carry over to the next one.
+  rc0 <- readIORef (drvRenderCache drv)
   let ed = refreshHighlight ed0
-      scr = renderEditor ed
+      !(scr, !rc1) = renderEditorCached rc0 ed
   writeIORef editorRef ed
+  writeIORef (drvRenderCache drv) $! rc1
   -- Theme-matched cursor colour (OSC 12), re-emitted only on theme changes.
   lastTheme <- readIORef (drvTheme drv)
   let theme = resolvedTheme ed

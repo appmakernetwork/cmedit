@@ -121,7 +121,17 @@ in `README.md`; the cross-cutting structure that matters when editing:
   identical printable-ASCII cells → `CSI n b`), gated on `rcRep` because a
   terminal that ignored REP would silently drop cells. The driver wraps every
   frame (diff + title + graphics) in synchronized-output marks (mode 2026)
-  inside `App.renderNow`; unsupporting terminals ignore them.
+  inside `App.renderNow`; unsupporting terminals ignore them. To avoid rebuilding
+  unchanged rows on every keystroke, `renderEditorCached :: RenderCache ->
+  Editor -> (Screen, RenderCache)` caches visible plain-text and word-wrapped
+  row slices (plus cached line widths for the horizontal scrollbar) in a pure
+  `RenderCache` owned by `App` (`drvRenderCache :: IORef RenderCache`), with
+  direct-write cell expansion (`expandLineCellsInto`) and pre-remapped rows for
+  forced-background themes; `renderEditor` stays as the uncached oracle.
+  **Theme remap contract:** any theme setting `thRemap = Just f` must pass
+  cells whose `fg` and `bg` are both `ColorRGB`/`Color256` through unchanged,
+  be idempotent (`f . f == f`), and map all text-area styles to exact
+  `ColorRGB`/`Color256` colours (verified by `test/RenderCacheSpec.hs`).
 
 - **Terminal capabilities: probe, reply, fold (`Cmedit.Caps`).**
   `App.enterScreen` fires a burst of queries (OSC 11 background, XTWINOPS

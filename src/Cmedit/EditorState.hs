@@ -1334,24 +1334,37 @@ hScrollBarInfo ed = case loHBarRow lo of
     in if trackWidth >= 1 && (totalWidth > viewport || offset > 0)
          then Just (row, x0, trackWidth, totalWidth, offset)
          else Nothing
+  Just _ ->
+    let tabw     = tabWidthOf ed
+        top      = edTop ed
+        h        = loTextHeight lo
+        lastLine = min (lineCount (edBuffer ed) - 1) (top + h - 1)
+        widest   = maximum (0 : [ lineDispWidth tabw (getLine' i (edBuffer ed))
+                                | i <- [top .. lastLine] ])
+    in hScrollBarInfoFor ed lo widest
+  where lo = computeLayout ed
+
+-- | Display width of one buffer line, matching the 4096-char cap used by
+-- 'hScrollBarInfo' so a megabyte-long minified line cannot dominate a frame.
+lineDispWidth :: Int -> Text -> Int
+lineDispWidth tabw ln
+  | T.length ln > 4096 = T.length ln
+  | otherwise          = colToDisplay tabw (T.length ln) ln
+
+-- | Horizontal scrollbar geometry for plain-text mode given a precomputed
+-- @widest@ visible line display width. Shared by 'hScrollBarInfo' and
+-- "Cmedit.Render"'s cached renderer so the thumb math is never duplicated.
+hScrollBarInfoFor :: Editor -> Layout -> Int -> Maybe (Int, Int, Int, Int, Int)
+hScrollBarInfoFor ed lo widest = case loHBarRow lo of
+  Nothing -> Nothing
   Just row ->
     let x0         = loTextLeft lo
         trackWidth = loCols lo - loVBarW lo - x0
         viewport   = loTextWidth lo
-        tabw       = tabWidthOf ed
-        top        = edTop ed
-        h          = loTextHeight lo
-        lastLine   = min (lineCount (edBuffer ed) - 1) (top + h - 1)
-        lineWidth i =
-          let ln = getLine' i (edBuffer ed)
-          in if T.length ln > 4096 then T.length ln
-                                   else colToDisplay tabw (T.length ln) ln
-        widest     = maximum (0 : [ lineWidth i | i <- [top .. lastLine] ])
         totalWidth = max (edLeft ed + viewport) widest
     in if trackWidth >= 1 && (totalWidth > viewport || edLeft ed > 0)
          then Just (row, x0, trackWidth, totalWidth, edLeft ed)
          else Nothing
-  where lo = computeLayout ed
 
 ------------------------------------------------------------------------------
 -- File explorer panel geometry

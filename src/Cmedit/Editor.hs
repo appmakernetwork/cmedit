@@ -282,11 +282,14 @@ module Cmedit.Editor
     -- * Queries used by the renderer
   , getSelection
   , currentLine
+  , liveFindTerm
   , liveMatchSpans
   , liveCellMatch
   , bracketPair
   , scrollBarInfo
   , hScrollBarInfo
+  , hScrollBarInfoFor
+  , lineDispWidth
   , scrollThumb
   , StatusZone(..)
   , statusRightInfo

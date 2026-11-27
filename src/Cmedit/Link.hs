@@ -45,7 +45,10 @@ urlSpansIn from to line
       in [ (a + lo, b + lo, u) | (a, b, u) <- urlSpans seg ]
 
 urlSpans :: Text -> [(Int, Int, Text)]
-urlSpans line = go 0 (T.unpack line)
+urlSpans line
+  -- Fast no-allocation pre-check: both recognised schemes contain "://".
+  | not (T.isInfixOf "://" line) = []
+  | otherwise                    = go 0 (T.unpack line)
   where
     go _ [] = []
     go i cs@(_ : rest)

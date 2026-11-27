@@ -22,6 +22,8 @@ Modes:
 | `bench lex2` | `lexLine` cost vs line length, per language | 0002 |
 | `bench frame` | render + diff + emit, scrolling | 0002, 0003 |
 | `bench type` | full driver cycle per keystroke, editor threaded | 0002, 0003 |
+| `bench cached` | the same cycles through `renderEditorCached` (typing, scrolling, all-miss overhead, wrap), distinct lines | 0042 |
+| `bench scroll` | uncached scrolling with the editor threaded: the like-for-like baseline for `cached` | 0042 |
 | `bench decomp` | where a frame's time/allocation goes | 0003 |
 | `bench edit2` | `update` cost vs file size | index ("checked and healthy") |
 | `bench wrap` | word-wrap vs horizontal-scroll paths | index ("checked and healthy") |
