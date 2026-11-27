@@ -30,6 +30,10 @@ module Cmedit.Gfx
   , kittyClientAnim
   , kittyClientAnimPayload
   , kittySwapFrame
+  , kittyTransmit
+  , kittyPlaceAt
+  , kittyDeletePlacements
+  , kittyDeleteImage
   , sixelPlace
     -- * Encoders (exposed for tests)
   , base64B
@@ -308,6 +312,45 @@ kittySwapFrame (row, col) (cols, rows) mprev cur =
     <> moveTo row col
     <> apc (string7 "Ga=p,q=2,i=" <> intDec cur
               <> string7 ",c=" <> intDec cols <> string7 ",r=" <> intDec rows)
+
+-- | Upload an image under id @i@ without placing it (@a=t@): the PDF
+-- fit-width layout uploads each band of a page once and then only moves its
+-- placements ('kittyPlaceAt') as the view scrolls.
+kittyTransmit :: Int -> (Int, Int) -> KittyPayload -> Builder
+kittyTransmit i (pxW, pxH) payload = case payload of
+  KpRaw bs -> emitChunks (hdr mempty) bs
+  KpZlib zbs -> emitChunks (hdr (string7 ",o=z")) zbs
+  KpLocal tc name ->
+    apc (string7 "Ga=t,f=32,t=" <> char7 tc <> string7 ",q=2,i=" <> intDec i
+           <> string7 ",s=" <> intDec pxW <> string7 ",v=" <> intDec pxH
+           <> char7 ';' <> base64B (TE.encodeUtf8 (T.pack name)))
+  where
+    hdr extra first m
+      | first = string7 "Ga=t,f=32,q=2,i=" <> intDec i <> extra
+                  <> string7 ",s=" <> intDec pxW <> string7 ",v=" <> intDec pxH
+                  <> string7 ",m=" <> intDec m
+      | otherwise = string7 "Gm=" <> intDec m
+
+-- | Place (or move: same image and placement id) the source rectangle
+-- @(x, y, w, h)@ of uploaded image @i@ at cell @(row, col)@, offset @(ox,
+-- oy)@ pixels into that cell, at its native size (no @c@/@r@: one image
+-- pixel per screen pixel), on layer @z@. The cursor does not move (@C=1@).
+kittyPlaceAt :: Int -> Int -> (Int, Int) -> (Int, Int) -> (Int, Int, Int, Int) -> Int -> Builder
+kittyPlaceAt i p (row, col) (ox, oy) (x, y, w, h) z =
+  moveTo row col
+    <> apc (string7 "Ga=p,q=2,C=1,i=" <> intDec i <> string7 ",p=" <> intDec p
+              <> string7 ",x=" <> intDec x <> string7 ",y=" <> intDec y
+              <> string7 ",w=" <> intDec w <> string7 ",h=" <> intDec h
+              <> string7 ",X=" <> intDec ox <> string7 ",Y=" <> intDec oy
+              <> string7 ",z=" <> intDec z)
+
+-- | Remove image @i@'s placements, keeping its pixels resident.
+kittyDeletePlacements :: Int -> Builder
+kittyDeletePlacements i = apc (string7 "Ga=d,d=i,q=2,i=" <> intDec i)
+
+-- | Remove image @i@ and free its pixels.
+kittyDeleteImage :: Int -> Builder
+kittyDeleteImage i = apc (string7 "Ga=d,d=I,q=2,i=" <> intDec i)
 
 -- | Place raw RGBA pixels as a sixel graphic at @(row, col)@. The terminal
 -- paints the pixels over that region at its own cell raster; the caller

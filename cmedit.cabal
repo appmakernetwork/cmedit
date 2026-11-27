@@ -107,6 +107,7 @@ library
                       Cmedit.PdfRenderFont
                       Cmedit.PdfRenderShade
                       Cmedit.PdfRender
+                      Cmedit.PdfStrip
                       Cmedit.Docx
                       Cmedit.Xlsx
                       Cmedit.Formula
@@ -156,6 +157,8 @@ test-suite cmedit-test
                       SvgSpec
                       SvgViewSpec
                       PdfViewSpec
+                      PdfSelectSpec
+                      PdfStripSpec
                       PdfRenderSpec
                       GfxTransportSpec
                       RenderCacheSpec

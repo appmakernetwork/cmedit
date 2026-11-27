@@ -26,6 +26,8 @@ import PdfImageSpec (pdfImageSpec)
 import SvgSpec (svgSpec)
 import SvgViewSpec (svgViewSpec)
 import PdfViewSpec (pdfViewSpec)
+import PdfSelectSpec (pdfSelectSpec)
+import PdfStripSpec (pdfStripSpec)
 import PdfRenderSpec (pdfRenderSpec)
 import GfxTransportSpec (gfxTransportSpec)
 import RenderCacheSpec (renderCacheSpec)
@@ -8809,7 +8811,7 @@ main = do
 
     -- settingsSpec / applySettingRow position sync (extends the settings tests).
     checkEq "settingsSpec has editing + master + per-linter rows"
-      (length settingsSpec) (17 + length linters)
+      (length settingsSpec) (19 + length linters)
     check "applySettingRow round-trips every spec row to its default"
       (and [ edConfig (applySettingRow k (ixOf defaultConfig) ed0) == defaultConfig
            | (k, (_, _, _, ixOf, _)) <- zip [0 ..] settingsSpec ])
@@ -8923,16 +8925,16 @@ main = do
 
     -- Master toggle off clears diagnostics everywhere (no future pass will).
     let edDirty = edLR { edDiags = [d0] }                 -- active + zipper both carry diags
-        edMOff  = applySettingRow 16 0 edDirty            -- row 16 = Linting master, 0 = off
+        edMOff  = applySettingRow 18 0 edDirty            -- row 18 = Linting master, 0 = off
     check "master lint off clears active diags" (null (edDiags edMOff))
     check "master lint off clears zipper diags"
       (all (null . docDiags) (edBefore edMOff ++ edAfter edMOff))
-    check "master lint on keeps diags" (edDiags (applySettingRow 16 1 edDirty) == [d0])
+    check "master lint on keeps diags" (edDiags (applySettingRow 18 1 edDirty) == [d0])
 
     -- lintersDetected refreshes an open Settings dialog's per-linter notes.
     let edSettingsNone = openSettings ed0                 -- edLintAvail all Nothing
         edSettingsAv = lintersDetected availAll edSettingsNone
-        ruffRow d = dlgChoices d !! 17                     -- master at 16, ruff (linters!!0) at 17
+        ruffRow d = dlgChoices d !! 19                     -- master at 18, ruff (linters!!0) at 19
     check "settings shows not-installed note before detection"
       (maybe False (\d -> maybe False (T.isInfixOf (T.pack "\x2717")) (chNote (ruffRow d)))
              (edDialog edSettingsNone))
@@ -10125,6 +10127,8 @@ main = do
   svgSpec check
   svgViewSpec check
   pdfViewSpec check
+  pdfSelectSpec check
+  pdfStripSpec check
   pdfRenderSpec check
   gfxTransportSpec check
   renderCacheSpec check

@@ -84,7 +84,10 @@ import Cmedit.Raster (RenderStats(..))
 import Cmedit.Scene (Scene(..))
 import Cmedit.Svg (SvgEnv(..), defaultSvgEnv, parseSvgText, svgFontQueries, svgExternalRefs, sniffSvg)
 import Cmedit.SvgTree (decodeSvgBytes)
-import Cmedit.VecView (VecDoc(..), VecKey(..), SceneSize, rasterVec, rasterNoteList, measureScene, imageRGBA, keepPreviousPlacement)
+import Cmedit.VecView (VecDoc(..), VecKey(..), SceneSize, rasterVec, rasterNoteList, measureScene, imageRGBA, keepPreviousPlacement, vecBudget, vecDims, vecTruncatedText)
+import Cmedit.Geom (Rect(..))
+import Cmedit.PdfStrip (StripGeom(..), Piece(..), TileKey(..), TileBits(..), HlRect(..))
+import qualified Cmedit.PdfStrip as St
 import Cmedit.Pager (PagerDoc(..))
 import qualified Cmedit.Pager as Pg
 import Cmedit.Pdf (PdfDoc(..))
@@ -200,7 +203,7 @@ runTui cfg cfgWarns files readOnly statsOnExit restoreFlag = do
     _ <- persistSession ed0Px
     quickGen  <- newTVarIO 0
     capsRef   <- newIORef defaultCaps
-    pointerRef <- newIORef "default"
+    pointerRef <- newIORef ("default", Nothing)
     themeRef  <- newIORef (Nothing :: Maybe ThemeName)
     gfxRef    <- newIORef (Nothing :: Maybe GfxKey)
     gfxProbeRef  <- newIORef Nothing
@@ -924,7 +927,10 @@ data Drv = Drv
   , drvSession   :: !(IORef SessionShape) -- ^ The session shape as last persisted; a change rewrites the file.
   , drvQuickGen  :: !(TVar Int)       -- ^ id of the newest quick-open walk (independent of searches).
   , drvCaps      :: !(IORef TermCaps) -- ^ What the startup probes learned about the terminal.
-  , drvPointer   :: !(IORef String)   -- ^ The last OSC 22 pointer shape emitted (hover hint).
+  , drvPointer   :: !(IORef (String, Maybe MouseEvent))
+      -- ^ The last OSC 22 pointer shape emitted (hover hint), and the last
+      --   mouse event, so a key that changes what a drag would do (S, W, a
+      --   zoom) re-shapes the pointer where it already is.
   , drvTheme     :: !(IORef (Maybe ThemeName)) -- ^ The theme whose cursor colour (OSC 12) is current.
   , drvGfx       :: !(IORef (Maybe GfxKey))    -- ^ The pixel-image placement currently on screen, if any.
   , drvGfxProbe  :: !(IORef (Maybe (KittyLocalKind, String, Double)))
@@ -1016,6 +1022,8 @@ data JobKind = JSearch | JDefs | JQuickOpen | JLoad | JReplace | JJournal
              | JPdfPrefetch -- ^ A neighbouring page → scene, while the view is idle.
              | JVecGfxPrefetch -- ^ The next page's overlay raster, while the view is idle.
              | JImgDecode  -- ^ A finer decode of a reduced JPEG, for a zoom that needs it.
+             | JStripTile !Int -- ^ One band of a page for the PDF fit-width layout (several slots run at once).
+             | JPdfGlyphs  -- ^ A PDF page's positioned characters, for the select tool.
   deriving (Eq, Ord, Show)
 
 -- | The driver's half of the vector-picture view (plan 0034). Everything here
@@ -1037,7 +1045,33 @@ data VecDrv = VecDrv
   , vdrPrefetch :: !(IORef (Maybe PageWant))  -- ^ The neighbouring-page parse in flight.
   , vdrGfxPre   :: !(IORef (Maybe VecKey))    -- ^ The next page's overlay raster in flight.
   , vdrWheelAt  :: !(IORef Double)            -- ^ When the wheel last turned a PDF page (rate limit).
+  , vdrTiles    :: !(IORef (M.Map Int TileKey)) -- ^ The fit-width layout's band jobs in flight, by slot.
+  , vdrStrip    :: !(IORef StripOut)            -- ^ What the fit-width layout has put on the terminal.
+  , vdrGlyphs   :: !(IORef (Maybe PageWant))     -- ^ The character extraction in flight.
   }
+
+-- | The terminal's side of the PDF fit-width layout and of the select
+-- tool's highlight layer: which bands are uploaded (kitty image ids), where
+-- each is placed now, what composite was last sent (sixel, or kitty without
+-- a known cell size), and the highlight layer on screen. Every frame
+-- compares what it wants against this and emits only the difference, which
+-- for a scroll step on kitty is a few dozen bytes per band.
+data StripOut = StripOut
+  { soIds    :: !(M.Map TileKey Int)
+  , soPlaced :: !(M.Map Int ((Int, Int), (Int, Int), (Int, Int, Int, Int)))
+  , soNextId :: !Int
+  , soFrame  :: !(Maybe String)   -- ^ The composite's identity (shown), when one is up.
+  , soHl     :: !(Maybe [HlRect]) -- ^ The highlight layer's rectangles (absolute device pixels), when one is up.
+  , soHlUp   :: !Bool             -- ^ The highlight swatches are uploaded.
+  }
+
+emptyStripOut :: StripOut
+emptyStripOut = StripOut M.empty M.empty stripFirstId Nothing Nothing False
+
+-- | Kitty image ids of the fit-width layout's bands (the single-picture
+-- overlay is id 1, a client-driven animation 1..n), and of the highlight.
+stripFirstId :: Int
+stripFirstId = 100000
 
 -- | Worker-side compression cache for a vector overlay raster: distinguishes
 -- "not tried yet" from "tried and incompressible" so the UI thread never
@@ -1064,7 +1098,7 @@ newVecDrv = do
   VecDrv fp <$> newIORef Nothing <*> newIORef Nothing <*> newIORef Nothing
             <*> newIORef [] <*> newIORef 0
             <*> newIORef Nothing <*> newIORef Nothing <*> newIORef Nothing
-            <*> newIORef 0
+            <*> newIORef 0 <*> newIORef M.empty <*> newIORef emptyStripOut <*> newIORef Nothing
 
 -- | What the driver watches to decide a fresh lint pass is due: the active
 -- document path, its edit counter, and the linting configuration/availability.
@@ -1097,6 +1131,10 @@ data GfxKey = GfxKey
   , gkKind :: !GfxKind
   , gkScene :: !Int                     -- ^ A vector picture's scene id (0 for a bitmap): a re-parse re-places.
   , gkDen   :: !Int                     -- ^ The bitmap's decode scale ('idDen'): a refined decode re-places.
+  , gkHl    :: ![HlRect]                -- ^ Sixel only: highlights burned into the payload
+                                        --   (absolute device pixels): the rubber band of a
+                                        --   drag, the PDF select tool's lines. Kitty draws
+                                        --   them as a layer of their own ('hlOverlay').
   , gkFrame :: !Int                     -- ^ Displayed animation frame. Static under
                                         --   real kitty (the terminal loops natively);
                                         --   the editor's tick steps it elsewhere —
@@ -1178,6 +1216,12 @@ data SearchMsg
   | SMPageParsed !PageWant !Int !Bool !(Either String (Scene, SceneSize, [String]))
       -- ^ A PDF page's scene: the request, its scene id, drawn before fonts
       --   were known, the scene and its notes.
+  | SMPageGlyphs !PageWant ![Pdf.PdfGlyph]
+      -- ^ A PDF page's positioned characters, for the select tool (empty
+      --   when there are none or they could not be read).
+  | SMStripTile !TileKey !(Maybe TileBits) !Bool
+      -- ^ A band of the fit-width layout (Nothing: it could not be drawn),
+      --   and whether its drawing ran out of budget.
       -- ^ An overlay raster finished, as the RGBA payload to place.
   | SMImgDecoded !ImgWant !(Either String Image)
       -- ^ A finer JPEG decode finished (or why there is none).
@@ -1521,6 +1565,14 @@ eventLoop editorRef prevRef titleRef q drv _src = do
         atomicModifyIORef' (vdrPage v) (\cur -> (if cur == Just w then Nothing else cur, ()))
         atomicModifyIORef' (vdrPrefetch v) (\cur -> (if cur == Just w then Nothing else cur, ()))
         modifyIORef' editorRef (pdfPageParsed w sid fontless res)
+      SMPageGlyphs w glyphs -> do
+        atomicModifyIORef' (vdrGlyphs (drvVec drv)) (\cur -> (if cur == Just w then Nothing else cur, ()))
+        modifyIORef' editorRef (pdfGlyphsArrived w glyphs)
+      SMStripTile k res cut -> do
+        let v = drvVec drv
+        atomicModifyIORef' (vdrTiles v) (\m -> (M.filter (/= k) m, ()))
+        modifyIORef' editorRef (pdfTileRendered k res)
+        when cut $ modifyIORef' editorRef (setStatus (T.pack vecTruncatedText))
       -- A finished write-behind pass. The model is told which journals now
       -- hold which version, so a document edited while its journal was being
       -- written stays stale and is rewritten by the next tick.
@@ -1552,6 +1604,8 @@ eventLoop editorRef prevRef titleRef q drv _src = do
       SMVecCells {}   -> True
       SMVecGfx {}     -> True
       SMPageParsed {} -> True
+      SMStripTile {}  -> True
+      SMPageGlyphs {} -> True
       SMImgDecoded {} -> True
       SMFontsReady    -> True
       _               -> False
@@ -1669,17 +1723,6 @@ eventLoop editorRef prevRef titleRef q drv _src = do
         applyBatch ks
       _ -> do
         bump stKeys drv
-        -- Hover feedback: suggest a pointer shape for whatever the mouse is
-        -- over (emitted only on transitions; ignored by plain terminals).
-        case k of
-          KMouse me -> do
-            ed <- readIORef editorRef
-            let shape = pointerShapeAt me ed
-            old <- readIORef (drvPointer drv)
-            when (shape /= old) $ do
-              writeIORef (drvPointer drv) shape
-              emit (setPointerShape shape)   -- flushed with the batch's repaint
-          _ -> pure ()
         ed <- readIORef editorRef
         -- A wheel notch that would turn a PDF page (the page view at the
         -- fit, no Ctrl) is held to one turn per 'wheelPageGapS': a trackpad
@@ -1695,6 +1738,18 @@ eventLoop editorRef prevRef titleRef q drv _src = do
          let (ed1, effs) = update k ed
          ed2 <- performEffects drv effs ed1
          writeIORef editorRef ed2
+         -- Hover feedback: the pointer shape for whatever the mouse is over,
+         -- in the state this event left (a press that starts a pan is already
+         -- a grabbing hand), re-asked after keys too, at the last place the
+         -- mouse was. Emitted only on transitions; plain terminals ignore it.
+         (old, lastMe) <- readIORef (drvPointer drv)
+         let me' = case k of KMouse me -> Just me; _ -> lastMe
+         case me' of
+           Just me -> do
+             let shape = pointerShapeAt me ed2
+             writeIORef (drvPointer drv) (shape, me')
+             when (shape /= old) $ emit (setPointerShape shape)   -- flushed with the batch's repaint
+           Nothing -> pure ()
          if edQuit ed2 then pure False else applyBatch ks
 
 ------------------------------------------------------------------------------
@@ -2406,6 +2461,85 @@ vectorUpkeep drv editorRef = do
   when (edVecGfxReady ed /= ready) $
     modifyIORef' editorRef (\e -> e { edVecGfxReady = ready })
   pdfPageUpkeep drv editorRef caps ready
+  stripUpkeep drv editorRef
+  glyphUpkeep drv editorRef
+
+-- | The select tool's characters for the page(s) on screen
+-- ('pdfGlyphWant'): a second pass over the page's content, so it runs on a
+-- job of its own after the picture's parse, never delaying a page turn.
+glyphUpkeep :: Drv -> IORef Editor -> IO ()
+glyphUpkeep drv editorRef = do
+  ed <- readIORef editorRef
+  let v = drvVec drv
+  pend <- readIORef (vdrGlyphs v)
+  parsing <- readIORef (vdrPage v)
+  case pdfGlyphWant ed of
+    Just w | isNothing parsing, pend /= Just w ->
+      case edPdf ed >>= \pd -> Pdf.pdfPageSource pd (pwPage w) of
+        Nothing -> modifyIORef' editorRef (pdfGlyphsArrived w [])
+        Just (file, dict) -> do
+          let post gs = atomically (writeTQueue (drvSearchQ drv) (SMPageGlyphs w gs))
+          startJob drv JPdfGlyphs $ guardJob (const (post [])) $ do
+            r <- trySync $ do
+              let gs = Pdf.pdfPageGlyphs file dict
+              _ <- evaluate (foldl' (\acc gl -> acc + Pdf.pgX0 gl + fromIntegral (T.length (Pdf.pgText gl))) (0 :: Double) gs)
+              pure gs
+            post (either (const []) id r)
+          writeIORef (vdrGlyphs v) (Just w)
+    Just _ -> pure ()
+    Nothing -> when (isJust pend) $ do
+      writeIORef (vdrGlyphs v) Nothing
+      cancelJob drv JPdfGlyphs
+
+-- | The PDF fit-width layout's bands: the most wanted ones ('pdfTileWants':
+-- on screen first, then below, then above) on a few job slots at once (one
+-- band is 20–250 ms, and the first screen is several), each slot cancelled
+-- as soon as its band falls out of the wanted window, so a fast scroll
+-- never queues work for pages already left behind.
+stripUpkeep :: Drv -> IORef Editor -> IO ()
+stripUpkeep drv editorRef = do
+  ed <- readIORef editorRef
+  let v = drvVec drv
+  n <- stripSlots
+  slots <- readIORef (vdrTiles v)
+  let wants = take (3 * n) (pdfTileWants ed)
+      wantKeys = map fst wants
+  forM_ (M.toList slots) $ \(slot, k) -> when (k `notElem` wantKeys) $ do
+    cancelJob drv (JStripTile slot)
+    modifyIORef' (vdrTiles v) (M.delete slot)
+  slots' <- readIORef (vdrTiles v)
+  let inflight = M.elems slots'
+      free = [ i | i <- [0 .. n - 1], M.notMember i slots' ]
+      todo = [ w | w@(k, _) <- wants, k `notElem` inflight ]
+  forM_ (zip free todo) $ \(slot, (k, sc)) -> startStripTile drv slot k sc
+
+-- | Band jobs that may run at once: the capabilities beside the UI thread's,
+-- at most three.
+stripSlots :: IO Int
+stripSlots = do
+  c <- getNumCapabilities
+  pure (max 1 (min 3 (c - 1)))
+
+-- | Rasterise one band off the event-loop thread, its RGBA forced (and,
+-- for a remote kitty that takes compressed payloads, compressed) here.
+startStripTile :: Drv -> Int -> TileKey -> Scene -> IO ()
+startStripTile drv slot k sc = do
+  let v = drvVec drv
+      post r = atomically (writeTQueue (drvSearchQ drv) (SMStripTile k (fmap fst r) (maybe False snd r)))
+  startJob drv (JStripTile slot) $ guardJob (const (post Nothing)) $ do
+    caps <- readIORef (drvCaps drv)
+    r <- trySync $ case St.renderTile vecBudget sc k of
+      Nothing -> pure Nothing
+      Just (tb, st) -> do
+        _ <- evaluate (BS.length (tbRGBA tb))
+        z <- if tcKittyGfx caps && not (tcKittyShm caps) && tcKittyZlib caps && BS.length (tbRGBA tb) >= 16384
+               then case zlibCompressFast (tbRGBA tb) of
+                      Just zb -> Just <$> evaluate zb
+                      Nothing -> pure Nothing
+               else pure Nothing
+        pure (Just (tb { tbZlib = z }, rsExhausted st))
+    post (either (const Nothing) id r)
+  modifyIORef' (vdrTiles v) (M.insert slot k)
 
 -- | The bitmap image view's half of the upkeep: a finer decode of a reduced
 -- JPEG when the view needs one ('imageRefineWant'), unless that request is
@@ -2480,9 +2614,10 @@ pdfPageUpkeep drv editorRef caps gfxReady = do
   let promoted = isJust pendF && pendF == want
       busy = isJust pendP' || isJust pendC || isJust pendG || promoted
              || (imageOverlayWanted ed && not gfxReady)
+             || (pageStripOn ed && not (stripScreenReady ed))
       stillWanted w = case edPdfView ed of
         Just pv -> pageViewOn ed && edPath ed == Just (pwPath w) && pvEpoch pv == pwEpoch w
-                     && abs (pwPage w - pvPage pv) <= 1
+                     && pdfPageNear ed (pwPage w)
                      && isNothing (lookup (pwPage w) (pvScenes pv))
         Nothing -> False
   case pendF of
@@ -4392,8 +4527,24 @@ renderNow drv editorRef prevRef titleRef = do
   -- Pixel-image overlay (kitty graphics / sixel), when the terminal supports
   -- one and the image view is unobstructed; re-placed only when its identity
   -- changes or a full redraw invalidated the terminal's copy.
-  overlay <- gfxOverlay drv caps ed (isNothing prev)
-  let (overlayPart, cursorFix) = case overlay of
+  gkBefore <- readIORef (drvGfx drv)
+  overlay0 <- gfxOverlay drv caps ed (isNothing prev)
+  gkAfter <- readIORef (drvGfx drv)
+  -- The PDF fit-width layout's bands, then the highlight layer (a drag's
+  -- rubber band, the select tool's lines) over whichever picture is up.
+  -- Either is told when the single-picture overlay just deleted every image.
+  -- (an animation's placement swap deletes nothing; every other placement
+  -- the single-picture overlay emits starts with a delete-all)
+  let swapOnly = case (gkBefore, gkAfter) of
+        (Just a, Just b) -> a { gkFrame = gkFrame b } == b
+        _ -> False
+      wiped = isNothing prev || (isJust overlay0 && not swapOnly)
+  stripPart <- stripOverlay drv caps ed wiped
+  hlPart <- hlOverlay drv caps ed wiped
+  let overlay = case (overlay0, stripPart, hlPart) of
+        (Nothing, Nothing, Nothing) -> Nothing
+        _ -> Just (fromMaybe mempty overlay0 <> fromMaybe mempty stripPart <> fromMaybe mempty hlPart)
+      (overlayPart, cursorFix) = case overlay of
         Nothing -> (mempty, mempty)
         Just b  ->
           -- Graphics emission moves the terminal cursor; restore the frame's.
@@ -4463,6 +4614,245 @@ gfxOverlay drv caps ed fullRedraw = do
           writeIORef (drvGfx drv) (Just key)
           Just <$> placeGfxIO drv caps ed key prevFrame
 
+-- | The cell pixel size the overlay geometry uses (8×16 when unknown).
+overlayCellPx :: Editor -> (Int, Int)
+overlayCellPx = stripCellPx
+
+-- | The highlights over the single picture (an image, an SVG, a PDF page
+-- fitted in the window), in absolute device pixels: the rubber band of a
+-- drag in progress (a zoom drag anywhere, the PDF select tool's), and the
+-- PDF select tool's selected lines. Only while that picture's pixels are up:
+-- otherwise the cells draw them ('Cmedit.Render').
+pictureHighlights :: TermCaps -> Editor -> [HlRect]
+pictureHighlights caps ed
+  | pageStripOn ed || not (imageOverlayWanted ed) = []
+  | otherwise = case activePicture ed of
+      Nothing -> []
+      Just pic ->
+        let lo = computeLayout ed
+            (cw, ch) = overlayCellPx ed
+            lw = if cw >= 14 then 2 else 1
+            cellBox (ar, ac, br, bc) =
+              let r0 = min ar br; r1 = max ar br; c0 = min ac bc; c1 = max ac bc
+              in Rect (fromIntegral ((loTextLeft lo + c0) * cw)) (fromIntegral ((loTextTop lo + r0) * ch))
+                      (fromIntegral ((loTextLeft lo + c1 + 1) * cw)) (fromIntegral ((loTextTop lo + r1 + 1) * ch))
+            moved (ar, ac, br, bc) = (ar, ac) /= (br, bc)
+            band = [ HlRect (cellBox b) bandRGB 0.9 lw
+                   | Just b <- [idDrag pic, edPdfView ed >>= pvBox], moved b ]
+            -- The placement's cell box, computed here as 'vecGfxTarget' does
+            -- but not through it: 'wantGfx' asks this function for the sixel
+            -- key's highlights, and 'vecGfxTarget' asks 'wantGfx'.
+            kind = if tcKittyGfx caps then GfxKitty else GfxSixel
+            crop@(_, _, cropW, cropH) = imageCrop pic
+            px = case cellPxKey ed of (0, 0) -> (8, 16); p -> p
+            fills = case idVec pic of
+              Just vd | pageViewOn ed ->
+                let (row, col, cols, rows, _, _) =
+                      gfxFitVector kind px (loTextTop lo, loTextLeft lo, loTextWidth lo, loTextHeight lo) (cropW, cropH)
+                    (cx, cy, cwv, chv) = crop
+                    (vw, vh) = vecDims (vdSize vd)
+                    (sw, sh) = vdSize vd
+                    bx = fromIntegral (col * cw); by = fromIntegral (row * ch)
+                    bw = fromIntegral (cols * cw); bh = fromIntegral (rows * ch)
+                    fx x = bx + (x * fromIntegral vw / sw - fromIntegral cx) / fromIntegral (max 1 cwv) * bw
+                    fy y = by + (y * fromIntegral vh / sh - fromIntegral cy) / fromIntegral (max 1 chv) * bh
+                in [ HlRect (Rect (fx x0) (fy y0) (fx x1) (fy y1)) selFillRGB 0.35 0
+                   | (k, Rect x0 y0 x1 y1) <- pdfSelHighlights ed, Just k == fmap pvPage (edPdfView ed) ]
+              _ -> []
+        in clipHighlights ed (fills ++ band)
+
+-- Hold highlights to the text area (a selected line scrolled half off the
+-- top must not draw over the menu bar, nor a placement reach past the
+-- screen's last row and scroll it).
+clipHighlights :: Editor -> [HlRect] -> [HlRect]
+clipHighlights ed hls =
+  let lo = computeLayout ed
+      (cw, ch) = overlayCellPx ed
+      ax0 = fromIntegral (loTextLeft lo * cw); ay0 = fromIntegral (loTextTop lo * ch)
+      ax1 = ax0 + fromIntegral (loTextWidth lo * cw); ay1 = ay0 + fromIntegral (loTextHeight lo * ch)
+      clip hr = let Rect x0 y0 x1 y1 = hrRect hr
+                    r = Rect (max ax0 x0) (max ay0 y0) (min ax1 x1) (min ay1 y1)
+                in if rectOk r then Just hr { hrRect = r } else Nothing
+      rectOk (Rect x0 y0 x1 y1) = x1 - x0 >= 1 && y1 - y0 >= 1
+  in mapMaybe clip hls
+
+-- | Burn highlights (absolute device pixels) into a sixel payload placed at
+-- cell @(row, col)@: sixel has no layers, so the outline and the tint are
+-- part of the picture, and a moving drag re-sends it.
+burnHighlights :: Editor -> (Int, Int) -> (Int, Int) -> [HlRect] -> BS.ByteString -> BS.ByteString
+burnHighlights _ _ _ [] bs = bs
+burnHighlights ed (row, col) (pxW, pxH) hls bs =
+  let (cw, ch) = overlayCellPx ed
+      ox = fromIntegral (col * cw); oy = fromIntegral (row * ch)
+      shift hr = let Rect x0 y0 x1 y1 = hrRect hr in hr { hrRect = Rect (x0 - ox) (y0 - oy) (x1 - ox) (y1 - oy) }
+  in St.tintRGBA pxW pxH (map shift hls) bs
+
+-- | Kitty images of the highlight layer: three solid swatches uploaded
+-- once, from which every outline and fill is cut as a source rectangle at
+-- its exact pixel size, so drawing a rubber band per mouse motion is a few
+-- placements (a couple of hundred bytes), never an image.
+hlLineH, hlLineV, hlFillImg :: Int
+hlLineH = 99997
+hlLineV = 99996
+hlFillImg = 99995
+
+hlSwatches :: [(Int, (Int, Int), (Word8, Word8, Word8), Double)]
+hlSwatches =
+  [ (hlLineH, (4096, 4), bandRGB, 0.9)
+  , (hlLineV, (4, 4096), bandRGB, 0.9)
+  , (hlFillImg, (256, 64), selFillRGB, 0.35) ]
+
+-- | The highlight layer on kitty: whatever 'pictureHighlights' or (for the
+-- fit-width layout) 'stripHighlights' wants, placed from the swatches, only
+-- when it changes. Sixel burns them into its payload instead, and with no
+-- known cell size the layer is not drawn (its pixels could not be placed).
+hlOverlay :: Drv -> TermCaps -> Editor -> Bool -> IO (Maybe Builder)
+hlOverlay drv caps ed wiped = do
+  let v = drvVec drv
+  so0 <- readIORef (vdrStrip v)
+  let so = if wiped then so0 { soHl = Nothing, soHlUp = False } else so0
+      -- (gone already after a delete-all; after a full redraw maybe not)
+      pre = if wiped && soHlUp so0 then foldMap (\(i, _, _, _) -> kittyDeleteImage i) hlSwatches else mempty
+      lo = computeLayout ed
+      (cw, ch) = overlayCellPx ed
+      kittyOk = tcKittyGfx caps && isJust (edCellPx ed)
+      want
+        | not kittyOk = []
+        | pageStripOn ed = if stripOverlayActive ed && stripKittyTiles caps ed
+                             then clipHighlights ed [ hr { hrRect = absR (hrRect hr) } | hr <- stripHighlights ed ]
+                             else []
+        | otherwise = pictureHighlights caps ed
+      absR (Rect x0 y0 x1 y1) = let ox = fromIntegral (loTextLeft lo * cw); oy = fromIntegral (loTextTop lo * ch)
+                                in Rect (x0 + ox) (y0 + oy) (x1 + ox) (y1 + oy)
+      prev = fromMaybe [] (soHl so)
+  if want == prev && (isJust (soHl so) || null want)
+    then writeIORef (vdrStrip v) so >> pure (if wiped && soHlUp so0 then Just pre else Nothing)
+    else do
+      let clear = if null prev then mempty else foldMap (\(i, _, _, _) -> kittyDeletePlacements i) hlSwatches
+      up <- if soHlUp so || null want then pure mempty else do
+        batchId <- beginGfxBatch drv
+        fmap mconcat $ forM hlSwatches $ \(i, (w, h), rgb, a) -> do
+          let bytes = St.highlightImage w h [HlRect (Rect 0 0 (fromIntegral w) (fromIntegral h)) rgb a 0]
+          pay <- encodeKittyFrame drv batchId caps bytes ZlibUntried
+          pure (kittyTransmit i (w, h) pay)
+      let pieces = concat (zipWith hlPieces [1 ..] want)
+          places = mconcat [ kittyPlaceAt i pid (y `div` ch, x `div` cw) (x `mod` cw, y `mod` ch) (0, 0, w, h) 1
+                           | (pid, (i, x, y, w, h)) <- zip [1 ..] pieces ]
+      writeIORef (vdrStrip v) so { soHl = if null want then Nothing else Just want
+                                 , soHlUp = soHlUp so || not (null want) }
+      pure (Just (pre <> clear <> up <> places))
+  where
+    -- one highlight as swatch cuts: (image, x, y, w, h) in device pixels
+    hlPieces :: Int -> HlRect -> [(Int, Int, Int, Int, Int)]
+    hlPieces _ hr =
+      let Rect fx0 fy0 fx1 fy1 = hrRect hr
+          x0 = floor fx0; y0 = floor fy0; x1 = ceiling fx1; y1 = ceiling fy1
+          lw = hrOutline hr
+          tileH i x y w h = [ (i, xx, y, min 4096 (x + w - xx), h) | xx <- [x, x + 4096 .. x + w - 1] ]
+          tileV i x y w h = [ (i, x, yy, w, min 4096 (y + h - yy)) | yy <- [y, y + 4096 .. y + h - 1] ]
+          fill = [ (hlFillImg, xx, yy, min 256 (x1 - xx), min 64 (y1 - yy))
+                 | yy <- [y0, y0 + 64 .. y1 - 1], xx <- [x0, x0 + 256 .. x1 - 1] ]
+      in if lw <= 0 then fill
+         else tileH hlLineH x0 y0 (x1 - x0) (min 4 lw) ++ tileH hlLineH x0 (y1 - min 4 lw) (x1 - x0) (min 4 lw)
+              ++ tileV hlLineV x0 (y0 + lw) (min 4 lw) (max 0 (y1 - y0 - 2 * lw))
+              ++ tileV hlLineV (x1 - min 4 lw) (y0 + lw) (min 4 lw) (max 0 (y1 - y0 - 2 * lw))
+
+-- | Does the fit-width layout go to kitty as individually placed bands
+-- (cell size known, so a band can be put at an exact pixel), rather than
+-- as one composite?
+stripKittyTiles :: TermCaps -> Editor -> Bool
+stripKittyTiles caps ed = tcKittyGfx caps && isJust (edCellPx ed)
+
+-- | The PDF fit-width layout on a pixel terminal. On kitty with a known
+-- cell size each band is uploaded once (as its own image id) and placed at
+-- its exact pixel with a source rectangle clipped to the view, so a scroll
+-- step only moves placements; bands that leave the view lose their
+-- placement, and bands the model has dropped are freed. Otherwise (sixel,
+-- or kitty with no cell size to place pixels by) the view is composited
+-- and sent whole when it changes, the highlights burned in. Leaving the
+-- layout deletes everything it put up.
+stripOverlay :: Drv -> TermCaps -> Editor -> Bool -> IO (Maybe Builder)
+stripOverlay drv caps ed wiped = do
+  let v = drvVec drv
+  so0 <- readIORef (vdrStrip v)
+  let so = if wiped then so0 { soIds = M.empty, soPlaced = M.empty, soFrame = Nothing } else so0
+      -- after a delete-all they are gone; after a full redraw they may not be
+      pre = if wiped then foldMap kittyDeleteImage (M.elems (soIds so0)) else mempty
+      teardown = do
+        writeIORef (vdrStrip v) so { soIds = M.empty, soPlaced = M.empty, soFrame = Nothing }
+        pure (Just (pre <> foldMap kittyDeleteImage (M.elems (soIds so))
+              <> (if isJust (soFrame so) && tcKittyGfx caps then kittyDeleteImage 1 else mempty)))
+  case stripState ed of
+    Just (_, pv, g, a, pan) | stripOverlayActive ed, tcKittyGfx caps || tcSixel caps ->
+      let lo = computeLayout ed
+          top = loTextTop lo; left = loTextLeft lo
+          pieces = St.visiblePieces g a
+          keysOf k = [ key | pc <- pieces, pcPage pc == k, key <- St.tilesFor g pan False (stripSceneOf pv) pc 0 (sgViewH g) ]
+          look k = M.lookup k (pvTiles pv)
+      in if stripKittyTiles caps ed
+        then do
+          let (cw, ch) = overlayCellPx ed
+              cl = St.colLeft g pan
+              vis = [ (k, tb, ((top + y0 `div` ch, left + x0 `div` cw), (x0 `mod` cw, y0 `mod` ch), (x0 - sx0, y0 - sy0, x1 - x0, y1 - y0)))
+                    | pc <- pieces, k <- keysOf (pcPage pc), Just tb <- [look k]
+                    , let sx0 = cl + tkX k; sy0 = pcTop pc + tkY k
+                          x0 = max 0 sx0; x1 = min (sgViewW g) (sx0 + tkW k)
+                          y0 = max 0 sy0; y1 = min (sgViewH g) (sy0 + tkH k)
+                    , x1 > x0, y1 > y0 ]
+          -- a composite left over from before the cell size was known
+          let dropComposite = if isJust (soFrame so) then kittyDeleteImage 1 else mempty
+          batchId <- beginGfxBatch drv
+          (ids, next, ups) <- foldM (\(m, n, acc) (k, tb, _) -> case M.lookup k m of
+              Just _ -> pure (m, n, acc)
+              Nothing -> do
+                -- (the job compressed it when the terminal takes zlib; a band
+                -- it could not shrink is not tried again on this thread)
+                pay <- encodeKittyFrame drv batchId caps (tbRGBA tb) (maybe ZlibSkip ZlibReady (tbZlib tb))
+                recordGfxStat drv (kittyPayloadWireBytes pay) (kittyPayloadMode pay)
+                pure (M.insert k n m, n + 1, acc <> kittyTransmit n (tbW tb, tbH tb) pay))
+            (soIds so, soNextId so, mempty) vis
+          let placedNow = M.fromList [ (i, pl) | (k, _, pl) <- vis, Just i <- [M.lookup k ids] ]
+              moves = mconcat [ kittyPlaceAt i 1 rc off src 0
+                              | (i, pl@(rc, off, src)) <- M.toList placedNow, M.lookup i (soPlaced so) /= Just pl ]
+              unplace = mconcat [ kittyDeletePlacements i | i <- M.keys (soPlaced so), M.notMember i placedNow ]
+              -- bands the model no longer holds are freed on the terminal too
+              (keep, gone) = M.partitionWithKey (\k _ -> M.member k (pvTiles pv)) ids
+              free = foldMap kittyDeleteImage (M.elems gone)
+          writeIORef (vdrStrip v) so { soIds = keep, soPlaced = M.filterWithKey (\i _ -> i `elem` M.elems keep) placedNow
+                                     , soNextId = if next > 2000000000 then stripFirstId else next, soFrame = Nothing }
+          let out = pre <> dropComposite <> ups <> unplace <> moves <> free
+              quiet = M.null gone && M.null (M.difference ids (soIds so)) && M.null (M.difference (soPlaced so) placedNow)
+                      && all (\(i, pl) -> M.lookup i (soPlaced so) == Just pl) (M.toList placedNow)
+                      && isNothing (soFrame so) && not wiped
+          pure (if quiet then Nothing else Just out)
+        else do
+          let hls = stripHighlights ed
+              present = [ k | pc <- pieces, k <- keysOf (pcPage pc), isJust (look k) ]
+              frameKey = show (sgViewW g, sgViewH g, a, pan, St.colWidth g, present, hls, top, left, loTextWidth lo, loTextHeight lo)
+          if soFrame so == Just frameKey then writeIORef (vdrStrip v) so >> pure Nothing else do
+            let desk = if tcKittyGfx caps then Nothing else Just (0x3A, 0x3A, 0x3A)
+                rgba = St.composeView g pan pieces look keysOf hls desk
+                freeTiles = foldMap kittyDeleteImage (M.elems (soIds so))
+            writeIORef (vdrStrip v) so { soIds = M.empty, soPlaced = M.empty, soFrame = Just frameKey }
+            if tcKittyGfx caps
+              then do
+                batchId <- beginGfxBatch drv
+                pay <- encodeKittyFrame drv batchId caps rgba ZlibUntried
+                recordGfxStat drv (kittyPayloadWireBytes pay) (kittyPayloadMode pay)
+                pure (Just (pre <> freeTiles <> kittyPlacePayload (top, left) (loTextWidth lo, loTextHeight lo) (sgViewW g, sgViewH g) pay))
+              else do
+                recordGfxStat drv (fromIntegral (BS.length rgba)) "sixel"
+                pure (Just (sixelPlace (top, left) (sgViewW g, sgViewH g) rgba))
+    _ | M.null (soIds so) && isNothing (soFrame so) -> writeIORef (vdrStrip v) so >> pure (if wiped && not (M.null (soIds so0)) then Just pre else Nothing)
+      -- Covered for a moment (a menu, a dialog): the bands only lose their
+      -- placements, so closing it re-places them without re-sending a pixel.
+      | pageStripOn ed && isNothing (soFrame so) ->
+          if M.null (soPlaced so) then writeIORef (vdrStrip v) so >> pure (if wiped then Just pre else Nothing)
+          else do
+            writeIORef (vdrStrip v) so { soPlaced = M.empty }
+            pure (Just (pre <> foldMap kittyDeletePlacements (M.keys (soPlaced so))))
+      | otherwise -> teardown
+
 -- Is a pixel placement wanted right now, and under what identity?
 wantGfx :: TermCaps -> Editor -> Maybe GfxKey
 wantGfx caps ed = do
@@ -4486,6 +4876,7 @@ wantGfx caps ed = do
               , gkKind = kind
               , gkScene = maybe 0 vdSceneId (idVec idoc)
               , gkDen = idDen idoc
+              , gkHl = if kind == GfxSixel then pictureHighlights caps ed else []
               , gkFrame = idFrame idoc
               }
 
@@ -4518,7 +4909,7 @@ vecPlacement drv caps ed mprev key = do
           pure (Just (kittyPlacePayload (row, col) (cols, rows) (pxW, pxH) pay))
         GfxSixel -> do
           recordGfxStat drv (fromIntegral (BS.length (vrRaw vr))) "sixel"
-          pure (Just (sixelPlace (row, col) (pxW, pxH) (vrRaw vr)))
+          pure (Just (sixelPlace (row, col) (pxW, pxH) (burnHighlights ed (row, col) (pxW, pxH) (gkHl key) (vrRaw vr))))
     -- Nothing to place yet (still rendering) or ever (refused, failed): the
     -- previous placement may stay up only while this one is genuinely on its
     -- way, and only at the same place ('keepPreviousPlacement'); otherwise a
@@ -4631,7 +5022,7 @@ placeGfxIO drv caps ed key prevFrame = case edImage ed of
             recordGfxStat drv (kittyPayloadWireBytes pay) (kittyPayloadMode pay)
             pure (kittyPlacePayload (row, col) (cols, rows) (pxW, pxH) pay)
       GfxSixel -> do
-        let rgba = scaleRGBA img dcrop pxW pxH
+        let rgba = burnHighlights ed (row, col) (pxW, pxH) (gkHl key) (scaleRGBA img dcrop pxW pxH)
         recordGfxStat drv (fromIntegral (pxW * pxH * 4)) "sixel"
         pure (sixelPlace (row, col) (pxW, pxH) rgba)
 

@@ -24,7 +24,7 @@ import Cmedit.Types
 import Cmedit.TextBuffer
 import Cmedit.Width (colToDisplay, displayToCol, strCells, textCells, wrapLine)
 import Cmedit.ConfigFile
-  ( Config(..), ThemeName(..), PdfViewMode(..), defaultConfig, RecentEntry(..)
+  ( Config(..), ThemeName(..), PdfViewMode(..), PdfFit(..), PdfDrag(..), defaultConfig, RecentEntry(..)
   , maxRecentEntries, maxHistoryEntries )
 import Cmedit.Menu
 import Cmedit.Dialog
@@ -646,6 +646,12 @@ settingsSpec =
   , ( Nothing, "Open PDF files as", ["auto", "pages", "reflow"]
     , \c -> case cfgPdfView c of PdfViewAuto -> 0; PdfViewPage -> 1; PdfViewReflow -> 2
     , "Pages as pictures, or reflowed text; auto shows pages when the terminal draws pixels." )
+  , ( Nothing, "PDF page layout", ["fit page", "fit width"]
+    , \c -> case cfgPdfFit c of PdfFitPage -> 0; PdfFitWidth -> 1
+    , "One page in the window, or a continuous column of pages as wide as the window (W switches)." )
+  , ( Nothing, "Dragging over a PDF page", ["zooms", "selects text"]
+    , \c -> case cfgPdfDrag c of PdfDragZoom -> 0; PdfDragSelect -> 1
+    , "Zoom into the box, or select the text inside it for Ctrl+C (S switches)." )
   -- Linting rows (row 'nEditingSettings' onward). The master switch first, then
   -- one row per 'linters' entry in table order. Per-linter hints and the
   -- availability notes are filled in by 'mkSettings' from 'edLintAvail'.
@@ -692,6 +698,19 @@ pageStatus pv =
         _ -> ""
   in "Page " ++ show (pvPage pv) ++ "/" ++ show (pvPages pv) ++ " \xb7 " ++ show zoom ++ "%" ++ pending ++ "   PDF "
 
+-- | The page view's status in either layout, with the drag tool when it
+-- selects: "Page 3/12 · Width 100% · Select".
+pageStatusFor :: Editor -> PdfView -> String
+pageStatusFor ed pv = case stripState ed of
+  Just _ ->
+    let pending = if stripScreenReady ed then "" else "  rendering\x2026"
+    in "Page " ++ show (pvPage pv) ++ "/" ++ show (pvPages pv) ++ " \xb7 Width "
+         ++ show (round (100 * pvZoom pv) :: Int) ++ "%" ++ tool ++ pending ++ "   PDF "
+  Nothing -> let s = pageStatus pv
+                 (a, b) = T.breakOn "   PDF " (T.pack s)
+             in if null tool then s else T.unpack a ++ tool ++ T.unpack b
+  where tool = if pvDrag pv == PdfDragSelect then " \xb7 Select" else ""
+
 -- | The clickable regions of the status bar's right side.
 data StatusZone = SZGoTo | SZOverwrite | SZEncoding | SZLineEnding | SZDiagnostics
   deriving (Eq, Show)
@@ -719,7 +738,7 @@ statusRightInfo ed = flatten segs
       Just pg -> [ zone SZGoTo (Pg.pagerStatus pg) ]
       -- The PDF view has no cursor, no selection and nothing writable; what
       -- matters is which page you are on, and clicking it opens Go To Page.
-      Nothing | pageViewOn ed, Just pv <- edPdfView ed -> [ zone SZGoTo (pageStatus pv) ]
+      Nothing | pageViewOn ed, Just pv <- edPdfView ed -> [ zone SZGoTo (pageStatusFor ed pv) ]
       Nothing | Just pd <- edPdf ed -> [ zone SZGoTo (Pdf.pdfStatus pd) ]
       -- The formatted view has no cursor and no selection, and its line
       -- numbers are laid-out rows rather than file lines, so Go To Line does

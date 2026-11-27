@@ -78,6 +78,9 @@ import Cmedit.Syntax
 import Cmedit.TextBuffer
 import Cmedit.Types
 import Cmedit.Image (Image(..), ImgMode(..), renderImage)
+import Cmedit.Geom (Rect(..))
+import Cmedit.PdfStrip (StripGeom(..))
+import qualified Cmedit.PdfStrip as St
 import Cmedit.Width (cellAdvance, charWidth, colToDisplay, controlCaret, dropCellsEnd, fitCells, inputWindow, isCombining, strCells, takeCells, textCells, isControlChar, isInvisibleFormat, windowStart)
 
 -- | A rendered frame: a flat row-major grid plus the desired cursor position.
@@ -966,8 +969,10 @@ renderEditorCore mrc ed = runST $ do
             Nothing -> case edPdf ed of
               -- the page view is the PDF view's other mode: its picture is
               -- drawn by the image view's code ('activePicture')
+              Just _ | pageStripOn ed ->
+                drawPdfStrip ed lo arr >> pure (Nothing, emptyRenderCache)
               Just _ | pageViewOn ed, Just pic <- activePicture ed ->
-                drawImage ed pic lo arr >> pure (Nothing, emptyRenderCache)
+                drawImage ed pic lo arr >> drawPdfPageSel ed lo arr >> pure (Nothing, emptyRenderCache)
               Just pd -> drawPdf th ed pd lo arr >> pure (Nothing, emptyRenderCache)
               Nothing -> case edCsv ed of
                 Just v  -> drawCsvTable th ed v lo arr >> pure (Nothing, emptyRenderCache)
@@ -2419,6 +2424,8 @@ shortName = reverse . takeWhile (/= '/') . reverse
 drawHints :: Theme -> Editor -> Layout -> Surf s -> ST s ()
 drawHints th ed lo arr = do
   let cols = loCols lo; rows = loRows lo; r = loHintRow lo
+      selTool = maybe False ((== PdfDragSelect) . pvDrag) (edPdfView ed)
+      hasSel = maybe False (isJust . pvSel) (edPdfView ed)
   fillRow arr cols rows r (thHint th)
   let hints
        | edFocus ed == FSearch =
@@ -2431,9 +2438,14 @@ drawHints th ed lo arr = do
          [ ("\x2191\x2193", "Move"), ("\x21b5", "Open"), ("Ins", "New")
          , ("F2", "Rename"), ("Del", "Delete"), (".", "Hidden")
          , ("^B", "Editor"), ("F10", "Menu") ]
+       | pageStripOn ed =
+         [ ("PgDn", "Scroll"), ("]", "NextPage"), ("+-", "Zoom"), ("W", "FitPage")
+         , ("S", if selTool then "Zoom" else "Select") ] ++ [ ("^C", "Copy") | hasSel ] ++
+         [ ("^G", "GoToPage"), ("A+T", "Text"), ("F10", "Menu") ]
        | pageViewOn ed =
-         [ ("PgDn", "Page"), ("+-", "Zoom"), ("0", "Fit"), ("^G", "GoToPage")
-         , ("A+T", "Text"), ("^O", "Open"), ("^Q", "Quit"), ("F10", "Menu") ]
+         [ ("PgDn", "Page"), ("+-", "Zoom"), ("W", "FitWidth")
+         , ("S", if selTool then "Zoom" else "Select") ] ++ [ ("^C", "Copy") | hasSel ] ++
+         [ ("^G", "GoToPage"), ("A+T", "Text"), ("F10", "Menu") ]
        | isJust (edPdf ed) =
          [ ("[ ]", "Page"), ("^G", "GoToPage"), ("^F", "Find"), ("F3", "FindNext")
          , ("^C", "Copy"), ("^O", "Open"), ("^Q", "Quit"), ("F10", "Menu") ]
@@ -3213,8 +3225,11 @@ drawImage ed idoc lo arr = do
                      _ -> renderPicture ed idoc tw th
         forM_ [0 .. th-1] $ \r -> forM_ [0 .. tw-1] $ \c ->
           putCell arr cols rows (top+r) (left+c) (grid ! (r, c))
-  -- While dragging, highlight the border of the selection rectangle.
+  -- While dragging, highlight the border of the selection rectangle (in
+  -- cells only where the cells are the picture: over pixels the driver draws
+  -- it as a fine line, and reversing blank cells would punch holes in sixel).
   case idDrag idoc of
+    _ | imageOverlayActive ed -> pure ()
     Nothing -> pure ()
     Just (ar, ac, br, bc) -> do
       let r0 = min ar br; r1 = max ar br; c0 = min ac bc; c1 = max ac bc
@@ -3226,6 +3241,107 @@ drawImage ed idoc lo arr = do
             writeArray arr (rr*cols + cc)
               cell { cellStyle = (cellStyle cell)
                        { styleAttr = styleAttr (cellStyle cell) .|. attrReverse } }
+
+-- | The PDF page view's fit-width layout. Under pixels ('stripOverlayActive')
+-- the cells are blank except where a band of a page is still being drawn,
+-- which shows as paper, so a page's shape is there from the first frame;
+-- otherwise (a cell terminal, or a menu over a pixel one) the cell picture
+-- sampled from the bands. Then what neither can draw: a failed page's
+-- reason, and (cells only) the rubber band of a drag.
+drawPdfStrip :: Editor -> Layout -> Surf s -> ST s ()
+drawPdfStrip ed lo arr = do
+  let cols = loCols lo; rows = loRows lo
+      top = loTextTop lo; left = loTextLeft lo
+      th = loTextHeight lo; tw = loTextWidth lo
+      paperCell = Cell ' ' (Style Default (ColorRGB 0xEE 0xEE 0xEC) attrNone)
+  forM_ [0 .. th - 1] $ \r -> forM_ [0 .. tw - 1] $ \c -> putCell arr cols rows (top + r) (left + c) blankCell
+  case stripState ed of
+    Nothing -> pure ()
+    Just (_, pv, g, a, pan) -> do
+      let pieces = St.visiblePieces g a
+          (cw, ch) = stripCellPx ed
+          -- a layout pixel rectangle as the cells it touches
+          toCells (x0, y0, x1, y1)
+            | stripPixel ed = (y0 `div` ch, (y1 + ch - 1) `div` ch, x0 `div` cw, (x1 + cw - 1) `div` cw)
+            | otherwise = (y0 `div` 2, (y1 + 1) `div` 2, x0, x1)
+          cl = St.colLeft g pan
+          pageCells pc = toCells (max 0 cl, max 0 (St.pcTop pc), min (sgViewW g) (cl + St.colWidth g), min (sgViewH g) (St.pcTop pc + St.pcH pc))
+          paint (r0, r1, c0, c1) cell =
+            forM_ [max 0 r0 .. min th r1 - 1] $ \r -> forM_ [max 0 c0 .. min tw c1 - 1] $ \c ->
+              putCell arr cols rows (top + r) (left + c) cell
+      if stripOverlayActive ed
+        then forM_ pieces $ \pc ->
+          if stripSceneOf pv (St.pcPage pc) < 0
+            then paint (pageCells pc) paperCell
+            else forM_ (stripTileKeys ed pv g a pan 0 (sgViewH g)) $ \k ->
+              when (St.tkPage k == St.pcPage pc && Map.notMember k (pvTiles pv)) $ do
+                let x0 = cl + St.tkX k; y0 = St.pcTop pc + St.tkY k
+                paint (toCells (max 0 x0, max 0 y0, min (sgViewW g) (x0 + St.tkW k), min (sgViewH g) (y0 + St.tkH k))) paperCell
+        else case stripCellGrid ed of
+          Just grid -> forM_ [0 .. th - 1] $ \r -> forM_ [0 .. tw - 1] $ \c ->
+            putCell arr cols rows (top + r) (left + c) (grid ! (r, c))
+          Nothing -> pure ()
+      -- a page that could not be drawn says so where it would be
+      forM_ pieces $ \pc -> case lookup (St.pcPage pc) (pvFailed pv) of
+        Just err -> do
+          let (r0, r1, c0, c1) = pageCells pc
+              w = max 0 (min tw c1 - max 0 c0)
+              msg = takeCells (max 0 (w - 2)) ("Page " ++ show (St.pcPage pc) ++ " could not be drawn: " ++ err)
+              r = (max 0 r0 + min th r1) `div` 2
+          when (r >= 0 && r < th && w > 2) $ do
+            paint (r0, r1, c0, c1) paperCell
+            drawStr arr cols rows (top + r) (left + max 0 c0 + max 0 ((w - strCells msg) `div` 2))
+              (Style Black (ColorRGB 0xEE 0xEE 0xEC) attrNone) msg
+        Nothing -> pure ()
+      -- the rubber band, where no pixel layer draws it
+      when (not (stripOverlayActive ed)) $ drawBandCells ed lo arr (pvBox pv)
+
+-- | The select tool over the fitted page picture, where the cells are the
+-- picture (a cell terminal, or a menu over a pixel one): the selected lines
+-- tinted and the rubber band in reverse video. Under pixels the driver
+-- draws both as a layer of its own.
+drawPdfPageSel :: Editor -> Layout -> Surf s -> ST s ()
+drawPdfPageSel ed lo arr = when (not (imageOverlayActive ed)) $ case edPdfView ed of
+  Just pv -> do
+    let cols = loCols lo; rows = loRows lo
+        top = loTextTop lo; left = loTextLeft lo
+        th = loTextHeight lo; tw = loTextWidth lo
+    forM_ (picHighlightsSub ed) $ \(Rect x0 y0 x1 y1) ->
+      forM_ [max 0 (floor (y0 / 2)) .. min (th - 1) (ceiling (y1 / 2) - 1)] $ \r ->
+        forM_ [max 0 (floor x0) .. min (tw - 1) (ceiling x1 - 1)] $ \c -> do
+          let i = (top + r) * cols + (left + c)
+          when (top + r < rows && left + c < cols) $ do
+            cell <- readArray arr i
+            writeArray arr i (tintCell cell)
+    drawBandCells ed lo arr (pvBox pv)
+  Nothing -> pure ()
+
+-- Blend a cell's colours towards the selection colour.
+tintCell :: Cell -> Cell
+tintCell cell =
+  let st = cellStyle cell
+      (sr, sg, sb) = selFillRGB
+      mix v w = round (fromIntegral v * 0.6 + fromIntegral w * (0.4 :: Double))
+      t (ColorRGB r g b) = ColorRGB (mix r sr) (mix g sg) (mix b sb)
+      t Default = ColorRGB sr sg sb
+      t c = c
+  in cell { cellStyle = st { styleFg = t (styleFg st), styleBg = t (styleBg st) } }
+
+-- The border of a drag box (text-area cells) in reverse video.
+drawBandCells :: Editor -> Layout -> Surf s -> Maybe (Int, Int, Int, Int) -> ST s ()
+drawBandCells _ _ _ Nothing = pure ()
+drawBandCells _ lo arr (Just (ar, ac, br, bc)) = do
+  let cols = loCols lo; rows = loRows lo
+      top = loTextTop lo; left = loTextLeft lo
+      r0 = min ar br; r1 = max ar br; c0 = min ac bc; c1 = max ac bc
+  when ((ar, ac) /= (br, bc)) $
+    forM_ [r0 .. r1] $ \r -> forM_ [c0 .. c1] $ \c ->
+      when (r == r0 || r == r1 || c == c0 || c == c1) $ do
+        let rr = top + r; cc = left + c
+        when (rr >= 0 && rr < rows && cc >= 0 && cc < cols) $ do
+          cell <- readArray arr (rr * cols + cc)
+          writeArray arr (rr * cols + cc)
+            cell { cellStyle = (cellStyle cell) { styleAttr = styleAttr (cellStyle cell) .|. attrReverse } }
 
 drawCsvTable :: Theme -> Editor -> CsvView -> Layout -> Surf s -> ST s ()
 drawCsvTable th ed v lo arr = do

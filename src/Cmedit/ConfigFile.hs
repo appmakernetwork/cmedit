@@ -16,6 +16,8 @@ module Cmedit.ConfigFile
     Config(..)
   , ThemeName(..)
   , PdfViewMode(..)
+  , PdfFit(..)
+  , PdfDrag(..)
   , defaultConfig
   , parseConfigText
   , updateConfigText
@@ -92,6 +94,17 @@ data ThemeName = ThemeDark | ThemeLight | ThemeAuto | ThemeCherryBlossom
 data PdfViewMode = PdfViewAuto | PdfViewPage | PdfViewReflow
   deriving (Eq, Show)
 
+-- | How the PDF page view lays pages out: one page fitted inside the window
+-- (turned page by page), or every page as wide as the window in one
+-- continuous column, scrolled smoothly past the page breaks.
+data PdfFit = PdfFitPage | PdfFitWidth
+  deriving (Eq, Show)
+
+-- | What dragging a rectangle over the PDF page view does: zoom into it, or
+-- select the text inside it (Ctrl+C copies).
+data PdfDrag = PdfDragZoom | PdfDragSelect
+  deriving (Eq, Show)
+
 data Config = Config
   { cfgTabWidth       :: !Int
   , cfgTabsToSpaces   :: !Bool
@@ -110,6 +123,8 @@ data Config = Config
   , cfgPagedView      :: !Bool   -- ^ Offer the read-only paged view for files too large to load, instead of refusing them.
   , cfgSvgPicture     :: !Bool   -- ^ @svg-view = picture@: open an SVG as its picture (Alt+T shows the source); @source@ opens the markup.
   , cfgPdfView        :: !PdfViewMode -- ^ @pdf-view@: how a PDF opens (Alt+T switches either way).
+  , cfgPdfFit         :: !PdfFit      -- ^ @pdf-fit@: the page view's layout a PDF opens in (W switches).
+  , cfgPdfDrag        :: !PdfDrag     -- ^ @pdf-drag@: what a drag over the page view does (S switches).
   , cfgDebugStats     :: !Bool   -- ^ Show live session counters (frames, heap, jobs) on the status bar.
   , cfgLint           :: !Bool                -- ^ Master switch for external-linter diagnostics.
   , cfgLintOn         :: ![(LinterId, Bool)]  -- ^ Per-linter enable flags, one entry per 'Cmedit.Lint.linters' row.
@@ -134,6 +149,8 @@ defaultConfig = Config
   , cfgPagedView      = True
   , cfgSvgPicture     = True
   , cfgPdfView        = PdfViewAuto
+  , cfgPdfFit         = PdfFitPage
+  , cfgPdfDrag        = PdfDragZoom
   , cfgDebugStats     = False
   , cfgLint           = True
   , cfgLintOn         = [ (linId l, linDefaultOn l) | l <- linters ]
@@ -203,6 +220,14 @@ applyKey key val cfg = case key of
     "page"   -> Right cfg { cfgPdfView = PdfViewPage }
     "reflow" -> Right cfg { cfgPdfView = PdfViewReflow }
     _        -> Left "pdf-view expects 'auto', 'page' or 'reflow'"
+  "pdf-fit" -> case map toLower val of
+    "page"  -> Right cfg { cfgPdfFit = PdfFitPage }
+    "width" -> Right cfg { cfgPdfFit = PdfFitWidth }
+    _       -> Left "pdf-fit expects 'page' or 'width'"
+  "pdf-drag" -> case map toLower val of
+    "zoom"   -> Right cfg { cfgPdfDrag = PdfDragZoom }
+    "select" -> Right cfg { cfgPdfDrag = PdfDragSelect }
+    _        -> Left "pdf-drag expects 'zoom' or 'select'"
   "debug-stats" -> boolKey (\b -> cfg { cfgDebugStats = b })
   "lint" -> boolKey (\b -> cfg { cfgLint = b })
   _ | Just suffix <- stripPrefix' "lint-" key
@@ -281,6 +306,14 @@ configKeysHelp =
   , "                     'auto' (default) shows pages when the terminal can"
   , "                     draw pixels (kitty graphics or sixel) and reflow"
   , "                     otherwise. Alt+T switches either way."
+  , "pdf-fit = page|width The page view's layout: one page fitted in the window"
+  , "                     (default; PgDn turns), or every page as wide as the"
+  , "                     window in one continuous column that scrolls"
+  , "                     smoothly across the page breaks. W switches."
+  , "pdf-drag = zoom|select"
+  , "                     What dragging a box over the page view does: zoom"
+  , "                     into it (default), or select the text inside it for"
+  , "                     Ctrl+C. S switches."
   , "debug-stats = BOOL   Show live session counters (frame time, heap, jobs)"
   , "                     on the status bar (default off). For a one-shot"
   , "                     summary instead, run with --stats-on-exit."
@@ -313,6 +346,8 @@ configFields =
   , ("svg-view",                 \c -> if cfgSvgPicture c then "picture" else "source")
   , ("pdf-view",                 \c -> case cfgPdfView c of
                                          PdfViewAuto -> "auto"; PdfViewPage -> "page"; PdfViewReflow -> "reflow")
+  , ("pdf-fit",                  \c -> case cfgPdfFit c of PdfFitPage -> "page"; PdfFitWidth -> "width")
+  , ("pdf-drag",                 \c -> case cfgPdfDrag c of PdfDragZoom -> "zoom"; PdfDragSelect -> "select")
   , ("debug-stats",              renderBool . cfgDebugStats)
   , ("lint",                     renderBool . cfgLint)
   ] ++

@@ -8,6 +8,8 @@ module Cmedit.Editor
     Editor(..)
   , Config(..)
   , PdfViewMode(..)
+  , PdfFit(..)
+  , PdfDrag(..)
   , defaultConfig
   , Focus(..)
   , EditKind(..)
@@ -96,6 +98,50 @@ module Cmedit.Editor
   , trimPageCache
   , pdfNextPageFit
   , handlePdfPageKey
+    -- ** Fit width, and the select tool
+  , PdfBoxSel(..)
+  , pageStripOn
+  , stripState
+  , stripCellPx
+  , stripPixel
+  , stripGeomOf
+  , stripSync
+  , stripSet
+  , stripOverlayActive
+  , stripCellGrid
+  , stripHighlights
+  , stripScreenReady
+  , stripTileKeys
+  , stripSceneOf
+  , stripVisiblePages
+  , stripCellRect
+  , stripScroll
+  , stripScrollRows
+  , stripGoPage
+  , stripZoomTo
+  , pdfTileWants
+  , pdfTileRendered
+  , pdfGlyphsArrived
+  , pdfGlyphWant
+  , panStarts
+  , beginPan
+  , panDragMove
+  , picturePannable
+  , pictureShown
+  , pdfSelectTool
+  , pdfPageNear
+  , togglePdfFit
+  , togglePdfDrag
+  , pdfBoxPages
+  , boxSelection
+  , pdfSelectPage
+  , pdfCopyBox
+  , pdfSelHighlights
+  , picHighlightsSub
+  , picSceneToSub
+  , selFillRGB
+  , bandRGB
+  , pageStatusFor
   , vecCellWant
   , vecCellKey
   , vecCellsRendered
@@ -105,6 +151,7 @@ module Cmedit.Editor
   , imageDims
   , wheelZoom
   , cellRectToCrop
+  , fitCropToView
   , activeVec
   , bufferlessImage
   , isSvgPath
@@ -400,10 +447,11 @@ import Cmedit.Xlsx (Workbook(..))
 import qualified Cmedit.Xlsx as Xlsx
 import Cmedit.Pdf (PdfDoc(..))
 import qualified Cmedit.Pdf as Pdf
+import qualified Cmedit.PdfStrip as St
 import Cmedit.TextBuffer
 import Cmedit.Width (colToDisplay, displayToCol, inputWindow, takeCells, textCells, wrapLine)
 import Cmedit.ConfigFile
-  ( Config(..), ThemeName(..), PdfViewMode(..), defaultConfig, RecentEntry(..)
+  ( Config(..), ThemeName(..), PdfViewMode(..), PdfFit(..), PdfDrag(..), defaultConfig, RecentEntry(..)
   , maxRecentEntries, maxHistoryEntries, SessionSummary(..) )
 import Cmedit.Menu
 import Cmedit.Dialog
@@ -684,7 +732,9 @@ handlePdfKey key pd ed = case key of
 -- * Alt+T reads the text (reflow view, same page), where Ctrl+F and Ctrl+C
 --   live: both are sent there from here.
 handlePdfPageKey :: Key -> PdfView -> Editor -> (Editor, [Effect])
-handlePdfPageKey key pv ed = case key of
+handlePdfPageKey key pv ed
+  | pvFit pv == PdfFitWidth = handlePdfStripKey key pv ed
+  | otherwise = case key of
   KPageDown _     -> turn 1
   KPageUp _       -> turn (-1)
   KChar ' '       -> turn 1
@@ -705,7 +755,10 @@ handlePdfPageKey key pv ed = case key of
   KChar '='       -> noEff (pdfZoomCentre True ed)
   KChar '-'       -> noEff (pdfZoomCentre False ed)
   KChar '0'       -> noEff (refreshImage (zoomFull ed))
+  KEsc | isJust (pvSel pv) -> noEff (clearSel ed)
   KEsc | zoomed   -> noEff (refreshImage (zoomFull ed))
+  KChar c | c == 'w' || c == 'W' -> noEff (togglePdfFit ed)
+  KChar c | c == 's' || c == 'S' -> noEff (togglePdfDrag ed)
   KChar c | c == 'a' || c == 'A' ->
       noEff (refreshImage (setImgMode (if idMode (pvPic pv) == HalfBlock then Ascii else HalfBlock) ed))
   KMouse me
@@ -717,6 +770,9 @@ handlePdfPageKey key pv ed = case key of
         in if modCtrl (meMods me) || zoomed
              then noEff (wheelZoom (not down) row col ed)
              else turn (if down then 1 else -1)
+    -- The select tool owns the drag (switching tools mid-drag ends it:
+    -- 'togglePdfDrag').
+    | pvDrag pv == PdfDragSelect -> noEff (pdfBoxMouse me ed)
     | otherwise -> noEff (handleImageMouse me (pvPic pv) ed)
   KChar _     -> readOnlyNote
   KEnter      -> readOnlyNote
@@ -728,7 +784,69 @@ handlePdfPageKey key pv ed = case key of
   where
     zoomed = isJust (idCrop (pvPic pv))
     turn d = noEff (pdfTurnTo (pvPage pv + d) ed)
-    readOnlyNote = noEff ed { edStatus = "Page view \x2014 PgUp/PgDn turn pages, +/- zoom, Alt+T for the text" }
+    readOnlyNote = noEff ed { edStatus = "Page view \x2014 PgUp/PgDn turn pages, +/- zoom, W fit width, S select, Alt+T for the text" }
+    clearSel e = e { edPdfView = Just pv { pvSel = Nothing }, edStatus = "" }
+
+-- | Keys in the fit-width layout of the page view: the pages are one
+-- continuous column, so movement /scrolls/ (by rows, by screens, to a page's
+-- top) instead of turning:
+--
+-- * Up/Down and the wheel scroll a few rows; PgDn/PgUp and Space a screen
+--   (two rows of overlap); @]@/@[@ (and @n@/@p@) go to the next/previous
+--   page's top; Home/End to the document's ends; Ctrl+G to any page;
+-- * @+@/@-@ zoom about the centre, Ctrl+wheel about the pointer, @0@ (or a
+--   click, or Esc) back to the width; zoomed past the view, Left/Right pan
+--   (otherwise they turn pages, as at the fit);
+-- * a drag zooms into its box or selects the text in it (S switches);
+-- * W goes back to one page fitted in the window.
+handlePdfStripKey :: Key -> PdfView -> Editor -> (Editor, [Effect])
+handlePdfStripKey key pv ed = case key of
+  KPageDown _     -> noEff (stripScrollScreen 1 ed)
+  KPageUp _       -> noEff (stripScrollScreen (-1) ed)
+  KChar ' '       -> noEff (stripScrollScreen 1 ed)
+  KChar ']'       -> page 1
+  KChar '['       -> page (-1)
+  KChar 'n'       -> page 1
+  KChar 'p'       -> page (-1)
+  KHome _         -> noEff (stripGoStart ed)
+  KEnd _          -> noEff (stripGoEnd ed)
+  KArrow DDown _  -> noEff (stripScrollRows 2 ed)
+  KArrow DUp _    -> noEff (stripScrollRows (-2) ed)
+  KArrow DLeft _  | stripPannable ed -> noEff (stripPan (-0.1) ed)
+                  | otherwise -> page (-1)
+  KArrow DRight _ | stripPannable ed -> noEff (stripPan 0.1 ed)
+                  | otherwise -> page 1
+  KChar '+'       -> noEff (stripZoomStep True (stripCentre ed) ed)
+  KChar '='       -> noEff (stripZoomStep True (stripCentre ed) ed)
+  KChar '-'       -> noEff (stripZoomStep False (stripCentre ed) ed)
+  KChar '0'       -> noEff (stripZoomTo 1 (stripCentre ed) ed)
+  KEsc | isJust (pvBox pv) -> noEff ed { edPdfView = Just pv { pvBox = Nothing }, edMouseSelecting = False }
+       | isJust (pvSel pv) -> noEff ed { edPdfView = Just pv { pvSel = Nothing }, edStatus = "" }
+       | pvZoom pv /= 1 -> noEff (stripZoomTo 1 (stripCentre ed) ed)
+  KChar c | c == 'w' || c == 'W' -> noEff (togglePdfFit ed)
+  KChar c | c == 's' || c == 'S' -> noEff (togglePdfDrag ed)
+  KChar c | c == 'a' || c == 'A' ->
+      let m = if idMode (pvPic pv) == HalfBlock then Ascii else HalfBlock
+      in noEff ed { edPdfView = Just pv { pvPic = (pvPic pv) { idMode = m } } }
+  KMouse me
+    | meButton me == MBWheelUp || meButton me == MBWheelDown ->
+        let down = meButton me == MBWheelDown
+            lo = computeLayout ed
+            at = stripCellCentre ed (meRow me - loTextTop lo) (meCol me - loTextLeft lo)
+        in if modCtrl (meMods me)
+             then noEff (stripZoomStep (not down) at ed)
+             else noEff (stripScrollRows (if down then 3 else -3) ed)
+    | otherwise -> noEff (pdfBoxMouse me ed)
+  KChar _     -> readOnlyNote
+  KEnter      -> readOnlyNote
+  KBackspace  -> readOnlyNote
+  KDelete _   -> readOnlyNote
+  KTab        -> readOnlyNote
+  KPaste _    -> readOnlyNote
+  _           -> handleEditKey key ed
+  where
+    page d = noEff (stripGoPage (pvPage pv + d) ed)
+    readOnlyNote = noEff ed { edStatus = "Fit width \x2014 scroll or PgDn through the pages, ] next page, +/- zoom, W fit page, S select" }
 
 -- | Mouse in the PDF view: select text to copy out of it.
 --
@@ -808,7 +926,7 @@ finishImageDrag idoc ed =
           ed1 = modImage (\d -> d { idDrag = Nothing }) ed
       in refreshImage $
          if (r1 - r0) >= 1 && (c1 - c0) >= 1
-           then modImage (\d -> d { idCrop = Just (cellRectToCrop ed idoc (r0,c0,r1,c1)) }) ed1
+           then modImage (\d -> d { idCrop = Just (fitCropToView ed idoc (cellRectToCrop ed idoc (r0,c0,r1,c1))) }) ed1
            else modImage (\d -> d { idCrop = Nothing }) ed1   -- a click: zoom out fully
 
 -- | Entries for a menu: the dynamic open-files list for the Window menu,
@@ -861,6 +979,8 @@ pruneEntries ed = map (relabelEntry ed)
       MAToggleRtf   -> not (isRtfFile ed)
       MAToggleSvg   -> not (isSvgFile ed || isJust (activeVec ed))
       MATogglePdfPage -> isNothing (edPdf ed) || isNothing (edPdfView ed)
+      MAPdfFit -> not (pageViewOn ed)
+      MAPdfDrag -> not (pageViewOn ed)
       MAArchiveView -> not (containerViewActive ed || containerListing ed)
       -- A workbook keeps the freeze-header row (it is a view setting, and a
       -- spreadsheet has a header row more often than a CSV does) and loses
@@ -1037,6 +1157,8 @@ goToUnitOK _ _ = False
 relabelEntry :: Editor -> MenuEntry -> MenuEntry
 relabelEntry ed e = case e of
   MEItem _ acc MATogglePdfPage | pageViewOn ed -> MEItem "&Reflow View (PDF)" acc MATogglePdfPage
+  MEItem _ acc MAPdfFit | pageStripOn ed -> MEItem "Fit Pa&ge (PDF)" acc MAPdfFit
+  MEItem _ acc MAPdfDrag | maybe False ((== PdfDragSelect) . pvDrag) (edPdfView ed) -> MEItem "Drag &Zooms (PDF)" acc MAPdfDrag
   -- One action, two meanings: in the PDF view Go To takes a page number (see
   -- 'gotoLine'), so the menu has to say so — the dialog already does.
   MEItem _ acc MAGoToLine | isJust (edPdf ed) ->
@@ -1097,7 +1219,7 @@ dropViewModes unwanted es = case span isModeItem es of
 
 viewModeActions :: [MenuAction]
 viewModeActions =
-  [MAToggleCsv, MAToggleFreezeHeader, MASortColumn, MAToggleRtf, MAToggleSvg, MATogglePdfPage, MAArchiveView]
+  [MAToggleCsv, MAToggleFreezeHeader, MASortColumn, MAToggleRtf, MAToggleSvg, MATogglePdfPage, MAPdfFit, MAPdfDrag, MAArchiveView]
 
 windowEntries :: Editor -> [MenuEntry]
 windowEntries ed =
@@ -1147,8 +1269,13 @@ runAction a ed0 =
      -- which is where the hit can be shown and copied; copying says where.
      else if pageViewOn ed && a `elem` [MAFind, MAFindNext, MAFindPrev]
        then runAction a (togglePdfPage ed)
-     else if pageViewOn ed && a `elem` [MACopy, MASelectAll]
-       then noEff ed { edStatus = "The page view has no text selection \x2014 Alt+T for the reflow view, where you can select and copy" }
+     -- The page view's text is the select tool's (S, then drag a box).
+     else if pageViewOn ed && a == MACopy
+       then pdfCopyBox ed
+     else if pageViewOn ed && a == MASelectAll
+       then noEff (pdfSelectPage ed)
+     else if pageViewOn ed && a `elem` [MACut, MAPaste]
+       then noEff ed { edStatus = "A PDF is read-only \x2014 Ctrl+C copies the text selected with S and a drag" }
      else if isJust (edPdf ed) && a `elem` pdfDisabledActions
        then noEff ed { edStatus = "Not available in the PDF view" }
      else if isJust (edPdf ed) && a `elem` [MASave, MASaveAll, MARevert]
@@ -1204,6 +1331,8 @@ runAction a ed0 =
        MAToggleRtf  -> noEff (toggleRtf ed)
        MAToggleSvg  -> noEff (toggleSvg ed)
        MATogglePdfPage -> noEff (togglePdfPage ed)
+       MAPdfFit -> noEff (togglePdfFit ed)
+       MAPdfDrag -> noEff (togglePdfDrag ed)
        MAArchiveView -> archiveViewFlow ed
        MAToggleFreezeHeader -> noEff (toggleFreezeHeader ed)
        MASortColumn -> noEff (sortCsvColumn ed)
@@ -1284,7 +1413,10 @@ applySettingRow k v ed = case k of
   14 -> upd (\c -> c { cfgSvgPicture = on }) ed
   -- Likewise read when a PDF is opened.
   15 -> upd (\c -> c { cfgPdfView = [PdfViewAuto, PdfViewPage, PdfViewReflow] !! max 0 (min 2 v) }) ed
-  16 ->                                                  -- master linting switch
+  -- Read when a PDF is opened, like the row above.
+  16 -> upd (\c -> c { cfgPdfFit = if on then PdfFitWidth else PdfFitPage }) ed
+  17 -> upd (\c -> c { cfgPdfDrag = if on then PdfDragSelect else PdfDragZoom }) ed
+  18 ->                                                  -- master linting switch
     let ed1 = upd (\c -> c { cfgLint = on }) ed
     -- Off means no future pass will ever clear diagnostics, so drop them
     -- everywhere now (active doc and zipper) — squiggles must not outlive
@@ -1293,8 +1425,8 @@ applySettingRow k v ed = case k of
        else ed1 { edDiags = []
                 , edBefore = map (\d -> d { docDiags = [] }) (edBefore ed1)
                 , edAfter  = map (\d -> d { docDiags = [] }) (edAfter ed1) }
-  _ | k >= 17, k - 17 < length linters ->                -- one row per linter
-        let lid = linId (linters !! (k - 17))
+  _ | k >= 19, k - 19 < length linters ->                -- one row per linter
+        let lid = linId (linters !! (k - 19))
             ed1 = upd (\c -> c { cfgLintOn = setLintOn lid on (cfgLintOn c) }) ed
         -- Turning a linter off immediately drops its squiggles on the active
         -- doc; zipper docs refresh on their next lint pass.
@@ -1402,6 +1534,10 @@ dispatchKey key ed
   | KMouse me <- key, edSidebarDrag ed = noEff (sidebarDragMove me ed)
 -- A scrollbar-thumb drag swallows mouse events until release, likewise.
 dispatchKey key ed
+  -- A pan drag over a picture owns the mouse until it ends, wherever the
+  -- pointer goes (like the scroll-bar drag).
+  | KMouse me <- key, Just at <- edPanDrag ed = noEff (panDragMove me at ed)
+  | KMouse me <- key, edFocus ed == FEdit, panStarts me ed = noEff (beginPan me ed)
   | KMouse me <- key, edScrollDrag ed = noEff (scrollDragMove me ed)
 -- A horizontal scrollbar-thumb drag swallows mouse events until release too.
 dispatchKey key ed
@@ -2089,6 +2225,9 @@ scrollBarTo row ed = case scrollBarInfo ed of
              Just rd -> ed { edRtf = Just (Rtf.rtfClamp (rtfHeight ed) rd { rdTop = target }) }
              Nothing -> case edPdf ed of
                -- (the page view's bar measures pages: see 'scrollBarInfo')
+               Just _ | pageStripOn ed, Just (_, _, g, _, pan) <- stripState ed ->
+                 let end = St.anchorFraction g (St.maxAnchor g)
+                 in stripSet g (St.fractionAnchor g (end * fromIntegral target / fromIntegral (max 1 (total - h)))) pan ed
                Just _ | pageViewOn ed -> pdfTurnTo (target `div` max 1 h + 1) ed
                Just pd -> ed { edPdf = Just (Pdf.pdfClamp (pdfHeight ed) pd { pdTop = target }) }
                Nothing -> scrollLine (target - edTop ed) ed
@@ -2195,7 +2334,14 @@ urlAtMouse me ed
 pointerShapeAt :: MouseEvent -> Editor -> String
 pointerShapeAt me ed
   | edFocus ed == FEdit, isJust (urlAtMouse me ed) = "pointer"
+  -- Over a picture that can be dragged around, holding Ctrl (or the middle
+  -- button) turns the pointer into the hand that will grab it.
+  | isNothing (edPanDrag ed), edFocus ed == FEdit, picturePannable ed
+  , modCtrl (meMods me) || meButton me == MBMiddle
+  , meRow me >= loTextTop lo, meRow me < loTextTop lo + loTextHeight lo
+  , meCol me >= loTextLeft lo, meCol me < loTextLeft lo + loTextWidth lo = "grab"
   | otherwise = pointerShapeFor ed (meRow me) (meCol me)
+  where lo = computeLayout ed
 
 -- | Open an http(s) URL via the driver, noting it on the status line (the
 -- hover hint is dropped so the note shows through until the next motion).

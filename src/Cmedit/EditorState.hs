@@ -25,7 +25,7 @@ import Cmedit.History (pushHist)
 import Cmedit.Width (colToDisplay, displayToCol, textCells, wrapLine)
 import qualified Cmedit.Zip as Zip
 import Cmedit.ConfigFile
-  ( Config(..), ThemeName(..), PdfViewMode(..), defaultConfig, RecentEntry(..)
+  ( Config(..), ThemeName(..), PdfViewMode(..), PdfFit(..), PdfDrag(..), defaultConfig, RecentEntry(..)
   , maxRecentEntries, maxHistoryEntries, SessionSummary(..) )
 import Cmedit.Menu
 import Cmedit.Dialog
@@ -49,6 +49,10 @@ import Cmedit.Image (Image(..), ImgMode(..), renderImage, renderImagePlaced, vie
 import Cmedit.Gfx (gfxFit, maxGfxPixels)
 import Cmedit.VecView (VecDoc(..), SceneSize(..), emptyVecDoc, vecDims, placeholderImage)
 import Cmedit.Scene (Scene)
+import Cmedit.Geom (Rect(..))
+import Cmedit.PdfStrip (TileKey(..), TileBits(..), HlRect(..))
+import qualified Data.Map.Strict as M
+import qualified Data.IntMap.Strict as IM
 import Cmedit.Pager (PagerDoc(..), pagerStatus)
 import Cmedit.Rtf (RtfDoc(..))
 import qualified Cmedit.Rtf as Rtf
@@ -56,6 +60,9 @@ import Cmedit.Xlsx (Workbook(..))
 import qualified Cmedit.Xlsx as Xlsx
 import Cmedit.Pdf (PdfDoc(..))
 import qualified Cmedit.Pdf as Pdf
+import qualified Cmedit.PdfObj as PO
+import Cmedit.PdfStrip (StripGeom(..), Piece(..))
+import qualified Cmedit.PdfStrip as St
 import qualified Cmedit.Pager as Pg
 import Cmedit.Syntax (HlCache, CommentSyntax(..), langComment, langForPath)
 import Cmedit.Lint
@@ -443,7 +450,119 @@ data PdfView = PdfView
     -- with the window still there returns to 'pvPage' exactly; the reflow
     -- window cannot always show the page's start (a short document clamps
     -- the scroll), so deriving the page from it again would lose the page.
+  , pvFit         :: !PdfFit
+    -- ^ The layout: one page fitted in the window ('pvPic', turned page by
+    -- page), or the continuous fit-width column ("Cmedit.PdfStrip").
+  , pvDrag        :: !PdfDrag  -- ^ What a drag does: zoom into the box, or select the text in it.
+  , pvAnchor      :: !Int
+    -- ^ Fit width: the page at the view's top edge. 'pvPage' is then the
+    -- page the view is /on/ (the most visible one), kept in step with it.
+  , pvOff         :: !Double
+    -- ^ Fit width: how far below the top of 'pvAnchor' the view's top edge
+    -- is, in units of that page's width (so a resize or a zoom keeps the
+    -- reading position, not the pixel count). Past the page's height it is
+    -- in the gap after it.
+  , pvZoom        :: !Double   -- ^ Fit width: the column's width over the view's (1 = fit width).
+  , pvPanX        :: !Double
+    -- ^ Fit width, zoomed wider than the view: the view's left edge in the
+    -- column, as a fraction of the column's width.
+  , pvTiles       :: !(M.Map TileKey TileBits)
+    -- ^ Fit width: rendered bands of the pages near the view (device pixels
+    -- on a pixel terminal, sub-pixels for the cell picture), made once on
+    -- jobs and composited per frame. Held to the view's neighbourhood.
+  , pvTileFailed  :: ![TileKey]  -- ^ Bands whose raster failed: not asked for again.
+  , pvGlyphs      :: !(IM.IntMap [Pdf.PdfGlyph])
+    -- ^ Positioned characters of the pages parsed in this opening (they
+    -- arrive with the page's scene), for the select tool. Small; held for
+    -- the pages near the current one.
+  , pvBox         :: !(Maybe (Int, Int, Int, Int))
+    -- ^ A drag in progress over the page view, in text-area cells (anchor
+    -- row and column, current row and column). Drawn as a rubber band; what
+    -- it does on release depends on 'pvDrag'.
+  , pvSel         :: !(Maybe PdfBoxSel)  -- ^ The text the select tool took.
   } deriving (Show)
+
+-- | A box selection in the page view: per page, the rectangle the user drew
+-- (page points), the characters inside it, their text, and one highlight
+-- rectangle per line. Stored in page coordinates, so it survives scrolling,
+-- zooming and a change of layout.
+data PdfBoxSel = PdfBoxSel
+  { bsBoxes :: ![(Int, Rect)]
+  , bsRects :: ![(Int, Rect)]
+  , bsText  :: !Text
+  } deriving (Show)
+
+-- | A page's displayed size in points: its crop box, with @/Rotate@ applied.
+-- Cheap (a dictionary lookup), so a page's picture has its true aspect from
+-- the first frame, before its scene exists.
+pdfPageSize :: PdfDoc -> Int -> (Double, Double)
+pdfPageSize pd n = case Pdf.pdfPageSource pd n of
+  Nothing -> (612, 792)
+  Just (f, d) ->
+    let Rect x0 y0 x1 y1 = PO.pageCropBox f d
+        w = max 1 (x1 - x0); h = max 1 (y1 - y0)
+    in if PO.pageRotation f d `elem` [90, 270] then (h, w) else (w, h)
+
+-- | The cell's pixel size in effect (8×16 when the terminal never said).
+stripCellPx :: Editor -> (Int, Int)
+stripCellPx ed = case edCellPx ed of
+  Just (w, h) | w > 0, h > 0 -> (w, h)
+  _ -> (8, 16)
+
+-- | Does the fit-width layout draw in device pixels (the terminal shows
+-- pixels), or in half-block sub-pixels?
+stripPixel :: Editor -> Bool
+stripPixel = edGfxCaps
+
+-- | The layout's geometry for the active document.
+stripGeomOf :: Editor -> PdfDoc -> PdfView -> StripGeom
+stripGeomOf ed pd pv =
+  let lo = computeLayout ed
+      tw = max 0 (loTextWidth lo); th = max 0 (loTextHeight lo)
+      (cw, ch) = stripCellPx ed
+      pixel = stripPixel ed
+  in StripGeom
+       { sgViewW = if pixel then tw * cw else tw
+       , sgViewH = if pixel then th * ch else 2 * th
+       , sgAspect = if pixel then 1 else cellAspect ed
+       , sgGap = if pixel then ch else 2
+       , sgZoom = pvZoom pv
+       , sgPages = pvPages pv
+       , sgSize = pdfPageSize pd }
+
+-- | The geometry, the anchor in its pixels and the horizontal pan, when the
+-- fit-width layout is showing.
+stripState :: Editor -> Maybe (PdfDoc, PdfView, StripGeom, St.Anchor, Int)
+stripState ed = case (edPdf ed, edPdfView ed) of
+  (Just pd, Just pv) | pageStripOn ed ->
+    let g = stripGeomOf ed pd pv
+        a = (pvAnchor pv, St.offToPx g (pvAnchor pv) (pvOff pv))
+        pan = round (pvPanX pv * fromIntegral (St.colWidth g))
+    in Just (pd, pv, g, a, pan)
+  _ -> Nothing
+
+-- | The scene id the bands of page @k@ would be drawn from (-1: none yet).
+stripSceneOf :: PdfView -> Int -> Int
+stripSceneOf pv k = maybe (-1) psSceneId (lookup k (pvScenes pv))
+
+-- Every band the pieces overlapping rows @[lo, hi)@ need (pages with a
+-- scene only), in order.
+stripTileKeys :: Editor -> PdfView -> StripGeom -> St.Anchor -> Int -> Int -> Int -> [TileKey]
+stripTileKeys ed pv g a pan lo hi =
+  [ k | pc <- St.piecesIn g a lo hi, stripSceneOf pv (pcPage pc) >= 0
+      , k <- St.tilesFor g pan (not (stripPixel ed)) (stripSceneOf pv) pc lo hi ]
+
+-- | Are all the bands on screen drawn? (False while any is still coming.)
+stripScreenReady :: Editor -> Bool
+stripScreenReady ed = case stripState ed of
+  Nothing -> True
+  Just (_, pv, g, a, pan) ->
+    all (\pc -> stripSceneOf pv (pcPage pc) >= 0 || isJust (lookup (pcPage pc) (pvFailed pv))) (St.visiblePieces g a)
+      && all (\k -> M.member k (pvTiles pv) || k `elem` pvTileFailed pv) (stripTileKeys ed pv g a pan 0 (sgViewH g))
+
+-- | Is the active document's page view in the continuous fit-width layout?
+pageStripOn :: Editor -> Bool
+pageStripOn ed = pageViewOn ed && maybe False ((== PdfFitWidth) . pvFit) (edPdfView ed)
 
 -- | A cached page scene.
 data PageScene = PageScene
@@ -459,18 +578,21 @@ pageViewOn :: Editor -> Bool
 pageViewOn ed = isJust (edPdf ed) && maybe False pvOn (edPdfView ed)
 
 -- | The picture the image-view machinery works on: an image document's, or
--- the PDF page view's current page.
+-- the PDF page view's current page. Not the fit-width layout's: that shows
+-- several pages at once and has machinery of its own ("Cmedit.PdfStrip"),
+-- so every single-picture path (the fit, zoom crops, the cell raster, the
+-- overlay) is simply off while it shows.
 activePicture :: Editor -> Maybe ImageDoc
 activePicture ed = case edImage ed of
   Just i -> Just i
-  Nothing | pageViewOn ed -> fmap pvPic (edPdfView ed)
+  Nothing | pageViewOn ed, not (pageStripOn ed) -> fmap pvPic (edPdfView ed)
           | otherwise -> Nothing
 
 -- | Update the picture 'activePicture' returns (no-op without one).
 modPicture :: (ImageDoc -> ImageDoc) -> Editor -> Editor
 modPicture f ed = case edImage ed of
   Just i -> ed { edImage = Just (f i) }
-  Nothing | pageViewOn ed, Just pv <- edPdfView ed -> ed { edPdfView = Just pv { pvPic = f (pvPic pv) } }
+  Nothing | pageViewOn ed, not (pageStripOn ed), Just pv <- edPdfView ed -> ed { edPdfView = Just pv { pvPic = f (pvPic pv) } }
           | otherwise -> ed
 
 -- | The vector side of 'activePicture'.
@@ -541,6 +663,10 @@ data Editor = Editor
   , edExpCollapsed  :: !Bool            -- ^ The panel is collapsed to a single-column strip.
   , edSidebarDrag   :: !Bool            -- ^ A panel-width drag (on the divider) is in progress.
   , edScrollDrag    :: !Bool            -- ^ A vertical scrollbar-thumb drag is in progress (swallows mouse until release).
+  , edPanDrag       :: !(Maybe (Int, Int))
+    -- ^ A pan drag over a picture is in progress (Ctrl+drag or the middle
+    -- button over a zoomed picture or the PDF fit-width column): the cell
+    -- the pointer was last at. Swallows the mouse until release.
   , edHScrollDrag   :: !Bool            -- ^ A horizontal scrollbar-thumb drag is in progress (swallows mouse until release).
   , edCsvColDrag    :: !(Maybe Int)     -- ^ A CSV column-width drag (on a header border) is in progress: the column being resized.
   , edCsvRowDrag    :: !(Maybe Int)     -- ^ A CSV row-height drag (on a tall row's gutter @+@) is in progress: the row being resized.
@@ -738,6 +864,7 @@ newEditor size cfg = Editor
   , edExpCollapsed  = False
   , edSidebarDrag   = False
   , edScrollDrag    = False
+  , edPanDrag       = Nothing
   , edHScrollDrag   = False
   , edCsvColDrag    = Nothing
   , edCsvRowDrag    = Nothing
@@ -980,8 +1107,33 @@ imageOverlayWanted ed = case activePicture ed of
          && not (edSearchMode ed)
          && isNothing (edDialog ed)
          && isNothing (edLoading ed)
-         && isNothing (idDrag idoc)
+         -- A drag-to-zoom no longer drops the pixels for the blocky cells:
+         -- its rubber band is drawn over them (a layer of its own on kitty,
+         -- burned into the payload on sixel; see the driver's 'hlOverlay').
+         && dragOk idoc
          && loTextWidth lo > 0 && loTextHeight lo > 0
+  where
+    -- ... except on kitty with no known cell size, where the layer cannot be
+    -- placed at a pixel: there the cells (with their border) still show.
+    dragOk idoc
+      | edGfxKitty ed && isNothing (edCellPx ed) =
+          isNothing (idDrag idoc) && maybe True (\pv -> isNothing (pvBox pv) && isNothing (pvSel pv)) (edPdfView ed)
+      | otherwise = True
+
+-- | Do pixels cover the fit-width layout this frame? (Its 'imageOverlayActive':
+-- the same unobstructed-view conditions; the driver places the bands it has,
+-- and the renderer leaves those cells blank and paints paper where a band is
+-- still being drawn.)
+stripOverlayActive :: Editor -> Bool
+stripOverlayActive ed =
+  let lo = computeLayout ed
+  in pageStripOn ed
+       && edGfxCaps ed
+       && (edFocus ed == FEdit || edFocus ed == FExplorer)
+       && not (edSearchMode ed)
+       && isNothing (edDialog ed)
+       && isNothing (edLoading ed)
+       && loTextWidth lo > 0 && loTextHeight lo > 0
 
 -- | The active image doc, when it is a multi-frame animation.
 imageAnim :: Editor -> Maybe ImageDoc
@@ -1126,7 +1278,11 @@ pointerShapeFor ed row col
   | onDivider                                = "col-resize" -- panel width handle
   | inPanel                                  = "pointer"
   | edSearchMode ed && inContent             = "pointer"   -- result rows / fields
-  | isJust (activePicture ed) && inContent  = "crosshair" -- drag-zoom
+  | isJust (edPanDrag ed)                    = "grabbing"  -- mid pan drag
+  -- Over a picture the pointer says what a drag would do: zoom into a box
+  -- (a crosshair), or select the text in a box (an I-beam, the PDF select
+  -- tool), the same in every layout and zoom.
+  | pictureShown ed && inContent            = if pdfSelectTool ed then "text" else "crosshair"
   | Just v <- edCsv ed, row == loTextTop lo, inContent
   , isJust (csvBorderColAt v (col - loContentLeft lo))
                                              = "col-resize" -- header column border
@@ -1145,6 +1301,20 @@ pointerShapeFor ed row col
     onDivider = inPanel && col == loContentLeft lo - 1 && not (edExpCollapsed ed)
     inContent = inRows && col >= loContentLeft lo
     inText    = inRows && col >= loTextLeft lo
+
+-- | Is a picture what the text area shows (an image, an SVG, a PDF page in
+-- either layout)?
+pictureShown :: Editor -> Bool
+pictureShown ed = isJust (activePicture ed) || pageStripOn ed
+
+-- | Does a drag over the PDF page view select text (the select tool)?
+pdfSelectTool :: Editor -> Bool
+pdfSelectTool ed = pageViewOn ed && maybe False ((== PdfDragSelect) . pvDrag) (edPdfView ed)
+
+-- | Can the picture be dragged around (Ctrl+drag, middle drag)? When it is
+-- zoomed in, and always in the PDF fit-width column (which scrolls).
+picturePannable :: Editor -> Bool
+picturePannable ed = pageStripOn ed || maybe False (isJust . idCrop) (activePicture ed)
 
 tabWidthOf :: Editor -> Int
 tabWidthOf = cfgTabWidth . edConfig
@@ -1255,6 +1425,20 @@ scrollBarInfo ed
   -- The page view's bar measures pages: each page is one track's worth of
   -- rows, so the thumb is one page long and sits at the current page
   -- ('scrollBarTo' maps a click back the same way).
+  -- The fit-width layout scrolls continuously, so its bar does too: the
+  -- document is measured in text rows (pages counted equal, which is exact
+  -- for the usual one-size document and O(1) on a thousand pages), the
+  -- thumb is the view's share of it.
+  | pageStripOn ed, cfgScrollBarV (edConfig ed), Just (_, _, g, a, _) <- stripState ed =
+      let lo = computeLayout ed
+          h = loTextHeight lo
+          rowPx = fromIntegral (sgViewH g) / fromIntegral (max 1 h) :: Double
+          unit = fromIntegral (St.pageHeightPx g (fst a) + sgGap g)
+          total = max (h + 1) (round (fromIntegral (sgPages g) * unit / max 1 rowPx))
+          -- scaled so the thumb meets the bottom exactly at the document's end
+          end = max 1e-9 (St.anchorFraction g (St.maxAnchor g))
+          win = round (min 1 (St.anchorFraction g a / end) * fromIntegral (total - h))
+      in if h > 0 then Just (loCols lo - 1, loTextTop lo, h, total, max 0 (min (total - h) win)) else Nothing
   | pageViewOn ed, cfgScrollBarV (edConfig ed), Just pv <- edPdfView ed =
       let lo = computeLayout ed
           h = loTextHeight lo
@@ -2015,7 +2199,7 @@ pushNavIfFar tpath tpos ed
 -- "Linting" switch and rows @nEditingSettings+1 ..@ are one per 'linters'
 -- entry, in table order. A Spec test keeps this constant in step with the spec.
 nEditingSettings :: Int
-nEditingSettings = 16
+nEditingSettings = 18
 
 -- | The 'linters' entry a Settings dialog choice row maps to, if it is a
 -- per-linter row (the master switch and the editing rows return 'Nothing').

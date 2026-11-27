@@ -18,12 +18,13 @@ import qualified Data.Text as T
 import System.FilePath (dropExtension, takeDirectory, takeExtension, takeFileName)
 
 import Data.Array (Array)
+import Data.Word (Word8)
 
 import Cmedit.Types
 import Cmedit.TextBuffer
 import Cmedit.Width (colToDisplay, displayToCol, wrapLine)
 import Cmedit.ConfigFile
-  ( Config(..), ThemeName(..), PdfViewMode(..), defaultConfig, RecentEntry(..)
+  ( Config(..), ThemeName(..), PdfViewMode(..), PdfFit(..), PdfDrag(..), defaultConfig, RecentEntry(..)
   , maxRecentEntries, maxHistoryEntries, Session(..), SessionFile(..)
   , SessionSummary(..), maxSessionFiles )
 import Cmedit.Menu
@@ -46,6 +47,10 @@ import Cmedit.Manual (manualPath, manualText)
 import Cmedit.Clipboard (CopyOutcome(..))
 import Cmedit.Image (Image(..), ImgMode(..), renderImage, renderImagePlaced, viewFit, reduceImage)
 import Cmedit.Geom (Rect(..), rectW, rectH)
+import Cmedit.PdfStrip (StripGeom(..), Piece(..), TileKey(..), TileBits(..), HlRect(..))
+import qualified Cmedit.PdfStrip as St
+import qualified Data.Map.Strict as M
+import qualified Data.IntMap.Strict as IM
 import Cmedit.Scene (Scene(..))
 import Cmedit.Svg (sniffSvgText)
 import Cmedit.Raster (RenderStats(..))
@@ -356,7 +361,7 @@ refreshPdf ed = case edPdf ed of
   Nothing -> ed
   Just pd ->
     let lo = computeLayout ed
-    in ed { edPdf = Just (Pdf.pdfRelayout (tabWidthOf ed) (loTextWidth lo)
+    in stripSync ed { edPdf = Just (Pdf.pdfRelayout (tabWidthOf ed) (loTextWidth lo)
                             (loTextHeight lo) pd) }
 
 ------------------------------------------------------------------------------
@@ -946,6 +951,27 @@ cellRectToCrop ed idoc (r0,c0,r1,c1) =
       nh = max 1 (min (ih - y0) (y1 - y0))
   in (max 0 x0, max 0 y0, nw, nh)
 
+-- | Widen a crop (source pixels) to the text area's shape, about its centre:
+-- a box dragged taller or wider than the view would otherwise fill only a
+-- slice of it, with the picture on either side of that slice not shown though
+-- there is room for it. The box always stays inside the result (it is what
+-- was asked to see); the result is clamped to the picture, sliding back
+-- inside at an edge, and simply spans the picture in a direction the view's
+-- shape asks for more than it has.
+fitCropToView :: Editor -> ImageDoc -> (Int, Int, Int, Int) -> (Int, Int, Int, Int)
+fitCropToView ed idoc (x, y, w, h) =
+  let lo = computeLayout ed
+      cols = max 1 (loTextWidth lo); rows = max 1 (loTextHeight lo)
+      (iw, ih) = imageDims idoc
+      -- the view's shape in source pixels: a cell is one sub-pixel wide and
+      -- two tall, and a sub-pixel is 'cellAspect' times taller than wide
+      ratio = fromIntegral cols / (2 * fromIntegral rows * cellAspect ed) :: Double
+      wd = fromIntegral (max 1 w); hd = fromIntegral (max 1 h)
+      (w', h') | wd / hd < ratio = (min iw (max w (round (hd * ratio))), h)
+               | otherwise       = (w, min ih (max h (round (wd / ratio))))
+      place pos len len' total = max 0 (min (total - len') (pos - (len' - len) `div` 2))
+  in (place x w w' iw, place y h h' ih, w', h')
+
 -- | One scroll-wheel notch of zoom in the image view, anchored on the text-area
 -- cell @(row, col)@ under the pointer: the source pixel there stays put on
 -- screen, as in a desktop image viewer. Each notch scales by 'wheelZoomStep';
@@ -1314,17 +1340,6 @@ data PageWant = PageWant
 pdfSourcePages :: PdfDoc -> Int
 pdfSourcePages pd = max 1 (Seq.length (Pdf.srcPages (pdSource pd)))
 
--- | A page's displayed size in points: its crop box, with @/Rotate@ applied.
--- Cheap (a dictionary lookup), so a page's picture has its true aspect from
--- the first frame, before its scene exists.
-pdfPageSize :: PdfDoc -> Int -> (Double, Double)
-pdfPageSize pd n = case Pdf.pdfPageSource pd n of
-  Nothing -> (612, 792)
-  Just (f, d) ->
-    let Rect x0 y0 x1 y1 = PO.pageCropBox f d
-        w = max 1 (x1 - x0); h = max 1 (y1 - y0)
-    in if PO.pageRotation f d `elem` [90, 270] then (h, w) else (w, h)
-
 -- A page's picture with no scene yet.
 pagePicture :: Int -> PdfDoc -> Int -> ImageDoc
 pagePicture epoch pd n =
@@ -1344,14 +1359,18 @@ newPdfView epoch cfg gfx pd =
   in PdfView { pvOn = on, pvManual = False, pvAutoPending = pending
              , pvPage = 1, pvPages = pdfSourcePages pd, pvEpoch = epoch
              , pvPic = pagePicture epoch pd 1, pvScenes = []
-             , pvFailed = [], pvNoFit = [], pvLeftAt = Nothing }
+             , pvFailed = [], pvNoFit = [], pvLeftAt = Nothing
+             , pvFit = cfgPdfFit cfg, pvDrag = cfgPdfDrag cfg
+             , pvAnchor = 1, pvOff = 0, pvZoom = 1, pvPanX = 0
+             , pvTiles = M.empty, pvTileFailed = [], pvGlyphs = IM.empty
+             , pvBox = Nothing, pvSel = Nothing }
 
 -- | Drop every scene a page view holds (an inactive document keeps none);
 -- the current page re-parses when the document is shown again.
 dropPageScenes :: PdfView -> PdfView
 dropPageScenes pv =
   let pic = pvPic pv
-  in pv { pvScenes = []
+  in pv { pvScenes = [], pvTiles = M.empty, pvBox = Nothing, pvGlyphs = IM.empty
         , pvPic = pic { idCache = Nothing
                       , idVec = fmap (\vd -> vd { vdScene = Nothing, vdCells = Nothing, vdSeq = -1
                                                 , vdCellsPartial = False, vdCellsFailed = Nothing }) (idVec pic) } }
@@ -1366,7 +1385,8 @@ togglePdfPage ed = case (edPdf ed, edPdfView ed) of
     | pvOn pv ->
         let pd' = Pdf.pdfGoToPage (pdfHeight ed) (min (Pdf.pdfPageCount pd) (pvPage pv)) pd
         in ed { edPdf = Just pd', edPdfView = Just pv { pvOn = False, pvManual = True, pvAutoPending = False
-                                                       , pvLeftAt = Just (pdTop pd') }
+                                                       , pvLeftAt = Just (pdTop pd'), pvTiles = M.empty, pvBox = Nothing }
+              , edMouseSelecting = False
               , edStatus = "Reflow view \x2014 select, copy and find the text; Alt+T shows the pages" }
     | otherwise -> enterPageView True ed
   _ -> ed { edStatus = "The page view is only for PDF files" }
@@ -1421,6 +1441,7 @@ pdfCapsArrived ed0
             (Just pd, Just pv) | pvAutoPending pv && not (pvManual pv) ->
               let n = max 1 (min (pvPages pv) (reflowPageAt pd))
               in d { docPdfView = Just pv { pvOn = True, pvAutoPending = False, pvPage = n
+                                          , pvAnchor = n, pvOff = 0
                                           , pvPic = pagePicture (pvEpoch pv) pd n, pvScenes = [] } }
             _ -> d
       in ed1 { edBefore = map fixDoc (edBefore ed1), edAfter = map fixDoc (edAfter ed1) }
@@ -1432,6 +1453,7 @@ pdfCapsArrived ed0
 -- the fit on every turn.
 pdfTurnTo :: Int -> Editor -> Editor
 pdfTurnTo n0 ed = case (edPdf ed, edPdfView ed) of
+  (Just _, Just pv) | pvOn pv, pvFit pv == PdfFitWidth -> stripGoPage n0 ed
   (Just pd, Just pv) | pvOn pv ->
     let n = max 1 (min (pvPages pv) n0)
         cur = pvPage pv
@@ -1453,7 +1475,8 @@ pdfTurnTo n0 ed = case (edPdf ed, edPdfView ed) of
           Just err -> T.pack ("Page " ++ show n ++ " could not be drawn: " ++ err)
           Nothing -> edStatus ed
     in if n == cur then ed
-       else refreshImage ed { edPdfView = Just pv { pvPage = n, pvPic = pic, pvScenes = cache, pvNoFit = [] }
+       -- (a selection is of the page it was made on, the only one highlighted)
+       else refreshImage ed { edPdfView = Just pv { pvPage = n, pvPic = pic, pvScenes = cache, pvNoFit = [], pvSel = Nothing }
                             , edStatus = note }
   _ -> ed
 
@@ -1486,6 +1509,12 @@ trimPageCache n pool =
 
 -- | The current page's scene to request, when it has none.
 pdfPageWant :: Editor -> Maybe PageWant
+pdfPageWant ed
+  | pageStripOn ed = do
+      p <- edPath ed
+      pv <- edPdfView ed
+      n <- listToMaybe [ k | k <- stripVisiblePages ed, needsScene pv k ]
+      pure (PageWant p (pvEpoch pv) n)
 pdfPageWant ed = do
   p <- edPath ed
   pv <- edPdfView ed
@@ -1497,6 +1526,13 @@ pdfPageWant ed = do
 -- and its cell picture drawn): the next page, then the previous, if not
 -- cached already. The driver adds its own condition (no job in flight).
 pdfPrefetchWant :: Editor -> Maybe PageWant
+pdfPrefetchWant ed
+  | pageStripOn ed = do
+      p <- edPath ed
+      pv <- edPdfView ed
+      if any (needsScene pv) (stripVisiblePages ed) then Nothing else Just ()
+      n <- listToMaybe [ k | k <- stripNearPages ed, needsScene pv k, k `notElem` pvNoFit pv ]
+      pure (PageWant p (pvEpoch pv) n)
 pdfPrefetchWant ed = do
   p <- edPath ed
   pv <- edPdfView ed
@@ -1516,6 +1552,8 @@ pdfPrefetchWant ed = do
 -- one, a page since left behind).
 pdfPageParsed :: PageWant -> Int -> Bool -> Either String (Scene, SceneSize, [String]) -> Editor -> Editor
 pdfPageParsed w sid fontless res ed = case edPdfView ed of
+  Just pv | pvFit pv == PdfFitWidth, pvOn pv, edPath ed == Just (pwPath w), pvEpoch pv == pwEpoch w, isJust (edPdf ed) ->
+    stripPageParsed w sid fontless res pv ed
   Just pv | edPath ed == Just (pwPath w), pvEpoch pv == pwEpoch w, isJust (edPdf ed) -> case res of
     Right (sc, sz, notes)
       | pwPage w == pvPage pv ->
@@ -1558,7 +1596,7 @@ pdfPageParsed w sid fontless res ed = case edPdfView ed of
 pdfNextPageFit :: Editor -> Maybe (Int, Scene, (Int, Int, Int, Int))
 pdfNextPageFit ed = do
   pv <- edPdfView ed
-  if pageViewOn ed && isNothing (idCrop (pvPic pv)) then Just () else Nothing
+  if pageViewOn ed && not (pageStripOn ed) && isNothing (idCrop (pvPic pv)) then Just () else Nothing
   ps <- lookup (pvPage pv + 1) (pvScenes pv)
   let b = scBounds (psScene ps)
       (vw, vh) = vecDims (rectW b, rectH b)
@@ -1572,6 +1610,52 @@ pdfFontsReady pv =
   in if not stale then pv
      else pv { pvScenes = filter (not . psFontless . snd) (pvScenes pv)
              , pvPic = pic { idVec = fmap (\vd -> if vdFontless vd then vd { vdSeq = -1, vdFontless = False } else vd) (idVec pic) } }
+
+-- | Does this mouse event start a pan drag: Ctrl+drag or the middle button,
+-- over a picture that can move (zoomed in, or the PDF fit-width column)?
+-- (Not Shift: terminals keep Shift+drag for their own text selection.)
+panStarts :: MouseEvent -> Editor -> Bool
+panStarts me ed =
+  mePressed me && not (meDrag me)
+    && (meButton me == MBMiddle || (meButton me == MBLeft && modCtrl (meMods me)))
+    && edFocus ed == FEdit && picturePannable ed
+    && row >= 0 && row < loTextHeight lo && col >= 0 && col < loTextWidth lo
+  where lo = computeLayout ed
+        row = meRow me - loTextTop lo
+        col = meCol me - loTextLeft lo
+
+-- | Begin a pan drag at the pointer's cell.
+beginPan :: MouseEvent -> Editor -> Editor
+beginPan me ed = ed { edPanDrag = Just (meRow me, meCol me), edMouseSelecting = True }
+
+-- | A mouse event during a pan drag: a motion moves the picture with the
+-- pointer (the point grabbed stays under it), a release ends the drag. A
+-- motion with no button held means the release was missed (it happened
+-- outside the window): the drag ends there too.
+panDragMove :: MouseEvent -> (Int, Int) -> Editor -> Editor
+panDragMove me (r0, c0) ed
+  | not (mePressed me) || (meDrag me && meButton me == MBNone) =
+      ed { edPanDrag = Nothing, edMouseSelecting = False }
+  | meDrag me =
+      (panByCells (meCol me - c0) (meRow me - r0) ed) { edPanDrag = Just (meRow me, meCol me) }
+  | otherwise = ed
+
+-- Move the picture by whole cells (right and down when positive).
+panByCells :: Int -> Int -> Editor -> Editor
+panByCells dc dr ed
+  | dc == 0 && dr == 0 = ed
+  | Just (_, _, g, a, pan) <- stripState ed =
+      let (cw, _) = stripCellPx ed
+          colPx = if stripPixel ed then cw else 1
+      in stripSet g (St.scrollAnchor g (negate (fromIntegral dr * stripRowPx ed)) a) (pan - dc * colPx) ed
+  | Just pic <- activePicture ed, Just (x, y, w, h) <- idCrop pic =
+      let lo = computeLayout ed
+          (outW, outH, _, _) = viewFit (cellAspect ed) (imageFitCap ed pic) (loTextWidth lo) (loTextHeight lo) w h
+          (iw, ih) = imageDims pic
+          nx = max 0 (min (iw - w) (x - round (fromIntegral dc * fromIntegral w / fromIntegral (max 1 outW) :: Double)))
+          ny = max 0 (min (ih - h) (y - round (fromIntegral (2 * dr) * fromIntegral h / fromIntegral (max 1 outH) :: Double)))
+      in refreshImage (modPicture (\p -> p { idCrop = Just (nx, ny, w, h) }) ed)
+  | otherwise = ed
 
 -- | Pan a zoomed page by a fraction of the view (arrow keys), clamped to the
 -- page.
@@ -1589,6 +1673,546 @@ pdfZoomCentre :: Bool -> Editor -> Editor
 pdfZoomCentre zin ed =
   let lo = computeLayout ed
   in wheelZoom zin (loTextHeight lo `div` 2) (loTextWidth lo `div` 2) ed
+
+------------------------------------------------------------------------------
+-- PDF page view: the fit-width layout ("Cmedit.PdfStrip"). Pages stacked in
+-- one column, scrolled by pixels. Its scenes share the page view's pool
+-- ('pvScenes', every page in it; 'pvPic' is the fit-page layout's and sits
+-- idle here), its bands are 'pvTiles', and its position is an anchor
+-- ('pvAnchor', 'pvOff'). Everything here addresses the geometry of the
+-- terminal's raster: device pixels where the overlay draws, half-block
+-- sub-pixels otherwise.
+
+-- | One text row in the layout's pixels (what an arrow key scrolls by).
+stripRowPx :: Editor -> Double
+stripRowPx ed = if stripPixel ed then fromIntegral (snd (stripCellPx ed)) else 2
+
+-- Store a new anchor and pan (settled and clamped), then 'stripSync'.
+stripSet :: StripGeom -> St.Anchor -> Int -> Editor -> Editor
+stripSet g a pan ed = case edPdfView ed of
+  Just pv ->
+    let (p, o) = St.settleAnchor g a
+        pan' = max 0 (min (St.panMax g) pan)
+        pv' = pv { pvAnchor = p, pvOff = St.pxToOff g p o
+                 , pvPanX = if St.colWidth g > 0 then fromIntegral pan' / fromIntegral (St.colWidth g) else 0 }
+    in stripSync ed { edPdfView = Just pv' }
+  Nothing -> ed
+
+-- | Keep the derived state in step with the anchor: settle it (a resize or
+-- zoom may have pushed it past the end), make 'pvPage' the page the view is
+-- on, and hold the bands and scenes to the view's neighbourhood. A band is
+-- kept only while it is exactly one the view would ask for now (same scene,
+-- scale, window), which is what drops every band of the old zoom at once.
+-- Cheap (one screen of pages); 'refreshPdf' runs it after every key.
+stripSync :: Editor -> Editor
+stripSync ed = case stripState ed of
+  Nothing -> ed
+  Just (_, pv, g, a0, pan) ->
+    let a@(p, o) = St.settleAnchor g a0
+        cur = maybe (pvPage pv) pcPage (St.currentPiece g a)
+        wanted = M.fromList [ (k, ()) | k <- stripTileKeys ed pv g a pan (stripNearLo g) (stripNearHi g) ]
+        tiles = M.intersection (pvTiles pv) wanted
+        near = stripPagesIn g a (stripNearLo g) (stripNearHi g)
+        glyphs = IM.filterWithKey (\k _ -> abs (k - cur) <= glyphKeepPages || k `elem` near) (pvGlyphs pv)
+        pv' = pv { pvAnchor = p, pvOff = St.pxToOff g p o, pvPage = cur
+                 , pvTiles = tiles, pvGlyphs = glyphs
+                 -- what did not fit the budget is tried again from a new page
+                 , pvNoFit = if cur /= pvPage pv then [] else pvNoFit pv }
+    in ed { edPdfView = Just pv' }
+
+-- The neighbourhood held around the view: a screen above, two below
+-- (reading goes down).
+stripNearLo, stripNearHi :: StripGeom -> Int
+stripNearLo g = negate (sgViewH g)
+stripNearHi g = 2 * sgViewH g
+
+stripPagesIn :: StripGeom -> St.Anchor -> Int -> Int -> [Int]
+stripPagesIn g a lo hi = map pcPage (St.piecesIn g a lo hi)
+
+-- | The pages on screen in the fit-width layout, top to bottom.
+stripVisiblePages :: Editor -> [Int]
+stripVisiblePages ed = case stripState ed of
+  Just (_, _, g, a, _) -> map pcPage (St.visiblePieces g a)
+  Nothing -> []
+
+-- | The pages to prefetch: below the view, then above it.
+stripNearPages :: Editor -> [Int]
+stripNearPages ed = case stripState ed of
+  Just (_, _, g, a, _) ->
+    let vis = map pcPage (St.visiblePieces g a)
+        below = [ k | k <- stripPagesIn g a (sgViewH g) (stripNearHi g), k `notElem` vis ]
+        above = reverse [ k | k <- stripPagesIn g a (stripNearLo g) 0, k `notElem` vis ]
+    in below ++ [ k | k <- above, k `notElem` below ]
+  Nothing -> []
+
+-- | Is page @k@ one the page view keeps a scene for? (The driver asks, to
+-- cancel a prefetch nobody needs any more.)
+pdfPageNear :: Editor -> Int -> Bool
+pdfPageNear ed k = case edPdfView ed of
+  Just pv | pageStripOn ed -> k `elem` (stripVisiblePages ed ++ stripNearPages ed)
+          | otherwise -> abs (k - pvPage pv) <= 1
+  Nothing -> False
+
+-- A page that has no scene yet and has not failed.
+needsScene :: PdfView -> Int -> Bool
+needsScene pv k = isNothing (lookup k (pvScenes pv)) && isNothing (lookup k (pvFailed pv))
+
+-- | The bands to render, most wanted first: what is on screen (top to
+-- bottom), then below the view, then above it; each with the scene to draw
+-- it from. The driver runs the first few on its tile jobs.
+pdfTileWants :: Editor -> [(TileKey, Scene)]
+pdfTileWants ed = case stripState ed of
+  Nothing -> []
+  Just (_, pv, g, a, pan) ->
+    let vh = sgViewH g
+        order = stripTileKeys ed pv g a pan 0 vh
+                ++ stripTileKeys ed pv g a pan vh (stripNearHi g)
+                ++ reverse (stripTileKeys ed pv g a pan (stripNearLo g) 0)
+        missing k = M.notMember k (pvTiles pv) && k `notElem` pvTileFailed pv
+        dedup = go M.empty
+          where go _ [] = []
+                go seen (k : ks) | M.member k seen = go seen ks
+                                 | otherwise = k : go (M.insert k () seen) ks
+    in [ (k, psScene ps) | k <- dedup order, missing k, Just ps <- [lookup (tkPage k) (pvScenes pv)] ]
+
+-- | A band arrived (driver callback). Kept when the view would still ask
+-- for exactly it; a failure is remembered so it is not asked for again.
+pdfTileRendered :: TileKey -> Maybe TileBits -> Editor -> Editor
+pdfTileRendered k res ed = case stripState ed of
+  Nothing -> ed
+  Just (_, pv, g, a, pan)
+    | k `elem` stripTileKeys ed pv g a pan (stripNearLo g) (stripNearHi g) -> case res of
+        Just tb -> ed { edPdfView = Just pv { pvTiles = M.insert k tb (pvTiles pv) } }
+        Nothing -> ed { edPdfView = Just pv { pvTileFailed = take 64 (k : pvTileFailed pv) } }
+    | otherwise -> ed
+
+-- A page scene for the fit-width layout: into the pool when the view is
+-- near it, held to the neighbourhood within the memory budget (the pages on
+-- screen are always kept: dropping one would re-parse it forever).
+stripPageParsed :: PageWant -> Int -> Bool -> Either String (Scene, SceneSize, [String]) -> PdfView -> Editor -> Editor
+stripPageParsed w sid fontless res pv ed = case res of
+  Right (sc, sz, notes)
+    | pwPage w `elem` vis || pwPage w `elem` near ->
+        let -- drawn before font discovery finished, but the fonts are here
+            -- now: not kept, so the page is simply asked for again (with them)
+            redo = fontless && edFontsReady ed
+            ps = PageScene sid sc notes fontless sz
+            pool = [ (pwPage w, ps) | not redo ] ++ filter ((/= pwPage w) . fst) (pvScenes pv)
+            kept = stripTrimScenes vis near pool
+            lost = [ q | (q, _) <- pool, q `elem` near, isNothing (lookup q kept) ]
+            pv1 = pv { pvScenes = kept, pvNoFit = lost ++ filter (`notElem` lost) (pvNoFit pv) }
+            note = if null notes || pwPage w `notElem` vis then edStatus ed
+                   else T.pack ("Page " ++ show (pwPage w) ++ ": " ++ intercalate "; " notes)
+        in stripSync ed { edPdfView = Just pv1, edStatus = note }
+    | otherwise -> ed
+  Left err ->
+    let pv1 = pv { pvFailed = (pwPage w, err) : filter ((/= pwPage w) . fst) (pvFailed pv) }
+    in ed { edPdfView = Just pv1
+          , edStatus = if pwPage w `elem` vis then T.pack ("Page " ++ show (pwPage w) ++ " could not be drawn: " ++ err)
+                       else edStatus ed }
+  where
+    vis = stripVisiblePages ed
+    near = stripNearPages ed
+
+-- The fit-width layout's scene cache: every page on screen, then the
+-- neighbours in order (below first) while they fit 'pageKeepBytes'.
+stripTrimScenes :: [Int] -> [Int] -> [(Int, PageScene)] -> [(Int, PageScene)]
+stripTrimScenes vis near pool =
+  let onScreen = [ e | e@(p, _) <- pool, p `elem` vis ]
+      used0 = sum [ szBytes (psSize ps) | (_, ps) <- onScreen ]
+      pick _ [] = []
+      pick used (q : qs) = case lookup q pool of
+        Just ps | used + szBytes (psSize ps) <= pageKeepBytes -> (q, ps) : pick (used + szBytes (psSize ps)) qs
+        _ -> pick used qs
+  in onScreen ++ pick used0 [ q | q <- near, q `notElem` vis ]
+
+-- | How many pages either side of the current one keep their characters
+-- (a page's are a few hundred kilobytes; they are re-extracted on return).
+glyphKeepPages :: Int
+glyphKeepPages = 4
+
+-- | The page whose characters the select tool needs and does not have: the
+-- current page in fit page, the pages on screen in fit width. The driver
+-- extracts them on a job of their own ('JPdfGlyphs'), after the pictures.
+pdfGlyphWant :: Editor -> Maybe PageWant
+pdfGlyphWant ed = do
+  p <- edPath ed
+  pv <- edPdfView ed
+  if pageViewOn ed then Just () else Nothing
+  let pages = if pageStripOn ed then stripVisiblePages ed else [pvPage pv]
+  n <- listToMaybe [ k | k <- pages, IM.notMember k (pvGlyphs pv) ]
+  pure (PageWant p (pvEpoch pv) n)
+
+-- | Characters of a page arrived (driver callback).
+pdfGlyphsArrived :: PageWant -> [Pdf.PdfGlyph] -> Editor -> Editor
+pdfGlyphsArrived w gs ed = case edPdfView ed of
+  Just pv | edPath ed == Just (pwPath w), pvEpoch pv == pwEpoch w ->
+    let near k = abs (k - pvPage pv) <= glyphKeepPages || k `elem` stripVisiblePages ed
+        pv1 = pv { pvGlyphs = IM.filterWithKey (\k _ -> near k) (IM.insert (pwPage w) gs (pvGlyphs pv)) }
+        -- a selection made before this page's text was known takes it now
+        pv2 = case pvSel pv1 of
+          Just bs | any ((== pwPage w) . fst) (bsBoxes bs) -> pv1 { pvSel = Just (boxSelection pv1 (bsBoxes bs)) }
+          _ -> pv1
+    in ed { edPdfView = Just pv2 }
+  _ -> ed
+
+------------------------------------------------------------------------------
+-- Moving the fit-width view
+
+-- | Scroll by @d@ pixels of the layout (down when positive).
+stripScroll :: Double -> Editor -> Editor
+stripScroll d ed = case stripState ed of
+  Just (_, _, g, a, pan) -> stripSet g (St.scrollAnchor g d a) pan ed
+  Nothing -> ed
+
+-- | Scroll by @n@ text rows.
+stripScrollRows :: Double -> Editor -> Editor
+stripScrollRows n ed = stripScroll (n * stripRowPx ed) ed
+
+-- | Scroll by a screen, less two rows of overlap, so a line cut by the edge
+-- is seen whole on the next one.
+stripScrollScreen :: Int -> Editor -> Editor
+stripScrollScreen dir ed = case stripState ed of
+  Just (_, _, g, _, _) ->
+    let step = max (stripRowPx ed) (fromIntegral (sgViewH g) - 2 * stripRowPx ed)
+    in stripScroll (fromIntegral dir * step) ed
+  Nothing -> ed
+
+-- | Put the top of page @n@ (clamped) at the top of the view.
+stripGoPage :: Int -> Editor -> Editor
+stripGoPage n ed = case stripState ed of
+  Just (_, pv, g, _, pan) -> stripSet g (max 1 (min (pvPages pv) n), 0) pan ed
+  Nothing -> ed
+
+-- | The end of the document, or its start.
+stripGoEnd, stripGoStart :: Editor -> Editor
+stripGoEnd ed = case stripState ed of
+  Just (_, _, g, _, pan) -> stripSet g (St.maxAnchor g) pan ed
+  Nothing -> ed
+stripGoStart ed = case stripState ed of
+  Just (_, _, g, _, pan) -> stripSet g (1, 0) pan ed
+  Nothing -> ed
+
+-- | Pan a column wider than the view by a fraction of the view's width.
+stripPan :: Double -> Editor -> Editor
+stripPan f ed = case stripState ed of
+  Just (_, _, g, a, pan) -> stripSet g a (pan + round (f * fromIntegral (sgViewW g))) ed
+  Nothing -> ed
+
+-- | Can the column pan sideways (it is wider than the view)?
+stripPannable :: Editor -> Bool
+stripPannable ed = maybe False (\(_, _, g, _, _) -> St.panMax g > 0) (stripState ed)
+
+-- | The fit-width layout's zoom bounds.
+stripZoomMin, stripZoomMax :: Double
+stripZoomMin = 0.2
+stripZoomMax = 8
+
+-- | Zoom to @z@ (clamped), holding still the page point under the layout
+-- pixel @(x, y)@.
+stripZoomTo :: Double -> (Double, Double) -> Editor -> Editor
+stripZoomTo z0 (x, y) ed = case stripState ed of
+  Just (_, pv, g, a, pan) ->
+    let z = max stripZoomMin (min stripZoomMax z0)
+        g' = g { sgZoom = z }
+        set = stripSet g'
+    in case St.pointToPage g pan a (x, y) of
+         Just (k, (px, py)) ->
+           let (sx, sy) = St.pieceScale g' k
+               top = y - py * sy                      -- where page k's top goes
+               cl = x - px * sx                       -- and its left edge
+               pan' = if St.colWidth g' > sgViewW g' then round (negate cl) else 0
+           in set (k, negate top) pan' (ed { edPdfView = Just pv { pvZoom = z } })
+         Nothing -> set a 0 (ed { edPdfView = Just pv { pvZoom = z } })
+  Nothing -> ed
+
+-- | One zoom step (in or out) about a layout pixel.
+stripZoomStep :: Bool -> (Double, Double) -> Editor -> Editor
+stripZoomStep zin at ed = case edPdfView ed of
+  Just pv -> stripZoomTo (if zin then pvZoom pv * wheelZoomStep else pvZoom pv / wheelZoomStep) at ed
+  Nothing -> ed
+
+-- | The middle of the view, in layout pixels.
+stripCentre :: Editor -> (Double, Double)
+stripCentre ed = case stripState ed of
+  Just (_, _, g, _, _) -> (fromIntegral (sgViewW g) / 2, fromIntegral (sgViewH g) / 2)
+  Nothing -> (0, 0)
+
+-- | A text-area cell's centre in layout pixels.
+stripCellCentre :: Editor -> Int -> Int -> (Double, Double)
+stripCellCentre ed row col
+  | stripPixel ed = let (cw, ch) = stripCellPx ed
+                    in ((fromIntegral col + 0.5) * fromIntegral cw, (fromIntegral row + 0.5) * fromIntegral ch)
+  | otherwise = (fromIntegral col + 0.5, 2 * fromIntegral row + 1)
+
+-- | A text-area cell rectangle (inclusive corners) in layout pixels.
+stripCellRect :: Editor -> (Int, Int, Int, Int) -> Rect
+stripCellRect ed (ar, ac, br, bc) =
+  let r0 = min ar br; r1 = max ar br; c0 = min ac bc; c1 = max ac bc
+  in if stripPixel ed
+       then let (cw, ch) = stripCellPx ed
+            in Rect (fromIntegral (c0 * cw)) (fromIntegral (r0 * ch)) (fromIntegral ((c1 + 1) * cw)) (fromIntegral ((r1 + 1) * ch))
+       else Rect (fromIntegral c0) (fromIntegral (2 * r0)) (fromIntegral (c1 + 1)) (fromIntegral (2 * r1 + 2))
+
+-- | Zoom so that a cell rectangle the user dragged fills the view (by its
+-- width or its height, whichever is tighter), centred.
+stripZoomToBox :: (Int, Int, Int, Int) -> Editor -> Editor
+stripZoomToBox box ed = case stripState ed of
+  Just (_, pv, g, _, _) ->
+    let Rect x0 y0 x1 y1 = stripCellRect ed box
+        f = min (fromIntegral (sgViewW g) / max 1 (x1 - x0)) (fromIntegral (sgViewH g) / max 1 (y1 - y0))
+        mid = ((x0 + x1) / 2, (y0 + y1) / 2)
+        -- zoom about the box's centre, then bring that centre to the view's
+        ed1 = stripZoomTo (pvZoom pv * f) mid ed
+    in case stripState ed1 of
+         Just (_, _, g1, a1, pan1) ->
+           let (cx, cy) = stripCentre ed1
+           in stripSet g1 (St.scrollAnchor g1 (snd mid - cy) a1) (pan1 + round (fst mid - cx)) ed1
+         Nothing -> ed1
+  Nothing -> ed
+
+------------------------------------------------------------------------------
+-- Switching layout and drag mode
+
+-- | W / View ▸ Fit Width: switch the page view between one page fitted in
+-- the window and the continuous fit-width column, staying on the same page.
+togglePdfFit :: Editor -> Editor
+togglePdfFit ed = case (edPdf ed, edPdfView ed) of
+  (Just pd, Just pv) | pvOn pv -> case pvFit pv of
+    PdfFitPage ->
+      -- the page on screen joins the pool the column draws from
+      let pic = pvPic pv
+          leaving = case idVec pic of
+            Just vd | Just sc <- vdScene vd, vdSeq vd == pvPage pv ->
+              [(pvPage pv, PageScene (vdSceneId vd) sc (vdNotes vd) (vdFontless vd) (SceneSize (vdCost vd) (vdBytes vd)))]
+            _ -> []
+          pool = leaving ++ filter ((/= pvPage pv) . fst) (pvScenes pv)
+          pv1 = pv { pvFit = PdfFitWidth, pvScenes = pool, pvAnchor = pvPage pv, pvOff = 0
+                   , pvZoom = 1, pvPanX = 0, pvBox = Nothing
+                     -- idle while the column shows: its scene is in the pool
+                   , pvPic = pic { idCrop = Nothing, idDrag = Nothing, idCache = Nothing
+                                 , idVec = fmap (\vd -> vd { vdScene = Nothing, vdCells = Nothing, vdSeq = -1 }) (idVec pic) } }
+          ed1 = stripSync ed { edPdfView = Just pv1, edMouseSelecting = False }
+      in ed1 { edStatus = "Fit width \x2014 scroll through the pages; W fits one page, +/- zoom" }
+    PdfFitWidth ->
+      let n = pvPage pv
+          fresh = (pagePicture (pvEpoch pv) pd n) { idMode = idMode (pvPic pv) }
+          pic = case lookup n (pvScenes pv) of
+            Just ps -> fresh { idVec = fmap (installPageScene n ps) (idVec fresh) }
+            Nothing -> fresh
+          pv1 = pv { pvFit = PdfFitPage, pvPic = pic, pvTiles = M.empty, pvBox = Nothing
+                   , pvScenes = trimPageCache n (filter ((/= n) . fst) (pvScenes pv)) }
+      in refreshImage ed { edPdfView = Just pv1, edMouseSelecting = False, edStatus = "Fit page \x2014 PgUp/PgDn turn pages; W for the continuous fit-width view" }
+  _ -> ed { edStatus = "Fit width is for the PDF page view" }
+
+-- | S / View ▸ Drag Selects Text: what dragging a box over the page view does.
+togglePdfDrag :: Editor -> Editor
+togglePdfDrag ed = case edPdfView ed of
+  Just pv | pageViewOn ed ->
+    let d = if pvDrag pv == PdfDragZoom then PdfDragSelect else PdfDragZoom
+    in ed { edPdfView = Just pv { pvDrag = d, pvBox = Nothing, pvPic = (pvPic pv) { idDrag = Nothing } }
+          , edMouseSelecting = False
+          , edStatus = case d of
+              PdfDragSelect -> "Drag selects text \x2014 draw a box over the text, Ctrl+C copies it; S to zoom by dragging"
+              PdfDragZoom -> "Drag zooms \x2014 draw a box to zoom into it; S to select text by dragging" }
+  _ -> ed { edStatus = "Selecting by box is for the PDF page view" }
+
+------------------------------------------------------------------------------
+-- The select tool: a box over the page view, its text, its highlight
+
+-- | The page-point rectangles a text-area cell box covers, per page, in
+-- whichever layout is showing.
+pdfBoxPages :: Editor -> (Int, Int, Int, Int) -> [(Int, Rect)]
+pdfBoxPages ed box = case stripState ed of
+  Just (_, _, g, a, pan) -> St.rectToPages g pan a (stripCellRect ed box)
+  Nothing -> case (edPdfView ed, activePicture ed) of
+    (Just pv, Just pic) | pageViewOn ed, Just vd <- idVec pic, isJust (vdScene vd) ->
+      let (ar, ac, br, bc) = box
+          r0 = min ar br; r1 = max ar br; c0 = min ac bc; c1 = max ac bc
+          Rect sx0 sy0 sx1 sy1 = picCellRectToScene ed pic (r0, c0, r1, c1)
+      in if sx1 > sx0 && sy1 > sy0 then [(pvPage pv, Rect sx0 sy0 sx1 sy1)] else []
+    _ -> []
+
+-- | A cell rectangle of the fitted page picture, in its scene's points
+-- (the inverse of the fit the cell picture and drag-to-zoom use).
+picCellRectToScene :: Editor -> ImageDoc -> (Int, Int, Int, Int) -> Rect
+picCellRectToScene ed pic (r0, c0, r1, c1) =
+  let lo = computeLayout ed
+      cols = loTextWidth lo; rows = loTextHeight lo
+      (cx, cy, cw, ch) = imageCrop pic
+      (outW, outH, offX, offY) = viewFit (cellAspect ed) (imageFitCap ed pic) cols rows cw ch
+      (vw, vh) = imageDims pic
+      (sw, sh) = maybe (1, 1) vdSize (idVec pic)
+      fx k = (fromIntegral cx + fromIntegral (k - offX) * fromIntegral cw / fromIntegral (max 1 outW)) * sw / fromIntegral (max 1 vw)
+      fy k = (fromIntegral cy + fromIntegral (k - offY) * fromIntegral ch / fromIntegral (max 1 outH)) * sh / fromIntegral (max 1 vh)
+      clampX = max 0 . min sw; clampY = max 0 . min sh
+  in Rect (clampX (fx c0)) (clampY (fy (2 * r0))) (clampX (fx (c1 + 1))) (clampY (fy (2 * r1 + 2)))
+
+-- | The fitted page picture's mapping from scene points to text-area
+-- sub-pixels (the cell picture's grid: @cols × 2·rows@), for drawing a
+-- highlight over it.
+picSceneToSub :: Editor -> ImageDoc -> Rect -> Rect
+picSceneToSub ed pic (Rect x0 y0 x1 y1) =
+  let lo = computeLayout ed
+      cols = loTextWidth lo; rows = loTextHeight lo
+      (cx, cy, cw, ch) = imageCrop pic
+      (outW, outH, offX, offY) = viewFit (cellAspect ed) (imageFitCap ed pic) cols rows cw ch
+      (vw, vh) = imageDims pic
+      (sw, sh) = maybe (1, 1) vdSize (idVec pic)
+      gx x = fromIntegral offX + (x * fromIntegral vw / sw - fromIntegral cx) * fromIntegral outW / fromIntegral (max 1 cw)
+      gy y = fromIntegral offY + (y * fromIntegral vh / sh - fromIntegral cy) * fromIntegral outH / fromIntegral (max 1 ch)
+  in Rect (gx x0) (gy y0) (gx x1) (gy y1)
+
+-- | The selection the boxes take: every character whose centre is inside,
+-- per page, with its text and one highlight rectangle per line. A page whose
+-- characters have not arrived yet contributes its box and no text (they are
+-- folded in when they come: 'pdfGlyphsArrived').
+boxSelection :: PdfView -> [(Int, Rect)] -> PdfBoxSel
+boxSelection pv boxes =
+  let per = [ (k, Pdf.pdfGlyphsIn r (IM.findWithDefault [] k (pvGlyphs pv))) | (k, r) <- boxes ]
+      texts = [ t | (_, gs) <- per, not (null gs), let t = Pdf.pdfGlyphsText gs, not (T.null t) ]
+  in PdfBoxSel { bsBoxes = boxes
+               , bsRects = [ (k, r) | (k, gs) <- per, r <- Pdf.pdfGlyphRects gs ]
+               , bsText = T.intercalate "\n\n" texts }
+
+-- | Select every character of the page the view is on (Ctrl+A).
+pdfSelectPage :: Editor -> Editor
+pdfSelectPage ed = case (edPdf ed, edPdfView ed) of
+  (Just pd, Just pv) | pageViewOn ed ->
+    let n = pvPage pv
+        (w, h) = pdfPageSize pd n
+        bs = boxSelection pv [(n, Rect (-1) (-1) (w + 1) (h + 1))]
+    in ed { edPdfView = Just pv { pvSel = Just bs }, edStatus = selNote n bs }
+  _ -> ed
+  where
+    selNote n bs
+      | T.null (bsText bs) = T.pack ("Page " ++ show n ++ " has no text to select" ++ loadingNote n)
+      | otherwise = T.pack ("Selected page " ++ show n ++ ": " ++ show (T.length (bsText bs)) ++ " characters \x2014 Ctrl+C copies")
+    loadingNote n = case edPdfView ed of
+      Just pv | IM.notMember n (pvGlyphs pv) -> " yet (still loading)"
+      _ -> ""
+
+-- | Ctrl+C in the page view: copy the box selection's text.
+pdfCopyBox :: Editor -> (Editor, [Effect])
+pdfCopyBox ed = case edPdfView ed >>= pvSel of
+  Just bs | not (T.null (bsText bs)) ->
+    let t = detach (bsText bs)
+    in (ed { edClipboard = t, edStatus = T.pack ("Copied " ++ show (T.length t) ++ " characters") }, [EffCopy t])
+  Just _ -> (ed { edStatus = "No text in the selected box" }, [])
+  Nothing -> (ed { edStatus = case fmap pvDrag (edPdfView ed) of
+                     Just PdfDragSelect -> "Drag a box over the text to select it, then Ctrl+C (Ctrl+A takes the whole page)"
+                     _ -> "Press S, then drag a box over the text to select it (Ctrl+A takes the whole page); or Alt+T for the reflow view" }, [])
+
+-- | Mouse press / drag / release of a box over the page view (select mode in
+-- either layout, and zoom mode in the fit-width one; the fit-page zoom drag
+-- is the image view's own). Coordinates are text-area cells.
+pdfBoxMouse :: MouseEvent -> Editor -> Editor
+pdfBoxMouse me ed = case edPdfView ed of
+  Nothing -> ed
+  Just pv
+    | mePressed me && not (meDrag me) && meButton me == MBLeft ->
+        if inArea then put pv { pvBox = Just (row, col, row, col) } ed { edMouseSelecting = True } else ed
+    | meDrag me, Just (ar, ac, _, _) <- pvBox pv ->
+        let box = (ar, ac, clampR row, clampC col)
+            pv1 = pv { pvBox = Just box }
+        in if pvDrag pv == PdfDragSelect
+             then put pv1 { pvSel = Just (boxSelection pv1 (pdfBoxPages ed box)) } ed
+             else put pv1 ed
+    | not (mePressed me), Just box@(ar, ac, br, bc) <- pvBox pv ->
+        let moved = (ar, ac) /= (br, bc)
+            ed1 = ed { edMouseSelecting = False }
+            pv1 = pv { pvBox = Nothing }
+        in case pvDrag pv of
+             PdfDragSelect
+               | moved ->
+                   let bs = boxSelection pv1 (pdfBoxPages ed box)
+                       missing = [ k | (k, _) <- bsBoxes bs, IM.notMember k (pvGlyphs pv1) ]
+                       msg | not (T.null (bsText bs)) = T.pack ("Selected " ++ show (T.length (bsText bs)) ++ " characters \x2014 Ctrl+C copies")
+                           | not (null missing) = "The page's text is still loading \x2014 it will be selected when it arrives"
+                           | null (bsBoxes bs) = "The box is not over a page"
+                           | otherwise = "No text in the box (a picture or a scan has none to copy)"
+                   in put pv1 { pvSel = Just bs } ed1 { edStatus = msg }
+               | otherwise -> put pv1 { pvSel = Nothing } ed1    -- a click drops the selection
+             PdfDragZoom
+               | moved && abs (br - ar) >= 1 && abs (bc - ac) >= 1 -> stripZoomToBox box (put pv1 ed1)
+               | pvZoom pv /= 1 -> stripZoomTo 1 (stripCellCentre ed row col) (put pv1 ed1)
+               | otherwise -> put pv1 ed1
+    | otherwise -> ed
+  where
+    lo = computeLayout ed
+    rows = loTextHeight lo; cols = loTextWidth lo
+    row = meRow me - loTextTop lo
+    col = meCol me - loTextLeft lo
+    inArea = row >= 0 && row < rows && col >= 0 && col < cols
+    clampR r = max 0 (min (rows - 1) r)
+    clampC c = max 0 (min (cols - 1) c)
+    put pv' e = e { edPdfView = Just pv' }
+
+-- | The highlights over the page view, in page points: the selected lines
+-- (fills), each with its page. The rubber band of a drag in progress is in
+-- cells ('pvBox') and drawn by the caller.
+pdfSelHighlights :: Editor -> [(Int, Rect)]
+pdfSelHighlights ed = case edPdfView ed of
+  Just pv | pageViewOn ed, Just bs <- pvSel pv -> bsRects bs
+  _ -> []
+
+-- | The colour and opacity of a text selection over a page, and of the
+-- rubber band.
+selFillRGB, bandRGB :: (Word8, Word8, Word8)
+selFillRGB = (0x2F, 0x7C, 0xF6)
+bandRGB = (0x2F, 0x7C, 0xF6)
+
+-- | How wide the rubber band's line is in device pixels: a fine line, one
+-- pixel on an ordinary display and two on a dense one (big cells).
+bandWidth :: Editor -> Int
+bandWidth ed = if fst (stripCellPx ed) >= 14 then 2 else 1
+
+-- | Every highlight over the fit-width layout, in its pixels.
+stripHighlights :: Editor -> [HlRect]
+stripHighlights ed = case stripState ed of
+  Nothing -> []
+  Just (_, pv, g, a, pan) ->
+    let pieces = St.piecesIn g a 0 (sgViewH g)
+        fills = [ HlRect (St.pageRectToScreen g pan pc r) selFillRGB 0.35 0
+                | (k, r) <- pdfSelHighlights ed, pc <- pieces, pcPage pc == k ]
+        band = case pvBox pv of
+          Just box | (\(ar, ac, br, bc) -> (ar, ac) /= (br, bc)) box ->
+            [ HlRect (stripCellRect ed box) bandRGB 0.9 (bandWidth ed) ]
+          _ -> []
+    in fills ++ band
+
+-- | Highlights over the fitted page picture, in the cell picture's
+-- sub-pixels (fills only; the rubber band is cells).
+picHighlightsSub :: Editor -> [Rect]
+picHighlightsSub ed = case (edPdfView ed, activePicture ed) of
+  (Just pv, Just pic) | pageViewOn ed ->
+    [ picSceneToSub ed pic r | (k, r) <- pdfSelHighlights ed, k == pvPage pv ]
+  _ -> []
+
+-- | The fit-width layout's cell picture: the bands sampled into half-block
+-- cells (a pixel terminal's device-pixel bands too, when a menu or dialog
+-- covers the overlay), unrendered pages as paper, the gaps as background,
+-- selections tinted.
+stripCellGrid :: Editor -> Maybe (Array (Int, Int) Cell)
+stripCellGrid ed = case stripState ed of
+  Nothing -> Nothing
+  Just (_, pv, g, a, pan) ->
+    let lo = computeLayout ed
+        tw = loTextWidth lo; th = loTextHeight lo
+        pieces = St.piecesIn g a 0 (sgViewH g)
+        -- each page's bands, worked out once per picture, not per sub-pixel
+        byPage = IM.fromListWith (flip (++))
+                   [ (pcPage pc, St.tilesFor g pan (not (stripPixel ed)) (stripSceneOf pv) pc 0 (sgViewH g)) | pc <- pieces ]
+        keysOf k = IM.findWithDefault [] k byPage
+        hls = [ hr | hr <- stripHighlights ed, hrOutline hr == 0 ]
+        (cw, ch) = stripCellPx ed
+        toRaster sx sy
+          | stripPixel ed = ((fromIntegral sx + 0.5) * fromIntegral cw, (fromIntegral sy + 0.5) * fromIntegral ch / 2)
+          | otherwise = (fromIntegral sx + 0.5, fromIntegral sy + 0.5)
+        sample sx sy = let (x, y) = toRaster sx sy
+                       in St.stripSample g pan pieces (\k -> M.lookup k (pvTiles pv)) keysOf hls (x, y)
+    in if tw <= 0 || th <= 0 then Nothing
+       else Just (St.cellsFrom (idMode (pvPic pv)) tw th sample)
 
 -- Cycle to the next open file, wrapping around at the end.
 nextFile :: Editor -> Editor

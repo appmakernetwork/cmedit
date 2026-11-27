@@ -217,8 +217,15 @@ in `README.md`; the cross-cutting structure that matters when editing:
   the blocky fallback and its transparency checkerboard can't bleed through the
   overlay's transparent pixels. It holds when the terminal advertises pixels
   (`edGfxCaps`, mirrored from `TermCaps` in `applyReplyIO`) and the image is
-  the unobstructed content; any overlay (menu, dialog, zoom drag) drops it, so
-  the cell picture reappears as the true fallback under that UI.
+  the unobstructed content; any overlay (menu, dialog) drops it, so the cell
+  picture reappears as the true fallback under that UI. **A drag does not**:
+  a zoom drag (any picture) or the PDF select tool's box keeps the pixels and
+  is drawn over them as a fine line by the driver's `hlOverlay` (kitty: three
+  solid swatches uploaded once, every outline and fill cut from them as a
+  source rectangle at its exact pixel size, so a drag motion is a few
+  placements; sixel: burned into the payload, which `GfxKey.gkHl` makes
+  re-send), and the renderer draws the reverse-video cell border only when the
+  cells are the picture (reversed blank cells would punch holes in sixel).
   **Explorer-panel focus does not** drop it (the panel sits left of the
   placement, and viewing an image with the tree focused is intended; opening
   one from the panel keeps focus there). Cursor position is re-asserted after
@@ -569,14 +576,64 @@ in `README.md`; the cross-cutting structure that matters when editing:
   into a rectangle, zoomed the wheel zooms about the pointer and the arrows
   pan by a tenth of the view, `0`/Esc/click return to the fit; Find (and
   Next/Previous) switch to the reflow view on the same page and run there,
-  Copy and Select All say to use it, and a workspace-search hit lands there
-  too (`applyPendingDoc`). The scrollbar measures pages (`scrollBarInfo` with
+  Copy and Select All belong to the select tool (below), and a
+  workspace-search hit lands there too (`applyPendingDoc`). The scrollbar measures pages (`scrollBarInfo` with
   a track's worth of rows per page, and `scrollBarTo` maps back), and the
   status zone reads `Page 3/12 · 100%`. The pages themselves are
   `Cmedit.PdfRender`'s (see the PDF page rendering bullet); the view only ever
   sees a `Scene`. `docs/plans/bench/pty_pdf.py` checks the view (placements,
   paging, zoom, modes, and that a non-embedded Helvetica page has text pixels
   where a blank page has none), and `pty_pdfbench.py` measures real files.
+  **Fit width (`pvFit`, W, `pdf-fit`) is a layout of the page view, with its
+  own machinery (`Cmedit.PdfStrip`)**: every page as wide as the column, one
+  column, a one-row gap at each break, scrolled by pixels. `activePicture`
+  returns `Nothing` while it shows, so every single-picture path (fit, crop,
+  cell raster, `vecGfxTarget`, `wantGfx`) is simply off and `pvPic` idles;
+  its scenes are all in the `pvScenes` pool (`stripTrimScenes`: the pages on
+  screen always, the neighbourhood within `pageKeepBytes`). Three decisions
+  carry it. **Position is an anchor** (`pvAnchor`, `pvOff` in units of the
+  page's *width*), so everything is found by walking one screen from it
+  (O(screen) on any page count, the pager's bargain) and a resize or zoom
+  keeps the reading position; `pvPage` is derived (the most visible page) by
+  `stripSync`, which `refreshPdf` runs after every key. **One geometry in
+  raster pixels with an aspect**: device pixels on a pixel terminal,
+  half-block sub-pixels otherwise (`stripGeomOf`), so the cell picture and the
+  overlay share every computation. **Pages are drawn once, in 256-px bands**
+  (`TileKey`: scene, scale, horizontal tile, band; `pvTiles`; a column wider
+  than the view is cut into fixed 1024-px tiles so a pan keeps the ones still
+  in view), because
+  re-rasterising the window per scroll step measured 80–600 ms on real pages:
+  `pdfTileWants` orders them (on screen, below, above), the driver runs up to
+  three `JStripTile` slots and cancels any band that leaves the wanted window,
+  and a band is kept exactly while the view would ask for its key (a zoom or
+  pan drops the old scale's at once). On kitty with a known cell size each band
+  is uploaded once as its own image (ids from 100000) and only *placed* per
+  frame with a source rectangle and pixel offset (`stripOverlay`, `StripOut`
+  diffs placements; a scroll step is a few dozen bytes per band; a menu only
+  removes placements); sixel, or kitty with no cell size, gets one composite
+  (`composeView`) sent when its identity changes, its gaps an opaque desk
+  colour on sixel (a transparent sixel pixel keeps the previous frame's). A band still drawing is
+  paper (cells under pixels, pixels in the composite). The scrollbar counts
+  pages as equal (exact for the usual document) and is scaled to meet the
+  bottom at `maxAnchor`. **The select tool (`pvDrag`, S, `pdf-drag`) works in
+  both layouts**: `Pdf.pdfPageGlyphs` (scene-space character boxes) runs on a
+  job of its own (`JPdfGlyphs`, `pdfGlyphWant`: the pages on screen, after
+  their parse, so a page turn never waits for it; `pvGlyphs` holds ±4 pages
+  and is dropped with the scenes), a drag's cell box maps
+  to page rectangles (`pdfBoxPages`: `rectToPages` in the strip, the inverse
+  `viewFit` in fit page), `boxSelection` keeps per-page boxes, highlight
+  rectangles and text, re-selecting when a page's glyphs arrive late, and
+  Ctrl+C / Ctrl+A in the page view are `pdfCopyBox` / `pdfSelectPage`.
+  **The pointer says what a drag would do** (`pointerShapeFor`: crosshair to
+  zoom, `text` for the select tool, in every layout and zoom), and over a
+  picture that can move (`picturePannable`: zoomed, or the fit-width column)
+  Ctrl+drag or a middle drag pans (`panStarts`/`edPanDrag`, swallowing the
+  mouse like the scroll-bar drag; a motion with no button ends a pan whose
+  release was missed), with `grab`/`grabbing` from `pointerShapeAt`. Not
+  Shift: terminals keep Shift+drag for their own selection. The driver
+  re-asks the shape after every event, keys included, at the last mouse
+  position (`drvPointer`), so S re-shapes the pointer where it already is.
+  `test/PdfStripSpec.hs` and `docs/plans/bench/pty_pdfstrip.py` cover it.
 - **Archive listings (`Cmedit.Zip`).** A `.zip`, and everything built on it
   (`.jar`, `.whl`, `.docx`, `.epub`, `.apk`; sniffed by `zipMagic` in
   `classifyFileWith`, *before* the size check and the binary refusal, exactly

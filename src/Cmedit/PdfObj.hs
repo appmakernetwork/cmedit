@@ -97,6 +97,7 @@ module Cmedit.PdfObj
   , pageMediaBox
   , pageCropBox
   , pageRotation
+  , pageGeometry
   , contentsOf
     -- * Encodings and glyph names
   , glyphChar
@@ -1526,6 +1527,23 @@ pageRotation :: PdfFile -> Dict -> Int
 pageRotation f d =
   let r = ((intOf f (M.lookup (BC.pack "Rotate") d) `mod` 360) + 360) `mod` 360
   in if r `mod` 90 == 0 then r else 0
+
+-- | The displayed page and the PDF-default-space → scene matrix: crop box
+-- (clipped to the media box) and @\/Rotate@ (clockwise). This is the scene
+-- space of "Cmedit.PdfRender" (y-down points, origin at the crop box's
+-- top-left), and the space "Cmedit.Pdf"'s positioned glyphs are given in.
+pageGeometry :: PdfFile -> Dict -> (Rect, Affine)
+pageGeometry f page = (Rect 0 0 w h, m)
+  where
+    Rect x0 y0 x1 y1 = pageCropBox f page
+    cw = x1 - x0; ch = y1 - y0
+    rot = pageRotation f page
+    (w, h) = if rot == 90 || rot == 270 then (ch, cw) else (cw, ch)
+    m = case rot of
+      90  -> Affine 0 1 1 0 (-y0) (-x0)
+      180 -> Affine (-1) 0 0 1 x1 (-y0)
+      270 -> Affine 0 (-1) (-1) 0 y1 x1
+      _   -> Affine 1 0 0 (-1) (-x0) y1
 
 ------------------------------------------------------------------------------
 -- Encodings by glyph name

@@ -122,6 +122,17 @@ escape sequences and the POSIX `termios` API.
   thumbnail elsewhere), with PgDn/PgUp, zoom (+/-, Ctrl+wheel, drag), and the
   next page drawn in the background so turning to it is instant.
   `pdf-view = auto|page|reflow` (default: pages when the terminal shows pixels).
+  **W** switches to **fit width**: every page as wide as the window in one
+  continuous column, scrolled smoothly past visible page breaks (pages are
+  drawn once in bands and, on kitty, only re-placed as you scroll; a few dozen
+  bytes per band per step). **S** makes a drag **select text** instead of
+  zooming: the characters inside the box are highlighted as you drag and
+  Ctrl+C copies them as plain text in reading order (Ctrl+A takes the page).
+  `pdf-fit = page|width`, `pdf-drag = zoom|select`. On a pixel terminal a drag
+  box (here or over any picture) is a thin line over the picture, which stays
+  sharp while you drag; the pointer is a crosshair where a drag zooms and an I-beam
+  where it selects, and Ctrl+drag (or a middle drag) pans a zoomed picture or
+  the fit-width column with a grab hand.
 - **Paged view for huge files**: a file too large to load as an editable buffer
   (over 100 MB) used to be refused outright. It now opens in a read-only paged
   viewer whose memory does not depend on the file's size — a 281 MB, 4-million
@@ -590,6 +601,7 @@ logic unit-testable without a terminal.
 | `Cmedit.About` | The About box's animated wordmark (pure frame→cells generation) |
 | `Cmedit.Render` | Model → cell grid, and the diff to escape codes |
 | `Cmedit.PdfRender` (+ `PdfRenderFont`, `PdfRenderShade`) | PDF page → scene for the page view: the graphics state, text with PDF's own widths (substitute fonts stretched to them), forms/Type 3/patterns shared via `CTransform`, shadings and meshes, transparency, annotation appearances |
+| `Cmedit.PdfStrip` | The PDF page view's fit-width layout: an anchor-based continuous column of pages, page bands rendered once and composited (or placed by source rectangle on kitty), screen ↔ page coordinates for the select tool, highlight tinting |
 | `Cmedit.PdfObj` | The PDF object layer shared by the reading view and the page renderer: lexer, object scan, object streams, filters, content tokenizer, page tree, the document budget (`Fuel`) |
 | `Cmedit.PdfImage` / `Cmedit.PdfFunc` / `Cmedit.Ccitt` | PDF image XObjects and inline images → RGBA (every colour space, masks, CMYK JPEG); PDF functions (sampled, exponential, stitching, PostScript calculator); CCITT fax G3/G4 |
 | `Cmedit.Jobs` | Background-job supervision: one job per kind, newest cancels the previous, forked unmasked so a kill is immediate |

@@ -148,20 +148,9 @@ maxGsDepth = 256
 -- | Mesh triangles one page may draw.
 maxPageTris = 200000
 
--- | The displayed page and the PDF-default-space → scene matrix: crop box
--- (clipped to the media box) and @\/Rotate@ (clockwise).
-pageGeometry :: PdfFile -> Dict -> (Rect, Affine)
-pageGeometry f page = (Rect 0 0 w h, m)
-  where
-    Rect x0 y0 x1 y1 = pageCropBox f page
-    cw = x1 - x0; ch = y1 - y0
-    rot = pageRotation f page
-    (w, h) = if rot == 90 || rot == 270 then (ch, cw) else (cw, ch)
-    m = case rot of
-      90  -> Affine 0 1 1 0 (-y0) (-x0)
-      180 -> Affine (-1) 0 0 1 x1 (-y0)
-      270 -> Affine 0 (-1) (-1) 0 y1 x1
-      _   -> Affine 1 0 0 (-1) (-x0) y1
+-- ('pageGeometry', the displayed page and the PDF-default-space → scene
+-- matrix, lives in "Cmedit.PdfObj" so the text extraction in "Cmedit.Pdf"
+-- can place glyphs in the same space; it is re-exported from here.)
 
 ------------------------------------------------------------------------------
 -- Interpreter state

@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 -- | The PDF reading view: a page-description file shown as a document.
 --
 -- PDF is binary, so unlike the RTF view ("Cmedit.Rtf") this is not a
@@ -110,10 +111,17 @@ module Cmedit.Pdf
     -- * Presentation
   , pdfStatus
   , pdfPlainText
+    -- * Positioned glyphs (the page view's rectangle selection)
+  , PdfGlyph(..)
+  , pdfPageGlyphs
+  , pdfGlyphsIn
+  , pdfGlyphsText
+  , pdfGlyphRects
+  , maxSelGlyphs
   ) where
 
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
-import Data.Char (chr, isDigit, isHexDigit, digitToInt, ord, toLower)
+import Data.Char (chr, isDigit, isHexDigit, digitToInt, ord, toLower, generalCategory, GeneralCategory(..))
 import Data.Foldable (toList)
 import Data.List (foldl', sortOn, isInfixOf)
 import Data.Maybe (fromMaybe, mapMaybe, isJust)
@@ -130,7 +138,7 @@ import qualified Data.IntMap.Strict as IM
 import qualified Data.IntSet as IS
 import qualified Data.Map.Strict as M
 
-import Cmedit.Geom (Affine(..), identityA, composeA, translateA)
+import Cmedit.Geom (Affine(..), Pt(..), Rect(..), identityA, composeA, translateA, applyA)
 import qualified Cmedit.IntervalMap as IV
 import Cmedit.PdfObj
 import Cmedit.Types (Pos(..), origin)
@@ -712,7 +720,25 @@ data Run = Run
   , rSize :: !Double
   , rTxt  :: !Text
   , rFmt  :: !PdfFmt
+  , rGeom :: RunGeom
+      -- ^ Where each glyph sits, for 'pdfPageGlyphs'; 'noGeom' unless
+      -- 'runContent' was asked for it, and lazy even then, so the page view's
+      -- selection reuses this interpreter without the reflow extraction (which
+      -- runs over every page at open) paying for it.
   }
+
+-- | A run's glyphs in text space: the text-space → default-user-space matrix
+-- (@Tm × CTM@ when the string was shown), the vertical extent of a glyph box
+-- in text space (descent and ascent about the baseline, rise included), and
+-- each glyph's start and end advance with the text it stands for. The end is
+-- the start of the next glyph (character and word spacing included), so a
+-- run's glyph boxes abut and the gap between two runs is exactly the gap
+-- 'joinRuns' measures.
+data RunGeom = RunGeom !Mat !Double !Double [(Double, Double, Text)]
+
+-- | The geometry of a run whose geometry nobody asked for.
+noGeom :: RunGeom
+noGeom = RunGeom identityMat 0 0 []
 
 data GState = GState
   { gCTM    :: !Mat
@@ -746,8 +772,15 @@ data IState = IState
 
 -- | Run a page's content, collecting positioned text runs, and hand back
 -- what the document has left to spend.
-runContent :: PdfFile -> XFuel -> Dict -> BS.ByteString -> ([Run], XFuel)
-runContent f fuIn res0 dat = (reverse (isRuns end), isFuel end)
+--
+-- @wantGeom@ says whether the runs should carry their glyphs' positions
+-- ('rGeom'): only 'pdfPageGlyphs' asks. Even unforced, the geometry keeps
+-- the run's decoded glyph list alive until the page is assembled, so the
+-- reflow extraction does not build it at all. (For the same reason each run
+-- is forced as it is collected: an unevaluated one holds that list too, and
+-- holding them measured 3-10% slower opens on text-heavy files.)
+runContent :: Bool -> PdfFile -> XFuel -> Dict -> BS.ByteString -> ([Run], XFuel)
+runContent wantGeom f fuIn res0 dat = (reverse (isRuns end), isFuel end)
   where
     end = exec 0 res0 (contentTokens dat) st0 0 []
     st0 = IState gInit [] identityMat identityMat [] 0 0 fuIn M.empty
@@ -853,12 +886,29 @@ runContent f fuIn res0 dat = (reverse (isRuns end), isFuel end)
             tm' = matMul (translateA adv 0) (isTm st)
             Affine _ _ _ _ e2 f2 = matMul tm' (gCTM gs)
             fmt = PdfFmt (fiBold fi) (fiItalic fi) (fiMono fi) (gSize gs * scaleY)
-            run = Run x0 y0 e2 f2 (max 0.01 (gSize gs * scaleY)) txt fmt
+            run0 = Run x0 y0 e2 f2 (max 0.01 (gSize gs * scaleY)) txt fmt
+            -- Built only if 'pdfPageGlyphs' asks (see 'rGeom'), and even
+            -- then lazily.
+            run | wantGeom = run0 (RunGeom base (gRise gs - 0.2 * gSize gs) (gRise gs + 0.8 * gSize gs)
+                                           (glyphSpans gs fi glyphs))
+                | otherwise = run0 noGeom
         in if T.null txt || T.all (== ' ') txt || scaleX <= 0
              then st { isTm = tm' }
              else st { isTm = tm'
-                     , isRuns = run : isRuns st
+                     , isRuns = run `seq` (run : isRuns st)
                      , isChars = isChars st + T.length txt }
+
+    -- Each glyph's start and end advance: the same sum as @adv@ in
+    -- 'showStr', taken cumulatively.
+    glyphSpans gs fi = go 0
+      where
+        go !_ [] = []
+        go !a ((c, t) : rest) =
+          let w = (glyphWidth fi c * fiWScale fi * gSize gs
+                    + gChar gs
+                    + (if c == 32 && not (fiTwoByte fi) then gWord gs else 0))
+                  * gHScale gs
+          in (a, a + w, t) : go (a + w) rest
 
     -- One string's glyphs, up to the point where they alone would fill the
     -- document's character budget: the page stops after an operator that
@@ -1016,10 +1066,15 @@ rotateRun (bx0, by0, bx1, by1) rot r =
 -- otherwise fill the gutter and hide it, which is the failure mode that makes
 -- naive column detection useless on real papers.
 splitColumns :: Double -> [Run] -> [[Run]]
-splitColumns pw runs = go 0 runs
+splitColumns = splitColumnsBy rX0 rX1
+
+-- | 'splitColumns' over anything with a horizontal extent (the page view's
+-- selection splits chunks of glyphs with it).
+splitColumnsBy :: forall a. (a -> Double) -> (a -> Double) -> Double -> [a] -> [[a]]
+splitColumnsBy x0Of x1Of pw runs = go 0 runs
   where
     nbins = 100 :: Int
-    go :: Int -> [Run] -> [[Run]]
+    go :: Int -> [a] -> [[a]]
     go depth rs
       | depth >= 2 || length rs < 12 = [rs]
       | otherwise = case gapAt rs of
@@ -1031,16 +1086,16 @@ splitColumns pw runs = go 0 runs
                  || length left * 5 < length rs || length right * 5 < length rs
                  then [rs]
                  else go (depth + 1) left ++ go (depth + 1) right
-    mid r = (rX0 r + rX1 r) / 2
+    mid r = (x0Of r + x1Of r) / 2
     gapAt rs =
-      let narrow = [ r | r <- rs, rX1 r - rX0 r < 0.6 * pw ]
-          xs = concatMap (\r -> [rX0 r, rX1 r]) narrow
+      let narrow = [ r | r <- rs, x1Of r - x0Of r < 0.6 * pw ]
+          xs = concatMap (\r -> [x0Of r, x1Of r]) narrow
       in if length narrow < 10 then Nothing else
         let lo = minimum xs; hi = maximum xs
             span' = max 1 (hi - lo)
             bin v = max 0 (min (nbins - 1) (floor ((v - lo) / span' * fromIntegral nbins)))
             filled = foldl' (\m r -> foldl' (flip (`IM.insert` True)) m
-                                            [bin (rX0 r) .. bin (rX1 r)])
+                                            [bin (x0Of r) .. bin (x1Of r)])
                             IM.empty narrow
             empties = [ i | i <- [0 .. nbins - 1], not (IM.member i filled) ]
             runsOf = groupRuns empties
@@ -1056,24 +1111,13 @@ splitColumns pw runs = go 0 runs
       where span2 _ [] = ([], [])
             span2 k (y : ys) | y == k = let (p, q) = span2 (k + 1) ys in (y : p, q)
                              | otherwise = ([], y : ys)
+{-# INLINE splitColumnsBy #-}
 
 -- | Cluster runs into lines by their baseline, then order each line by x and
 -- join it into spans, inserting the spaces PDF does not record.
 buildLines :: [Run] -> [PLine]
-buildLines rs = map mkLine (cluster (sortOn rY rs))
+buildLines rs = map mkLine (clusterBaselines rY rSize (sortOn rY rs))
   where
-    cluster [] = []
-    cluster (r : rest) = go [r] (rY r) (rSize r) rest
-      where
-        go acc y sz (x : xs)
-          -- A baseline within about half an em of the running one belongs to
-          -- the same line: superscripts, subscripts, inline maths and the
-          -- separately-drawn halves of an accented glyph all sit off it.
-          -- Comfortably under a line of leading either way, which is what
-          -- stops this from swallowing the next line.
-          | abs (rY x - y) <= max 0.5 (0.45 * sz) = go (x : acc) y (max sz (rSize x)) xs
-          | otherwise = reverse acc : cluster (x : xs)
-        go acc _ _ [] = [reverse acc]
     mkLine grp =
       let srt = sortOn rX0 grp
           sz = maximum (map rSize srt)
@@ -1085,14 +1129,40 @@ buildLines rs = map mkLine (cluster (sortOn rY rs))
                , lSpans = spans
                , lFixed = fixed }
 
+-- | Group items already sorted by baseline into lines (shared by the reflow
+-- extraction and the page view's selection, so the two cannot disagree on
+-- what a line is).
+clusterBaselines :: (a -> Double) -> (a -> Double) -> [a] -> [[a]]
+clusterBaselines baseOf sizeOf = cluster
+  where
+    cluster [] = []
+    cluster (r : rest) = go [r] (baseOf r) (sizeOf r) rest
+      where
+        go acc y sz (x : xs)
+          -- A baseline within about half an em of the running one belongs to
+          -- the same line: superscripts, subscripts, inline maths and the
+          -- separately-drawn halves of an accented glyph all sit off it.
+          -- Comfortably under a line of leading either way, which is what
+          -- stops this from swallowing the next line.
+          | abs (baseOf x - y) <= max 0.5 (0.45 * sz) = go (x : acc) y (max sz (sizeOf x)) xs
+          | otherwise = reverse acc : cluster (x : xs)
+        go acc _ _ [] = [reverse acc]
+{-# INLINE clusterBaselines #-}
+
+-- | The gap, in ems of the line's largest size, from which a junction is a
+-- word break, and from which it is a column boundary ('joinRuns').
+wordGapEm, colGapEm :: Double
+wordGapEm = 0.22
+colGapEm = 1.6
+
 -- | Join a line's runs, deciding at each junction between nothing (kerning),
 -- one space (a word break) and a column boundary (which keeps the runs apart
 -- and marks the line as positioned rather than prose).
 joinRuns :: Double -> [Run] -> ([PdfSpan], Bool)
 joinRuns sz (r : rest) = go (PdfSpan (rX0 r) (rTxt r) (rFmt r)) (rX1 r) rest [] False
   where
-    wordGap = 0.22 * sz
-    colGap = 1.6 * sz
+    wordGap = wordGapEm * sz
+    colGap = colGapEm * sz
     go cur _ [] acc fixed = (reverse (cur : acc), fixed)
     go cur end (x : xs) acc fixed
       | gap >= colGap =
@@ -1300,7 +1370,7 @@ extractPdf tokenBudget bs file bytesLeft
           rot = ((intOf file (M.lookup (BC.pack "Rotate") d) `mod` 360) + 360) `mod` 360
           (dat, core1) = contentsOf file (xfFuel fu) d
           fu1 = fu { xfFuel = core1 }
-          (runs, fu2) = runContent file fu1 res dat
+          (runs, fu2) = runContent False file fu1 res dat
       in (assemblePage box rot runs, fu2)
 
     -- Body size is the size most of the document's characters are set in;
@@ -1683,3 +1753,256 @@ pdfPlainText pd = T.unlines (concatMap pageLines (toList (pdPages pd)))
     pageLines pg = map parLine (pgPars pg) ++ [T.empty]
     parLine p | ppKind p == PKBlank = T.empty
               | otherwise = T.concat (map psText (ppRuns p))
+
+------------------------------------------------------------------------------
+-- Positioned glyphs: the page view's rectangle selection
+--
+-- The page view draws the page; to select text on it, it needs to know where
+-- each character is. That is the reflow extraction's interpreter
+-- ('runContent') again, with one addition it pays nothing for: every 'Run'
+-- carries its glyphs' advances in a lazy field ('rGeom') that only this
+-- section forces. The positions are placed in the *scene* space of
+-- "Cmedit.PdfRender" ('pageGeometry': crop box, y down, @\/Rotate@ applied),
+-- so a selection rectangle drawn over the rendered page and the glyphs it
+-- covers are in one coordinate system.
+--
+-- Turning a set of glyphs back into text reuses the reflow's judgements
+-- rather than a second set that could drift from them: columns by
+-- 'splitColumnsBy', lines by 'clusterBaselines' (±half an em), and word
+-- breaks from the gap in ems ('wordGapEm'). What it does not do is join
+-- lines into paragraphs: a copy of what is inside a box keeps the box's line
+-- breaks.
+
+-- | One extracted character of a page, in the page's scene coordinates
+-- (points, origin at the top-left of the crop box, y growing down,
+-- @\/Rotate@ applied clockwise): the space 'pageGeometry' maps PDF default
+-- user space into.
+--
+-- The box runs along the baseline from the glyph's pen position to the next
+-- glyph's (character and word spacing included, so a word's boxes abut), and
+-- across it from about 0.8 em above the baseline to 0.2 em below, moved by the
+-- text rise.
+-- A glyph standing for several characters (a ligature, a multi-character
+-- @\/ToUnicode@ entry) is split into that many glyphs of equal advance, so a
+-- selection over half of an "ffi" takes half of it; a combining mark stays
+-- with the character before it.
+--
+-- The box is always the glyph's axis-aligned bounding box on the scene, so it
+-- is what a highlight should cover and what a hit test should use, whichever
+-- way the text runs. Text that does not run left to right on the displayed
+-- page (a label set sideways, a landscape table printed on a portrait page)
+-- says which way it runs in 'pgDir', and its baseline is then the coordinate
+-- /across/ the line: an x for text running up or down the page.
+data PdfGlyph = PdfGlyph
+  { pgX0, pgX1   :: !Double   -- ^ Horizontal extent, @pgX0 <= pgX1@ (along the line, for 'pgDir' 0).
+  , pgTop, pgBot :: !Double   -- ^ Vertical extent, @pgTop <= pgBot@.
+  , pgBase       :: !Double
+      -- ^ The baseline, without the text rise (as the reflow clusters lines):
+      -- its y for 'pgDir' 0 and 2, its x for 1 and 3.
+  , pgSize       :: !Double   -- ^ Effective font size (points).
+  , pgText       :: !Text     -- ^ What the glyph stands for; never empty.
+  , pgSeq        :: !Int      -- ^ Content order, for stable tie-breaking.
+  , pgDir        :: !Int
+      -- ^ Which way the text advances on the displayed page, to the nearest
+      -- quarter turn: 0 rightward (ordinary text), 1 downward (turned a
+      -- quarter clockwise), 2 leftward (upside down), 3 upward.
+  } deriving (Eq, Show)
+
+-- | Most glyphs 'pdfPageGlyphs' returns for one page. A dense page of text has
+-- a few thousand; the interpreter's own bound ('maxPdfChars') is sized for a
+-- whole document.
+maxSelGlyphs :: Int
+maxSelGlyphs = 200000
+
+-- | Every character drawn on page dictionary @d@ of file @f@, in content
+-- order. Glyphs that stand for nothing (an unmapped code) are absent; spaces
+-- the page draws are present, with text @" "@.
+--
+-- Pure and bounded: the page is interpreted under its own fresh budgets
+-- ('fuelDefault', the page renderer's per-page allowance), 'maxOpsPerPage',
+-- 'maxFormDepth' and 'maxPdfChars', and at most 'maxSelGlyphs' glyphs come
+-- back. Glyphs with a non-finite coordinate are dropped.
+pdfPageGlyphs :: PdfFile -> Dict -> [PdfGlyph]
+pdfPageGlyphs f d = zipWith number [0 ..] (take maxSelGlyphs (concatMap runGlyphs runs))
+  where
+    res = dictOf f (M.findWithDefault ONull (BC.pack "Resources") d)
+    (dat, core) = contentsOf f fuelDefault d
+    (runs, _) = runContent True f (XFuel core IM.empty IM.empty IM.empty) res dat
+    (_, toScene) = pageGeometry f d
+    number k g = g { pgSeq = k }
+    runGlyphs r = case rGeom r of
+      RunGeom base lo hi gl ->
+        let m = composeA toScene base
+        in concatMap (glyphsOf m lo hi (rSize r)) gl
+    glyphsOf m lo hi sz (a0, a1, t0) =
+      let units = textUnits (cleanText t0)
+          n = length units
+          step = (a1 - a0) / fromIntegral (max 1 n)
+      in [ g | (k, u) <- zip [0 :: Int ..] units
+             , let b0 = a0 + step * fromIntegral k
+                   b1 = if k == n - 1 then a1 else b0 + step
+                   g = boxOf m lo hi sz b0 b1 u
+             , finiteGlyph g ]
+    -- Along the line the box is the baseline's extent, pen to pen; across it,
+    -- the extent of the whole glyph quad. Not the quad's extent both ways:
+    -- under a slanted text matrix (synthetic italic) that makes neighbouring
+    -- boxes overlap by the slant, and the gaps word breaks are read from
+    -- would all shrink by it.
+    boxOf m lo hi sz b0 b1 u =
+      let Pt sx sy = applyA m (Pt b0 0)
+          Pt ex ey = applyA m (Pt b1 0)
+          qs = [ applyA m (Pt a v) | a <- [b0, b1], v <- [lo, hi] ]
+          qxs = [ x | Pt x _ <- qs ]
+          qys = [ y | Pt _ y <- qs ]
+          -- The advance direction, from the matrix alone, so a glyph with no
+          -- advance still knows which way its line runs.
+          Affine ma mb _ _ _ _ = m
+          dir | abs ma >= abs mb = if ma >= 0 then 0 else 2
+              | otherwise        = if mb >= 0 then 1 else 3
+          (x0, x1, y0, y1)
+            | odd dir   = (minimum qxs, maximum qxs, min sy ey, max sy ey)
+            | otherwise = (min sx ex, max sx ex, minimum qys, maximum qys)
+      in PdfGlyph { pgX0 = x0, pgX1 = x1, pgTop = y0, pgBot = y1
+                  , pgBase = if odd dir then sx else sy
+                  , pgSize = sz, pgText = u, pgSeq = 0, pgDir = dir }
+    finiteGlyph g = all ok [pgX0 g, pgX1 g, pgTop g, pgBot g, pgBase g]
+    ok v = not (isNaN v || isInfinite v)
+    -- A tab is a space; any other control character is not text anyone
+    -- wants pasted.
+    cleanText t
+      | T.all (\c -> c >= ' ' && c /= '\DEL') t = t
+      | otherwise = T.filter (\c -> c >= ' ' && c /= '\DEL') (T.map (\c -> if c == '\t' then ' ' else c) t)
+    -- Characters, each with the combining marks that follow it.
+    textUnits t = case T.uncons t of
+      Nothing -> []
+      Just (c, rest) ->
+        let (marks, rest') = T.span isMark rest
+        in T.cons c marks : textUnits rest'
+    isMark c = case generalCategory c of
+      NonSpacingMark -> True
+      EnclosingMark  -> True
+      _              -> False
+
+-- | The glyphs a selection rectangle (scene coordinates, either corner first)
+-- takes: those whose box's centre is inside it, so dragging over half a word
+-- takes that half. A rectangle with no area takes nothing.
+pdfGlyphsIn :: Rect -> [PdfGlyph] -> [PdfGlyph]
+pdfGlyphsIn (Rect ax0 ay0 ax1 ay1) = filter inside
+  where
+    x0 = min ax0 ax1; x1 = max ax0 ax1
+    y0 = min ay0 ay1; y1 = max ay0 ay1
+    inside g =
+      let cx = (pgX0 g + pgX1 g) / 2
+          cy = (pgTop g + pgBot g) / 2
+      in cx >= x0 && cx < x1 && cy >= y0 && cy < y1
+
+-- | Plain text of a set of glyphs, in reading order: column by column (a
+-- blank line between columns), line by line (one newline between lines,
+-- the page's own line breaks kept), and within a line in reading order with a
+-- space wherever the gap is a word break by the reflow's measure (a kerning
+-- adjustment is not one). Text running in another direction ('pgDir') is a
+-- block of its own, read in its own direction. No trailing newline; a line's
+-- leading and trailing spaces are dropped.
+pdfGlyphsText :: [PdfGlyph] -> Text
+pdfGlyphsText gs =
+  T.intercalate (T.pack "\n\n") [ T.intercalate (T.singleton '\n') (map lineText col) | col <- selLayout gs ]
+  where
+    lineText [] = T.empty
+    lineText ls@(g0 : rest) =
+      let sz = maximum (map sgSize ls)
+          wordGap = wordGapEm * sz
+          go acc _ _ [] = acc
+          go acc end sp (x : xs) =
+            let t = pgText (sgGlyph x)
+                need = sgX0 x - end >= wordGap && not sp && not (startsSp t)
+                acc' = t : (if need then T.singleton ' ' : acc else acc)
+            in go acc' (max end (sgX1 x)) (endsSp t) xs
+          t0 = pgText (sgGlyph g0)
+      in T.dropAround (== ' ') (T.concat (reverse (go [t0] (sgX1 g0) (endsSp t0) rest)))
+    endsSp t = not (T.null t) && T.last t == ' '
+    startsSp t = not (T.null t) && T.head t == ' '
+
+-- | Highlight rectangles for a set of glyphs (scene coordinates): one per line
+-- of the selection, grouped exactly as 'pdfGlyphsText' groups them, each the
+-- union of that line's glyph boxes (spaces at the line's ends excluded, so a
+-- highlight does not run on past the last word).
+pdfGlyphRects :: [PdfGlyph] -> [Rect]
+pdfGlyphRects gs = [ r | col <- selLayout gs, ln <- col, Just r <- [lineRect (map sgGlyph ln)] ]
+  where
+    lineRect ln = case filter (not . isSpaceGlyph) ln of
+      [] -> Nothing
+      ink -> Just (Rect (minimum (map pgX0 ink)) (minimum (map pgTop ink))
+                        (maximum (map pgX1 ink)) (maximum (map pgBot ink)))
+
+isSpaceGlyph :: PdfGlyph -> Bool
+isSpaceGlyph = T.all (== ' ') . pgText
+
+-- | A glyph seen in its own line's frame: turned so that its text runs left
+-- to right ('pgDir' 0), which is the frame every judgement below is made in.
+data SelGlyph = SelGlyph
+  { sgX0, sgX1, sgBase, sgSize :: !Double
+  , sgGlyph :: !PdfGlyph
+  }
+
+upright :: PdfGlyph -> SelGlyph
+upright g = case pgDir g of
+  1 -> SelGlyph (pgTop g) (pgBot g) (negate (pgBase g)) (pgSize g) g
+  2 -> SelGlyph (negate (pgX1 g)) (negate (pgX0 g)) (negate (pgBase g)) (pgSize g) g
+  3 -> SelGlyph (negate (pgBot g)) (negate (pgTop g)) (pgBase g) (pgSize g) g
+  _ -> SelGlyph (pgX0 g) (pgX1 g) (pgBase g) (pgSize g) g
+
+-- | A string's worth of glyphs: consecutive in content order, each starting
+-- where the last ended on the same baseline at the same size. This recovers
+-- 'runContent''s runs closely enough for 'splitColumnsBy', whose test for a
+-- spanning title (a run wider than 60% of the page) needs runs, not glyphs.
+data Chunk = Chunk
+  { cX0, cX1, cBase, cSize :: !Double
+  , cGlyphs :: [SelGlyph]
+  }
+
+-- | Columns of lines of glyphs (each line in reading order, all-space lines
+-- dropped): the reading order 'pdfGlyphsText' and 'pdfGlyphRects' share.
+-- Each writing direction is laid out on its own, in the order the page first
+-- draws it.
+selLayout :: [PdfGlyph] -> [[[SelGlyph]]]
+selLayout gs0 = concatMap layoutDir dirs
+  where
+    gs = sortOn pgSeq gs0
+    dirs = [ [ upright g | g <- gs, pgDir g == k ] | k <- dirOrder [] gs ]
+    dirOrder seen (g : rest)
+      | pgDir g `elem` seen = dirOrder seen rest
+      | otherwise = pgDir g : dirOrder (pgDir g : seen) rest
+    dirOrder _ [] = []
+
+layoutDir :: [SelGlyph] -> [[[SelGlyph]]]
+layoutDir [] = []
+layoutDir sgs = filter (not . null) (map colLines columns)
+  where
+    chunks = chunked sgs
+    pw = maximum (map sgX1 sgs) - minimum (map sgX0 sgs)
+    columns = splitColumnsBy cX0 cX1 pw chunks
+    colLines cs = [ ln | grp <- clusterBaselines cBase cSize (sortOn cBase cs)
+                       , let ln = dedupe (sortOn (\g -> (sgX0 g, pgSeq (sgGlyph g))) (concatMap cGlyphs grp))
+                       , not (all (isSpaceGlyph . sgGlyph) ln) ]
+    chunked [] = []
+    chunked (g : rest) = go [g] g rest
+      where
+        go acc prev (x : xs)
+          | continues prev x = go (x : acc) x xs
+        go acc _ xs = mkChunk (reverse acc) : chunked xs
+    continues prev x =
+      let tol = 0.01 * max 1 (sgSize prev)
+      in sgSize x == sgSize prev
+           && abs (sgBase x - sgBase prev) <= tol
+           && abs (sgX0 x - sgX1 prev) <= tol
+    mkChunk cg = Chunk { cX0 = minimum (map sgX0 cg), cX1 = maximum (map sgX1 cg)
+                       , cBase = case cg of (g : _) -> sgBase g; [] -> 0
+                       , cSize = maximum (0 : map sgSize cg), cGlyphs = cg }
+    -- The same glyph drawn twice a hair apart (faked bold, a drop shadow) is
+    -- one character to anyone copying it.
+    dedupe (a : b : rest)
+      | pgText (sgGlyph a) == pgText (sgGlyph b)
+      , abs (sgX0 a - sgX0 b) < 0.1 * max 1 (sgSize a)
+      , abs (sgBase a - sgBase b) < 0.1 * max 1 (sgSize a) = dedupe (a : rest)
+      | otherwise = a : dedupe (b : rest)
+    dedupe xs = xs
