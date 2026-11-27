@@ -190,7 +190,16 @@ in `README.md`; the cross-cutting structure that matters when editing:
   cell-pixel size is unknown), refuses to enlarge past native (1 device
   pixel per source pixel). This cap tracks `EditorState.imageFitCap`, which
   applies the identical rule to the cell fallback, so overlay and fallback
-  agree on the box. The half-block cell picture is the fallback, drawn
+  agree on the box. When the terminal answers the extra kitty probes (`i=32`
+  local transport after `i=31;OK`, `i=33` RFC 1950 zlib), placements
+  automatically upgrade to `t=s` POSIX shared memory / `t=t` Windows temp
+  files (`Cmedit.Term.writeKittyLocal`, ~75 B wire) or `o=z` LZ77
+  compression (`Cmedit.Deflate`, pre-compressed on vector workers with 64
+  KiB incompressibility bailout). Its Huffman code is constant but is sent
+  as a **dynamic** block (BTYPE=10 with a precomputed header), never a fixed
+  one: Ghostty 1.3.1 segfaults on any sizeable fixed-Huffman stream (stock
+  zlib's `Z_FIXED` included), and a Spec test pins the block type. The half-block cell picture is the fallback,
+  drawn
   **only when no placement will cover it**: the shared predicate
   `EditorState.imageOverlayActive` (mirroring `wantGfx`) gates both the
   driver's placement *and* the renderer: when it holds, `Render.drawImage`
@@ -1255,7 +1264,7 @@ in `README.md`; the cross-cutting structure that matters when editing:
   `imageFitCap` and `gfxFit` are unchanged.
   `pictureSample` is the one translation into the decoded pixels, and
   everything that samples a bitmap goes through it: `renderPicture` (for
-  `refreshImage` and `drawImage`) and `placeGfx`. Never sample `idImage`
+  `refreshImage` and `drawImage`) and `placeGfxIO`. Never sample `idImage`
   with a crop directly. It maps an edge *by the scale* (decoded pixel i
   covers source `[i·den, (i+1)·den)`), not proportionally to the two sizes,
   which drift apart by the partial last pixel.
@@ -1351,7 +1360,7 @@ in `README.md`; the cross-cutting structure that matters when editing:
   pre-uploads every fitted frame as its own image id (`Gfx.kittyClientAnim`,
   same pixel budget) and the editor's tick swaps the visible placement
   (`Gfx.kittySwapFrame`, a few dozen bytes: `gfxOverlay` detects a
-  same-key-but-`gkFrame` change and `placeGfx` gets the previous frame to
+  same-key-but-`gkFrame` change and `placeGfxIO` gets the previous frame to
   swap from). Everywhere else the event loop arms a separate `ImgTick`
   timer from the pure `imageTickUs` (current frame's delay, floored at 50ms
   for half-block cells and kitty placement swaps, and at a

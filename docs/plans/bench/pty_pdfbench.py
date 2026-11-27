@@ -38,16 +38,35 @@ SIXEL = re.compile(rb"\x1bP[0-9;]*q")
 STATUS = re.compile(r"Page (\d+)/(\d+)")
 
 
+PROBE32 = re.compile(rb"\x1b_Gi=32,[^;\x1b]*;([^\x1b]*)\x1b\\")
+
+
 def replies(s, mode):
+    import base64
     s.pump(0.3)
     if mode == "kitty":
         s.send(b"\x1b_Gi=31;OK\x1b\\" + b"\x1b[6;16;8t" + b"\x1b[?62;22c")
+    elif mode == "kitty-zlib":
+        s.send(b"\x1b_Gi=31;OK\x1b\\" + b"\x1b_Gi=33;OK\x1b\\"
+               + b"\x1b[6;16;8t" + b"\x1b[?62;22c")
+        if s.until(lambda: PROBE32.search(bytes(s.raw)) is not None, 3):
+            s.send(b"\x1b_Gi=32;ENOENT:remote\x1b\\")
+    elif mode == "kitty-shm":
+        s.send(b"\x1b_Gi=31;OK\x1b\\" + b"\x1b_Gi=33;OK\x1b\\"
+               + b"\x1b[6;16;8t" + b"\x1b[?62;22c")
+        if s.until(lambda: PROBE32.search(bytes(s.raw)) is not None, 3):
+            m = PROBE32.search(bytes(s.raw))
+            try:
+                os.unlink("/dev/shm" + base64.b64decode(m.group(1)).decode("ascii"))
+            except OSError:
+                pass
+            s.send(b"\x1b_Gi=32;OK\x1b\\")
     elif mode == "sixel":
         s.send(b"\x1b[6;16;8t" + b"\x1b[?62;4c")
 
 
 def placed_since(s, mark, mode):
-    pat = KITTY_PLACE if mode == "kitty" else SIXEL
+    pat = KITTY_PLACE if mode.startswith("kitty") else SIXEL
     return pat.search(bytes(s.raw[mark:])) is not None
 
 
@@ -171,6 +190,10 @@ def main():
             mode = "sixel"
         elif a == "--nocaps":
             mode = "nocaps"
+        elif a == "--kitty-zlib":
+            mode = "kitty-zlib"
+        elif a == "--kitty-shm":
+            mode = "kitty-shm"
         elif a == "--max":
             limit = int(args.pop(0))
         elif a.lower().endswith(".pdf"):

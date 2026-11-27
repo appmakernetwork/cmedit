@@ -23,21 +23,36 @@ module Cmedit.Term
   , statEntry
     -- * Private files
   , setPrivateMode
+    -- * Local graphics transfer (kitty t=s / t=t)
+  , KittyLocalKind(..)
+  , writeKittyLocal
+  , unlinkKittyLocal
   ) where
 
 import Control.Concurrent (ThreadId)
 import Control.Exception (SomeException, bracket, throwTo, try, AsyncException(UserInterrupt))
 import Control.Monad (void, when)
-import Foreign.C.Types (CInt(..))
+import Data.Bits ((.&.), shiftR)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Unsafe as BU
+import Data.IORef (IORef, atomicModifyIORef', newIORef)
+import Data.Word (Word8)
+import Foreign.C.String (CString, withCString)
+import Foreign.C.Types (CInt(..), CSize(..))
 import Foreign.Marshal.Alloc (alloca)
-import Foreign.Ptr (Ptr)
+import Foreign.Ptr (Ptr, castPtr)
 import Foreign.Storable (peek)
+import GHC.Clock (getMonotonicTimeNSec)
+import Numeric (showHex)
+import System.Directory (removeFile)
 import System.Environment (lookupEnv)
 import System.IO
+import System.IO.Unsafe (unsafePerformIO)
 import System.Posix.Files
   ( FileStatus, getSymbolicLinkStatus, isSymbolicLink, isDirectory, isRegularFile
   , fileSize, setFileMode )
 import System.Posix.IO (stdInput, stdOutput)
+import System.Posix.Process (getProcessID)
 import System.Posix.Signals
 import System.Posix.Signals.Exts (windowChange)
 import System.Posix.Terminal
@@ -49,6 +64,12 @@ foreign import ccall unsafe "cmedit_get_winsize"
 
 foreign import ccall unsafe "cmedit_get_winsize_px"
   c_get_winsize_px :: CInt -> Ptr CInt -> Ptr CInt -> IO CInt
+
+foreign import ccall safe "cmedit_shm_write"
+  c_shm_write :: CString -> Ptr Word8 -> CSize -> IO CInt
+
+foreign import ccall unsafe "cmedit_shm_unlink"
+  c_shm_unlink :: CString -> IO CInt
 
 -- | Opaque saved terminal attributes, restored on teardown.
 newtype SavedTerm = SavedTerm TerminalAttributes
@@ -209,3 +230,53 @@ setPrivateMode :: FilePath -> IO ()
 setPrivateMode path = do
   r <- try (setFileMode path 0o700) :: IO (Either SomeException ())
   pure (either (const ()) id r)
+
+------------------------------------------------------------------------------
+-- Local graphics transfer (kitty t=s POSIX shared memory)
+
+-- | Medium used by 'writeKittyLocal': POSIX shared memory (@t=s@) or an
+-- auto-deleted temporary file (@t=t@).
+data KittyLocalKind = KittyLocalShm | KittyLocalTemp
+  deriving (Eq, Show)
+
+{-# NOINLINE shmCounterRef #-}
+shmCounterRef :: IORef Int
+shmCounterRef = unsafePerformIO (newIORef 0)
+
+{-# NOINLINE shmTagStr #-}
+shmTagStr :: String
+shmTagStr = unsafePerformIO $ do
+  ns <- getMonotonicTimeNSec
+  let tag = (ns `shiftR` 4) .&. 0xFFFFFFFF
+  pure (showHex tag "")
+
+-- | Write raw pixel bytes into a fresh one-shot POSIX shared-memory object
+-- (mode @0600@, @O_CREAT | O_EXCL@) and return @(KittyLocalShm, name)@ for
+-- kitty @t=s@ transport. The name stays under 30 characters so it satisfies
+-- macOS's 31-byte @PSHMNAMLEN@ limit as well as Linux. Returns 'Nothing' on
+-- any error (full @/dev/shm@, permissions, etc.) so the caller falls back to
+-- inline @t=d@.
+writeKittyLocal :: BS.ByteString -> IO (Maybe (KittyLocalKind, String))
+writeKittyLocal bs = do
+  pid <- getProcessID
+  attempt pid (4 :: Int)
+  where
+    attempt _ 0 = pure Nothing
+    attempt pid tries = do
+      seqNo <- atomicModifyIORef' shmCounterRef (\n -> let !n' = n + 1 in (n', n'))
+      let name = "/cm-" ++ show pid ++ "-" ++ shmTagStr ++ "-" ++ show (seqNo `mod` 1000000)
+      rc <- withCString name $ \cname ->
+              BU.unsafeUseAsCStringLen bs $ \(ptr, len) ->
+                c_shm_write cname (castPtr ptr) (fromIntegral len)
+      case rc of
+        0 -> pure (Just (KittyLocalShm, name))
+        1 -> attempt pid (tries - 1)   -- EEXIST: retry with next sequence number
+        _ -> pure Nothing
+
+-- | Best-effort cleanup for a transfer object created by 'writeKittyLocal'.
+-- @ENOENT@ is normal once the terminal has consumed and unlinked the object.
+unlinkKittyLocal :: KittyLocalKind -> String -> IO ()
+unlinkKittyLocal KittyLocalShm name =
+  void (withCString name c_shm_unlink)
+unlinkKittyLocal KittyLocalTemp path =
+  void (try (removeFile path) :: IO (Either SomeException ()))

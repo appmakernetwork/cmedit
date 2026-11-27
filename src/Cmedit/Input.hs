@@ -11,7 +11,8 @@ module Cmedit.Input
 
 import Control.Exception (SomeException, catch)
 import Data.Bits ((.&.))
-import Data.Char (chr, ord)
+import Data.Char (chr, isDigit, ord)
+import Text.Read (readMaybe)
 import Data.IORef
 import Data.List (isSuffixOf)
 import Data.Word (Word8)
@@ -193,13 +194,38 @@ parseStringSeq src intro = do
            'P' -> case s of
                     ('>' : '|' : v) -> KReply (TrTermVersion v)
                     _               -> unknown' s
-           -- Kitty graphics probe reply: APC G i=..;OK ST (or an error text).
+           -- Kitty graphics probe reply: APC G i=<id>[,...];OK ST (or error).
+           -- Dispatch on the query id so each probe (i=31 graphics, i=32 local
+           -- shm/temp transport, i=33 zlib compression) stays independent and
+           -- an error from one probe never clobbers another.
            '_' -> case s of
-                    ('G' : rest) -> KReply (TrKittyGfx (";OK" `isSuffixOf` (';' : rest)))
+                    ('G' : rest) -> parseKittyReply (unknown' s) rest
                     _            -> unknown' s
            _   -> unknown' s
       where unknown' str = KUnknown (0x1b : fromIntegral (fromEnum intro)
                                        : map (fromIntegral . fromEnum) str)
+
+
+-- Parse a kitty graphics protocol reply payload (after the leading 'G').
+-- Format: @<k=v,k=v,...>;<message>@ where @message@ is @OK@ on success.
+parseKittyReply :: Key -> String -> Key
+parseKittyReply fallback rest =
+  let (ctrl, msg) = break (== ';') rest
+      ok = msg == ";OK"
+      parts = splitComma ctrl
+      findId [] = Nothing
+      findId (kv : kvs) = case kv of
+        ('i' : '=' : ds) | not (null ds), all isDigit ds -> readMaybe ds :: Maybe Int
+        _ -> findId kvs
+  in case findId parts of
+       Just 31 -> KReply (TrKittyGfx ok)
+       Just 32 -> KReply (TrKittyShm ok)
+       Just 33 -> KReply (TrKittyZlib ok)
+       _       -> fallback
+  where
+    splitComma xs = case break (== ',') xs of
+      (a, ',' : b) -> a : splitComma b
+      (a, _)       -> [a]
 
 -- Parse an SS3 sequence (ESC O already consumed): function keys F1..F4 and
 -- application-mode cursor keys.

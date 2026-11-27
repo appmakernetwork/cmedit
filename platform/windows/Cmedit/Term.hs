@@ -33,19 +33,24 @@ module Cmedit.Term
   , statEntry
     -- * Private files
   , setPrivateMode
+    -- * Local graphics transfer (kitty t=s / t=t)
+  , KittyLocalKind(..)
+  , writeKittyLocal
+  , unlinkKittyLocal
   ) where
 
 import Control.Concurrent (ThreadId, forkIO, threadDelay)
-import Control.Exception (SomeException, bracket, handle, throwTo, AsyncException(UserInterrupt))
+import Control.Exception (SomeAsyncException(..), SomeException, bracket, fromException, handle, onException, throwIO, throwTo, try, AsyncException(UserInterrupt))
 import Control.Monad (void, when)
 import Data.Bits ((.&.), (.|.), complement)
+import qualified Data.ByteString as BS
 import Data.Int (Int16)
 import Data.Word (Word32)
 import Foreign.C.Types (CInt(..))
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Ptr (FunPtr, Ptr)
 import Foreign.Storable (peekByteOff)
-import System.Directory (doesDirectoryExist, doesFileExist, getFileSize, pathIsSymbolicLink)
+import System.Directory (doesDirectoryExist, doesFileExist, getFileSize, getTemporaryDirectory, pathIsSymbolicLink, removeFile)
 import System.Environment (lookupEnv)
 import System.IO
 import Text.Read (readMaybe)
@@ -267,3 +272,26 @@ statEntry path = handle (\(_ :: SomeException) -> pure Nothing) $ do
 -- no @#ifdef@ around the journal directory.
 setPrivateMode :: FilePath -> IO ()
 setPrivateMode _ = pure ()
+
+------------------------------------------------------------------------------
+-- Local graphics transfer (kitty t=t auto-deleted temporary file)
+
+-- | Medium used by 'writeKittyLocal': POSIX shared memory (@t=s@) or an
+-- auto-deleted temporary file (@t=t@).
+data KittyLocalKind = KittyLocalShm | KittyLocalTemp
+  deriving (Eq, Show)
+
+-- | Write raw pixel bytes into a fresh one-shot temp file inside the user's
+-- temp directory with @tty-graphics-protocol@ in its name (required by the
+-- kitty graphics spec so the terminal unlinks it safely after reading).
+writeKittyLocal :: BS.ByteString -> IO (Maybe (KittyLocalKind, String))
+writeKittyLocal bs = handle (\(e :: SomeException) -> case fromException e of Just (_ :: SomeAsyncException) -> throwIO e; Nothing -> pure Nothing) $ do
+  tmpDir <- getTemporaryDirectory
+  (path, h) <- openBinaryTempFile tmpDir "cmedit-tty-graphics-protocol-.bin"
+  (BS.hPut h bs >> hClose h) `onException` (hClose h >> unlinkKittyLocal KittyLocalTemp path)
+  pure (Just (KittyLocalTemp, path))
+
+-- | Best-effort cleanup for a transfer file created by 'writeKittyLocal'.
+unlinkKittyLocal :: KittyLocalKind -> String -> IO ()
+unlinkKittyLocal _ path =
+  void (try (removeFile path) :: IO (Either SomeException ()))

@@ -561,6 +561,7 @@ logic unit-testable without a terminal.
 | `Cmedit.Syntax` | Per-language lexers (one token per character) |
 | `Cmedit.Csv` | CSV parse/serialise + spreadsheet table model |
 | `Cmedit.Inflate` | Hand-rolled DEFLATE (RFC 1951), shared by PNG and PDF's compressed streams |
+| `Cmedit.Deflate` | Hand-rolled RFC 1950 zlib + DEFLATE compressor (constant Huffman code, sent as a dynamic block) for kitty `o=z` graphics transport |
 | `Cmedit.Image` | From-scratch BMP/PNM/GIF/PNG/JPEG (baseline+progressive)/WebP (VP8L+VP8) decoders + image→cell scaler |
 | `Cmedit.Jxl` | From-scratch JPEG XL decoder: container, headers, frames, VarDCT reconstruction, features, blending, XYB→sRGB |
 | `Cmedit.JxlBits` / `JxlEntropy` | JPEG XL bit reader; ANS/prefix codes, LZ77, hybrid integers, clustered contexts |

@@ -30,7 +30,9 @@ import Cmedit.Types (TermReply(..), RenderCaps(..))
 -- | Everything the driver has learned about the connected terminal.
 data TermCaps = TermCaps
   { tcSixel     :: !Bool           -- ^ DA1 advertised sixel graphics (attribute 4).
-  , tcKittyGfx  :: !Bool           -- ^ The kitty graphics probe came back OK.
+  , tcKittyGfx  :: !Bool           -- ^ The kitty graphics probe (i=31) came back OK.
+  , tcKittyShm  :: !Bool           -- ^ The kitty local-transport probe (i=32) came back OK.
+  , tcKittyZlib :: !Bool           -- ^ The kitty zlib-compression probe (i=33) came back OK.
   , tcUndercurl :: !Bool           -- ^ Fingerprinted as understanding SGR colon forms (4:3).
   , tcRep       :: !Bool           -- ^ REP confirmed working by the cursor-position probe.
   , tcVersion   :: !(Maybe String) -- ^ XTVERSION reply, for the fingerprint and diagnostics.
@@ -40,6 +42,8 @@ defaultCaps :: TermCaps
 defaultCaps = TermCaps
   { tcSixel     = False
   , tcKittyGfx  = False
+  , tcKittyShm  = False
+  , tcKittyZlib = False
   , tcUndercurl = False
   , tcRep       = False
   , tcVersion   = Nothing
@@ -53,7 +57,9 @@ applyReply rep caps = case rep of
   TrDA1 ps        -> caps { tcSixel = tcSixel caps || 4 `elem` ps }
   TrTermVersion v -> caps { tcVersion   = Just v
                           , tcUndercurl = tcUndercurl caps || supportsUndercurl v }
-  TrKittyGfx ok   -> caps { tcKittyGfx = ok }
+  TrKittyGfx ok   -> caps { tcKittyGfx  = ok }
+  TrKittyShm ok   -> caps { tcKittyShm  = ok }
+  TrKittyZlib ok  -> caps { tcKittyZlib = ok }
   TrCursorPos r c -> case repProbeResult r c of
                        Just ok -> caps { tcRep = ok }
                        Nothing -> caps

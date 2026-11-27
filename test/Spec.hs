@@ -27,6 +27,7 @@ import SvgSpec (svgSpec)
 import SvgViewSpec (svgViewSpec)
 import PdfViewSpec (pdfViewSpec)
 import PdfRenderSpec (pdfRenderSpec)
+import GfxTransportSpec (gfxTransportSpec)
 import qualified Cmedit.JxlVarDct as JVD
 import qualified Cmedit.Jxl as Jxl
 import qualified Control.Monad.ST as ST
@@ -10124,6 +10125,7 @@ main = do
   svgViewSpec check
   pdfViewSpec check
   pdfRenderSpec check
+  gfxTransportSpec check
 
   -- Report -------------------------------------------------------------------
   (passed, failed) <- readIORef results

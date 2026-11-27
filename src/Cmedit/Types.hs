@@ -133,7 +133,9 @@ data TermReply
   | TrCellPx !Int !Int             -- ^ XTWINOPS 16 reply (CSI 6;h;w t): one cell's (height, width) in pixels.
   | TrTextPx !Int !Int             -- ^ XTWINOPS 14 reply (CSI 4;h;w t): the text area's (height, width) in pixels.
   | TrCursorPos !Int !Int          -- ^ DECXCPR reply (CSI ? row ; col R), 1-based: used by the REP probe.
-  | TrKittyGfx !Bool               -- ^ Kitty graphics probe reply: True when it came back "OK".
+  | TrKittyGfx !Bool               -- ^ Kitty graphics probe reply (i=31): True when it came back "OK".
+  | TrKittyShm !Bool               -- ^ Kitty local transport probe reply (i=32): True when it came back "OK".
+  | TrKittyZlib !Bool              -- ^ Kitty zlib compression probe reply (i=33): True when it came back "OK".
   deriving (Eq, Show)
 
 data MouseButton = MBLeft | MBMiddle | MBRight

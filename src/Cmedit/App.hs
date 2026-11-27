@@ -28,7 +28,6 @@ import Data.List (dropWhileEnd, isPrefixOf, isSuffixOf, sort, sortOn)
 import Data.Ord (Down(..))
 import qualified Data.Map.Strict as M
 import qualified Data.Sequence as Seq
-import qualified Data.Sequence as Seq
 import Data.Maybe (fromMaybe, isJust, isNothing, mapMaybe)
 import Data.Time.Clock (UTCTime, diffUTCTime, getCurrentTime)
 import qualified Data.Set as Set
@@ -70,6 +69,7 @@ import Cmedit.ConfigFile
   , summarizeSession, newestSession, sessionDirMax, maxSessionFiles )
 import Cmedit.Definition (DefReq(..))
 import qualified Cmedit.Definition as D
+import Cmedit.Deflate (zlibCompressFast)
 import Cmedit.Editor
 import Cmedit.Gfx
 import Cmedit.Image (Image, imgW, imgH, sniffImage, decodeFrames, decodeJPEGScaled, jpegDims, jpegFitScale, scaleRGBA, jpegCostHint, decodePNGParts, pngParRetry)
@@ -138,7 +138,7 @@ runTui cfg cfgWarns files readOnly statsOnExit restoreFlag = do
   setNumCapabilities (max 1 (min 4 (procs - 1)))
   -- Enter raw mode (capturing pristine attributes) and always restore them on
   -- the way out, even if an async signal interrupts the loop.
-  bracket setRawMode restoreTermAttrs $ \_ -> do
+  drvDone <- bracket setRawMode restoreTermAttrs $ \_ -> do
     size <- getTerminalSize
     recents <- loadRecentFile
     (findHist, replHist) <- loadHistoryFile
@@ -203,6 +203,9 @@ runTui cfg cfgWarns files readOnly statsOnExit restoreFlag = do
     pointerRef <- newIORef "default"
     themeRef  <- newIORef (Nothing :: Maybe ThemeName)
     gfxRef    <- newIORef (Nothing :: Maybe GfxKey)
+    gfxProbeRef  <- newIORef Nothing
+    gfxProbedRef <- newIORef False
+    gfxTmpRef    <- newIORef (0, 0, Seq.empty)
     lintGen   <- newTVarIO 0
     lintFpRef <- newIORef (lintFingerprint ed0Px)
     lintAvRef <- newIORef (edLintAvail ed0Px)
@@ -219,7 +222,8 @@ runTui cfg cfgWarns files readOnly statsOnExit restoreFlag = do
     vecDrv <- newVecDrv
     imgDecRef <- newIORef Nothing
     let drv = Drv loadQ searchQ searchGen defGen dirMtimes focused recentsRef sessionRef quickGen
-                  capsRef pointerRef themeRef gfxRef lintGen lintFpRef lintAvRef lintRunRef
+                  capsRef pointerRef themeRef gfxRef gfxProbeRef gfxProbedRef gfxTmpRef
+                  lintGen lintFpRef lintAvRef lintRunRef
                   lintLastRef journalDir journalsRef journalFpRef journalWarnRef
                   journalLastRef journalRunRef journalGate stats jobsRef vecDrv imgDecRef
     src       <- mkHandleSource stdin
@@ -242,7 +246,7 @@ runTui cfg cfgWarns files readOnly statsOnExit restoreFlag = do
 
     bracket_
       (enterScreen ed0)
-      leaveScreen
+      (leaveScreen `finally` cleanupGfxLocal drv)
       ((do fillPagerNow drv editorRef      -- a paged file named on the command line
            renderNow drv editorRef prevRef titleRef
            eventLoop editorRef prevRef titleRef q drv src)
@@ -261,7 +265,10 @@ runTui cfg cfgWarns files readOnly statsOnExit restoreFlag = do
                       -- clean exit a snapshot claims to be.
                       when (edQuit edF) (writeSnapshots edF stamp)
                       dropJournalsOnExit drv edF))
-    when statsOnExit (reportStats drv)
+    pure drv
+  -- After the terminal attributes are restored: printed in raw mode the
+  -- lines stair-step, since a bare LF no longer returns the carriage.
+  when statsOnExit (reportStats drvDone)
 
 -- Construct the starting editor. Directory arguments open as the workspace
 -- folder (the explorer panel); file arguments are loaded (the first becomes the
@@ -793,6 +800,10 @@ reportStats drv = do
   lints  <- readIORef (stLints st)
   idle   <- readIORef (stIdleGcs st)
   opened <- readIORef (stOpened st)
+  gfxP   <- readIORef (stGfxPlaces st)
+  gfxB   <- readIORef (stGfxBytes st)
+  gfxM   <- readIORef (stGfxMode st)
+  caps   <- readIORef (drvCaps drv)
   enabled <- getRTSStatsEnabled
   rts <- if enabled then Just <$> getRTSStats else pure Nothing
   let secs = now - stStart st
@@ -811,7 +822,23 @@ reportStats drv = do
                           (fromIntegral (gc_elapsed_ns s) / 1e6 :: Double)
       r3 = printf "        %d files opened, %d background jobs (%d cancelled), %d lint passes, %d idle collections"
                   opened jobs killed lints idle :: String
-  mapM_ (hPutStrLn stderr) [r1, r2, r3]
+      gfxMode :: String
+      gfxMode
+        | not (null gfxM)                     = gfxM
+        | tcKittyGfx caps && tcKittyShm caps  = "kitty shm"
+        | tcKittyGfx caps && tcKittyZlib caps = "kitty zlib"
+        | tcKittyGfx caps                     = "kitty inline"
+        | tcSixel caps                        = "sixel"
+        | otherwise                           = "cells"
+      fmtBytes :: Integer -> String
+      fmtBytes b
+        | b >= 1024 * 1024 = printf "%.2f MB" (fromIntegral b / (1024 * 1024) :: Double)
+        | b >= 1024        = printf "%.1f KB" (fromIntegral b / 1024 :: Double)
+        | otherwise        = show b ++ " B"
+      r4 :: [String]
+      r4 = [ printf "        %d graphics placements (%s sent, %s)" gfxP (fmtBytes gfxB) gfxMode
+           | gfxP > 0 || gfxB > 0 ]
+  mapM_ (hPutStrLn stderr) ([r1, r2, r3] ++ r4)
 
 ------------------------------------------------------------------------------
 -- Terminal screen lifecycle
@@ -829,7 +856,7 @@ enterScreen ed = do
            -- and are decoded to KReply events; a terminal that answers none
            -- of them simply keeps every fallback behaviour.
            <> queryBg <> queryCellPx <> queryTextPx <> queryVersion
-           <> kittyGfxProbe <> repProbe <> queryDA1
+           <> kittyGfxProbe <> kittyZlibProbe <> repProbe <> queryDA1
   hFlush stdout
 
 leaveScreen :: IO ()
@@ -899,6 +926,14 @@ data Drv = Drv
   , drvPointer   :: !(IORef String)   -- ^ The last OSC 22 pointer shape emitted (hover hint).
   , drvTheme     :: !(IORef (Maybe ThemeName)) -- ^ The theme whose cursor colour (OSC 12) is current.
   , drvGfx       :: !(IORef (Maybe GfxKey))    -- ^ The pixel-image placement currently on screen, if any.
+  , drvGfxProbe  :: !(IORef (Maybe (KittyLocalKind, String, Double)))
+      -- ^ Active i=32 local-transport probe object, unlinked on error, timeout or exit.
+  , drvGfxProbed :: !(IORef Bool)              -- ^ True once the i=32 local-transport probe has been sent.
+  , drvGfxTmp    :: !(IORef (Int, Int, Seq.Seq (Int, KittyLocalKind, String, Int)))
+      -- ^ Bounded teardown ring of recent local shm/temp objects:
+      --   @(nextBatchId, totalBytes, entries)@ where each entry is
+      --   @(batchId, kind, name, byteLen)@. Unlinked on exit; older batches
+      --   evict once the ring exceeds 256 entries or 64 MiB.
   , drvLintGen   :: !(TVar Int)       -- ^ id of the newest lint pass; a stale runner's result is dropped.
   , drvLintFp    :: !(IORef LintFp)   -- ^ Last-seen lint fingerprint; the debounce arms when it changes.
   , drvLintAvail :: !(IORef LintAvail) -- ^ Driver copy of detected linters (the runner reads it; the editor's copy drives the pure side).
@@ -951,14 +986,18 @@ data DrvStats = DrvStats
   , stKilled  :: !(IORef Int)      -- ^ Background jobs cancelled by a newer one.
   , stLints   :: !(IORef Int)      -- ^ Lint passes started.
   , stIdleGcs :: !(IORef Int)      -- ^ Idle collections performed.
-  , stOpened  :: !(IORef Int)      -- ^ Files opened.
-  , stStart   :: !Double           -- ^ Monotonic start time.
+  , stOpened    :: !(IORef Int)      -- ^ Files opened.
+  , stGfxPlaces :: !(IORef Int)      -- ^ Pixel-graphics placements emitted.
+  , stGfxBytes  :: !(IORef Integer)  -- ^ Total graphics escape bytes emitted.
+  , stGfxMode   :: !(IORef String)   -- ^ Transport mode actually used on the last placement.
+  , stStart     :: !Double           -- ^ Monotonic start time.
   }
 
 newDrvStats :: IO DrvStats
 newDrvStats = DrvStats
   <$> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef 0
   <*> newIORef 0 <*> newIORef 0 <*> newIORef 0 <*> newIORef 0
+  <*> newIORef 0 <*> newIORef 0 <*> newIORef ""
   <*> getMonotonicTime
 
 bump :: (DrvStats -> IORef Int) -> Drv -> IO ()
@@ -986,15 +1025,29 @@ data VecDrv = VecDrv
       -- ^ The parse in flight: not re-requested while it runs.
   , vdrCells    :: !(IORef (Maybe VecKey))   -- ^ The cell raster in flight.
   , vdrGfxReq   :: !(IORef (Maybe VecKey))   -- ^ The overlay raster in flight.
-  , vdrGfx      :: !(IORef [(VecKey, Maybe BS.ByteString)])
-      -- ^ The last 'vecGfxCacheSize' overlay rasters as RGBA payloads (Nothing:
-      --   the raster was refused, so it is not retried for this key). Bounded
-      --   by count and so by bytes: each is at most 'maxGfxPixels' pixels.
+  , vdrGfx      :: !(IORef [(VecKey, Maybe VecRaster)])
+      -- ^ The last 'vecGfxCacheSize' overlay rasters (Nothing: refused, so it
+      --   is not retried for this key). Bounded by count and so by bytes: each
+      --   raw buffer is at most 'maxGfxPixels' pixels.
   , vdrSceneGen :: !(IORef Int)              -- ^ Session-unique scene ids.
   , vdrPage     :: !(IORef (Maybe PageWant))  -- ^ The current-page parse in flight.
   , vdrPrefetch :: !(IORef (Maybe PageWant))  -- ^ The neighbouring-page parse in flight.
   , vdrGfxPre   :: !(IORef (Maybe VecKey))    -- ^ The next page's overlay raster in flight.
   , vdrWheelAt  :: !(IORef Double)            -- ^ When the wheel last turned a PDF page (rate limit).
+  }
+
+-- | Worker-side compression cache for a vector overlay raster: distinguishes
+-- "not tried yet" from "tried and incompressible" so the UI thread never
+-- re-runs compression on an incompressible raster.
+data ZlibCache
+  = ZlibUntried
+  | ZlibSkip
+  | ZlibReady !BS.ByteString
+
+-- | A cached vector overlay raster: raw RGBA plus worker-computed zlib state.
+data VecRaster = VecRaster
+  { vrRaw  :: !BS.ByteString
+  , vrZlib :: !ZlibCache
   }
 
 -- | Overlay rasters kept: the one on screen and the one before it (so
@@ -1117,7 +1170,7 @@ data SearchMsg
   | SMVecCells   !VecKey !(Maybe (Image, Bool, [String]))
       -- ^ A cell raster finished (Nothing: refused or failed); the flag says
       --   the budget ran out.
-  | SMVecGfx     !Bool !VecKey !(Maybe (BS.ByteString, [String]))
+  | SMVecGfx     !Bool !VecKey !(Maybe (VecRaster, [String]))
       -- ^ (whether it was a prefetch)
   | SMPageParsed !PageWant !Int !Bool !(Either String (Scene, SceneSize, [String]))
       -- ^ A PDF page's scene: the request, its scene id, drawn before fonts
@@ -1348,6 +1401,7 @@ eventLoop editorRef prevRef titleRef q drv _src = do
           loop pollT mlint mjour Nothing
         -- Periodic filesystem freshness pass; repaint only if it changed anything.
         FsTick -> do
+          sweepExpiredGfxProbe drv
           changed <- pollFs drv editorRef
           -- The live counters ride the freshness poll rather than arming a
           -- timer of their own: a 2 s cadence is plenty for a diagnostic, and
@@ -1660,7 +1714,11 @@ applyTerminalPixels ed = do
 -- editor-visible state (background colour, pixel geometry), the editor.
 applyReplyIO :: Drv -> IORef Editor -> TermReply -> IO ()
 applyReplyIO drv editorRef rep = do
-  modifyIORef' (drvCaps drv) (applyReply rep)
+  -- Only honour a positive shm reply when we actually issued an i=32 probe.
+  accept <- case rep of
+    TrKittyShm True -> readIORef (drvGfxProbed drv)
+    _               -> pure True
+  when accept (modifyIORef' (drvCaps drv) (applyReply rep))
   -- Mirror pixel-graphics support into the editor so the renderer can drop the
   -- half-block fallback under a real placement (kept in step with 'wantGfx').
   caps' <- readIORef (drvCaps drv)
@@ -1680,6 +1738,14 @@ applyReplyIO drv editorRef rep = do
       in if isNothing (edCellPx ed) && rows > 0 && cols > 0 && w >= cols && h >= rows
            then setCellPx (w `div` cols, h `div` rows) ed
            else ed
+    -- Once kitty graphics is confirmed, probe whether the terminal shares
+    -- local shared memory / temp storage with us (i=32). Never sent to
+    -- terminals that did not answer i=31, so non-kitty sessions create zero
+    -- shm/temp objects.
+    TrKittyGfx True -> probeKittyLocal drv
+    -- Unlink the probe on any i=32 reply (ENOENT is harmless if the terminal
+    -- already unlinked it; guards against terminals that reply OK without unlinking).
+    TrKittyShm _ -> unlinkPendingProbe drv
     _ -> pure ()
 
 -- | Post a desktop notification (OSC 9) — but only when the terminal is
@@ -2507,12 +2573,12 @@ startPageParse drv kind marker w ed = case edPdf ed >>= \pd -> Pdf.pdfPageSource
 startVecGfxPre :: Drv -> VecKey -> Scene -> IO ()
 startVecGfxPre drv k sc = startJob drv JVecGfxPrefetch $
   guardJob (const (atomically (writeTQueue (drvSearchQ drv) (SMVecGfx True k Nothing)))) $ do
+  caps <- readIORef (drvCaps drv)
   r <- trySync $ case rasterVec sc (vkCrop k) (vkW k) (vkH k) of
     Nothing -> pure Nothing
     Just (img, st) -> do
-      let rgba = imageRGBA img
-      _ <- evaluate (BS.length rgba)
-      pure (Just (rgba, rasterNoteList st))
+      vr <- buildVecRaster caps (imageRGBA img)
+      pure (Just (vr, rasterNoteList st))
   atomically (writeTQueue (drvSearchQ drv) (SMVecGfx True k (either (const Nothing) id r)))
 
 -- | The overlay the active vector picture wants this frame, if any: its
@@ -2632,13 +2698,26 @@ startVecCells drv k sc = startJob drv JVecCells $
 startVecGfx :: Drv -> VecKey -> Scene -> IO ()
 startVecGfx drv k sc = startJob drv JVecGfx $
   guardJob (const (atomically (writeTQueue (drvSearchQ drv) (SMVecGfx False k Nothing)))) $ do
+  caps <- readIORef (drvCaps drv)
   r <- trySync $ case rasterVec sc (vkCrop k) (vkW k) (vkH k) of
     Nothing -> pure Nothing
     Just (img, st) -> do
-      let rgba = imageRGBA img
-      _ <- evaluate (BS.length rgba)
-      pure (Just (rgba, rasterNoteList st))
+      vr <- buildVecRaster caps (imageRGBA img)
+      pure (Just (vr, rasterNoteList st))
   atomically (writeTQueue (drvSearchQ drv) (SMVecGfx False k (either (const Nothing) id r)))
+
+-- Force the RGBA payload on the worker thread and, when remote kitty @o=z@
+-- is active (and local shm is not), pre-compress it here so 'renderNow' only
+-- emits already-compressed bytes.
+buildVecRaster :: TermCaps -> BS.ByteString -> IO VecRaster
+buildVecRaster caps rgba = do
+  _ <- evaluate (BS.length rgba)
+  zc <- if tcKittyGfx caps && not (tcKittyShm caps) && tcKittyZlib caps && BS.length rgba >= 16384
+          then case zlibCompressFast rgba of
+                 Just z  -> evaluate (BS.length z) >> pure (ZlibReady z)
+                 Nothing -> pure ZlibSkip
+          else pure ZlibUntried
+  pure (VecRaster rgba zc)
 
 -- | Start a lint pass, cancelling whatever was in flight.
 --
@@ -4309,19 +4388,21 @@ renderNow drv editorRef prevRef titleRef = do
   -- one and the image view is unobstructed; re-placed only when its identity
   -- changes or a full redraw invalidated the terminal's copy.
   overlay <- gfxOverlay drv caps ed (isNothing prev)
-  let cursorFix = case overlay of
-        Nothing -> mempty
-        -- Graphics emission moves the terminal cursor; restore the frame's.
-        Just _  -> case scrCursor scr of
+  let (overlayPart, cursorFix) = case overlay of
+        Nothing -> (mempty, mempty)
+        Just b  ->
+          -- Graphics emission moves the terminal cursor; restore the frame's.
+          let cf = case scrCursor scr of
                      Just (r, c) -> moveTo r c <> showCursor
                      Nothing     -> hideCursor
+          in (b, cf)
   -- The whole frame — diff, title, cursor colour, graphics — goes out inside
   -- one synchronized-output block so the terminal commits it atomically.
   emit (beginSync
           <> cursorColorPart
           <> renderFrame (renderCapsOf caps) prev scr
           <> titlePart
-          <> fromMaybe mempty overlay
+          <> overlayPart
           <> cursorFix
           <> endSync)
   hFlush stdout
@@ -4375,7 +4456,7 @@ gfxOverlay drv caps ed fullRedraw = do
                           -> Just (gkFrame prev)
                 _         -> Nothing
           writeIORef (drvGfx drv) (Just key)
-          pure (Just (placeGfx ed key prevFrame))
+          Just <$> placeGfxIO drv caps ed key prevFrame
 
 -- Is a pixel placement wanted right now, and under what identity?
 wantGfx :: TermCaps -> Editor -> Maybe GfxKey
@@ -4422,11 +4503,17 @@ vecPlacement drv caps ed mprev key = do
                      && gkPx prev == gkPx key && gkKind prev == gkKind key
         Nothing -> False
   case (target, look) of
-    (Just (_, _, _, (row, col, cols, rows, pxW, pxH)), Just (Just rgba)) -> do
+    (Just (_, _, _, (row, col, cols, rows, pxW, pxH)), Just (Just vr)) -> do
       writeIORef (drvGfx drv) (Just key)
-      pure $ Just $ case gkKind key of
-        GfxKitty -> kittyPlace (row, col) (cols, rows) (pxW, pxH) rgba
-        GfxSixel -> sixelPlace (row, col) (pxW, pxH) rgba
+      case gkKind key of
+        GfxKitty -> do
+          batchId <- beginGfxBatch drv
+          pay <- encodeKittyFrame drv batchId caps (vrRaw vr) (vrZlib vr)
+          recordGfxStat drv (kittyPayloadWireBytes pay) (kittyPayloadMode pay)
+          pure (Just (kittyPlacePayload (row, col) (cols, rows) (pxW, pxH) pay))
+        GfxSixel -> do
+          recordGfxStat drv (fromIntegral (BS.length (vrRaw vr))) "sixel"
+          pure (Just (sixelPlace (row, col) (pxW, pxH) (vrRaw vr)))
     -- Nothing to place yet (still rendering) or ever (refused, failed): the
     -- previous placement may stay up only while this one is genuinely on its
     -- way, and only at the same place ('keepPreviousPlacement'); otherwise a
@@ -4448,53 +4535,229 @@ vecPlacement drv caps ed mprev key = do
 -- sixel the placement shows the current frame and the tick re-places it per
 -- frame ('gkFrame' is in the key). A zoom crop on any kitty-protocol
 -- terminal deliberately shows a still (see 'imageKittyAnim').
-placeGfx :: Editor -> GfxKey -> Maybe Int -> Builder
-placeGfx ed key prevFrame = fromMaybe mempty $ do
-  idoc <- edImage ed
-  let (_, _, cw, ch) = gkCrop key
-      -- The fit is the full-resolution crop's; the pixels come from the
-      -- decode, which for a reduced JPEG is smaller ('pictureSample').
-      (img, dcrop@(_, _, dcw, dch)) = pictureSample idoc (gkCrop key)
-      cellPx = case gkPx key of (0, 0) -> (8, 16); p -> p  -- unknown: assume 2:1
-      (top, left, tw, th) = gkGeom key
-      -- Fill (upscale) only when zoomed into a crop, or when the real cell
-      -- pixel size is unknown so "native" is meaningless; otherwise a small
-      -- image stays at 1:1 and centred. Matches 'imageFitCap' for the cell view.
-      allowUpscale = isJust (idCrop idoc) || gkPx key == (0, 0)
-      (row, col, cols, rows, pxW0, pxH0) = gfxFit cellPx (top, left, tw, th) (cw, ch) allowUpscale
-      -- Kitty scales the payload into the cell box, so a payload is never
-      -- larger than the decoded crop (an upscale would only cost bytes);
-      -- sixel draws 1:1, so it keeps the fitted size and is upsampled.
-      shrink = minimum [ 1.0, fromIntegral dcw / fromIntegral (max 1 pxW0)
-                       , fromIntegral dch / fromIntegral (max 1 pxH0) ] :: Double
-      (pxW, pxH)
-        | gkKind key == GfxKitty, shrink < 1 =
-            (max 1 (min dcw (round (fromIntegral pxW0 * shrink))), max 1 (min dch (round (fromIntegral pxH0 * shrink))))
-        | otherwise = (pxW0, pxH0)
-      rgba = scaleRGBA img dcrop pxW pxH
-      frames = idFrames idoc
-      nFrames = length frames
-      kittyAnim = gkKind key == GfxKitty && nFrames > 1 && isNothing (idCrop idoc)
-      -- 1-based image id of an animation frame in the client-driven scheme.
-      frameId f = (f `mod` nFrames) + 1
-      -- Shrink the common frame resolution so the whole upload fits the
-      -- animation budget; kitty stretches the payload back into the cell box.
-      animScale = min 1.0 (sqrt (fromIntegral maxAnimGfxPixels
-                                 / fromIntegral (max 1 (pxW * pxH * length frames)))) :: Double
-      apxW = max 1 (round (fromIntegral pxW * animScale))
-      apxH = max 1 (round (fromIntegral pxH * animScale))
-      animPayload = [ (scaleRGBA f (0, 0, imgW f, imgH f) apxW apxH, delay)
-                    | (f, delay) <- frames ]
-  pure $ case gkKind key of
-    GfxKitty
-      | kittyAnim, edGfxKittyAnim ed ->
-          kittyPlaceAnim (row, col) (cols, rows) (apxW, apxH) animPayload
-      | kittyAnim, Just pf <- prevFrame, pf /= gkFrame key ->
-          -- Same client-driven animation, next frame: the data is resident.
-          kittySwapFrame (row, col) (cols, rows)
-                         (Just (frameId pf)) (frameId (gkFrame key))
-      | kittyAnim ->
-          kittyClientAnim (row, col) (cols, rows) (apxW, apxH)
-                          (gkFrame key `mod` nFrames) (map fst animPayload)
-      | otherwise -> kittyPlace (row, col) (cols, rows) (pxW, pxH) rgba
-    GfxSixel -> sixelPlace (row, col) (pxW, pxH) rgba
+placeGfxIO :: Drv -> TermCaps -> Editor -> GfxKey -> Maybe Int -> IO Builder
+placeGfxIO drv caps ed key prevFrame = case edImage ed of
+  Nothing -> pure mempty
+  Just idoc -> do
+    let (_, _, cw, ch) = gkCrop key
+        -- The fit is the full-resolution crop's; the pixels come from the
+        -- decode, which for a reduced JPEG is smaller ('pictureSample').
+        (img, dcrop@(_, _, dcw, dch)) = pictureSample idoc (gkCrop key)
+        cellPx = case gkPx key of (0, 0) -> (8, 16); p -> p  -- unknown: assume 2:1
+        (top, left, tw, th) = gkGeom key
+        -- Fill (upscale) only when zoomed into a crop, or when the real cell
+        -- pixel size is unknown so "native" is meaningless; otherwise a small
+        -- image stays at 1:1 and centred. Matches 'imageFitCap' for the cell view.
+        allowUpscale = isJust (idCrop idoc) || gkPx key == (0, 0)
+        (row, col, cols, rows, pxW0, pxH0) = gfxFit cellPx (top, left, tw, th) (cw, ch) allowUpscale
+        -- Kitty scales the payload into the cell box, so a payload is never
+        -- larger than the decoded crop (an upscale would only cost bytes);
+        -- sixel draws 1:1, so it keeps the fitted size and is upsampled.
+        shrink = minimum [ 1.0, fromIntegral dcw / fromIntegral (max 1 pxW0)
+                         , fromIntegral dch / fromIntegral (max 1 pxH0) ] :: Double
+        (pxW, pxH)
+          | gkKind key == GfxKitty, shrink < 1 =
+              (max 1 (min dcw (round (fromIntegral pxW0 * shrink))), max 1 (min dch (round (fromIntegral pxH0 * shrink))))
+          | otherwise = (pxW0, pxH0)
+        frames = idFrames idoc
+        nFrames = length frames
+        kittyAnim = gkKind key == GfxKitty && nFrames > 1 && isNothing (idCrop idoc)
+        -- 1-based image id of an animation frame in the client-driven scheme.
+        frameId f = (f `mod` nFrames) + 1
+        -- Shrink the common frame resolution so the whole upload fits the
+        -- animation budget; kitty stretches the payload back into the cell box.
+        animScale = min 1.0 (sqrt (fromIntegral maxAnimGfxPixels
+                                   / fromIntegral (max 1 (pxW * pxH * length frames)))) :: Double
+        apxW = max 1 (round (fromIntegral pxW * animScale))
+        apxH = max 1 (round (fromIntegral pxH * animScale))
+        animRaw = [ (scaleRGBA f (0, 0, imgW f, imgH f) apxW apxH, delay)
+                  | (f, delay) <- frames ]
+    -- Animations with more frames than the local shm ring budget cannot hold
+    -- every frame in /dev/shm concurrently without risking self-eviction or
+    -- flooding /dev/shm; fall back to o=z (or lazy raw t=d) instead.
+    let animCaps
+          | nFrames > maxGfxTmpCount = caps { tcKittyShm = False }
+          | otherwise                = caps
+        useAltTransport = tcKittyShm animCaps || tcKittyZlib animCaps
+    case gkKind key of
+      GfxKitty
+        | kittyAnim, edGfxKittyAnim ed, not useAltTransport -> do
+            -- Plain kitty: keep animation frame scaling lazy so only one frame
+            -- is live in heap at a time while hPutBuilder streams to stdout.
+            let !wBytes = fromIntegral nFrames * kittyInlineWireBytes False (apxW * apxH * 4)
+            recordGfxStat drv wBytes "kitty inline"
+            pure (kittyPlaceAnim (row, col) (cols, rows) (apxW, apxH) animRaw)
+        | kittyAnim, edGfxKittyAnim ed -> do
+            batchId <- beginGfxBatch drv
+            animPay <- forM animRaw $ \(bs, delay) -> do
+              p <- encodeKittyFrame drv batchId animCaps bs ZlibUntried
+              pure (p, delay)
+            let !wBytes = sum [ kittyPayloadWireBytes p | (p, _) <- animPay ]
+                !mode   = case animPay of
+                            ((p, _) : _) -> kittyPayloadMode p
+                            []           -> "kitty inline"
+            recordGfxStat drv wBytes mode
+            pure (kittyPlaceAnimPayload (row, col) (cols, rows) (apxW, apxH) animPay)
+        | kittyAnim, Just pf <- prevFrame, pf /= gkFrame key -> do
+            -- Same client-driven animation, next frame: the data is resident.
+            modifyIORef' (stGfxBytes (drvStats drv)) (+ 48)
+            pure (kittySwapFrame (row, col) (cols, rows)
+                                 (Just (frameId pf)) (frameId (gkFrame key)))
+        | kittyAnim, not useAltTransport -> do
+            let !wBytes = fromIntegral nFrames * kittyInlineWireBytes False (apxW * apxH * 4)
+            recordGfxStat drv wBytes "kitty inline"
+            pure (kittyClientAnim (row, col) (cols, rows) (apxW, apxH)
+                                  (gkFrame key `mod` nFrames) (map fst animRaw))
+        | kittyAnim -> do
+            batchId <- beginGfxBatch drv
+            animPay <- forM animRaw $ \(bs, _) ->
+              encodeKittyFrame drv batchId animCaps bs ZlibUntried
+            let !wBytes = sum (map kittyPayloadWireBytes animPay)
+                !mode   = case animPay of
+                            (p : _) -> kittyPayloadMode p
+                            []      -> "kitty inline"
+            recordGfxStat drv wBytes mode
+            pure (kittyClientAnimPayload (row, col) (cols, rows) (apxW, apxH)
+                                         (gkFrame key `mod` nFrames) animPay)
+        | otherwise -> do
+            let rgba = scaleRGBA img dcrop pxW pxH
+            batchId <- beginGfxBatch drv
+            pay <- encodeKittyFrame drv batchId caps rgba ZlibUntried
+            recordGfxStat drv (kittyPayloadWireBytes pay) (kittyPayloadMode pay)
+            pure (kittyPlacePayload (row, col) (cols, rows) (pxW, pxH) pay)
+      GfxSixel -> do
+        let rgba = scaleRGBA img dcrop pxW pxH
+        recordGfxStat drv (fromIntegral (pxW * pxH * 4)) "sixel"
+        pure (sixelPlace (row, col) (pxW, pxH) rgba)
+
+------------------------------------------------------------------------------
+-- Kitty local-transport (t=s / t=t) and zlib (o=z) driver helpers (plan 0041)
+
+localTransChar :: KittyLocalKind -> Char
+localTransChar KittyLocalShm  = 's'
+localTransChar KittyLocalTemp = 't'
+
+-- | Send the i=32 local-transport probe once per session after kitty graphics
+-- (i=31) is confirmed.
+probeKittyLocal :: Drv -> IO ()
+probeKittyLocal drv = do
+  already <- readIORef (drvGfxProbed drv)
+  unless already $ do
+    writeIORef (drvGfxProbed drv) True
+    mref <- mask_ $ do
+      r <- writeKittyLocal (BS.pack [0, 0, 0, 255])
+      forM_ r $ \(kind, name) -> do
+        now <- getMonotonicTime
+        writeIORef (drvGfxProbe drv) (Just (kind, name, now))
+      pure r
+    forM_ mref $ \(kind, name) -> do
+      emit (kittyLocalProbe (localTransChar kind) name)
+      hFlush stdout
+
+-- | Unlink any still-tracked i=32 probe object immediately.
+unlinkPendingProbe :: Drv -> IO ()
+unlinkPendingProbe drv = do
+  mp <- atomicModifyIORef' (drvGfxProbe drv) (\cur -> (Nothing, cur))
+  forM_ mp $ \(kind, name, _) -> unlinkKittyLocal kind name
+
+-- | Unlink an unanswered i=32 probe object once 2 s have elapsed (terminal
+-- ignored the query silently).
+sweepExpiredGfxProbe :: Drv -> IO ()
+sweepExpiredGfxProbe drv = do
+  mp <- readIORef (drvGfxProbe drv)
+  forM_ mp $ \(_, _, createdAt) -> do
+    now <- getMonotonicTime
+    when (now - createdAt >= 2.0) (unlinkPendingProbe drv)
+
+maxGfxTmpCount :: Int
+maxGfxTmpCount = 256
+
+maxGfxTmpBytes :: Int
+maxGfxTmpBytes = 64 * 1024 * 1024
+
+-- | Allocate a fresh upload batch id so all frames belonging to one
+-- placement or animation share a batch and can never evict each other before
+-- the builder is emitted.
+beginGfxBatch :: Drv -> IO Int
+beginGfxBatch drv = atomicModifyIORef' (drvGfxTmp drv) $ \(b, tot, q) ->
+  let !b' = b + 1 in ((b', tot, q), b')
+
+-- | Record a local placement object in the bounded teardown ring so clean
+-- exit / SIGTERM / SIGHUP never leaves orphaned objects behind. When the ring
+-- exceeds 'maxGfxTmpCount' entries or 'maxGfxTmpBytes' total bytes, objects
+-- from strictly earlier batches (@eb < batchId@) are evicted and unlinked
+-- immediately; objects from the in-flight batch are never evicted before their
+-- escape sequence is written to stdout.
+recordGfxTmp :: Drv -> Int -> KittyLocalKind -> String -> Int -> IO ()
+recordGfxTmp drv batchId kind name sz = do
+  evicted <- atomicModifyIORef' (drvGfxTmp drv) $ \(b, tot, q) ->
+    let !q1   = q Seq.|> (batchId, kind, name, sz)
+        !tot1 = tot + sz
+        go !t acc s
+          | Seq.length s <= maxGfxTmpCount && t <= maxGfxTmpBytes = (t, acc, s)
+          | otherwise = case Seq.viewl s of
+              (eb, ek, en, esz) Seq.:< rest
+                | eb < batchId -> go (t - esz) ((ek, en) : acc) rest
+              _ -> (t, acc, s)
+        (tot', evs, q') = go tot1 [] q1
+    in ((b, tot', q'), reverse evs)
+  forM_ evicted $ \(ek, en) -> unlinkKittyLocal ek en
+
+-- | Best-effort unlink of any remaining probe or placement objects on exit.
+cleanupGfxLocal :: Drv -> IO ()
+cleanupGfxLocal drv = do
+  unlinkPendingProbe drv
+  tmps <- atomicModifyIORef' (drvGfxTmp drv) (\(b, _, s) -> ((b, 0, Seq.empty), s))
+  forM_ (toList tmps) $ \(_, kind, name, _) -> unlinkKittyLocal kind name
+
+-- | Fast arithmetic wire-byte estimate for an inline kitty frame (avoids
+-- materialising the whole base64 stream in heap just to count stats).
+kittyInlineWireBytes :: Bool -> Int -> Integer
+kittyInlineWireBytes isZ n =
+  let !b64    = ((n + 2) `div` 3) * 4
+      !chunks = max 1 ((n + 3071) `div` 3072)
+      !hdr0   = if isZ then 56 else 52
+  in fromIntegral (b64 + hdr0 + (chunks - 1) * 14)
+
+kittyPayloadWireBytes :: KittyPayload -> Integer
+kittyPayloadWireBytes = \case
+  KpLocal _ name -> fromIntegral (62 + ((length name + 2) `div` 3) * 4)
+  KpRaw bs       -> kittyInlineWireBytes False (BS.length bs)
+  KpZlib bs      -> kittyInlineWireBytes True  (BS.length bs)
+
+kittyPayloadMode :: KittyPayload -> String
+kittyPayloadMode (KpLocal 's' _) = "kitty shm"
+kittyPayloadMode (KpLocal 't' _) = "kitty temp"
+kittyPayloadMode (KpLocal _   _) = "kitty local"
+kittyPayloadMode (KpZlib _)      = "kitty zlib"
+kittyPayloadMode (KpRaw _)       = "kitty inline"
+
+recordGfxStat :: Drv -> Integer -> String -> IO ()
+recordGfxStat drv nBytes mode = do
+  let st = drvStats drv
+  modifyIORef' (stGfxPlaces st) (+ 1)
+  modifyIORef' (stGfxBytes st) (+ nBytes)
+  writeIORef (stGfxMode st) mode
+
+-- | Prepare one RGBA frame for kitty transmission according to negotiated
+-- capabilities: local shm/temp (t=s / t=t) first, then RFC 1950 zlib (o=z)
+-- when >= 16 KiB and compressible, else raw inline (t=d). Any local write
+-- error falls back transparently so a placement never turns blank.
+encodeKittyFrame :: Drv -> Int -> TermCaps -> BS.ByteString -> ZlibCache -> IO KittyPayload
+encodeKittyFrame drv batchId caps rgba preZlib
+  | tcKittyShm caps = do
+      mref <- mask_ $ do
+        r <- writeKittyLocal rgba
+        forM_ r $ \(kind, name) -> recordGfxTmp drv batchId kind name (BS.length rgba)
+        pure r
+      case mref of
+        Just (kind, name) -> pure (KpLocal (localTransChar kind) name)
+        Nothing           -> pure (directPayload caps rgba preZlib)
+  | otherwise = pure (directPayload caps rgba preZlib)
+  where
+    directPayload c bs zc
+      | not (tcKittyZlib c) = KpRaw bs
+      | ZlibReady z <- zc   = KpZlib z
+      | ZlibSkip    <- zc   = KpRaw bs
+      | BS.length bs >= 16384, Just z <- zlibCompressFast bs = KpZlib z
+      | otherwise           = KpRaw bs

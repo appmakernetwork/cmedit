@@ -34,7 +34,7 @@ RTSOPTS = -rtsopts "-with-rtsopts=--disable-delayed-os-memory-return -T -I2 -qm"
 PKGS = -package base -package bytestring -package text -package containers \
        -package array -package process -package stm \
        -package directory -package filepath -package mtl -package time
-PKGS_POSIX = $(PKGS) -package unix
+PKGS_POSIX = $(PKGS) -package unix $(if $(filter Linux,$(shell uname -s)),-lrt,)
 
 EXTS = -XLambdaCase -XOverloadedStrings -XBangPatterns -XTupleSections \
        -XScopedTypeVariables -XMultiWayIf -XRecordWildCards -XNamedFieldPuns

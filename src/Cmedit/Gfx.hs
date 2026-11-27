@@ -1,26 +1,34 @@
 -- | Pixel-graphics output: the kitty graphics protocol and sixel, both
--- hand-rolled on boot libraries (a base64 encoder and a run-length sixel
--- encoder). The image view upgrades to true pixels when the terminal
--- advertised one of these ('Cmedit.Caps'); the half-block cell renderer stays
--- underneath as the universal fallback, so terminals without either see
--- exactly what they saw before.
+-- hand-rolled on boot libraries (a base64 encoder, an RFC 1950 zlib
+-- compressor in "Cmedit.Deflate", and a run-length sixel encoder). The image
+-- view upgrades to true pixels when the terminal advertised one of these
+-- ('Cmedit.Caps'); the half-block cell renderer stays underneath as the
+-- universal fallback, so terminals without either see exactly what they saw
+-- before.
 --
--- Pure: everything here builds escape byte streams from an 'Image'; the
--- driver decides when to emit them.
+-- Pure: everything here builds escape byte streams from an 'Image' or
+-- 'KittyPayload'; the driver decides when to emit them and manages any
+-- out-of-band shared-memory / temp-file objects.
 module Cmedit.Gfx
   ( -- * Capability probe / teardown
     kittyGfxProbe
+  , kittyLocalProbe
+  , kittyZlibProbe
   , kittyGfxDeleteAll
     -- * Placement
   , GfxKind(..)
+  , KittyPayload(..)
   , gfxFit
   , gfxFitVector
   , maxSixelVectorPixels
   , maxGfxPixels
   , maxAnimGfxPixels
   , kittyPlace
+  , kittyPlacePayload
   , kittyPlaceAnim
+  , kittyPlaceAnimPayload
   , kittyClientAnim
+  , kittyClientAnimPayload
   , kittySwapFrame
   , sixelPlace
     -- * Encoders (exposed for tests)
@@ -34,17 +42,18 @@ import Data.ByteString.Builder (Builder, byteString, char7, intDec, string7, wor
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BI
 import qualified Data.ByteString.Unsafe as BU
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import Foreign.Storable (pokeByteOff)
 import Data.Word (Word8)
 import Data.Array.ST (STUArray, newArray, readArray, writeArray)
 import Data.Array.Unboxed (UArray, (!))
 import Data.Array.ST (runSTUArray)
-import qualified Data.Array.Unboxed as U
 import Control.Monad (forM_, when)
 import Control.Monad.ST (ST, runST)
 
-import Cmedit.Ansi (csi, esc, moveTo)
-import Cmedit.Image (Image(..))
+import Cmedit.Ansi (esc, moveTo)
+import Cmedit.Deflate (zlibCompress)
 
 ------------------------------------------------------------------------------
 -- Kitty graphics protocol
@@ -58,6 +67,28 @@ apc b = esc <> char7 '_' <> b <> esc <> char7 '\\'
 kittyGfxProbe :: Builder
 kittyGfxProbe = apc (string7 "Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA")
 
+-- | Query local out-of-band transport support (@t=s@ POSIX shared memory or
+-- @t=t@ auto-deleted temp file) with a 1x1 RGBA (4-byte) object at @name@.
+-- A local terminal that can open the object answers @APC G i=32;OK ST@
+-- (decoded to 'TrKittyShm True') and unlinks it; a remote terminal (SSH /
+-- isolated container) replies with an error (e.g. @ENOENT@, decoded to
+-- 'TrKittyShm False') or ignores it.
+kittyLocalProbe :: Char -> String -> Builder
+kittyLocalProbe tchar name =
+  apc (string7 "Gi=32,s=1,v=1,a=q,t=" <> char7 tchar <> string7 ",f=32;"
+         <> base64B (TE.encodeUtf8 (T.pack name)))
+
+-- | Query RFC 1950 zlib compression support (@o=z@) on direct inline
+-- transmission with an 8x8 RGB (192 raw bytes) all-zero payload compressed
+-- to ~90 bytes (most of it the block header). Because that is still shorter than the
+-- declared 192 raw bytes, a terminal that ignores @o=z@ rejects it for
+-- insufficient pixel data rather than answering OK. Supporting terminals
+-- reply @APC G i=33;OK ST@ ('TrKittyZlib True').
+kittyZlibProbe :: Builder
+kittyZlibProbe =
+  apc (string7 "Gi=33,s=8,v=8,a=q,t=d,f=24,o=z;"
+         <> base64B (zlibCompress (BS.replicate (8 * 8 * 3) 0)))
+
 -- | Delete every visible kitty-graphics placement (also safe to emit on
 -- terminals that never showed one).
 kittyGfxDeleteAll :: Builder
@@ -65,6 +96,13 @@ kittyGfxDeleteAll = apc (string7 "Ga=d,d=A")
 
 -- | Which pixel protocol a placement uses.
 data GfxKind = GfxKitty | GfxSixel
+  deriving (Eq, Show)
+
+-- | How one kitty image/frame's RGBA bytes are carried on the wire.
+data KittyPayload
+  = KpRaw !BS.ByteString      -- ^ Direct inline raw RGBA (@t=d@).
+  | KpZlib !BS.ByteString     -- ^ Direct inline RFC 1950 zlib-compressed RGBA (@t=d,o=z@).
+  | KpLocal !Char !String     -- ^ Out-of-band local transport (@t=s@ shm or @t=t@ temp file) naming the object.
   deriving (Eq, Show)
 
 -- | Don't ship more pixels than this per placement: it bounds the encode +
@@ -140,95 +178,125 @@ gfxFitVector kind (pw0, ph0) geom@(top, left, tw, th) crop =
 maxSixelVectorPixels :: Int
 maxSixelVectorPixels = 2500 * 1000
 
+-- Emit a direct byte payload in 4096-base64-char (3072-byte) APC chunks.
+emitChunks :: (Bool -> Int -> Builder) -> BS.ByteString -> Builder
+emitChunks mkHeader = go True
+  where
+    go first bs =
+      let (now, rest) = BS.splitAt 3072 bs   -- 4096 base64 chars per chunk
+          m = if BS.null rest then 0 else 1
+          part = apc (mkHeader first m <> char7 ';' <> base64B now)
+      in if BS.null rest then part else part <> go False rest
+
 -- | Place raw RGBA pixels (@pxW x pxH@) into a cell box at @(row, col)@ via
 -- the kitty protocol: delete the previous placement, transmit in base64
 -- chunks, display scaled into @cols x rows@ cells. @q=2@ suppresses the OK
 -- chatter a display action would otherwise send back.
 kittyPlace :: (Int, Int) -> (Int, Int) -> (Int, Int) -> BS.ByteString -> Builder
-kittyPlace (row, col) (cols, rows) (pxW, pxH) rgba =
+kittyPlace pos box dim rgba = kittyPlacePayload pos box dim (KpRaw rgba)
+
+-- | Like 'kittyPlace', carrying raw ('KpRaw'), zlib-compressed ('KpZlib'), or
+-- out-of-band local ('KpLocal') pixel data.
+kittyPlacePayload :: (Int, Int) -> (Int, Int) -> (Int, Int) -> KittyPayload -> Builder
+kittyPlacePayload (row, col) (cols, rows) (pxW, pxH) payload =
   kittyGfxDeleteAll
     <> moveTo row col
-    <> chunks True rgba
+    <> case payload of
+         KpRaw bs -> emitChunks (hdr mempty) bs
+         KpZlib zbs -> emitChunks (hdr (string7 ",o=z")) zbs
+         KpLocal tc name ->
+           apc (string7 "Ga=T,f=32,t=" <> char7 tc <> string7 ",i=1,q=2,s=" <> intDec pxW
+                  <> string7 ",v=" <> intDec pxH
+                  <> string7 ",c=" <> intDec cols <> string7 ",r=" <> intDec rows
+                  <> char7 ';' <> base64B (TE.encodeUtf8 (T.pack name)))
   where
-    header first m =
-      if first
-        then string7 "Ga=T,f=32,i=1,q=2,s=" <> intDec pxW <> string7 ",v=" <> intDec pxH
-               <> string7 ",c=" <> intDec cols <> string7 ",r=" <> intDec rows
-               <> string7 ",m=" <> intDec m
-        else string7 "Gm=" <> intDec m
-    chunks first bs =
-      let (now, rest) = BS.splitAt 3072 bs   -- 4096 base64 chars per chunk
-          m = if BS.null rest then 0 else 1
-          part = apc (header first m <> char7 ';' <> base64B now)
-      in if BS.null rest then part else part <> chunks False rest
+    hdr extra first m
+      | first = string7 "Ga=T,f=32,i=1,q=2" <> extra
+                  <> string7 ",s=" <> intDec pxW <> string7 ",v=" <> intDec pxH
+                  <> string7 ",c=" <> intDec cols <> string7 ",r=" <> intDec rows
+                  <> string7 ",m=" <> intDec m
+      | otherwise = string7 "Gm=" <> intDec m
 
 -- | Total pixels we are willing to transmit for one animation upload (all
 -- frames together). Kitty stores every frame, so this bounds both the
--- encode/transmit cost and the terminal's storage; 'placeGfx' scales the
+-- encode/transmit cost and the terminal's storage; 'placeGfxIO' scales the
 -- frames' common resolution down to fit (the terminal stretches the payload
 -- into the same cell box, so a long animation just gets a little softer).
 maxAnimGfxPixels :: Int
 maxAnimGfxPixels = 4 * 1000 * 1000
 
+-- | Place an animation via the kitty protocol (see 'kittyPlaceAnimPayload').
+kittyPlaceAnim :: (Int, Int) -> (Int, Int) -> (Int, Int) -> [(BS.ByteString, Int)] -> Builder
+kittyPlaceAnim pos box dim frames =
+  kittyPlaceAnimPayload pos box dim [ (KpRaw bs, gap) | (bs, gap) <- frames ]
+
 -- | Place an animation via the kitty protocol: transmit the root frame
--- exactly like 'kittyPlace' (so it displays immediately), then send every
--- further frame with the animation-frame action (@a=f@) carrying its
+-- exactly like 'kittyPlacePayload' (so it displays immediately), then send
+-- every further frame with the animation-frame action (@a=f@) carrying its
 -- per-frame gap, set the root frame's gap (it cannot be given at creation),
 -- and hand the loop to the terminal (@s=3,v=1@ = run, loop forever). The
--- terminal then animates on its own — the editor never ticks. Each frame is
--- full-canvas RGBA at the same resolution as the root, with @q=2@ keeping the
--- terminal quiet. Only emitted for terminals whitelisted as implementing the
--- animation actions ('Cmedit.Caps.supportsKittyAnim' — real kitty); a
--- kitty-protocol terminal without them gets 'kittyClientAnim' instead, and
--- even if one slipped through it would still show the root frame.
-kittyPlaceAnim :: (Int, Int) -> (Int, Int) -> (Int, Int) -> [(BS.ByteString, Int)] -> Builder
-kittyPlaceAnim _ _ _ [] = mempty
-kittyPlaceAnim pos box (pxW, pxH) ((root, rootGap) : rest) =
-  kittyPlace pos box (pxW, pxH) root
+-- terminal then animates on its own, and the editor never ticks. Each frame
+-- is full-canvas RGBA at the same resolution as the root, with @q=2@ keeping
+-- the terminal quiet. Only emitted for terminals whitelisted as implementing
+-- the animation actions ('Cmedit.Caps.supportsKittyAnim': real kitty); a
+-- kitty-protocol terminal without them gets 'kittyClientAnimPayload'
+-- instead, and even if one slipped through it would still show the root
+-- frame.
+kittyPlaceAnimPayload :: (Int, Int) -> (Int, Int) -> (Int, Int) -> [(KittyPayload, Int)] -> Builder
+kittyPlaceAnimPayload _ _ _ [] = mempty
+kittyPlaceAnimPayload pos box (pxW, pxH) ((root, rootGap) : rest) =
+  kittyPlacePayload pos box (pxW, pxH) root
     <> mconcat [ frameB gap dat | (dat, gap) <- rest ]
     <> apc (string7 "Ga=a,i=1,q=2,r=1,z=" <> intDec (max 1 rootGap))
     <> apc (string7 "Ga=a,i=1,q=2,s=3,v=1")
   where
-    frameB gap dat = chunks True dat
-      where
-        header first m
-          | first = string7 "Ga=f,i=1,f=32,q=2,s=" <> intDec pxW <> string7 ",v=" <> intDec pxH
-                      <> string7 ",z=" <> intDec (max 1 gap) <> string7 ",m=" <> intDec m
-          -- Continuation chunks of frame data carry only a=f, q and m.
-          | otherwise = string7 "Ga=f,q=2,m=" <> intDec m
-        chunks first bs =
-          let (now, restB) = BS.splitAt 3072 bs
-              m = if BS.null restB then 0 else 1
-              part = apc (header first m <> char7 ';' <> base64B now)
-          in if BS.null restB then part else part <> chunks False restB
+    frameB gap payload = case payload of
+      KpRaw bs -> emitChunks (hdr mempty gap) bs
+      KpZlib zbs -> emitChunks (hdr (string7 ",o=z") gap) zbs
+      KpLocal tc name ->
+        apc (string7 "Ga=f,i=1,f=32,t=" <> char7 tc <> string7 ",q=2,s=" <> intDec pxW
+               <> string7 ",v=" <> intDec pxH <> string7 ",z=" <> intDec (max 1 gap)
+               <> char7 ';' <> base64B (TE.encodeUtf8 (T.pack name)))
+    hdr extra gap first m
+      | first = string7 "Ga=f,i=1,f=32,q=2" <> extra
+                  <> string7 ",s=" <> intDec pxW <> string7 ",v=" <> intDec pxH
+                  <> string7 ",z=" <> intDec (max 1 gap) <> string7 ",m=" <> intDec m
+      -- Continuation chunks of frame data carry only a=f, q and m.
+      | otherwise = string7 "Ga=f,q=2,m=" <> intDec m
 
 -- | Client-driven animation for terminals that speak the kitty graphics
--- protocol but not its animation extension (Ghostty, WezTerm, Konsole):
--- delete everything, transmit every frame once as its own image id (@a=t@,
--- data only, ids are 1-based frame numbers), then show the current frame.
--- The editor's animation tick thereafter swaps the visible placement with
--- 'kittySwapFrame' — a few dozen bytes per step against the resident frame
--- data, instead of a re-upload. Total transmission equals the native
--- animation upload, so the same 'maxAnimGfxPixels' budget applies.
+-- protocol but not its animation extension (Ghostty, WezTerm, Konsole);
+-- see 'kittyClientAnimPayload'.
 kittyClientAnim :: (Int, Int) -> (Int, Int) -> (Int, Int) -> Int -> [BS.ByteString] -> Builder
-kittyClientAnim pos box (pxW, pxH) cur frames =
+kittyClientAnim pos box dim cur frames =
+  kittyClientAnimPayload pos box dim cur (map KpRaw frames)
+
+-- | Like 'kittyClientAnim', accepting per-frame 'KittyPayload's: delete
+-- everything, transmit every frame once as its own image id (@a=t@, data
+-- only, ids are 1-based frame numbers), then show the current frame. The
+-- editor's animation tick thereafter swaps the visible placement with
+-- 'kittySwapFrame', a few dozen bytes per step against the resident frame
+-- data instead of a re-upload. Total transmission equals the native
+-- animation upload, so the same 'maxAnimGfxPixels' budget applies.
+kittyClientAnimPayload :: (Int, Int) -> (Int, Int) -> (Int, Int) -> Int -> [KittyPayload] -> Builder
+kittyClientAnimPayload pos box (pxW, pxH) cur frames =
   kittyGfxDeleteAll
     <> mconcat [ transmitB i dat | (i, dat) <- zip [1 ..] frames ]
     <> kittySwapFrame pos box Nothing (cur + 1)
   where
-    transmitB :: Int -> BS.ByteString -> Builder
-    transmitB i dat = chunks True dat
-      where
-        header first m
-          | first = string7 "Ga=t,f=32,q=2,i=" <> intDec i
-                      <> string7 ",s=" <> intDec pxW <> string7 ",v=" <> intDec pxH
-                      <> string7 ",m=" <> intDec m
-          | otherwise = string7 "Gm=" <> intDec m
-        chunks first bs =
-          let (now, restB) = BS.splitAt 3072 bs
-              m = if BS.null restB then 0 else 1
-              part = apc (header first m <> char7 ';' <> base64B now)
-          in if BS.null restB then part else part <> chunks False restB
+    transmitB :: Int -> KittyPayload -> Builder
+    transmitB i payload = case payload of
+      KpRaw bs -> emitChunks (hdr mempty i) bs
+      KpZlib zbs -> emitChunks (hdr (string7 ",o=z") i) zbs
+      KpLocal tc name ->
+        apc (string7 "Ga=t,f=32,t=" <> char7 tc <> string7 ",q=2,i=" <> intDec i
+               <> string7 ",s=" <> intDec pxW <> string7 ",v=" <> intDec pxH
+               <> char7 ';' <> base64B (TE.encodeUtf8 (T.pack name)))
+    hdr extra i first m
+      | first = string7 "Ga=t,f=32,q=2" <> extra <> string7 ",i=" <> intDec i
+                  <> string7 ",s=" <> intDec pxW <> string7 ",v=" <> intDec pxH
+                  <> string7 ",m=" <> intDec m
+      | otherwise = string7 "Gm=" <> intDec m
 
 -- | Swap which pre-uploaded frame is on screen: delete the previous frame's
 -- placement (its pixel data stays resident) and place the new frame's image
